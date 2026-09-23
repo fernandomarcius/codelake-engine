@@ -187,90 +187,14 @@ mod tests {
         assert!(child.iter().all(|f| matches!(f.discriminant, PushedDown::No)));
     }
 
-    /// Reproduces the upstream defect without Docker: a federated "remote" whose
-    /// executor, like the real `datafusion-table-providers` executors, ignores the
-    /// `filters` argument and returns whatever its SQL selects.
+    /// Reproduces the upstream defect without Docker (see `crate::testing`).
     mod upstream_defect {
         use super::*;
-        use async_trait::async_trait;
-        use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
-        use datafusion::arrow::datatypes::SchemaRef;
-        use datafusion::catalog::TableProvider;
+        use crate::testing::{int64, remote_table, strings};
+        use datafusion::arrow::array::StringArray;
         use datafusion::execution::SessionStateBuilder;
-        use datafusion::physical_expr::PhysicalExpr;
         use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
-        use datafusion::physical_plan::memory::MemoryStream;
         use datafusion::prelude::SessionContext;
-        use datafusion::sql::unparser::dialect::{DefaultDialect, Dialect};
-        use datafusion_federation::FederatedTableProviderAdaptor;
-        use datafusion_federation::sql::{
-            RemoteTable, RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
-        };
-        use std::collections::HashMap;
-
-        #[derive(Debug)]
-        struct IgnoresFilters {
-            context: &'static str,
-            columns: HashMap<&'static str, ArrayRef>,
-        }
-
-        #[async_trait]
-        impl SQLExecutor for IgnoresFilters {
-            fn name(&self) -> &'static str {
-                "ignores_filters"
-            }
-            fn compute_context(&self) -> Option<String> {
-                Some(self.context.to_owned())
-            }
-            fn dialect(&self) -> Arc<dyn Dialect> {
-                Arc::new(DefaultDialect {})
-            }
-            fn execute(
-                &self,
-                _query: &str,
-                schema: SchemaRef,
-                _filters: &[Arc<dyn PhysicalExpr>],
-            ) -> Result<SendableRecordBatchStream> {
-                let arrays = schema
-                    .fields()
-                    .iter()
-                    .map(|f| Arc::clone(&self.columns[f.name().as_str()]))
-                    .collect();
-                let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
-                Ok(Box::pin(MemoryStream::try_new(vec![batch], schema, None)?))
-            }
-            async fn table_names(&self) -> Result<Vec<String>> {
-                Ok(vec![])
-            }
-            async fn get_table_schema(&self, table: &str) -> Result<SchemaRef> {
-                Err(DataFusionError::Plan(format!("unknown table {table}")))
-            }
-        }
-
-        fn remote(
-            context: &'static str,
-            table: &str,
-            columns: Vec<(&'static str, ArrayRef)>,
-        ) -> Arc<dyn TableProvider> {
-            let schema = Arc::new(Schema::new(
-                columns
-                    .iter()
-                    .map(|(name, array)| Field::new(*name, array.data_type().clone(), false))
-                    .collect::<Vec<_>>(),
-            ));
-            let executor = Arc::new(IgnoresFilters {
-                context,
-                columns: columns.into_iter().collect(),
-            });
-            let table = Arc::new(RemoteTable::new(
-                RemoteTableRef::try_from(table.to_owned()).unwrap(),
-                schema,
-            ));
-            let provider = Arc::new(SQLFederationProvider::new(executor));
-            Arc::new(FederatedTableProviderAdaptor::new(Arc::new(
-                SQLTableSource::new_with_table(provider, table),
-            )))
-        }
 
         fn session(guarded: bool) -> SessionContext {
             let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = Vec::new();
@@ -287,28 +211,24 @@ mod tests {
             let ctx = SessionContext::new_with_state(state);
             ctx.register_table(
                 "customers",
-                remote(
+                remote_table(
                     "erp",
                     "customers",
-                    vec![
-                        ("id", Arc::new(Int64Array::from(vec![1, 2]))),
-                        ("name", Arc::new(StringArray::from(vec!["Ana", "Bruno"]))),
-                    ],
+                    vec![("id", int64(&[1, 2])), ("name", strings(&["Ana", "Bruno"]))],
+                    None,
                 ),
             )
             .unwrap();
             ctx.register_table(
                 "contracts",
-                remote(
+                remote_table(
                     "crm",
                     "contracts",
                     vec![
-                        ("customer_id", Arc::new(Int64Array::from(vec![1, 2, 1]))),
-                        (
-                            "status",
-                            Arc::new(StringArray::from(vec!["active", "cancelled", "active"])),
-                        ),
+                        ("customer_id", int64(&[1, 2, 1])),
+                        ("status", strings(&["active", "cancelled", "active"])),
                     ],
+                    None,
                 ),
             )
             .unwrap();

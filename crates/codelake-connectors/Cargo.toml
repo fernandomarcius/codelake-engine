@@ -10,11 +10,12 @@ authors.workspace = true
 publish.workspace = true
 
 [features]
-default = ["postgres", "mysql", "mongodb"]
+default = ["postgres", "mysql", "mongodb", "sqlserver"]
 # Not shipped: pulls quick-xml 0.39 (RUSTSEC-2026-0194/0195) through opendal 0.57,
 # pinned by iceberg-storage-opendal 0.10. See ROADMAP.md (M3).
 postgres = ["datafusion-table-providers/postgres-federation"]
 mysql = ["datafusion-table-providers/mysql-federation"]
+sqlserver = ["dep:tiberius", "dep:bb8", "dep:tokio-util", "dep:futures", "dep:datafusion-federation"]
 mongodb = ["datafusion-table-providers/mongodb"]
 iceberg = ["dep:iceberg", "dep:iceberg-datafusion", "dep:iceberg-catalog-rest", "dep:iceberg-storage-opendal"]
 
@@ -26,9 +27,15 @@ iceberg = { workspace = true, optional = true }
 iceberg-datafusion = { workspace = true, optional = true }
 iceberg-catalog-rest = { workspace = true, optional = true }
 iceberg-storage-opendal = { workspace = true, optional = true }
+tiberius = { workspace = true, optional = true }
+bb8 = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true, features = ["compat"] }
+futures = { workspace = true, optional = true }
+datafusion-federation = { workspace = true, optional = true }
 async-trait.workspace = true
 secrecy.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
@@ -36,6 +43,8 @@ tempfile.workspace = true
 tokio-postgres = "0.7"
 mysql_async = { version = "0.36", default-features = false, features = ["minimal"] }
 mongodb = "3.6"
+tiberius = { workspace = true }
+tokio-util = { workspace = true, features = ["compat"] }
 testcontainers.workspace = true
 testcontainers-modules.workspace = true
 

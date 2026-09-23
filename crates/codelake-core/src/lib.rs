@@ -8,7 +8,10 @@ pub mod config;
 pub mod connector;
 pub mod engine;
 pub mod federation_guard;
+pub mod federation_policy;
 pub mod runtime;
+#[cfg(test)]
+mod testing;
 
 pub use bytes::ByteSize;
 pub use config::{Config, SourceConfig, SourceKind, ValidatedConfig};

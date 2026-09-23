@@ -20,8 +20,14 @@ pub mod mysql;
 mod params;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "sqlserver")]
+pub mod sqlserver;
 
 /// Builds the connector for one configured source. Does not connect yet.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one match arm per connector kind keeps the config-to-connector mapping in one place"
+)]
 pub fn build(source: &SourceConfig, secrets: &Secrets) -> Result<Arc<dyn Connector>, ConnectorError> {
     let name = source.name.clone();
     let secret = |var: &str| {
@@ -71,6 +77,29 @@ pub fn build(source: &SourceConfig, secrets: &Secrets) -> Result<Arc<dyn Connect
                 user: user.clone(),
                 password: secret(password_env)?,
                 sslmode: sslmode.clone(),
+            },
+        ))),
+        #[cfg(feature = "sqlserver")]
+        SourceKind::Sqlserver {
+            host,
+            port,
+            database,
+            user,
+            password_env,
+            encrypt,
+            trust_server_certificate,
+            pool_size,
+        } => Ok(Arc::new(sqlserver::SqlServerConnector::new(
+            name.clone(),
+            sqlserver::SqlServerParams {
+                host: host.clone(),
+                port: *port,
+                database: database.clone(),
+                user: user.clone(),
+                password: secret(password_env)?,
+                encrypt: encrypt.clone(),
+                trust_server_certificate: *trust_server_certificate,
+                pool_size: *pool_size,
             },
         ))),
         #[cfg(feature = "mongodb")]

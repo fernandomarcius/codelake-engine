@@ -17,3 +17,5 @@ mod mongodb;
 mod mysql;
 #[cfg(feature = "postgres")]
 mod postgres;
+#[cfg(all(feature = "sqlserver", feature = "postgres"))]
+mod sqlserver_smoke;

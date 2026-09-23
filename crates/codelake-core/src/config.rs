@@ -137,6 +137,26 @@ pub enum SourceKind {
         #[serde(default = "default_mysql_sslmode")]
         sslmode: String,
     },
+    Sqlserver {
+        host: String,
+        #[serde(default = "default_mssql_port")]
+        port: u16,
+        database: String,
+        user: String,
+        /// Name of the environment variable holding the password.
+        password_env: String,
+        /// `required` (default), `on` or `off`. `off` sends credentials in clear
+        /// text: only for isolated test networks.
+        #[serde(default = "default_mssql_encrypt")]
+        encrypt: String,
+        /// Accept the server certificate without validation (self-signed
+        /// development servers). Never in production.
+        #[serde(default)]
+        trust_server_certificate: bool,
+        /// Maximum pooled connections to this server.
+        #[serde(default = "default_pool_size")]
+        pool_size: u32,
+    },
     Mongodb {
         /// Name of the environment variable holding the full connection string.
         connection_string_env: String,
@@ -164,6 +184,7 @@ impl SourceKind {
         match self {
             Self::Postgres { .. } => "postgres",
             Self::Mysql { .. } => "mysql",
+            Self::Sqlserver { .. } => "sqlserver",
             Self::Mongodb { .. } => "mongodb",
             Self::Iceberg { .. } => "iceberg",
         }
@@ -172,7 +193,9 @@ impl SourceKind {
     /// Environment variables this source needs, in declaration order.
     pub fn secret_env_vars(&self) -> Vec<&str> {
         match self {
-            Self::Postgres { password_env, .. } | Self::Mysql { password_env, .. } => {
+            Self::Postgres { password_env, .. }
+            | Self::Mysql { password_env, .. }
+            | Self::Sqlserver { password_env, .. } => {
                 vec![password_env.as_str()]
             }
             Self::Mongodb {
@@ -212,6 +235,12 @@ const fn default_pg_port() -> u16 {
 const fn default_mysql_port() -> u16 {
     3306
 }
+const fn default_mssql_port() -> u16 {
+    1433
+}
+const fn default_pool_size() -> u32 {
+    10
+}
 const fn default_true() -> bool {
     true
 }
@@ -219,6 +248,9 @@ fn default_sslmode() -> String {
     "verify-full".to_owned()
 }
 fn default_mysql_sslmode() -> String {
+    "required".to_owned()
+}
+fn default_mssql_encrypt() -> String {
     "required".to_owned()
 }
 fn default_region() -> String {
@@ -265,6 +297,8 @@ const MIN_MEMORY_LIMIT: ByteSize = ByteSize::mib(64);
 const MAX_BATCH_SIZE: usize = 1 << 20;
 const PG_SSL_MODES: [&str; 5] = ["disable", "prefer", "require", "verify-ca", "verify-full"];
 const MYSQL_SSL_MODES: [&str; 3] = ["disabled", "preferred", "required"];
+const MSSQL_ENCRYPT: [&str; 3] = ["required", "on", "off"];
+const MAX_POOL_SIZE: u32 = 256;
 
 fn is_identifier(name: &str) -> bool {
     let mut chars = name.chars();
@@ -273,10 +307,16 @@ fn is_identifier(name: &str) -> bool {
         && name.len() <= 63
 }
 
-fn check_sql_source(name: &str, host: &str, sslmode: &str, allowed: &[&str], errors: &mut Vec<String>) {
-    if !allowed.contains(&sslmode) {
+fn check_sql_source(
+    name: &str,
+    host: &str,
+    (field, value): (&str, &str),
+    allowed: &[&str],
+    errors: &mut Vec<String>,
+) {
+    if !allowed.contains(&value) {
         errors.push(format!(
-            "source `{name}`: sslmode `{sslmode}` is not one of {allowed:?}"
+            "source `{name}`: {field} `{value}` is not one of {allowed:?}"
         ));
     }
     if host.trim().is_empty() {
@@ -407,10 +447,23 @@ impl Config {
             }
             match &source.kind {
                 SourceKind::Postgres { sslmode, host, .. } => {
-                    check_sql_source(name, host, sslmode, &PG_SSL_MODES, errors);
+                    check_sql_source(name, host, ("sslmode", sslmode), &PG_SSL_MODES, errors);
                 }
                 SourceKind::Mysql { sslmode, host, .. } => {
-                    check_sql_source(name, host, sslmode, &MYSQL_SSL_MODES, errors);
+                    check_sql_source(name, host, ("sslmode", sslmode), &MYSQL_SSL_MODES, errors);
+                }
+                SourceKind::Sqlserver {
+                    encrypt,
+                    host,
+                    pool_size,
+                    ..
+                } => {
+                    check_sql_source(name, host, ("encrypt", encrypt), &MSSQL_ENCRYPT, errors);
+                    if *pool_size == 0 || *pool_size > MAX_POOL_SIZE {
+                        errors.push(format!(
+                            "source `{name}`: pool_size must be between 1 and {MAX_POOL_SIZE}"
+                        ));
+                    }
                 }
                 SourceKind::Iceberg {
                     catalog_uri,
@@ -483,6 +536,14 @@ mod tests {
         password_env = "CRM_MYSQL_PASSWORD"
 
         [[source]]
+        name = "erp1"
+        kind = "sqlserver"
+        host = "erp.internal"
+        database = "ERP"
+        user = "codelake_reader"
+        password_env = "ERP1_MSSQL_PASSWORD"
+
+        [[source]]
         name = "events"
         kind = "mongodb"
         required = false
@@ -526,9 +587,24 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(cfg.execution.batch_size, 8192);
-        assert_eq!(cfg.sources.len(), 4);
+        assert_eq!(cfg.sources.len(), 5);
         assert!(cfg.sources[2].required);
-        assert!(!cfg.sources[3].required);
+        assert!(!cfg.sources[4].required);
+        match &cfg.sources[3].kind {
+            SourceKind::Sqlserver {
+                port,
+                encrypt,
+                trust_server_certificate,
+                pool_size,
+                ..
+            } => {
+                assert_eq!(*port, 1433);
+                assert_eq!(encrypt, "required", "encryption must be the default");
+                assert!(!trust_server_certificate, "certificates are validated by default");
+                assert_eq!(*pool_size, 10);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
         match &cfg.sources[2].kind {
             SourceKind::Mysql { port, sslmode, .. } => {
                 assert_eq!(*port, 3306);
@@ -558,7 +634,7 @@ mod tests {
     #[test]
     fn reports_all_missing_secrets_at_once() {
         let errors = errors_of(VALID, &|_| None);
-        assert_eq!(errors.len(), 5, "{errors:#?}");
+        assert_eq!(errors.len(), 6, "{errors:#?}");
         assert!(errors.iter().all(|e| e.contains("is not set")));
     }
 
@@ -672,6 +748,7 @@ mod tests {
         let doc = format!(
             "{VALID}\n[[source]]\nname = \"erp\"\nkind = \"postgres\"\nhost = \" \"\ndatabase = \"d\"\nuser = \"u\"\npassword_env = \"P\"\nsslmode = \"allow\"\n\
              [[source]]\nname = \"my\"\nkind = \"mysql\"\nhost = \"h\"\ndatabase = \"d\"\nuser = \"u\"\npassword_env = \"P\"\nsslmode = \"verify-full\"\n\
+             [[source]]\nname = \"ms\"\nkind = \"sqlserver\"\nhost = \"h\"\ndatabase = \"d\"\nuser = \"u\"\npassword_env = \"P\"\nencrypt = \"maybe\"\npool_size = 0\n\
              [[source]]\nname = \"Bad-Name\"\nkind = \"mongodb\"\nconnection_string_env = \"M\"\n\
              [[source]]\nname = \"information_schema\"\nkind = \"mongodb\"\nconnection_string_env = \"M\"\n\
              [[source]]\nname = \"half\"\nkind = \"iceberg\"\ncatalog_uri = \"thrift://x\"\naccess_key_id_env = \"K\"\n"
@@ -682,6 +759,8 @@ mod tests {
             "`erp`: sslmode `allow`",
             "`erp`: host is empty",
             "`my`: sslmode `verify-full`",
+            "`ms`: encrypt `maybe`",
+            "`ms`: pool_size must be between 1 and 256",
             "`Bad-Name`: name must match",
             "`information_schema`: name is reserved",
             "`half`: catalog_uri must be an http(s) URL",
@@ -729,10 +808,14 @@ mod tests {
                 vec!["ERP_PG_PASSWORD"],
                 vec!["LAKE_KEY", "LAKE_SECRET"],
                 vec!["CRM_MYSQL_PASSWORD"],
+                vec!["ERP1_MSSQL_PASSWORD"],
                 vec!["EVENTS_MONGO_URI"]
             ]
         );
         let labels: Vec<&str> = cfg.sources.iter().map(|s| s.kind.label()).collect();
-        assert_eq!(labels, vec!["postgres", "iceberg", "mysql", "mongodb"]);
+        assert_eq!(
+            labels,
+            vec!["postgres", "iceberg", "mysql", "sqlserver", "mongodb"]
+        );
     }
 }

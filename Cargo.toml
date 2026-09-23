@@ -38,6 +38,11 @@ datafusion-postgres = "=0.17.0"
 codelake-core = { path = "crates/codelake-core" }
 codelake-connectors = { path = "crates/codelake-connectors" }
 
+# SQL Server (TDS). native-tls: old SQL Server builds only negotiate TLS 1.0/1.1,
+# which rustls refuses.
+tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "native-tls"] }
+bb8 = "0.9"
+
 # Runtime
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
 tokio-util = "0.7"
@@ -59,7 +64,7 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 # Test / bench
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["postgres", "mysql", "mongo", "minio"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "mysql", "mongo", "minio", "mssql_server"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
 proptest = "1"
 tempfile = "3"
