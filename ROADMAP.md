@@ -24,10 +24,13 @@ when its DoD commands pass in CI, not when the code "looks finished".
 
 Blocking items, in order:
 
-1. **SQL Server connector** (R1): `tiberius` (pure Rust, TDS 7.3+ → SQL Server
-   2008+), federated pushdown with a T-SQL unparser dialect, `varbinary(10)` LSN
-   columns, identifiers with `$`. Integration tests against SQL Server 2019 and 2022
-   containers.
+1. ✅ **SQL Server connector** (R1, F1): `tiberius` (TDS 7.3+), per-source
+   pushdown policy (ADR 0006), T-SQL dialect, `varbinary(10)` LSNs, `$`
+   identifiers, real column spelling for case-sensitive collations, watermark
+   subqueries pre-evaluated and pushed as `0x…`. Independent acceptance suite
+   green against SQL Server 2019 and 2022 with real CDC.
+   Follow-up: route the PostgreSQL wire path through `Engine::sql`; apply a
+   pushdown policy to MySQL (same collation hazard) before any reference use.
 2. **Hive-style Parquet catalog** (R4–R7): directory per table on local disk or
    S3/MinIO, file-based metastore; `CREATE SCHEMA`, CTAS `WITH (format='PARQUET')`,
    `INSERT INTO … SELECT` appending **one new file per insert**, `DROP TABLE`,

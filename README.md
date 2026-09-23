@@ -1,7 +1,7 @@
 # CodeLake
 
-Federated SQL engine in Rust with a **hard memory ceiling**. Query PostgreSQL,
-MySQL, MongoDB and (experimental) Iceberg on S3/MinIO as one database, join
+Federated SQL engine in Rust with a **hard memory ceiling**. Query SQL Server,
+PostgreSQL, MySQL, MongoDB and (experimental) Iceberg on S3/MinIO as one database, join
 across them, and never let the process grow past the memory you gave it.
 
 Built on [Apache DataFusion](https://datafusion.apache.org/) 53,
@@ -10,8 +10,8 @@ Built on [Apache DataFusion](https://datafusion.apache.org/) 53,
 Goal: replace Trino in production workloads at a fraction of the memory
 (see [ROADMAP.md](ROADMAP.md)).
 
-> **Status: 0.1 skeleton.** Read path for PostgreSQL, MySQL and MongoDB works and
-> is tested against real databases. The PostgreSQL wire listener has **no client
+> **Status: 0.1 skeleton.** Read path for SQL Server, PostgreSQL, MySQL and
+> MongoDB works and is tested against real databases. The PostgreSQL wire listener has **no client
 > authentication yet**, so the server refuses to bind it beyond loopback unless you
 > opt in explicitly (see [Security](#security)).
 
@@ -37,7 +37,7 @@ Goal: replace Trino in production workloads at a fraction of the memory
  │                 ─ cross-source joins run here, inside  │
  │                   FairSpillPool(memory.limit) + spill  │
  ├───────────┬───────────┬────────────┬───────────────────┤
- │ postgres  │ mysql     │ mongodb    │ iceberg (exp.)    │  codelake-connectors
+ │ sqlserver · postgres · mysql · mongodb · iceberg (exp.) │  codelake-connectors
  └───────────┴───────────┴────────────┴───────────────────┘
 ```
 
@@ -79,7 +79,7 @@ Thresholds and the exception process: [docs/gates.md](docs/gates.md).
 |---|---|---|
 | Format / lint | rustfmt, clippy pedantic, `-D warnings`, no `unwrap`/`panic` | any finding |
 | Unit tests | nextest | any failure |
-| Integration | Testcontainers: real PostgreSQL, MySQL, MongoDB | any failure |
+| Integration | Testcontainers: real SQL Server 2019/2022, PostgreSQL, MySQL, MongoDB | any failure |
 | Architecture | `cargo xtask arch` | core depends on a connector/server |
 | Version train | `gates.sh train` | two DataFusion/Arrow majors in the graph |
 | Coverage | cargo-llvm-cov | lines < 75% |
