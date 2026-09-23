@@ -1,4 +1,5 @@
 [default.extend-words]
 # Portuguese words used in docs.
 [files]
-extend-exclude = ["Cargo.lock", "LICENSE", "*.svg"]
+# docs/requirements/GOAL.md is an internal document written in Portuguese.
+extend-exclude = ["Cargo.lock", "LICENSE", "*.svg", "docs/requirements/GOAL.md"]

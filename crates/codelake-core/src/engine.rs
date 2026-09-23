@@ -89,11 +89,22 @@ impl Engine {
             .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
             .with_physical_optimizer_rules(physical_rules())
             .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_udf(crate::functions::varbinary_literal());
         Ok(Self {
-            ctx: SessionContext::new_with_state(state),
+            ctx,
             runtime,
             sources: Vec::new(),
         })
+    }
+
+    /// Plans a statement the way clients should run it: uncorrelated scalar
+    /// subqueries in predicates are evaluated first so their values can be
+    /// pushed down to the sources (see [`crate::subquery`]).
+    pub async fn sql(&self, sql: &str) -> Result<datafusion::dataframe::DataFrame, DataFusionError> {
+        let plan = self.ctx.state().create_logical_plan(sql).await?;
+        let plan = crate::subquery::pre_evaluate_scalar_subqueries(&self.ctx, plan).await?;
+        self.ctx.execute_logical_plan(plan).await
     }
 
     /// Registers a source as a SQL catalog. Required sources abort startup on

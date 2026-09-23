@@ -11,6 +11,10 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   docker build -f "$ROOT/docker/dev.Dockerfile" -t "$IMAGE" "$ROOT/docker"
 fi
 
+# Docker Desktop's file sharing caches file attributes for about a second; a
+# build started right after an edit can read a stale size (truncated file).
+sleep 1
+
 TTY_FLAGS=()
 [ -t 1 ] && TTY_FLAGS=(-t)
 

@@ -9,7 +9,9 @@ pub mod connector;
 pub mod engine;
 pub mod federation_guard;
 pub mod federation_policy;
+pub mod functions;
 pub mod runtime;
+pub mod subquery;
 #[cfg(test)]
 mod testing;
 

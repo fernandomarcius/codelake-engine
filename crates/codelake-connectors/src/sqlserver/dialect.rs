@@ -19,6 +19,7 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use codelake_core::federation_policy::PushdownPolicy;
+use codelake_core::functions::{VARBINARY_LITERAL, as_binary_literal, decode_hex};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
@@ -28,6 +29,7 @@ use datafusion::sql::sqlparser::ast::{
     self, Expr as SqlExpr, Ident, LimitClause, ObjectName, ObjectNamePart, Query, SetExpr, Statement, Top,
     TopQuantity, VisitMut, VisitorMut,
 };
+use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::{CharacterLengthStyle, Dialect};
 
 /// SQL Server dialect for the `DataFusion` unparser.
@@ -62,6 +64,29 @@ impl Dialect for TsqlDialect {
 
     fn requires_derived_table_alias(&self) -> bool {
         true
+    }
+
+    fn scalar_function_to_sql_overrides(
+        &self,
+        _unparser: &Unparser<'_>,
+        func_name: &str,
+        args: &[Expr],
+    ) -> Result<Option<SqlExpr>> {
+        if func_name != VARBINARY_LITERAL {
+            return Ok(None);
+        }
+        match args {
+            [Expr::Literal(ScalarValue::Utf8(Some(hex)), _)] if decode_hex(hex).is_some() => {
+                // T-SQL binary constant: 0x followed by the bytes in hex.
+                Ok(Some(SqlExpr::value(ast::Value::Number(
+                    format!("0x{hex}"),
+                    false,
+                ))))
+            }
+            _ => Err(DataFusionError::Plan(format!(
+                "sqlserver: {VARBINARY_LITERAL} needs a hexadecimal literal"
+            ))),
+        }
     }
 }
 
@@ -176,6 +201,10 @@ fn safe_expr(expr: &Expr, schema: &DFSchema) -> bool {
     match expr {
         Expr::Column(_) => true,
         Expr::Literal(value, _) => safe_literal(value),
+        // Binary comparisons are byte-wise on both sides. SQL Server pads the
+        // shorter operand with zeros, the engine treats a prefix as smaller:
+        // they differ only when comparing an all-zero value to a shorter one.
+        Expr::ScalarFunction(_) => as_binary_literal(expr).is_some(),
         Expr::Alias(Alias { expr, .. }) => safe_expr(expr, schema),
         Expr::BinaryExpr(binary) => safe_binary(binary, schema),
         Expr::Not(inner) => safe_predicate(inner, schema),
@@ -363,6 +392,19 @@ mod tests {
     }
 
     #[test]
+    fn binary_literal_renders_as_tsql_constant() {
+        use codelake_core::functions::binary_literal_expr;
+        use datafusion::logical_expr::col;
+        let unparser = Unparser::new(&TsqlDialect);
+        let expr = col("lsn").gt(binary_literal_expr(&[0, 0, 0, 42]));
+        let sql = unparser.expr_to_sql(&expr).unwrap().to_string();
+        assert_eq!(sql, "([lsn] > 0x0000002a)");
+        let bad =
+            codelake_core::functions::varbinary_literal().call(vec![datafusion::logical_expr::lit("zz")]);
+        assert!(unparser.expr_to_sql(&bad).is_err());
+    }
+
+    #[test]
     fn dialect_quotes_with_brackets_and_casts_to_nvarchar() {
         let dialect = TsqlDialect;
         assert_eq!(dialect.identifier_quote_style("__$start_lsn"), Some('['));
@@ -426,6 +468,12 @@ mod tests {
                 scan().filter(col("name").between(lit("a"), lit("b"))).unwrap()
             ));
             assert!(!pushable(scan().filter(col("name").like(lit("A%"))).unwrap()));
+        }
+
+        #[test]
+        fn binary_watermark_literal_is_pushed() {
+            let watermark = codelake_core::functions::binary_literal_expr(&[0, 1]);
+            assert!(pushable(scan().filter(col("lsn").gt(watermark)).unwrap()));
         }
 
         #[test]
