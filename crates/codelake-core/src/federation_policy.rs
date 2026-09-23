@@ -18,13 +18,20 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use datafusion::error::Result;
-use datafusion::logical_expr::utils::conjunction;
+use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
 use datafusion::logical_expr::{Extension, Filter, LogicalPlan, TableScan};
 use datafusion_federation::{FederatedPlanNode, FederationPlanner};
 
 /// Decides whether a single plan node (not its inputs) may run at the source.
 pub trait PushdownPolicy: Send + Sync + Debug {
     fn node_is_pushable(&self, plan: &LogicalPlan) -> bool;
+
+    /// Last rewrite of a subtree that will be federated, e.g. to express
+    /// literals the unparser cannot render. Runs after the optimizer, so its
+    /// output is not folded again.
+    fn prepare(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        Ok(plan)
+    }
 }
 
 /// Rewrites `Federated(plan)` so only policy-approved subtrees are federated.
@@ -46,6 +53,14 @@ fn federate(plan: LogicalPlan, planner: &Arc<dyn FederationPlanner>) -> LogicalP
     })
 }
 
+fn federate_prepared(
+    plan: LogicalPlan,
+    policy: &dyn PushdownPolicy,
+    planner: &Arc<dyn FederationPlanner>,
+) -> Result<LogicalPlan> {
+    Ok(federate(policy.prepare(plan)?, planner))
+}
+
 fn fully_pushable(plan: &LogicalPlan, policy: &dyn PushdownPolicy) -> bool {
     policy.node_is_pushable(plan)
         && plan
@@ -60,11 +75,12 @@ fn split(
     planner: &Arc<dyn FederationPlanner>,
 ) -> Result<LogicalPlan> {
     if fully_pushable(&plan, policy) {
-        return Ok(federate(plan, planner));
+        return federate_prepared(plan, policy, planner);
     }
     if let LogicalPlan::TableScan(scan) = plan {
-        return lift_scan_filters(scan, planner);
+        return lift_scan_filters(scan, policy, planner);
     }
+    let plan = split_filter(plan, policy)?;
     let children = plan
         .inputs()
         .into_iter()
@@ -74,11 +90,38 @@ fn split(
     plan.with_new_exprs(plan.expressions(), children)
 }
 
+/// A rejected `Filter` whose predicate is a conjunction keeps its unsafe terms
+/// locally and puts the safe ones in a filter below, which can then be pushed.
+/// Rewritten only when both halves are non-empty, so recursion terminates.
+fn split_filter(plan: LogicalPlan, policy: &dyn PushdownPolicy) -> Result<LogicalPlan> {
+    let LogicalPlan::Filter(filter) = plan else {
+        return Ok(plan);
+    };
+    let input = Arc::clone(&filter.input);
+    let (safe, unsafe_terms): (Vec<_>, Vec<_>) = split_conjunction_owned(filter.predicate.clone())
+        .into_iter()
+        .partition(|term| {
+            Filter::try_new(term.clone(), Arc::clone(&input))
+                .is_ok_and(|f| policy.node_is_pushable(&LogicalPlan::Filter(f)))
+        });
+    match (conjunction(safe), conjunction(unsafe_terms)) {
+        (Some(safe), Some(rest)) => {
+            let lower = LogicalPlan::Filter(Filter::try_new(safe, input)?);
+            Ok(LogicalPlan::Filter(Filter::try_new(rest, Arc::new(lower))?))
+        }
+        _ => Ok(LogicalPlan::Filter(filter)),
+    }
+}
+
 /// A scan the policy rejects can only be due to its embedded filters: move them
 /// into a local `Filter` and federate the bare scan.
-fn lift_scan_filters(mut scan: TableScan, planner: &Arc<dyn FederationPlanner>) -> Result<LogicalPlan> {
+fn lift_scan_filters(
+    mut scan: TableScan,
+    policy: &dyn PushdownPolicy,
+    planner: &Arc<dyn FederationPlanner>,
+) -> Result<LogicalPlan> {
     let filters = std::mem::take(&mut scan.filters);
-    let bare = federate(LogicalPlan::TableScan(scan), planner);
+    let bare = federate_prepared(LogicalPlan::TableScan(scan), policy, planner)?;
     // Never drop a predicate: if it cannot be rebuilt, planning fails.
     Ok(match conjunction(filters) {
         Some(predicate) => LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(bare))?),
@@ -207,6 +250,139 @@ mod tests {
             "filter must stay local: {sent}"
         );
         assert!(sent.contains("contracts"), "{sent}");
+    }
+
+    /// Filters, scans and projections; aggregates stay local.
+    #[derive(Debug)]
+    struct NumericFilters;
+
+    impl PushdownPolicy for NumericFilters {
+        fn node_is_pushable(&self, plan: &LogicalPlan) -> bool {
+            matches!(
+                plan,
+                LogicalPlan::TableScan(_)
+                    | LogicalPlan::Projection(_)
+                    | LogicalPlan::SubqueryAlias(_)
+                    | LogicalPlan::Filter(_)
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn filter_of_one_side_of_a_cross_source_join_reaches_that_source() {
+        let ctx = crate::testing::federated_session();
+        let (contracts, sent) = remote_table_recording(
+            "crm",
+            "contracts",
+            vec![
+                ("customer_id", int64(&[1, 2, 3])),
+                ("amount", int64(&[10, 200, 300])),
+            ],
+            Some(Arc::new(NumericFilters)),
+        );
+        ctx.register_table("contracts", contracts).unwrap();
+        ctx.register_table(
+            "customers",
+            remote_table(
+                "erp",
+                "customers",
+                vec![("id", int64(&[1, 2, 3]))],
+                Some(Arc::new(NumericFilters)),
+            ),
+        )
+        .unwrap();
+        // The fake source ignores its SQL, so rows are not asserted here: this
+        // test checks that the predicate travels (rows are covered elsewhere).
+        let _ = rows(
+            &ctx,
+            "SELECT c.id FROM customers c JOIN contracts k ON k.customer_id = c.id WHERE k.amount >= 200",
+        )
+        .await
+        .unwrap();
+        let sent = sent.lock().unwrap().join("\n");
+        assert!(
+            sent.contains("WHERE") && sent.contains("200"),
+            "filter not pushed: {sent}"
+        );
+    }
+
+    /// Pushes filters without text literals.
+    #[derive(Debug)]
+    struct NoTextFilters;
+
+    impl PushdownPolicy for NoTextFilters {
+        fn node_is_pushable(&self, plan: &LogicalPlan) -> bool {
+            match plan {
+                LogicalPlan::Filter(f) => !f.predicate.to_string().contains("Utf8"),
+                LogicalPlan::TableScan(_) | LogicalPlan::Projection(_) | LogicalPlan::SubqueryAlias(_) => {
+                    true
+                }
+                _ => false,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_conjuncts_are_pushed_and_the_rest_stays_local() {
+        let ctx = crate::testing::federated_session();
+        let (table, sent) = remote_table_recording(
+            "crm",
+            "contracts",
+            vec![
+                ("customer_id", int64(&[1, 2, 3])),
+                ("status", strings(&["active", "active", "ACTIVE"])),
+            ],
+            Some(Arc::new(NoTextFilters)),
+        );
+        ctx.register_table("contracts", table).unwrap();
+        let batches = rows(
+            &ctx,
+            "SELECT customer_id FROM contracts WHERE customer_id >= 2 AND status = 'active'",
+        )
+        .await
+        .unwrap();
+        let sent = sent.lock().unwrap().join("\n");
+        assert!(sent.contains(">= 2"), "numeric term not pushed: {sent}");
+        assert!(!sent.contains("active"), "text term must stay local: {sent}");
+        // The fake source ignores its SQL: the engine applies both terms again
+        // only if the text term stayed local, so customer 1 appears here and
+        // customer 3 (ACTIVE) does not.
+        let ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(ids.values().iter().all(|id| *id != 3), "{ids:?}");
+    }
+
+    #[test]
+    fn prepare_runs_on_every_federated_subtree() {
+        #[derive(Debug)]
+        struct Marks;
+        impl PushdownPolicy for Marks {
+            fn node_is_pushable(&self, plan: &LogicalPlan) -> bool {
+                matches!(plan, LogicalPlan::TableScan(_))
+            }
+            fn prepare(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+                LogicalPlanBuilder::from(plan).filter(lit(true))?.build()
+            }
+        }
+        let table = remote_table("crm", "t", vec![("a", int64(&[1]))], None);
+        let scan = LogicalPlanBuilder::scan("t", provider_as_source(table), None)
+            .unwrap()
+            .build()
+            .unwrap();
+        let planner: Arc<dyn FederationPlanner> =
+            Arc::new(SQLFederationPlanner::new(crate::testing::executor("crm")));
+        let out = restrict_federation(federate(scan, &planner), &Marks).unwrap();
+        let LogicalPlan::Extension(ext) = out else {
+            panic!("expected federated node")
+        };
+        let inner = ext.node.as_any().downcast_ref::<FederatedPlanNode>().unwrap();
+        assert!(
+            matches!(inner.plan(), LogicalPlan::Filter(_)),
+            "prepare was not applied"
+        );
     }
 
     #[test]

@@ -127,10 +127,16 @@ async fn serves_sql_probes_and_drains_on_sigterm() {
         .status()
         .unwrap();
     assert!(status.success());
-    let ready = reqwest::get(format!("http://127.0.0.1:{http}/readyz"))
-        .await
-        .unwrap();
-    assert_eq!(ready.status(), 503, "readiness must fail while draining");
+    // The signal is handled asynchronously; readiness must flip well within
+    // the 1 s grace period.
+    let readyz = format!("http://127.0.0.1:{http}/readyz");
+    let flip_deadline = Instant::now() + Duration::from_millis(900);
+    let mut ready = reqwest::get(&readyz).await.unwrap().status();
+    while ready != 503 && Instant::now() < flip_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        ready = reqwest::get(&readyz).await.unwrap().status();
+    }
+    assert_eq!(ready, 503, "readiness must fail while draining");
 
     let deadline = Instant::now() + Duration::from_secs(20);
     let exit = loop {

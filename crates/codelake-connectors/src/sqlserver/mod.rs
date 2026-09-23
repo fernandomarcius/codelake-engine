@@ -8,6 +8,7 @@
 mod dialect;
 mod executor;
 mod pool;
+mod table;
 mod types;
 
 use std::collections::{BTreeMap, HashMap};
@@ -15,6 +16,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use self::table::SqlServerTable;
 use async_trait::async_trait;
 use codelake_core::catalog::{FederatedCatalog, NameListing, TableResolver};
 use codelake_core::{BoxError, Connector, ConnectorError};
@@ -194,7 +196,8 @@ fn metadata_error(source: &str, cause: impl fmt::Display) -> DataFusionError {
 }
 
 impl SqlServerResolver {
-    async fn schema_of(&self, schema: &str, table: &str) -> DfResult<Schema> {
+    /// Arrow schema (lower-case names) and the real spelling of each column.
+    async fn schema_of(&self, schema: &str, table: &str) -> DfResult<(Schema, HashMap<String, String>)> {
         let mut conn = self
             .pool
             .get()
@@ -211,6 +214,7 @@ impl SqlServerResolver {
             .await
             .map_err(|e| metadata_error(&self.source, e))?;
         let mut fields = Vec::with_capacity(rows.len());
+        let mut real_names = HashMap::with_capacity(rows.len());
         for row in rows {
             let column: &str = row.get(0).unwrap_or_default();
             let data_type: &str = row.get(1).unwrap_or_default();
@@ -220,6 +224,7 @@ impl SqlServerResolver {
             let scale = scale.and_then(|s| i8::try_from(s).ok());
             if let Some(arrow) = types::arrow_type(data_type, precision, scale) {
                 fields.push(Field::new(column.to_lowercase(), arrow, nullable));
+                real_names.insert(column.to_lowercase(), column.to_owned());
             } else {
                 tracing::warn!(
                     source = %self.source, %schema, %table, %column, %data_type,
@@ -227,7 +232,7 @@ impl SqlServerResolver {
                 );
             }
         }
-        Ok(Schema::new(fields))
+        Ok((Schema::new(fields), real_names))
     }
 }
 
@@ -238,9 +243,10 @@ impl TableResolver for SqlServerResolver {
         else {
             return Ok(None);
         };
-        let arrow_schema = Arc::new(self.schema_of(real_schema, real_table).await?);
+        let (arrow_schema, real_names) = self.schema_of(real_schema, real_table).await?;
         let remote = RemoteTableRef::from(TableReference::partial(real_schema.as_str(), real_table.as_str()));
-        let source = SQLTableSource::new_with_schema(Arc::clone(&self.provider), remote, arrow_schema);
+        let table = SqlServerTable::new(remote, Arc::new(arrow_schema), real_names);
+        let source = SQLTableSource::new_with_table(Arc::clone(&self.provider), Arc::new(table));
         Ok(Some(Arc::new(FederatedTableProviderAdaptor::new(Arc::new(
             source,
         )))))

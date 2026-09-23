@@ -19,8 +19,9 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use codelake_core::federation_policy::PushdownPolicy;
-use codelake_core::functions::{VARBINARY_LITERAL, as_binary_literal, decode_hex};
+use codelake_core::functions::{VARBINARY_LITERAL, as_binary_literal, binary_literal_expr, decode_hex};
 use datafusion::arrow::datatypes::DataType;
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::expr::{AggregateFunction, Alias};
@@ -105,6 +106,17 @@ impl VisitorMut for TsqlRewriter {
     type Break = DataFusionError;
 
     fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        // The unparser renders a projection without columns (e.g. below
+        // COUNT(*)) as `SELECT FROM …`, which T-SQL rejects.
+        if let SetExpr::Select(select) = query.body.as_mut()
+            && select.projection.is_empty()
+        {
+            // Derived tables need named columns in T-SQL.
+            select.projection.push(ast::SelectItem::ExprWithAlias {
+                expr: SqlExpr::value(ast::Value::Number("1".into(), false)),
+                alias: Ident::new("codelake_one"),
+            });
+        }
         let Some(clause) = query.limit_clause.take() else {
             return ControlFlow::Continue(());
         };
@@ -188,7 +200,9 @@ fn safe_literal(value: &ScalarValue) -> bool {
         | ScalarValue::UInt32(_)
         | ScalarValue::Float32(_)
         | ScalarValue::Float64(_)
-        | ScalarValue::Decimal128(..) => true,
+        | ScalarValue::Decimal128(..)
+        // Rendered as a T-SQL constant by `prepare` + the dialect override.
+        | ScalarValue::Binary(Some(_)) => true,
         ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) | ScalarValue::Utf8View(Some(s)) => {
             s.is_ascii()
         }
@@ -302,7 +316,10 @@ impl PushdownPolicy for SqlServerPolicy {
     fn node_is_pushable(&self, plan: &LogicalPlan) -> bool {
         match plan {
             LogicalPlan::TableScan(scan) => scan.filters.is_empty() && scan.fetch.is_none(),
-            LogicalPlan::Projection(p) => p.expr.iter().all(|e| safe_expr(e, p.input.schema())),
+            LogicalPlan::Projection(p) => p
+                .expr
+                .iter()
+                .all(|e| safe_expr(e, p.input.schema()) && !has_binary_literal(e)),
             LogicalPlan::Filter(f) => safe_predicate(&f.predicate, f.input.schema()),
             LogicalPlan::SubqueryAlias(_) | LogicalPlan::Union(_) => true,
             LogicalPlan::Join(join) => {
@@ -323,11 +340,76 @@ impl PushdownPolicy for SqlServerPolicy {
                 limit.skip.is_none()
                     && matches!(limit.fetch.as_deref(), Some(Expr::Literal(ScalarValue::Int64(Some(n)), _)) if *n > 0)
             }
-            LogicalPlan::Aggregate(aggregate) => safe_aggregate(aggregate),
+            LogicalPlan::Aggregate(aggregate) => {
+                safe_aggregate(aggregate)
+                    && !aggregate
+                        .group_expr
+                        .iter()
+                        .chain(&aggregate.aggr_expr)
+                        .any(has_binary_literal)
+            }
             LogicalPlan::Distinct(_) => plan.schema().fields().iter().all(|f| !is_text(f.data_type())),
             _ => false,
         }
     }
+
+    /// Adapts a subtree about to be unparsed:
+    /// - a projection of plain columns directly below an aggregation is
+    ///   dropped: the unparser would turn it into a derived table and then
+    ///   reference the base table's qualifier from outside it, which T-SQL
+    ///   rejects;
+    /// - the optimizer folds `codelake_varbinary('..')` into a binary literal
+    ///   the unparser cannot render; predicate literals become the function again.
+    fn prepare(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        let plan = plan
+            .transform_up(|node| {
+                let LogicalPlan::Aggregate(aggregate) = &node else {
+                    return Ok(Transformed::no(node));
+                };
+                let LogicalPlan::Projection(projection) = aggregate.input.as_ref() else {
+                    return Ok(Transformed::no(node));
+                };
+                if !projection.expr.iter().all(|e| matches!(e, Expr::Column(_))) {
+                    return Ok(Transformed::no(node));
+                }
+                match Aggregate::try_new(
+                    Arc::clone(&projection.input),
+                    aggregate.group_expr.clone(),
+                    aggregate.aggr_expr.clone(),
+                ) {
+                    Ok(flat) => Ok(Transformed::yes(LogicalPlan::Aggregate(flat))),
+                    Err(_) => Ok(Transformed::no(node)),
+                }
+            })
+            .data()?;
+        plan.transform_up(|node| {
+            if !matches!(node, LogicalPlan::Filter(_) | LogicalPlan::Join(_)) {
+                return Ok(Transformed::no(node));
+            }
+            node.map_expressions(|expr| {
+                expr.transform(|e| match &e {
+                    Expr::Literal(ScalarValue::Binary(Some(bytes)), _) => {
+                        Ok(Transformed::yes(binary_literal_expr(bytes)))
+                    }
+                    _ => Ok(Transformed::no(e)),
+                })
+            })
+        })
+        .data()
+    }
+}
+
+/// Binary literals are only rendered inside predicates (see `prepare`).
+fn has_binary_literal(expr: &Expr) -> bool {
+    let mut found = false;
+    let _ = expr.apply(|e| {
+        if matches!(e, Expr::Literal(ScalarValue::Binary(Some(_)), _)) {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
 }
 
 /// Shared handle used by the executor.
@@ -363,6 +445,77 @@ mod tests {
         let err = rewritten("SELECT a FROM t LIMIT 5 OFFSET 2").unwrap_err();
         assert!(err.to_string().contains("OFFSET"), "{err}");
         assert!(rewritten("SELECT a FROM t UNION ALL SELECT a FROM u LIMIT 1").is_err());
+    }
+
+    #[test]
+    fn empty_select_list_becomes_select_one() {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::functions_aggregate::expr_fn::count;
+        use datafusion::logical_expr::{col, lit, table_scan};
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let plan = table_scan(Some("t"), &schema, None)
+            .unwrap()
+            .filter(col("id").gt(lit(1_i64)))
+            .unwrap()
+            .project(Vec::<Expr>::new())
+            .unwrap()
+            .aggregate(Vec::<Expr>::new(), vec![count(lit(1))])
+            .unwrap()
+            .build()
+            .unwrap();
+        let statement = Unparser::new(&TsqlDialect).plan_to_sql(&plan).unwrap();
+        let sql = rewrite(statement).unwrap().to_string();
+        assert_eq!(
+            sql,
+            "SELECT COUNT_BIG(1) FROM (SELECT 1 AS codelake_one FROM [t] WHERE ([t].[id] > 1)) AS [derived_projection]"
+        );
+        Parser::parse_sql(&MsSqlDialect {}, &sql).unwrap();
+    }
+
+    #[test]
+    fn prepare_flattens_column_projections_below_aggregates() {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::functions_aggregate::expr_fn::{count, sum};
+        use datafusion::logical_expr::{col, lit, table_scan};
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("n", DataType::Int64, false),
+        ]);
+        let base = || {
+            table_scan(Some("Grandes"), &schema, None)
+                .unwrap()
+                .filter(col("id").gt(lit(1_i64)))
+                .unwrap()
+        };
+        let summed = base()
+            .project(vec![col("n")])
+            .unwrap()
+            .aggregate(Vec::<Expr>::new(), vec![sum(col("n"))])
+            .unwrap()
+            .build()
+            .unwrap();
+        let counted = base()
+            .project(Vec::<Expr>::new())
+            .unwrap()
+            .aggregate(Vec::<Expr>::new(), vec![count(lit(1))])
+            .unwrap()
+            .build()
+            .unwrap();
+        let render = |plan: LogicalPlan| {
+            let prepared = SqlServerPolicy.prepare(plan).unwrap();
+            let statement = Unparser::new(&TsqlDialect).plan_to_sql(&prepared).unwrap();
+            let sql = rewrite(statement).unwrap().to_string();
+            Parser::parse_sql(&MsSqlDialect {}, &sql).unwrap();
+            sql
+        };
+        assert_eq!(
+            render(summed),
+            "SELECT sum([grandes].[n]) FROM [grandes] WHERE ([grandes].[id] > 1)"
+        );
+        assert_eq!(
+            render(counted),
+            "SELECT COUNT_BIG(1) FROM [grandes] WHERE ([grandes].[id] > 1)"
+        );
     }
 
     #[test]
@@ -471,6 +624,25 @@ mod tests {
         }
 
         #[test]
+        fn folded_binary_literals_are_pushed_in_predicates_only() {
+            let folded = lit(ScalarValue::Binary(Some(vec![0, 1])));
+            assert!(pushable(scan().filter(col("lsn").gt(folded.clone())).unwrap()));
+            assert!(!pushable(scan().project(vec![folded.alias("b")]).unwrap()));
+        }
+
+        #[test]
+        fn prepare_restores_renderable_binary_literals() {
+            let folded = lit(ScalarValue::Binary(Some(vec![0, 42])));
+            let plan = scan().filter(col("lsn").gt(folded)).unwrap().build().unwrap();
+            let prepared = SqlServerPolicy.prepare(plan).unwrap();
+            let sql = datafusion::sql::unparser::Unparser::new(&TsqlDialect)
+                .plan_to_sql(&prepared)
+                .unwrap()
+                .to_string();
+            assert!(sql.contains("[lsn] > 0x002a"), "{sql}");
+        }
+
+        #[test]
         fn binary_watermark_literal_is_pushed() {
             let watermark = codelake_core::functions::binary_literal_expr(&[0, 1]);
             assert!(pushable(scan().filter(col("lsn").gt(watermark)).unwrap()));
@@ -478,8 +650,8 @@ mod tests {
 
         #[test]
         fn unfaithful_literals_stay_local() {
-            let binary = lit(ScalarValue::Binary(Some(vec![0])));
-            assert!(!pushable(scan().filter(col("lsn").gt(binary)).unwrap()));
+            let fixed = lit(ScalarValue::FixedSizeBinary(1, Some(vec![0])));
+            assert!(!pushable(scan().filter(col("lsn").gt(fixed)).unwrap()));
             assert!(!pushable(scan().filter(col("flag").eq(lit(true))).unwrap()));
             assert!(
                 !pushable(scan().filter(col("flag")).unwrap()),

@@ -29,6 +29,29 @@ pub enum EngineError {
     Timeout(String, Duration),
 }
 
+/// Logical rules: `DataFusion` defaults with federation right after scalar
+/// subquery decorrelation (upstream's position) and an extra `push_down_filter`
+/// just before it. Upstream alone federates before filters move below joins,
+/// so a filter over a cross-source join never reaches its source. Federating
+/// after *all* rules instead lets `optimize_projections` create derived tables
+/// that the unparser renders as invalid SQL for PostgreSQL and SQL Server.
+pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>> {
+    let mut rules = datafusion::optimizer::Optimizer::new().rules;
+    let position = rules
+        .iter()
+        .position(|r| r.name() == "scalar_subquery_to_join")
+        .map_or(rules.len(), |p| p + 1);
+    rules.insert(
+        position,
+        Arc::new(datafusion_federation::FederationOptimizerRule::new()),
+    );
+    rules.insert(
+        position,
+        Arc::new(datafusion::optimizer::push_down_filter::PushDownFilter::new()),
+    );
+    rules
+}
+
 /// Default `DataFusion` physical rules, preceded by the federation guard (it must
 /// run before `FilterPushdown`; see [`crate::federation_guard`]).
 fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
@@ -85,7 +108,7 @@ impl Engine {
             .with_config(session)
             .with_runtime_env(runtime.env())
             .with_default_features()
-            .with_optimizer_rules(datafusion_federation::default_optimizer_rules())
+            .with_optimizer_rules(optimizer_rules())
             .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
             .with_physical_optimizer_rules(physical_rules())
             .build();
@@ -235,6 +258,19 @@ mod tests {
     }
 
     const FAST: Duration = Duration::from_millis(200);
+
+    #[test]
+    fn filters_are_pushed_right_before_federation() {
+        let names: Vec<String> = optimizer_rules().iter().map(|r| r.name().to_owned()).collect();
+        let federation = names
+            .iter()
+            .position(|n| n == "federation_optimizer_rule")
+            .unwrap();
+        let decorrelate = names.iter().position(|n| n == "scalar_subquery_to_join").unwrap();
+        let projections = names.iter().position(|n| n == "optimize_projections").unwrap();
+        assert_eq!(names[federation - 1], "push_down_filter", "{names:?}");
+        assert!(decorrelate < federation && federation < projections, "{names:?}");
+    }
 
     #[test]
     fn federation_guard_runs_before_filter_pushdown() {

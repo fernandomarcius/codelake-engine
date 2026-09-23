@@ -622,7 +622,10 @@ async fn dod(tag: &str, scope: Scope) {
     let parceiros = remote.iter().find(|s| s.contains("[dbo].[Parceiros]"));
     checks.pushdown(
         "4a EXPLAIN: remote T-SQL uses [dbo].[Parceiros] with the numeric WHERE",
-        parceiros.is_some_and(|s| s.contains("WHERE") && s.contains(">= 200") && s.contains("[saldo]")),
+        // Column spelling in the remote SQL is the real one (`[Saldo]`).
+        parceiros.is_some_and(|s| {
+            s.contains("WHERE") && s.contains(">= 200") && s.to_lowercase().contains("[saldo]")
+        }),
         format!("remote={remote:?}"),
     );
     checks.check(
@@ -767,13 +770,11 @@ async fn sqlserver_acceptance_dod_2022() {
 }
 
 #[tokio::test]
-#[ignore = "F1 defect: LSN watermark and numeric WHERE of a cross-source join are not pushed to SQL Server (remote SQL has no WHERE)"]
 async fn sqlserver_acceptance_pushdown_2019() {
     dod("2019-latest", Scope::Pushdown).await;
 }
 
 #[tokio::test]
-#[ignore = "F1 defect: LSN watermark and numeric WHERE of a cross-source join are not pushed to SQL Server (remote SQL has no WHERE)"]
 async fn sqlserver_acceptance_pushdown_2022() {
     dod("2022-latest", Scope::Pushdown).await;
 }
@@ -954,13 +955,11 @@ async fn case_sensitive_database(tag: &str) {
 }
 
 #[tokio::test]
-#[ignore = "F1 defect: column names are lower-cased in the remote T-SQL; CS-collation databases fail with 'Invalid column name'"]
 async fn sqlserver_acceptance_case_sensitive_2019() {
     case_sensitive_database("2019-latest").await;
 }
 
 #[tokio::test]
-#[ignore = "F1 defect: column names are lower-cased in the remote T-SQL; CS-collation databases fail with 'Invalid column name'"]
 async fn sqlserver_acceptance_case_sensitive_2022() {
     case_sensitive_database("2022-latest").await;
 }
