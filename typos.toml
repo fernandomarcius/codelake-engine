@@ -1,0 +1,4 @@
+[default.extend-words]
+# Portuguese words used in docs.
+[files]
+extend-exclude = ["Cargo.lock", "LICENSE", "*.svg"]

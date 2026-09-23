@@ -1,0 +1,25 @@
+name: toolbelt
+description: Build the pinned toolbelt image (docker/dev.Dockerfile) and restore Cargo caches.
+inputs:
+  cache-key:
+    description: Extra cache key segment (one per job, so jobs do not evict each other).
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+    - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      with:
+        context: docker
+        file: docker/dev.Dockerfile
+        tags: codelake-dev:local
+        load: true
+        cache-from: type=gha,scope=toolbelt
+        cache-to: type=gha,scope=toolbelt,mode=max
+    - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+      with:
+        path: ${{ runner.temp }}/cargo-cache
+        key: cargo-${{ inputs.cache-key }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+        restore-keys: cargo-${{ inputs.cache-key }}-
+    - shell: bash
+      run: echo "CODELAKE_CACHE_DIR=${{ runner.temp }}/cargo-cache" >> "$GITHUB_ENV"

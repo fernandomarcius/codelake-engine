@@ -1,0 +1,57 @@
+# cargo-deny: supply-chain gate. Runs on every PR (see .github/workflows/ci.yml).
+# Changing a rule here is a gate exception: record it in docs/exceptions.md.
+
+[graph]
+# Audit what ships: default features of every crate. Experimental features that
+# fail this gate stay out of `default` and out of the release image.
+all-features = false
+
+[advisories]
+# RustSec advisories: vulnerable and unmaintained crates fail the build.
+version = 2
+yanked = "deny"
+unmaintained = "workspace"
+ignore = [
+  # { id = "RUSTSEC-XXXX-YYYY", reason = "...; tracked in docs/exceptions.md, expires YYYY-MM-DD" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Permissive licenses compatible with shipping an Apache-2.0 product.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "MIT-0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "CC0-1.0",
+  "BSL-1.0",
+  "CDLA-Permissive-2.0",
+  "bzip2-1.0.6",
+  "MPL-2.0",
+]
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Internal path dependencies (publish = false) carry no version by design.
+allow-wildcard-paths = true
+highlight = "all"
+deny = [
+  # A second DataFusion or Arrow major in the graph means the version train broke
+  # (docs/adr/0002). Enforced by the `train` job instead of here, because
+  # cargo-deny cannot express "only one major".
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

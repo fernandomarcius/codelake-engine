@@ -1,0 +1,47 @@
+[package]
+name = "codelake-server"
+description = "CodeLake server: PostgreSQL wire protocol plus operational HTTP endpoints."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Experimental; see crates/codelake-connectors/Cargo.toml.
+iceberg = ["codelake-connectors/iceberg"]
+
+[[bin]]
+name = "codelake"
+path = "src/main.rs"
+
+[dependencies]
+codelake-core.workspace = true
+codelake-connectors.workspace = true
+datafusion.workspace = true
+datafusion-postgres.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio-postgres = "0.7"
+reqwest = { version = "0.12", default-features = false }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile.workspace = true
+
+[lints]
+workspace = true

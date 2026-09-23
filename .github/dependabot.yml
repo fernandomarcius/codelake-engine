@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: America/Sao_Paulo }
+    open-pull-requests-limit: 10
+    groups:
+      # The DataFusion train moves as one unit (docs/adr/0002); never one crate alone.
+      datafusion-train:
+        patterns: ["datafusion*", "arrow*", "parquet", "iceberg*", "object_store"]
+      patch:
+        update-types: [patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+  - package-ecosystem: docker
+    directories: ["/", "/docker"]
+    schedule: { interval: weekly }

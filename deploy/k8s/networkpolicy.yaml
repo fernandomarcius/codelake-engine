@@ -1,0 +1,21 @@
+# Until client authentication ships (ROADMAP M1), the PostgreSQL port is only
+# reachable from namespaces explicitly labelled as CodeLake clients.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: codelake
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: codelake }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { codelake.io/client: "true" }
+      ports:
+        - { port: 5432, protocol: TCP }
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+      ports:
+        - { port: 8080, protocol: TCP }

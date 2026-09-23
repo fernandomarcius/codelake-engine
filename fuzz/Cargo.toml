@@ -1,0 +1,30 @@
+[package]
+name = "codelake-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+codelake-core = { path = "../crates/codelake-core" }
+toml = "1.1"
+
+# Separate workspace: fuzzing needs nightly and must not affect the main lockfile.
+[workspace]
+
+[[bin]]
+name = "config_parse"
+path = "fuzz_targets/config_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "byte_size"
+path = "fuzz_targets/byte_size.rs"
+test = false
+doc = false
+bench = false

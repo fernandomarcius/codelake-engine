@@ -1,0 +1,10 @@
+/target
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/mutants.out*
+junit.xml
+lcov.info
+*.profraw
+.env
+.DS_Store

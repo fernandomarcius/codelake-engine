@@ -1,0 +1,47 @@
+[package]
+name = "codelake-connectors"
+description = "Source connectors (PostgreSQL, MongoDB, Iceberg on S3/MinIO)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[features]
+default = ["postgres", "mysql", "mongodb"]
+# Not shipped: pulls quick-xml 0.39 (RUSTSEC-2026-0194/0195) through opendal 0.57,
+# pinned by iceberg-storage-opendal 0.10. See ROADMAP.md (M3).
+postgres = ["datafusion-table-providers/postgres-federation"]
+mysql = ["datafusion-table-providers/mysql-federation"]
+mongodb = ["datafusion-table-providers/mongodb"]
+iceberg = ["dep:iceberg", "dep:iceberg-datafusion", "dep:iceberg-catalog-rest", "dep:iceberg-storage-opendal"]
+
+[dependencies]
+codelake-core.workspace = true
+datafusion.workspace = true
+datafusion-table-providers.workspace = true
+iceberg = { workspace = true, optional = true }
+iceberg-datafusion = { workspace = true, optional = true }
+iceberg-catalog-rest = { workspace = true, optional = true }
+iceberg-storage-opendal = { workspace = true, optional = true }
+async-trait.workspace = true
+secrecy.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tempfile.workspace = true
+tokio-postgres = "0.7"
+mysql_async = { version = "0.36", default-features = false, features = ["minimal"] }
+mongodb = "3.6"
+testcontainers.workspace = true
+testcontainers-modules.workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,149 @@
+# Deterministic gates. Every PR must pass all of them BEFORE human review; a
+# human does not override a red gate (docs/gates.md). Each job calls the same
+# scripts/gates.sh a developer runs locally.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gates:
+    name: gate ${{ matrix.gate }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        gate: [fmt, clippy, typos, arch, train, test, doc, msrv, deny, machete]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: ./.github/actions/toolbelt
+        with:
+          cache-key: ${{ matrix.gate }}
+      - run: scripts/dev.sh scripts/gates.sh ${{ matrix.gate }}
+
+  integration:
+    name: gate integration (real databases)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: ./.github/actions/toolbelt
+        with: { cache-key: integration }
+      - run: scripts/dev.sh scripts/gates.sh integration
+
+  coverage:
+    name: gate coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: ./.github/actions/toolbelt
+        with: { cache-key: coverage }
+      - run: scripts/dev.sh scripts/gates.sh coverage
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with: { name: lcov, path: lcov.info, if-no-files-found: ignore }
+
+  mutants:
+    name: gate mutation (changed code)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false, fetch-depth: 0 }
+      - uses: ./.github/actions/toolbelt
+        with: { cache-key: mutants }
+      - run: scripts/dev.sh scripts/gates.sh mutants
+        env:
+          MUTANTS_BASE: origin/${{ github.base_ref }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with: { name: mutants, path: mutants.out, if-no-files-found: ignore }
+
+  bench:
+    name: gate performance (vs base branch)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false, fetch-depth: 0 }
+      - uses: ./.github/actions/toolbelt
+        with: { cache-key: bench }
+      # Same runner, same toolbelt, back to back: the only variable is the code.
+      - name: Benchmark base branch
+        run: |
+          git checkout --detach "origin/${{ github.base_ref }}"
+          scripts/dev.sh cargo bench -p codelake-core -- --noplot --save-baseline base \
+            || echo "::notice::base branch has no comparable benchmarks"
+      - name: Benchmark head and compare
+        run: |
+          git checkout --detach "${{ github.sha }}"
+          scripts/dev.sh cargo bench --locked -p codelake-core -- --noplot --save-baseline head
+          scripts/dev.sh cargo xtask bench-gate target/criterion base head
+
+  pr-title:
+    name: conventional commit title
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions: { pull-requests: read }
+    steps:
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependency-review:
+    name: dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          deny-licenses: GPL-2.0, GPL-3.0, AGPL-3.0, LGPL-2.1, LGPL-3.0, SSPL-1.0, BUSL-1.1
+
+  image:
+    name: container build and scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          tags: codelake:ci
+          load: true
+          cache-from: type=gha,scope=image
+          cache-to: type=gha,scope=image,mode=max
+      - name: Image must run as non-root and validate the example config
+        run: |
+          test "$(docker inspect -f '{{.Config.User}}' codelake:ci)" = "65532:65532"
+          docker run --rm -v "$PWD/examples:/cfg:ro" \
+            -e ERP_PG_PASSWORD=x -e CRM_MYSQL_PASSWORD=x -e EVENTS_MONGO_URI=x \
+            -e LAKE_ACCESS_KEY_ID=x -e LAKE_SECRET_ACCESS_KEY=x \
+            codelake:ci check-config --config /cfg/codelake.toml
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: codelake:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"

@@ -1,0 +1,113 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+exclude = ["fuzz"]
+default-members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/fernandomarcius/CodeLake"
+authors = ["CodeLake contributors"]
+publish = false
+
+# DataFusion "version train" (see docs/adr/0002-datafusion-version-train.md).
+# Every crate below that links DataFusion MUST resolve to the same major.
+# Bumping DataFusion means bumping this whole block together, never one line.
+[workspace.dependencies]
+datafusion = { version = "53.1", default-features = false, features = [
+  "nested_expressions",
+  "datetime_expressions",
+  "string_expressions",
+  "unicode_expressions",
+  "regex_expressions",
+  "crypto_expressions",
+  "parquet",
+] }
+datafusion-federation = { version = "=0.5.3", features = ["sql"] }
+datafusion-table-providers = { version = "=0.11.2", default-features = false }
+iceberg = "=0.10.1"
+iceberg-datafusion = "=0.10.1"
+iceberg-catalog-rest = "=0.10.1"
+iceberg-storage-opendal = { version = "=0.10.1", default-features = false, features = ["opendal-s3"] }
+datafusion-postgres = "=0.17.0"
+
+# Internal crates
+codelake-core = { path = "crates/codelake-core" }
+codelake-connectors = { path = "crates/codelake-connectors" }
+
+# Runtime
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
+tokio-util = "0.7"
+futures = "0.3"
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json", "query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.1"
+thiserror = "2"
+secrecy = "0.10"
+clap = { version = "4.6", features = ["derive", "env"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+
+# Test / bench
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres", "mysql", "mongo", "minio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
+proptest = "1"
+tempfile = "3"
+cargo_metadata = "0.23"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Panics in a query engine take the whole node down with every in-flight query.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+# Silent truncation of byte counts is how memory limits get bypassed.
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+# Pedantic lints that fight the codebase more than they help.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+# Full debuginfo for ~500 dependencies makes test binaries multi-GB and the
+# linker runs out of memory. Line tables keep backtraces useful.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+panic = "unwind"
+
+# Profile used by the container image and by benchmarks.
+[profile.bench]
+inherits = "release"
+debug = true

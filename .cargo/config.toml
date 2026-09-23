@@ -1,0 +1,8 @@
+[alias]
+xtask = "run --quiet --package xtask --"
+
+# GNU ld needs several GB per test binary here and gets OOM-killed when cargo
+# links binaries in parallel. lld uses a fraction of that memory. x86_64 Linux
+# already links with rust-lld by default since Rust 1.90.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]

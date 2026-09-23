@@ -1,0 +1,47 @@
+# Slow gates that would make PRs unbearable: full mutation run and fuzzing.
+name: nightly
+
+on:
+  schedule:
+    - cron: "23 5 * * *"   # 02:23 in America/Sao_Paulo
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutants-full:
+    name: mutation (whole codelake-core, HIGH >= 80%)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: ./.github/actions/toolbelt
+        with: { cache-key: mutants-full }
+      - run: scripts/dev.sh scripts/gates.sh mutants
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with: { name: mutants-full, path: mutants.out }
+
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [config_parse, byte_size]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Fuzz for 10 minutes
+        run: |
+          docker run --rm -v "$PWD":/work -w /work/fuzz rustlang/rust:nightly-bookworm sh -c '
+            cargo install --locked cargo-fuzz@0.13.2 &&
+            cargo fuzz run ${{ matrix.target }} -- -max_total_time=600'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: fuzz/artifacts

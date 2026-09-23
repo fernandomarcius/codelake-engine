@@ -1,0 +1,26 @@
+name: Bug
+description: Wrong result, crash, memory blow-up or any defect
+labels: [bug]
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options: [Wrong result (silent), Query error, Crash / panic, Memory or spill, Performance, Other]
+    validations: { required: true }
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: SQL, sources involved (kind + version), configuration (without secrets).
+    validations: { required: true }
+  - type: textarea
+    id: expected
+    attributes: { label: Expected vs actual }
+    validations: { required: true }
+  - type: dropdown
+    id: criticality
+    attributes:
+      label: Criticality
+      options: [LOW, MEDIUM, HIGH, CRITICAL]
+    validations: { required: true }

@@ -1,0 +1,374 @@
+//! Query engine: one `DataFusion` session per node, federated across sources and
+//! bounded by [`EngineRuntime`].
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use datafusion::error::DataFusionError;
+use datafusion::execution::SessionStateBuilder;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_federation::FederatedQueryPlanner;
+use futures::future::join_all;
+use serde::Serialize;
+use tracing::{info, warn};
+
+use crate::config::{ExecutionConfig, MemoryConfig};
+use crate::connector::{Connector, ConnectorError};
+use crate::federation_guard::FederationFilterGuard;
+use crate::runtime::{EngineRuntime, MemoryStats};
+
+#[derive(Debug, thiserror::Error)]
+pub enum EngineError {
+    #[error(transparent)]
+    DataFusion(#[from] DataFusionError),
+    #[error(transparent)]
+    Connector(#[from] ConnectorError),
+    #[error("source `{0}` did not answer within {1:?}")]
+    Timeout(String, Duration),
+}
+
+/// Default `DataFusion` physical rules, preceded by the federation guard (it must
+/// run before `FilterPushdown`; see [`crate::federation_guard`]).
+fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
+    let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = vec![Arc::new(FederationFilterGuard)];
+    rules.extend(PhysicalOptimizer::new().rules);
+    rules
+}
+
+/// Result of attaching one source at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Attach {
+    Attached,
+    /// Optional source that failed; the node starts without it.
+    Skipped(String),
+}
+
+/// Reachability of one source, as reported by readiness and `/healthz`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceStatus {
+    pub name: String,
+    pub kind: &'static str,
+    /// Required sources gate readiness; optional ones only show up in health.
+    pub required: bool,
+    pub up: bool,
+    pub error: Option<String>,
+}
+
+pub struct Engine {
+    ctx: SessionContext,
+    runtime: EngineRuntime,
+    sources: Vec<(Arc<dyn Connector>, bool)>,
+}
+
+impl std::fmt::Debug for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Engine")
+            .field("session_id", &self.ctx.session_id())
+            .field("runtime", &self.runtime)
+            .field("sources", &self.sources)
+            .finish()
+    }
+}
+
+impl Engine {
+    pub fn new(memory: &MemoryConfig, execution: &ExecutionConfig) -> Result<Self, EngineError> {
+        let runtime = EngineRuntime::new(memory)?;
+        let mut session = SessionConfig::new()
+            .with_batch_size(execution.batch_size)
+            .with_information_schema(true);
+        if let Some(partitions) = execution.target_partitions {
+            session = session.with_target_partitions(partitions);
+        }
+        let state = SessionStateBuilder::new()
+            .with_config(session)
+            .with_runtime_env(runtime.env())
+            .with_default_features()
+            .with_optimizer_rules(datafusion_federation::default_optimizer_rules())
+            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .with_physical_optimizer_rules(physical_rules())
+            .build();
+        Ok(Self {
+            ctx: SessionContext::new_with_state(state),
+            runtime,
+            sources: Vec::new(),
+        })
+    }
+
+    /// Registers a source as a SQL catalog. Required sources abort startup on
+    /// failure; optional ones are skipped and reported.
+    pub async fn attach(
+        &mut self,
+        connector: Arc<dyn Connector>,
+        required: bool,
+        timeout: Duration,
+    ) -> Result<Attach, EngineError> {
+        let name = connector.name().to_owned();
+        let failure = match tokio::time::timeout(timeout, connector.catalog()).await {
+            Ok(Ok(catalog)) => {
+                self.ctx.register_catalog(&name, catalog);
+                self.sources.push((connector, required));
+                info!(source = %name, "source attached");
+                return Ok(Attach::Attached);
+            }
+            Ok(Err(err)) => EngineError::from(err),
+            Err(_) => EngineError::Timeout(name.clone(), timeout),
+        };
+        if required {
+            return Err(failure);
+        }
+        warn!(source = %name, error = %failure, "optional source skipped");
+        Ok(Attach::Skipped(failure.to_string()))
+    }
+
+    pub fn context(&self) -> &SessionContext {
+        &self.ctx
+    }
+
+    pub fn memory(&self) -> MemoryStats {
+        self.runtime.stats()
+    }
+
+    /// Pings every attached source concurrently.
+    pub async fn check_sources(&self, timeout: Duration) -> Vec<SourceStatus> {
+        join_all(self.sources.iter().map(|(source, required)| async move {
+            let result = match tokio::time::timeout(timeout, source.ping()).await {
+                Ok(Ok(())) => None,
+                Ok(Err(err)) => Some(err.to_string()),
+                Err(_) => Some(format!("no answer within {timeout:?}")),
+            };
+            SourceStatus {
+                name: source.name().to_owned(),
+                kind: source.kind(),
+                required: *required,
+                up: result.is_none(),
+                error: result,
+            }
+        }))
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bytes::ByteSize;
+    use async_trait::async_trait;
+    use datafusion::arrow::array::{Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
+    use datafusion::datasource::MemTable;
+
+    #[derive(Debug)]
+    enum Behaviour {
+        Healthy,
+        Broken,
+        Hangs,
+    }
+
+    #[derive(Debug)]
+    struct FakeSource {
+        name: &'static str,
+        behaviour: Behaviour,
+    }
+
+    #[async_trait]
+    impl Connector for FakeSource {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn kind(&self) -> &'static str {
+            "fake"
+        }
+        async fn catalog(&self) -> Result<Arc<dyn CatalogProvider>, ConnectorError> {
+            self.ping().await?;
+            let schema = MemorySchemaProvider::new();
+            let catalog = MemoryCatalogProvider::new();
+            catalog
+                .register_schema("public", Arc::new(schema))
+                .map_err(|e| ConnectorError::Metadata {
+                    source_name: self.name.into(),
+                    cause: e.into(),
+                })?;
+            Ok(Arc::new(catalog))
+        }
+        async fn ping(&self) -> Result<(), ConnectorError> {
+            match self.behaviour {
+                Behaviour::Healthy => Ok(()),
+                Behaviour::Broken => Err(ConnectorError::Unreachable {
+                    source_name: self.name.into(),
+                    cause: "connection refused".into(),
+                }),
+                Behaviour::Hangs => std::future::pending().await,
+            }
+        }
+    }
+
+    fn engine(dir: &std::path::Path, limit: ByteSize, spill: ByteSize) -> Engine {
+        let memory = MemoryConfig {
+            limit,
+            spill_dir: dir.to_owned(),
+            spill_limit: spill,
+            metadata_cache_limit: ByteSize::mib(1),
+        };
+        let execution = ExecutionConfig {
+            target_partitions: Some(1),
+            ..ExecutionConfig::default()
+        };
+        Engine::new(&memory, &execution).unwrap()
+    }
+
+    fn source(name: &'static str, behaviour: Behaviour) -> Arc<dyn Connector> {
+        Arc::new(FakeSource { name, behaviour })
+    }
+
+    const FAST: Duration = Duration::from_millis(200);
+
+    #[test]
+    fn federation_guard_runs_before_filter_pushdown() {
+        let names: Vec<String> = physical_rules().iter().map(|r| r.name().to_owned()).collect();
+        let guard = names.iter().position(|n| n == "federation_filter_guard").unwrap();
+        let pushdown = names.iter().position(|n| n.contains("FilterPushdown")).unwrap();
+        assert!(guard < pushdown, "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn required_source_failure_aborts_and_optional_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+
+        let ok = engine
+            .attach(source("erp", Behaviour::Healthy), true, FAST)
+            .await
+            .unwrap();
+        assert_eq!(ok, Attach::Attached);
+        assert!(engine.context().catalog("erp").is_some());
+
+        let err = engine
+            .attach(source("down", Behaviour::Broken), true, FAST)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Connector(_)), "{err}");
+
+        let err = engine
+            .attach(source("slow", Behaviour::Hangs), true, FAST)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Timeout(..)), "{err}");
+
+        let skipped = engine
+            .attach(source("opt", Behaviour::Broken), false, FAST)
+            .await
+            .unwrap();
+        assert!(matches!(skipped, Attach::Skipped(ref m) if m.contains("connection refused")));
+        let skipped = engine
+            .attach(source("opt2", Behaviour::Hangs), false, FAST)
+            .await
+            .unwrap();
+        assert!(matches!(skipped, Attach::Skipped(ref m) if m.contains("did not answer")));
+
+        assert!(engine.context().catalog("down").is_none());
+        assert!(engine.context().catalog("opt").is_none());
+    }
+
+    #[tokio::test]
+    async fn check_sources_reports_each_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        engine
+            .attach(source("erp", Behaviour::Healthy), true, FAST)
+            .await
+            .unwrap();
+
+        let statuses = engine.check_sources(FAST).await;
+        assert_eq!(
+            statuses,
+            vec![SourceStatus {
+                name: "erp".into(),
+                kind: "fake",
+                required: true,
+                up: true,
+                error: None
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn check_sources_flags_down_and_hanging_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        engine.sources.push((source("down", Behaviour::Broken), true));
+        engine.sources.push((source("slow", Behaviour::Hangs), false));
+
+        let statuses = engine.check_sources(FAST).await;
+        assert!(statuses.iter().all(|s| !s.up));
+        assert!(statuses[0].required && !statuses[1].required);
+        assert!(
+            statuses[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("connection refused")
+        );
+        assert!(statuses[1].error.as_deref().unwrap().contains("no answer"));
+    }
+
+    /// ~40 MiB of rows, sorted under a 16 MiB ceiling.
+    async fn sort_large_table(engine: &Engine) -> datafusion::error::Result<Vec<RecordBatch>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batches = (0..40)
+            .map(|b| {
+                let keys: Vec<i64> = (0..65_536)
+                    .map(|i| (i * 7919 + b * 104_729) % 2_621_440)
+                    .collect();
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(keys.clone())),
+                        Arc::new(Int64Array::from(keys)),
+                    ],
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let table = MemTable::try_new(schema, vec![batches])?;
+        engine.context().register_table("big", Arc::new(table))?;
+        engine
+            .context()
+            // A full sort (no LIMIT, which would become a bounded TopK) feeding a
+            // window function: the sort must hold every row or spill.
+            .sql("SELECT max(rn) AS n FROM (SELECT row_number() OVER (ORDER BY k DESC, v) AS rn FROM big)")
+            .await?
+            .collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn query_larger_than_memory_spills_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(16), ByteSize::mib(512));
+        let result = sort_large_table(&engine).await.unwrap();
+        let n = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+            .unwrap();
+        assert_eq!(n.value(0), 40 * 65_536);
+        assert!(engine.memory().reserved_bytes <= ByteSize::mib(16).as_u64());
+    }
+
+    #[tokio::test]
+    async fn query_fails_cleanly_when_memory_and_spill_are_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(16), ByteSize::b(1));
+        let err = sort_large_table(&engine).await.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Resources exhausted") || message.contains("exceeds the maximum"),
+            "{message}"
+        );
+    }
+}

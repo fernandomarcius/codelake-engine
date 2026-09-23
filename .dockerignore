@@ -1,0 +1,6 @@
+target
+fuzz/target
+.git
+mutants.out*
+*.md
+!README.md

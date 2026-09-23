@@ -1,0 +1,35 @@
+name: Feature (Definition of Ready)
+description: New capability. Work starts only when every field is filled.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: objective
+    attributes: { label: Objective, description: What problem does it solve? }
+    validations: { required: true }
+  - type: textarea
+    id: context
+    attributes: { label: Context, description: Why now, what exists today }
+    validations: { required: true }
+  - type: textarea
+    id: scope
+    attributes: { label: Scope and out of scope }
+    validations: { required: true }
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Verifiable. "Works well" is not a criterion.
+    validations: { required: true }
+  - type: textarea
+    id: scenarios
+    attributes: { label: Scenarios, including edge cases }
+    validations: { required: true }
+  - type: textarea
+    id: dependencies
+    attributes: { label: Dependencies }
+  - type: dropdown
+    id: criticality
+    attributes:
+      label: Criticality
+      options: [LOW, MEDIUM, HIGH, CRITICAL]
+    validations: { required: true }

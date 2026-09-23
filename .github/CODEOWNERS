@@ -1,0 +1,8 @@
+# Changes to gates, supply chain and security policy need an owner's review.
+*                              @fernandomarcius
+/scripts/gates.sh              @fernandomarcius
+/deny.toml                     @fernandomarcius
+/.github/                      @fernandomarcius
+/docs/exceptions.md            @fernandomarcius
+/crates/codelake-core/src/runtime.rs           @fernandomarcius
+/crates/codelake-core/src/federation_guard.rs  @fernandomarcius

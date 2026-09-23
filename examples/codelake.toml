@@ -1,0 +1,53 @@
+# Example configuration. Secrets are NEVER written here: each source names the
+# environment variable that holds its secret. Validate with:
+#   codelake check-config --config examples/codelake.toml
+
+[server]
+pg_listen = "127.0.0.1:5432"
+http_listen = "0.0.0.0:8080"
+max_connections = 128
+shutdown_grace_secs = 30
+
+[memory]
+# Hard ceiling for query memory. Keep it ~75% of the container memory limit to
+# leave room for the allocator, connection buffers and metadata.
+limit = "3GiB"
+spill_dir = "/var/lib/codelake/spill"
+spill_limit = "40GiB"
+
+[execution]
+batch_size = 8192
+source_startup_timeout_secs = 60
+
+[[source]]
+name = "erp"
+kind = "postgres"
+host = "postgres.internal"
+database = "erp"
+user = "codelake_reader"
+password_env = "ERP_PG_PASSWORD"
+sslmode = "verify-full"
+
+[[source]]
+name = "crm"
+kind = "mysql"
+host = "mysql.internal"
+database = "crm"
+user = "codelake_reader"
+password_env = "CRM_MYSQL_PASSWORD"
+
+[[source]]
+name = "events"
+kind = "mongodb"
+required = false
+connection_string_env = "EVENTS_MONGO_URI"
+
+[[source]]
+name = "lake"
+kind = "iceberg"
+catalog_uri = "http://iceberg-rest:8181"
+warehouse = "s3://lake"
+s3_endpoint = "http://minio:9000"
+s3_path_style = true
+access_key_id_env = "LAKE_ACCESS_KEY_ID"
+secret_access_key_env = "LAKE_SECRET_ACCESS_KEY"

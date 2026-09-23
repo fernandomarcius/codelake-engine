@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: codelake
+resources:
+  - deployment.yaml
+  - service.yaml
+  - pdb.yaml
+  - networkpolicy.yaml
+configMapGenerator:
+  - name: codelake-config
+    files:
+      - codelake.toml=codelake.toml
+images:
+  # CI replaces this with the digest of the image that passed every gate.
+  # The same digest is promoted HML -> PRD; nothing is rebuilt per environment.
+  - name: codelake
+    newName: ghcr.io/fernandomarcius/codelake
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000

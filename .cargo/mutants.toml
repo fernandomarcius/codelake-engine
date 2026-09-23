@@ -1,0 +1,6 @@
+# cargo-mutants: measures whether tests would catch a wrong implementation.
+# Thresholds by criticality live in docs/gates.md; codelake-core is HIGH (>= 80%).
+exclude_globs = ["xtask/**", "fuzz/**", "**/tests/**", "**/benches/**"]
+# Integration tests need Docker; mutation runs use the unit-test lane.
+test_tool = "nextest"
+timeout_multiplier = 3.0

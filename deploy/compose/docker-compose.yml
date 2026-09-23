@@ -1,0 +1,32 @@
+# Local development stack: every source CodeLake federates, disposable.
+# Credentials here are throwaway development values for local containers only.
+name: codelake-dev
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment: { POSTGRES_PASSWORD: dev-only-password }
+    ports: ["15432:5432"]
+  mysql:
+    image: mysql:8.4
+    environment: { MYSQL_ROOT_PASSWORD: dev-only-password, MYSQL_DATABASE: crm }
+    ports: ["13306:3306"]
+  mongo:
+    image: mongo:8
+    ports: ["27017:27017"]
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data --console-address :9001
+    environment: { MINIO_ROOT_USER: dev-access-key, MINIO_ROOT_PASSWORD: dev-secret-key }
+    ports: ["9000:9000", "9001:9001"]
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:1.9.2
+    environment:
+      CATALOG_WAREHOUSE: s3://lake/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      AWS_ACCESS_KEY_ID: dev-access-key
+      AWS_SECRET_ACCESS_KEY: dev-secret-key
+      AWS_REGION: us-east-1
+    ports: ["8181:8181"]
+    depends_on: [minio]
