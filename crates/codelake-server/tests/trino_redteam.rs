@@ -214,9 +214,16 @@ async fn rt_pass_canceled_hive_write_leaves_no_files() {
         page = c.get(&next).await.1;
         rows.extend(page["data"].as_array().cloned().unwrap_or_default());
     }
-    assert_eq!(rows, vec![serde_json::json!([1])], "canceled INSERT added rows: {page}");
+    assert_eq!(
+        rows,
+        vec![serde_json::json!([1])],
+        "canceled INSERT added rows: {page}"
+    );
     let big = c.run("SELECT count(*) FROM hive.rt.big").await;
-    assert_eq!(big["stats"]["state"], "FAILED", "canceled CTAS left a visible table: {big}");
+    assert_eq!(
+        big["stats"]["state"], "FAILED",
+        "canceled CTAS left a visible table: {big}"
+    );
 }
 
 /// SIGTERM: new statements are refused with 503 while a query already running
