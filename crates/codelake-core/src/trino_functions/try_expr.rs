@@ -9,8 +9,10 @@
 //! the whole batch and, when that fails with a user error, splits the batch
 //! until each failing row is isolated and returns NULL for it.
 //!
-//! It also rewrites aggregate arguments, filters and grouping expressions.
-//! Anywhere else (a join condition, a sort key) the call stays a
+//! It also rewrites aggregate arguments, filters, grouping expressions, join
+//! keys and conditions (hash and nested-loop joins) and sort keys. Window
+//! function arguments are made to fail on overflow by the logical rule in
+//! `keys`; there, and in any other operator, a `try` call stays a
 //! pass-through: the expression's error surfaces as a query failure, never as
 //! a different answer.
 //!
@@ -33,12 +35,17 @@ use datafusion::logical_expr::{ColumnarValue, Operator, ScalarUDF, Volatility};
 use datafusion::physical_expr::expressions::BinaryExpr;
 use datafusion::physical_expr::projection::ProjectionExpr;
 use datafusion::physical_expr::utils::collect_columns;
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use datafusion::physical_plan::filter::{FilterExec, FilterExecBuilder};
+use datafusion::physical_plan::joins::utils::JoinFilter;
+use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec, NestedLoopJoinExecBuilder};
 use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 
 use super::errors::caught_by_try;
 use super::support::{Func, not_found};
@@ -262,8 +269,105 @@ fn rewrite_node(node: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exec
         && let Some(rewritten) = rewrite_aggregate(aggregate)?
     {
         return Ok(Transformed::yes(rewritten));
+    } else if let Some(join) = node.as_any().downcast_ref::<HashJoinExec>()
+        && let Some(rewritten) = rewrite_hash_join(join)?
+    {
+        return Ok(Transformed::yes(rewritten));
+    } else if let Some(join) = node.as_any().downcast_ref::<NestedLoopJoinExec>()
+        && let Some(filter) = rewrite_join_filter(join.filter())?
+    {
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            NestedLoopJoinExecBuilder::new(
+                Arc::clone(join.left()),
+                Arc::clone(join.right()),
+                *join.join_type(),
+            )
+            .with_projection_ref(join.projection().clone())
+            .with_filter(Some(filter))
+            .build()?,
+        );
+        return Ok(Transformed::yes(plan));
+    } else if let Some(sort) = node.as_any().downcast_ref::<SortExec>()
+        && let Some(ordering) = rewrite_ordering(sort.expr(), &sort.input().schema())?
+    {
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            SortExec::new(ordering, Arc::clone(sort.input()))
+                .with_preserve_partitioning(sort.preserve_partitioning())
+                .with_fetch(sort.fetch()),
+        );
+        return Ok(Transformed::yes(plan));
+    } else if let Some(merge) = node.as_any().downcast_ref::<SortPreservingMergeExec>()
+        && let Some(ordering) = rewrite_ordering(merge.expr(), &merge.input().schema())?
+    {
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            SortPreservingMergeExec::new(ordering, Arc::clone(merge.input())).with_fetch(merge.fetch()),
+        );
+        return Ok(Transformed::yes(plan));
     }
     Ok(Transformed::no(node))
+}
+
+/// A join's residual condition (non-equi part), checked like a filter.
+fn rewrite_join_filter(filter: Option<&JoinFilter>) -> Result<Option<JoinFilter>> {
+    let Some(filter) = filter else { return Ok(None) };
+    let expression = install_try(Arc::clone(filter.expression()), filter.schema())?;
+    if !expression.transformed {
+        return Ok(None);
+    }
+    Ok(Some(JoinFilter::new(
+        expression.data,
+        filter.column_indices().to_vec(),
+        Arc::clone(filter.schema()),
+    )))
+}
+
+/// Join keys and residual condition of a hash join. New keys drop the
+/// dynamic filter the join would push to its probe side (built from the old
+/// keys; the pushed copy stays a pass-through `true`).
+fn rewrite_hash_join(join: &HashJoinExec) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let (left, right) = (join.left().schema(), join.right().schema());
+    let mut keys_changed = false;
+    let on = join
+        .on()
+        .iter()
+        .map(|(l, r)| {
+            let (l, r) = (
+                install_try(Arc::clone(l), &left)?,
+                install_try(Arc::clone(r), &right)?,
+            );
+            keys_changed |= l.transformed || r.transformed;
+            Ok((l.data, r.data))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let filter = rewrite_join_filter(join.filter())?;
+    if !keys_changed && filter.is_none() {
+        return Ok(None);
+    }
+    let mut builder = join.builder();
+    if keys_changed {
+        builder = builder.with_on(on).reset_state();
+    }
+    if let Some(filter) = filter {
+        builder = builder.with_filter(Some(filter));
+    }
+    Ok(Some(builder.build_exec()?))
+}
+
+/// Sort keys (`ORDER BY x + 1`), checked like projections.
+fn rewrite_ordering(ordering: &LexOrdering, schema: &Schema) -> Result<Option<LexOrdering>> {
+    let mut changed = false;
+    let exprs = ordering
+        .iter()
+        .map(|sort| {
+            let expr = install_try(Arc::clone(&sort.expr), schema)?;
+            changed |= expr.transformed;
+            Ok(PhysicalSortExpr::new(expr.data, sort.options))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !changed {
+        return Ok(None);
+    }
+    Ok(LexOrdering::new(exprs))
 }
 
 /// Aggregate arguments, filters and grouping expressions of the modes that

@@ -81,6 +81,7 @@ pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + S
         position,
         Arc::new(datafusion::optimizer::push_down_filter::PushDownFilter::new()),
     );
+    rules.extend(crate::trino_functions::optimizer_rules());
     rules
 }
 

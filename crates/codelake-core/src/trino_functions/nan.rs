@@ -165,10 +165,80 @@ fn ieee_function(
     Func::new(name, |n, t| coerce_each(n, t, &[as_f64, as_f64]), BOOLEAN, invoke).udf()
 }
 
+/// A float join key: `-0.0` is `0.0` and NaN matches nothing (NULL), as
+/// Trino's `=`.
+pub(crate) const FLOAT_KEY: &str = "codelake_trino_float_key";
+/// A float grouping key: `-0.0` is `0.0`, every NaN one NaN (Trino's
+/// `IS DISTINCT FROM`, used by `GROUP BY`, `DISTINCT` and set operations).
+pub(crate) const FLOAT_GROUP_KEY: &str = "codelake_trino_float_group_key";
+
+fn canonical_floats(array: &ArrayRef, nan: Option<f64>) -> Result<ArrayRef> {
+    if let Some(values) = array.as_any().downcast_ref::<Float64Array>() {
+        let out: Float64Array = values
+            .iter()
+            .map(|v| {
+                v.and_then(|v| {
+                    if v.is_nan() {
+                        nan
+                    } else if v == 0.0 {
+                        Some(0.0)
+                    } else {
+                        Some(v)
+                    }
+                })
+            })
+            .collect();
+        return Ok(Arc::new(out));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Float32Array>() {
+        let nan = nan.map(|_| f32::NAN);
+        let out: Float32Array = values
+            .iter()
+            .map(|v| {
+                v.and_then(|v| {
+                    if v.is_nan() {
+                        nan
+                    } else if v == 0.0 {
+                        Some(0.0)
+                    } else {
+                        Some(v)
+                    }
+                })
+            })
+            .collect();
+        return Ok(Arc::new(out));
+    }
+    Err(DataFusionError::Internal(format!(
+        "not a float: {}",
+        array.data_type()
+    )))
+}
+
+fn key_function(name: &'static str, invoke: super::support::InvokeFn) -> datafusion::logical_expr::ScalarUDF {
+    use super::support::{Func, not_found};
+    Func::new(
+        name,
+        |name, types| match types {
+            [t @ (DataType::Float32 | DataType::Float64)] => Ok(vec![t.clone()]),
+            _ => Err(not_found(name, types)),
+        },
+        |r| {
+            r.types
+                .first()
+                .cloned()
+                .ok_or_else(|| DataFusionError::Internal("float key".into()))
+        },
+        invoke,
+    )
+    .udf()
+}
+
 /// IEEE comparisons of constants, which the simplifier would otherwise fold
-/// with the engine's total order.
+/// with the engine's total order; float key normalizations.
 pub(crate) fn udfs() -> Vec<datafusion::logical_expr::ScalarUDF> {
     vec![
+        key_function(FLOAT_KEY, |c| canonical_floats(c.arg(0)?, None)),
+        key_function(FLOAT_GROUP_KEY, |c| canonical_floats(c.arg(0)?, Some(f64::NAN))),
         ieee_function("codelake_trino_ieee_eq", |c| {
             ieee(c, |a, b| a.partial_cmp(&b) == Some(std::cmp::Ordering::Equal))
         }),
