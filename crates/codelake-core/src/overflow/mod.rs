@@ -59,7 +59,7 @@ use datafusion::optimizer::{AnalyzerRule, OptimizerConfig, OptimizerRule};
 
 use arith::{CheckedAbs, CheckedBinary, CheckedNegate, is_arithmetic, is_decimal, is_integer};
 use avg::TrinoAvg;
-use decimal::{DecimalBinary, as_decimal, is_decimal_operation};
+use decimal::{DecimalBinary, as_decimal, as_decimal_operand, is_decimal_operation};
 use sum::{CheckedSum, is_checked_sum_type};
 
 static CHECKED_OPS: LazyLock<[(Operator, Arc<ScalarUDF>); 5]> = LazyLock::new(|| {
@@ -184,13 +184,30 @@ fn check_arithmetic(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> 
             if collapsed.transformed {
                 return Ok(collapsed);
             }
-            return crate::timestamps::check_text_cast(collapsed.data, schema);
+            return check_cast(collapsed.data, schema);
         }
-        Expr::TryCast(_) | Expr::ScalarFunction(_) => {
-            return crate::timestamps::check_text_cast(expr, schema);
-        }
+        Expr::TryCast(_) | Expr::ScalarFunction(_) => return check_cast(expr, schema),
         other => Transformed::no(other),
     })
+}
+
+/// Casts evaluated with Trino's semantics: text to timestamps
+/// ([`crate::timestamps`]), text and floating point to decimals
+/// ([`crate::casts`]).
+fn check_cast(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
+    let text = crate::timestamps::check_text_cast(expr, schema)?;
+    if text.transformed {
+        return Ok(text);
+    }
+    let timestamp = crate::timestamp_casts::check_cast(text.data, schema)?;
+    if timestamp.transformed {
+        return Ok(timestamp);
+    }
+    let typed = crate::declared::check_typed(timestamp.data, schema)?;
+    if typed.transformed {
+        return Ok(typed);
+    }
+    crate::casts::check_cast(typed.data, schema)
 }
 
 fn is_builtin<T: 'static>(udf: &AggregateUDF) -> bool {
@@ -274,7 +291,7 @@ fn check_node(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
             if collapsed.transformed {
                 return Ok(collapsed);
             }
-            let text = crate::timestamps::check_text_cast(collapsed.data, schema)?;
+            let text = check_cast(collapsed.data, schema)?;
             if text.transformed {
                 return Ok(text);
             }
@@ -290,6 +307,13 @@ fn check_node(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
             }
         }
         Expr::TryCast(TryCast { expr, data_type }) if !matches!(data_type, DataType::Timestamp(..)) => {
+            let checked = check_cast(Expr::TryCast(TryCast { expr, data_type }), schema)?;
+            if checked.transformed {
+                return Ok(checked);
+            }
+            let Expr::TryCast(TryCast { expr, data_type }) = checked.data else {
+                return Ok(checked);
+            };
             match rounded(&expr, &expr.get_type(schema)?, &data_type) {
                 Some(source) => Ok(Transformed::yes(Expr::TryCast(TryCast::new(
                     Box::new(source),
@@ -298,7 +322,7 @@ fn check_node(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                 None => Ok(Transformed::no(Expr::TryCast(TryCast { expr, data_type }))),
             }
         }
-        Expr::TryCast(_) | Expr::ScalarFunction(_) => crate::timestamps::check_text_cast(expr, schema),
+        Expr::TryCast(_) | Expr::ScalarFunction(_) => check_cast(expr, schema),
         other => Ok(Transformed::no(other)),
     }
 }
@@ -313,7 +337,7 @@ fn unchecked_decimal(binary: &DecimalBinary, left: Expr, right: Expr, schema: &D
         if is_decimal(data_type) {
             return Ok((expr, data_type.clone()));
         }
-        let Some((p, s)) = as_decimal(data_type) else {
+        let Some((p, s)) = as_decimal_operand(data_type) else {
             return datafusion::common::plan_err!("{data_type} is not an exact number");
         };
         let target = DataType::Decimal128(p, s);
@@ -334,6 +358,24 @@ fn unchecked_decimal(binary: &DecimalBinary, left: Expr, right: Expr, schema: &D
 /// Checked functions → the operators they replace (for SQL sources).
 fn uncheck_node(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
     let expr = match crate::timestamps::uncheck_text_cast(expr) {
+        done @ Transformed {
+            transformed: true, ..
+        } => return Ok(done),
+        other => other.data,
+    };
+    let expr = match crate::timestamp_casts::uncheck_cast(expr) {
+        done @ Transformed {
+            transformed: true, ..
+        } => return Ok(done),
+        other => other.data,
+    };
+    let expr = match crate::casts::uncheck_cast(expr) {
+        done @ Transformed {
+            transformed: true, ..
+        } => return Ok(done),
+        other => other.data,
+    };
+    let expr = match crate::trino_functions::uncheck_round(expr, schema)? {
         done @ Transformed {
             transformed: true, ..
         } => return Ok(done),

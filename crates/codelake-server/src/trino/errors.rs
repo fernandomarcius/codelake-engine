@@ -22,6 +22,7 @@ pub(crate) enum Code {
     UserCanceled,
     NotFound,
     FunctionNotFound,
+    InvalidFunctionArgument,
     DivisionByZero,
     InvalidCastArgument,
     NotSupported,
@@ -54,6 +55,7 @@ impl Code {
             Self::UserCanceled => (3, "USER_CANCELED", "USER_ERROR"),
             Self::NotFound => (5, "NOT_FOUND", "USER_ERROR"),
             Self::FunctionNotFound => (6, "FUNCTION_NOT_FOUND", "USER_ERROR"),
+            Self::InvalidFunctionArgument => (7, "INVALID_FUNCTION_ARGUMENT", "USER_ERROR"),
             Self::DivisionByZero => (8, "DIVISION_BY_ZERO", "USER_ERROR"),
             Self::InvalidCastArgument => (9, "INVALID_CAST_ARGUMENT", "USER_ERROR"),
             Self::NotSupported => (13, "NOT_SUPPORTED", "USER_ERROR"),
@@ -319,6 +321,20 @@ const MESSAGE_RULES: &[(Pattern, Code)] = &[
         Pattern::Contains("failed to coerce arguments to satisfy a call to"),
         Code::FunctionNotFound,
     ),
+    // A decimal product whose scale passes 38 (Trino: `DECIMAL scale must be
+    // in range [0, precision (38)]`), a decimal quotient that cannot be
+    // rescaled (Trino: `Decimal overflow`).
+    (
+        Pattern::Both(
+            "cannot get result type for decimal operation",
+            "would exceed max scale",
+        ),
+        Code::InvalidFunctionArgument,
+    ),
+    (
+        Pattern::Both("cannot get result type for decimal operation", "overflow"),
+        Code::NumericValueOutOfRange,
+    ),
     (
         Pattern::StartsWith("cannot coerce arithmetic expression"),
         Code::TypeMismatch,
@@ -370,6 +386,12 @@ fn code_of(error: &DataFusionError) -> Code {
             ArrowError::ArithmeticOverflow(_) => Code::NumericValueOutOfRange,
             ArrowError::CastError(message) => cast_code(message),
             ArrowError::ParseError(_) => Code::InvalidCastArgument,
+            // A decimal cast to a precision too small for the value.
+            ArrowError::InvalidArgumentError(message)
+                if message.contains("too large to store in a Decimal") =>
+            {
+                Code::InvalidCastArgument
+            }
             _ => Code::GenericInternalError,
         },
         _ => Code::GenericInternalError,
@@ -499,6 +521,40 @@ mod tests {
                     Box::new(None),
                 ),
                 "AMBIGUOUS_NAME",
+            ),
+        ];
+        for (error, name) in cases {
+            assert_eq!(QueryError::from(&error).name(), name, "{error}");
+        }
+    }
+
+    #[test]
+    fn decimal_errors_map_to_trino_codes() {
+        let cases = [
+            // Trino 431: `decimal(5,2) * decimal(38,38)`, `decimal(5,2) /
+            // decimal(38,38)` and a narrowing decimal cast.
+            (
+                DataFusionError::Plan(
+                    "Cannot get result type for decimal operation Decimal128(5, 2) * Decimal128(38, 38): \
+                     Invalid argument error: Output scale of Decimal128(5, 2) * Decimal128(38, 38) would \
+                     exceed max scale of 38"
+                        .into(),
+                ),
+                "INVALID_FUNCTION_ARGUMENT",
+            ),
+            (
+                DataFusionError::Plan(
+                    "Cannot get result type for decimal operation Decimal128(5, 2) / Decimal128(38, 38): \
+                     Arithmetic overflow: Overflow happened on: 10 ^ 42"
+                        .into(),
+                ),
+                "NUMERIC_VALUE_OUT_OF_RANGE",
+            ),
+            (
+                DataFusionError::from(ArrowError::InvalidArgumentError(
+                    "777.4 is too large to store in a Decimal128 of precision 3. Max is 99.9".into(),
+                )),
+                "INVALID_CAST_ARGUMENT",
             ),
         ];
         for (error, name) in cases {

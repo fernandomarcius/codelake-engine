@@ -115,6 +115,22 @@ pub(crate) fn trino_zone(text: &str) -> Option<Zone> {
     Some(Zone { name, tz })
 }
 
+/// A time zone as Trino names it (`UTC`, `-03:00`, `America/Sao_Paulo`), or
+/// `None` when Trino does not know it: how a client's session zone is read.
+pub fn trino_time_zone(text: &str) -> Option<String> {
+    trino_zone(text).map(|zone| zone.name)
+}
+
+/// The Arrow time zone of a zone name as the engine stores it.
+pub(crate) fn arrow_tz(name: &str) -> Result<Tz, ArrowError> {
+    Tz::from_str(if name == "UTC" { "+00:00" } else { name })
+}
+
+/// The zone of an Arrow timestamp type as Trino prints it.
+pub(crate) fn zone_label(name: &str) -> String {
+    trino_zone(name).map_or_else(|| name.to_owned(), |zone| zone.name)
+}
+
 /// The zone a timestamp text names, as Trino prints it (`None` without a
 /// zone, or when the text is not a timestamp).
 pub(crate) fn zone_of_text(text: &str) -> Option<String> {
@@ -234,12 +250,26 @@ fn invalid(text: &str) -> ArrowError {
 
 /// Offset in seconds of local time `local` in `zone` (gap: the offset before
 /// it, so the time moves forward; overlap: the earlier offset).
-fn offset_seconds(zone: Tz, local: &chrono::NaiveDateTime) -> i64 {
+pub(crate) fn offset_seconds(zone: Tz, local: &chrono::NaiveDateTime) -> i64 {
     let offset = match zone.offset_from_local_datetime(local) {
         LocalResult::Single(offset) | LocalResult::Ambiguous(offset, _) => offset,
         LocalResult::None => zone.offset_from_utc_datetime(&(*local - Duration::days(1))),
     };
     i64::from(offset.fix().local_minus_utc())
+}
+
+/// Offset in seconds of `zone` at the UTC instant `seconds`.
+pub(crate) fn offset_at_instant(zone: Tz, seconds: i64) -> i64 {
+    let utc = chrono::DateTime::from_timestamp(seconds, 0)
+        .map_or_else(chrono::NaiveDateTime::default, |d| d.naive_utc());
+    i64::from(zone.offset_from_utc_datetime(&utc).fix().local_minus_utc())
+}
+
+/// Seconds of `local` (as if UTC) once placed in `zone` and read back: the
+/// same time, except in a daylight-saving gap, which it leaves forward.
+fn normalized_local(zone: Tz, local: &chrono::NaiveDateTime) -> i64 {
+    let instant = local.and_utc().timestamp() - offset_seconds(zone, local);
+    instant + offset_at_instant(zone, instant)
 }
 
 /// `text` as a value of `Timestamp(unit, zone)` (see the module
@@ -255,11 +285,16 @@ fn parse_timestamp(text: &str, unit: TimeUnit, target_zone: Option<&Tz>) -> Resu
         .ok_or_else(|| invalid(text))?;
     let digits = digits_of(unit);
     let (fraction, carry) = round_fraction(parts.fraction, digits).ok_or_else(|| invalid(text))?;
-    let seconds = local.and_utc().timestamp()
-        - match target_zone {
-            None => 0,
-            Some(target) => offset_seconds(zone.as_ref().map_or(*target, |z| z.tz), &local),
-        };
+    let seconds = match (target_zone, &zone) {
+        (Some(target), _) => {
+            local.and_utc().timestamp() - offset_seconds(zone.as_ref().map_or(*target, |z| z.tz), &local)
+        }
+        // A zone the text names still places the local time: one in a
+        // daylight-saving gap moves forward (Trino reads the value in its
+        // zone, then takes its local time).
+        (None, Some(zone)) => normalized_local(zone.tz, &local),
+        (None, None) => local.and_utc().timestamp(),
+    };
     let scale = 10_i64.pow(digits);
     (seconds + carry)
         .checked_mul(scale)
@@ -276,7 +311,7 @@ fn texts(array: &ArrayRef) -> Result<Vec<Option<&str>>> {
     })
 }
 
-fn timestamps(unit: TimeUnit, values: Vec<Option<i64>>, zone: Option<Arc<str>>) -> ArrayRef {
+pub(crate) fn timestamps(unit: TimeUnit, values: Vec<Option<i64>>, zone: Option<Arc<str>>) -> ArrayRef {
     match unit {
         TimeUnit::Second => {
             Arc::new(PrimitiveArray::<TimestampSecondType>::from(values).with_timezone_opt(zone))
@@ -409,18 +444,56 @@ pub(crate) fn check_text_cast(expr: Expr, schema: &DFSchema) -> Result<Transform
             ))
         }
         Expr::ScalarFunction(ScalarFunction { func, args })
-            if func.name() == "arrow_cast" && args.len() == 2 && is_text(&args[0].get_type(schema)?) =>
+            if (func.name() == "arrow_cast" || func.name() == crate::timestamp_casts::TRY_ARROW_CAST)
+                && args.len() == 2
+                && is_text(&args[0].get_type(schema)?) =>
         {
+            let safe = func.name() == crate::timestamp_casts::TRY_ARROW_CAST;
             match expr.get_type(schema)? {
-                target @ DataType::Timestamp(..) => Some(text_to_timestamp(args[0].clone(), target, false)),
+                target @ DataType::Timestamp(..) => Some(text_to_timestamp(args[0].clone(), target, safe)),
                 _ => None,
             }
+        }
+        // `CAST(CAST(<text> AS … WITH TIME ZONE) AS timestamp(p))`: each text's
+        // own zone gives its local time (the zone of the column type would
+        // give UTC's), see `fuse`.
+        Expr::Cast(Cast { expr: arg, data_type }) | Expr::TryCast(TryCast { expr: arg, data_type }) => {
+            fuse(arg, data_type, matches!(expr, Expr::TryCast(_)))
         }
         _ => None,
     };
     Ok(match replaced {
         Some(new) => Transformed::yes(new),
         None => Transformed::no(expr),
+    })
+}
+
+/// `CAST(<text → timestamp with time zone> AS timestamp(p))` → the text read
+/// as `timestamp(p)`: the local time each text names, moved forward out of a
+/// daylight-saving gap of its zone, as Trino answers it.
+fn fuse(inner: &Expr, target: &DataType, safe: bool) -> Option<Expr> {
+    let Expr::ScalarFunction(ScalarFunction { func, args }) = inner else {
+        return None;
+    };
+    let text = func.inner().as_any().downcast_ref::<TextToTimestamp>()?;
+    let (DataType::Timestamp(zoned_unit, Some(_)), DataType::Timestamp(unit, None)) = (&text.target, target)
+    else {
+        return None;
+    };
+    let [arg] = args.as_slice() else {
+        return None;
+    };
+    // The coarser of the two precisions rounds; widening back is exact.
+    let coarser = if digits_of(*zoned_unit) < digits_of(*unit) {
+        *zoned_unit
+    } else {
+        *unit
+    };
+    let parsed = text_to_timestamp(arg.clone(), DataType::Timestamp(coarser, None), safe || text.safe);
+    Some(if coarser == *unit {
+        parsed
+    } else {
+        Expr::Cast(Cast::new(Box::new(parsed), target.clone()))
     })
 }
 

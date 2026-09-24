@@ -7,7 +7,100 @@
 //! `timestamp(3) with time zone`, `array(integer)`, `map(varchar, bigint)`,
 //! `row(x integer, Y z varchar)`.
 
-use datafusion::arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
+use std::collections::HashMap;
+
+use datafusion::arrow::datatypes::{DataType, Field, IntervalUnit, TimeUnit};
+
+/// Field metadata naming the Trino type of a field whose Arrow type holds
+/// more than it: `varchar(5)`, `char(3)` (Arrow `Utf8`), `timestamp(1)`
+/// (Arrow milliseconds, values rounded to one digit). See [`Declared`].
+pub const TRINO_TYPE: &str = "codelake.trino_type";
+
+/// A Trino type narrower than the Arrow type carrying it, recorded in the
+/// field's metadata ([`TRINO_TYPE`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Declared {
+    /// `varchar(n)`: at most `n` characters.
+    Varchar(u32),
+    /// `char(n)`: `n` characters, padded with spaces when shown; stored
+    /// without the padding.
+    Char(u32),
+    /// `timestamp(p)` or `timestamp(p) with time zone` (the zone is in the
+    /// Arrow type): values rounded to `p` fraction digits.
+    Timestamp(u8),
+}
+
+/// Longest `varchar(n)` Trino accepts.
+const MAX_VARCHAR: u32 = 2_147_483_646;
+
+impl Declared {
+    /// `varchar(10)`, `char(3)`, `timestamp(1)` (a `with time zone` suffix is
+    /// ignored); `None` for anything else.
+    pub fn parse(text: &str) -> Option<Self> {
+        let lower = text.trim().to_ascii_lowercase();
+        let lower = lower.strip_suffix(" with time zone").unwrap_or(&lower);
+        let (name, rest) = lower.split_once('(')?;
+        let argument: u32 = rest.strip_suffix(')')?.trim().parse().ok()?;
+        match name.trim() {
+            "varchar" if (1..=MAX_VARCHAR).contains(&argument) => Some(Self::Varchar(argument)),
+            "char" if (1..=65_536).contains(&argument) => Some(Self::Char(argument)),
+            "timestamp" if argument <= 12 => Some(Self::Timestamp(u8::try_from(argument).ok()?)),
+            _ => None,
+        }
+    }
+
+    /// Whether values of `data_type` can carry this type.
+    pub fn fits(self, data_type: &DataType) -> bool {
+        match (self, data_type) {
+            (Self::Varchar(_) | Self::Char(_), DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) => {
+                true
+            }
+            (Self::Timestamp(p), DataType::Timestamp(unit, _)) => p <= digits(*unit),
+            _ => false,
+        }
+    }
+
+    /// Trino's name of this type for a field of `data_type`.
+    pub fn name(self, data_type: &DataType) -> String {
+        match self {
+            Self::Varchar(n) => format!("varchar({n})"),
+            Self::Char(n) => format!("char({n})"),
+            Self::Timestamp(p) if matches!(data_type, DataType::Timestamp(_, Some(_))) => {
+                format!("timestamp({p}) with time zone")
+            }
+            Self::Timestamp(p) => format!("timestamp({p})"),
+        }
+    }
+
+    /// The field metadata recording it.
+    pub fn metadata(self) -> HashMap<String, String> {
+        let text = match self {
+            Self::Varchar(n) => format!("varchar({n})"),
+            Self::Char(n) => format!("char({n})"),
+            Self::Timestamp(p) => format!("timestamp({p})"),
+        };
+        HashMap::from([(TRINO_TYPE.to_owned(), text)])
+    }
+}
+
+/// The Trino type `field` declares in its metadata, when its Arrow type can
+/// carry it.
+pub fn declared(field: &Field) -> Option<Declared> {
+    field
+        .metadata()
+        .get(TRINO_TYPE)
+        .and_then(|text| Declared::parse(text))
+        .filter(|declared| declared.fits(field.data_type()))
+}
+
+/// [`display_name`] of a field, honouring the type it declares
+/// ([`declared`]).
+pub fn field_display_name(field: &Field) -> String {
+    match declared(field) {
+        Some(declared) => declared.name(field.data_type()),
+        None => display_name(field.data_type()),
+    }
+}
 
 fn digits(unit: TimeUnit) -> u8 {
     match unit {

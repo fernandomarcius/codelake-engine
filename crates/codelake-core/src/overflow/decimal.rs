@@ -32,6 +32,7 @@ use datafusion::arrow::compute::{CastOptions, cast_with_options};
 use datafusion::arrow::datatypes::{DataType, Decimal128Type, Field, FieldRef, i256};
 use datafusion::arrow::error::ArrowError;
 use datafusion::common::{DataFusionError, Result, ScalarValue, exec_err, plan_err};
+use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion::logical_expr::{
     BinaryExpr, ColumnarValue, Expr, Operator, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature,
     Volatility,
@@ -60,6 +61,15 @@ pub(crate) fn as_decimal(data_type: &DataType) -> Option<(u8, i8)> {
     }
 }
 
+/// [`as_decimal`], plus Trino's `unknown` (a bare `NULL`), which takes part in
+/// decimal arithmetic as `decimal(1,0)`: `0.2 * NULL` is `decimal(2,1)`.
+pub(crate) fn as_decimal_operand(data_type: &DataType) -> Option<(u8, i8)> {
+    match data_type {
+        DataType::Null => Some((1, 0)),
+        other => as_decimal(other),
+    }
+}
+
 fn is_exact_decimal(data_type: &DataType) -> bool {
     matches!(
         data_type,
@@ -68,11 +78,11 @@ fn is_exact_decimal(data_type: &DataType) -> bool {
 }
 
 /// Whether `a <op> b` is decimal arithmetic in Trino: an arithmetic operator,
-/// both operands exact numbers and at least one of them a decimal.
+/// both operands exact numbers (or `NULL`) and at least one of them a decimal.
 pub(crate) fn is_decimal_operation(op: Operator, left: &DataType, right: &DataType) -> bool {
     is_arithmetic(op)
-        && as_decimal(left).is_some()
-        && as_decimal(right).is_some()
+        && as_decimal_operand(left).is_some()
+        && as_decimal_operand(right).is_some()
         && (is_exact_decimal(left) || is_exact_decimal(right))
 }
 
@@ -328,7 +338,7 @@ impl DecimalBinary {
         let [left, right] = arg_types else {
             return plan_err!("{} expects two arguments", self.name());
         };
-        let (Some(l), Some(r)) = (as_decimal(left), as_decimal(right)) else {
+        let (Some(l), Some(r)) = (as_decimal_operand(left), as_decimal_operand(right)) else {
             return plan_err!("{}: {left} and {right} are not exact numbers", self.name());
         };
         Ok((l, r))
@@ -380,6 +390,22 @@ impl ScalarUDFImpl for DecimalBinary {
             self.return_type(&types)?,
             nullable,
         )))
+    }
+
+    /// A `NULL` operand makes the result `NULL` of the result type. Scalar
+    /// subquery decorrelation evaluates the subquery's expression with every
+    /// aggregate replaced by an untyped `NULL` (TPC-H Q17's `0.2 * avg(…)`).
+    fn simplify(&self, args: Vec<Expr>, info: &SimplifyContext) -> Result<ExprSimplifyResult> {
+        let is_null = |e: &Expr| matches!(e, Expr::Literal(v, _) if v.is_null());
+        if !args.iter().any(is_null) {
+            return Ok(ExprSimplifyResult::Original(args));
+        }
+        let types = args
+            .iter()
+            .map(|a| info.get_data_type(a))
+            .collect::<Result<Vec<_>>>()?;
+        let null = ScalarValue::try_from(&self.return_type(&types)?)?;
+        Ok(ExprSimplifyResult::Simplified(Expr::Literal(null, None)))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {

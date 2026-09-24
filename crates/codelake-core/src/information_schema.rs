@@ -23,7 +23,8 @@
 //! - `columns(table_catalog, table_schema, table_name, column_name,
 //!   ordinal_position, column_default, is_nullable, data_type)`, the position
 //!   counted from 1 and the type named as Trino names it
-//!   ([`crate::trino_types::display_name`]: `bigint`, `decimal(10,2)`);
+//!   ([`crate::trino_types::field_display_name`]: `bigint`, `decimal(10,2)`,
+//!   `varchar(10)`);
 //! - `table_privileges`, `roles`, `enabled_roles`, `applicable_roles`, empty
 //!   (no privileges nor roles).
 //!
@@ -447,7 +448,7 @@ impl Rows {
                             ScalarValue::Int64(i64::try_from(position + 1).ok()),
                             NULL_TEXT,
                             text(if nullable { "YES" } else { "NO" }),
-                            text(&crate::trino_types::display_name(field.data_type())),
+                            text(&crate::trino_types::field_display_name(field)),
                         ])?;
                     }
                     Ok(())

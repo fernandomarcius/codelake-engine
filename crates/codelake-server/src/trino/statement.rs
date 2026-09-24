@@ -269,6 +269,8 @@ pub(crate) struct Exec {
     shape: Shape,
     encoding: Encoding,
     columns: Option<Arc<Vec<Column>>>,
+    /// The Trino type each result column declares beyond its Arrow type.
+    declared: Vec<Option<codelake_core::trino_types::Declared>>,
     count: Option<u64>,
     pending: Option<(Buffered, usize)>,
     finished: bool,
@@ -295,6 +297,7 @@ impl Exec {
             shape: Shape::Rows,
             encoding,
             columns: None,
+            declared: Vec::new(),
             count: None,
             pending: None,
             finished: false,
@@ -320,7 +323,11 @@ impl Exec {
             let row = batch
                 .columns()
                 .iter()
-                .map(|column| types::value(column, offset, self.encoding))
+                .enumerate()
+                .map(|(i, column)| {
+                    let declared = self.declared.get(i).copied().flatten();
+                    types::declared_value(column, offset, self.encoding, declared)
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             *bytes += row.iter().map(approximate_size).sum::<usize>();
             rows.push(row);
@@ -338,6 +345,11 @@ impl Exec {
             Event::Started(schema) => {
                 if self.shape == Shape::Rows {
                     self.columns = Some(Arc::new(types::columns(&schema, self.encoding)?));
+                    self.declared = schema
+                        .fields()
+                        .iter()
+                        .map(|f| codelake_core::trino_types::declared(f))
+                        .collect();
                 }
             }
             Event::Batch(buffered) => match self.shape {
@@ -934,6 +946,7 @@ fn start(
     let options = QueryOptions {
         catalog: session.catalog,
         schema: session.schema,
+        time_zone: session.time_zone,
         properties: session.properties,
         functions: vec![super::system_tables::version_function(PROTOCOL_VERSION)],
         ..QueryOptions::for_user(&session.user)
@@ -1034,7 +1047,7 @@ async fn describe(engine: &Engine, options: &QueryOptions, table: &str) -> Resul
     let mut type_names = Vec::with_capacity(fields.len());
     for field in fields {
         column_names.push(field.name().clone());
-        type_names.push(types::trino_type(field.data_type(), Encoding::MODERN)?.0);
+        type_names.push(codelake_core::trino_types::field_display_name(field));
     }
     let schema = Arc::new(Schema::new(vec![
         Field::new("Column", DataType::Utf8, false),

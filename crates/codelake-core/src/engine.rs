@@ -52,6 +52,9 @@ pub struct QueryOptions {
     /// Functions this protocol defines on top of the engine's (for instance
     /// `version()`, which reports the emulated server's version).
     pub functions: Vec<Arc<ScalarUDF>>,
+    /// Session time zone (`X-Trino-Time-Zone`), as Trino names it (see
+    /// [`crate::trino_time_zone`]); `None` keeps the engine's, `UTC`.
+    pub time_zone: Option<String>,
 }
 
 impl QueryOptions {
@@ -62,6 +65,7 @@ impl QueryOptions {
             schema: None,
             properties: SessionProperties::default(),
             functions: Vec::new(),
+            time_zone: None,
         }
     }
 }
@@ -95,8 +99,9 @@ pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + S
     rules
 }
 
-/// `DataFusion`'s analyzer rules with the engine's: Trino's decimal types
-/// right before type coercion (which then recomputes every schema), then
+/// `DataFusion`'s analyzer rules with the engine's: Trino's decimal types and
+/// common types (module `coercion`) right before type coercion (which then
+/// recomputes every schema), then
 /// checked arithmetic ([`crate::overflow`]) and the one-row rule of scalar
 /// subqueries ([`crate::subquery`]), which need the types coercion settles.
 pub fn analyzer_rules() -> Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Send + Sync>> {
@@ -105,6 +110,7 @@ pub fn analyzer_rules() -> Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Sen
         .iter()
         .position(|r| r.name() == "type_coercion")
         .unwrap_or(rules.len());
+    rules.insert(coercion, Arc::new(crate::coercion::TrinoCommonTypes));
     rules.insert(coercion, Arc::new(crate::overflow::TrinoDecimalTypes));
     rules.push(Arc::new(crate::overflow::CheckedArithmetic));
     rules.push(Arc::new(crate::subquery::EnforceScalarSubqueryRows));
@@ -130,6 +136,43 @@ pub fn analyzed_schema(
         .analyzer()
         .execute_and_check(plan.clone(), state.config_options(), |_, _| {})?;
     Ok(Arc::clone(analyzed.schema()))
+}
+
+/// The schema a new table gets from the rows that create it: the types its
+/// `CREATE TABLE` declares (`varchar(10)`, see [`crate::declared`]), and
+/// nullable columns when a query creates it, as in Trino.
+fn table_schema(
+    rows: &datafusion::arrow::datatypes::SchemaRef,
+    declared: &[(String, crate::trino_types::Declared)],
+    from_query: bool,
+) -> datafusion::arrow::datatypes::SchemaRef {
+    let schema = crate::declared::with_declared(rows, declared);
+    if !from_query {
+        return Arc::new(schema);
+    }
+    let fields: Vec<datafusion::arrow::datatypes::Field> = schema
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone().with_nullable(true))
+        .collect();
+    Arc::new(datafusion::arrow::datatypes::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
+}
+
+/// `stream` announced with `schema`, which must hold its batches (same
+/// columns, more metadata or nullability).
+fn with_schema(
+    stream: datafusion::physical_plan::SendableRecordBatchStream,
+    schema: datafusion::arrow::datatypes::SchemaRef,
+) -> datafusion::physical_plan::SendableRecordBatchStream {
+    use futures::StreamExt;
+    let announced = Arc::clone(&schema);
+    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+        announced,
+        stream.map(move |batch| batch.and_then(|b| Ok(b.with_schema(Arc::clone(&schema))?))),
+    ))
 }
 
 /// Result of attaching one source at startup.
@@ -180,6 +223,8 @@ impl Engine {
             .with_information_schema(false);
         // `1.5` is `decimal(2,1)`, as in Trino (and PostgreSQL), not a double.
         session.options_mut().sql_parser.parse_float_as_decimal = true;
+        // Trino's default session zone is the server's; `CodeLake` runs in UTC.
+        session.options_mut().execution.time_zone = Some("UTC".into());
         if let Some(partitions) = execution.target_partitions {
             session = session.with_target_partitions(partitions);
         }
@@ -195,6 +240,9 @@ impl Engine {
             .build();
         let ctx = SessionContext::new_with_state(state);
         ctx.register_udf(crate::functions::varbinary_literal());
+        ctx.register_udf(crate::coercion::values_cell());
+        ctx.register_udf(crate::timestamp_casts::try_arrow_cast());
+        ctx.register_udf(crate::declared::trino_typed());
         Ok(Self {
             ctx,
             runtime,
@@ -235,6 +283,9 @@ impl Engine {
         if let Some(schema) = &options.schema {
             defaults.default_schema.clone_from(schema);
         }
+        if let Some(zone) = &options.time_zone {
+            state.config_mut().options_mut().execution.time_zone = Some(zone.clone());
+        }
         for function in &options.functions {
             // Replacing a built-in is the point; the previous one is not needed.
             state.register_udf(Arc::clone(function))?;
@@ -262,6 +313,10 @@ impl Engine {
         // After `prepare`, which keeps a view's text as written.
         crate::literals::rewrite_zoned_timestamps(&mut statement);
         crate::literals::rewrite_exponent_numbers(&mut statement);
+        crate::coercion::mark_values(&mut statement);
+        crate::coercion::default_decimal_precision(&mut statement);
+        let declared = crate::declared::declared_columns(&mut statement);
+        crate::declared::rewrite_declared_casts(&mut statement);
         let session_zone = state.config().options().execution.time_zone.clone();
         crate::literals::rewrite_timestamp_types(&mut statement, session_zone.as_deref().unwrap_or("UTC"));
         match &prepared {
@@ -280,7 +335,7 @@ impl Engine {
         }
         let plan = state.statement_to_plan(statement).await?;
         if ddl::is_routable(&plan)
-            && let Some(result) = self.route_ddl(ctx, user, &plan, prepared).await?
+            && let Some(result) = self.route_ddl(ctx, user, &plan, prepared, &declared).await?
         {
             return Ok(result);
         }
@@ -323,6 +378,7 @@ impl Engine {
     async fn create_memory_table(
         ctx: &SessionContext,
         create: &datafusion::logical_expr::CreateMemoryTable,
+        declared: &[(String, crate::trino_types::Declared)],
     ) -> Result<DataFrame, DataFusionError> {
         use datafusion::datasource::MemTable;
         if create.temporary {
@@ -349,8 +405,10 @@ impl Engine {
             crate::subquery::pre_evaluate_scalar_subqueries(ctx, create.input.as_ref().clone()).await?;
         // The executed plan's schema: the analyzer settles some types (Trino's
         // decimal types, see `crate::overflow`) after SQL planning.
+        // Columns of `CREATE TABLE AS` are nullable in Trino, whatever the query.
+        let from_query = !matches!(input, LogicalPlan::EmptyRelation(_));
         let physical = DataFrame::new(ctx.state(), input).create_physical_plan().await?;
-        let schema = physical.schema();
+        let schema = table_schema(&physical.schema(), declared, from_query);
         let batches = datafusion::physical_plan::collect_partitioned(physical, ctx.task_ctx()).await?;
         let rows = batches
             .iter()
@@ -501,6 +559,7 @@ impl Engine {
         user: &str,
         plan: &LogicalPlan,
         prepared: Option<Prepared>,
+        declared: &[(String, crate::trino_types::Declared)],
     ) -> Result<Option<DataFrame>, DataFusionError> {
         let LogicalPlan::Ddl(ddl) = plan else {
             return Ok(None);
@@ -509,7 +568,7 @@ impl Engine {
             DdlStatement::CreateMemoryTable(create) => {
                 let (catalog, schema, table) = Self::resolve(ctx, &create.name);
                 let Some(writable) = self.writable(&catalog) else {
-                    return Self::create_memory_table(ctx, create).await.map(Some);
+                    return Self::create_memory_table(ctx, create, declared).await.map(Some);
                 };
                 if create.or_replace {
                     writable.drop_table(&schema, &table, true).await?;
@@ -517,7 +576,10 @@ impl Engine {
                 let input =
                     crate::subquery::pre_evaluate_scalar_subqueries(ctx, create.input.as_ref().clone())
                         .await?;
+                let from_query = !matches!(input, LogicalPlan::EmptyRelation(_));
                 let rows = ctx.execute_logical_plan(input).await?.execute_stream().await?;
+                let announced = table_schema(&rows.schema(), declared, from_query);
+                let rows = with_schema(rows, announced);
                 let written = writable
                     .create_table_as(&schema, &table, create.if_not_exists, user, rows, ctx.task_ctx())
                     .await?;
@@ -822,10 +884,10 @@ mod tests {
                 .value(0),
             1_767_250_800
         );
-        // Without a zone: unchanged.
+        // Without a zone: `timestamp(3)`, the precision of its digits.
         assert_eq!(
             schema.field(2).data_type(),
-            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+            &DataType::Timestamp(TimeUnit::Millisecond, None)
         );
     }
 
@@ -1686,7 +1748,7 @@ mod tests {
         let n = result[0]
             .column(0)
             .as_any()
-            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
             .unwrap();
         assert_eq!(n.value(0), 40 * 65_536);
         assert!(engine.memory().reserved_bytes <= ByteSize::mib(16).as_u64());
