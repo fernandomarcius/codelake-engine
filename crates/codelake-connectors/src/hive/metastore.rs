@@ -61,7 +61,15 @@ pub(crate) struct TableMetadata {
     pub(crate) view_original_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) view_expanded_text: Option<String>,
-    /// Fields this version does not model (statistics, serde parameters, …).
+    /// Trino 431 refuses metadata without this key ("Could not read table
+    /// schema"), so it is always written, empty when unknown.
+    #[serde(default)]
+    pub(crate) serde_parameters: BTreeMap<String, String>,
+    /// Per-column statistics, kept opaque. Always written, like
+    /// `serdeParameters`: Trino 431 requires the key.
+    #[serde(default)]
+    pub(crate) column_statistics: BTreeMap<String, serde_json::Value>,
+    /// Fields this version does not model (bucketing, original format, …).
     #[serde(flatten)]
     pub(crate) extra: BTreeMap<String, serde_json::Value>,
 }
@@ -87,6 +95,8 @@ impl TableMetadata {
             external_location: None,
             view_original_text: None,
             view_expanded_text: None,
+            serde_parameters: BTreeMap::new(),
+            column_statistics: BTreeMap::new(),
             extra: BTreeMap::new(),
         }
     }
@@ -94,7 +104,7 @@ impl TableMetadata {
     /// Statistics describe the files at the time they were computed; after a
     /// write they would lie to Trino's cost-based optimizer. Drop them.
     pub(crate) fn invalidate_statistics(&mut self) {
-        self.extra.remove("columnStatistics");
+        self.column_statistics.clear();
         for key in [
             "numFiles",
             "numRows",
@@ -390,10 +400,8 @@ mod tests {
                 ("vc", "varchar(10)"),
             ]
         );
-        assert!(
-            table.extra.contains_key("columnStatistics"),
-            "unknown fields are kept"
-        );
+        assert!(table.column_statistics.contains_key("nome"));
+        assert!(table.serde_parameters.is_empty());
         let view = metastore.table("pilot", "v1").await.unwrap().unwrap();
         assert!(view.is_view());
         assert!(view.view_original_text.unwrap().starts_with("/* Presto View: "));
@@ -438,10 +446,14 @@ mod tests {
         );
         table.parameters.insert("numRows".into(), "10".into());
         table
-            .extra
-            .insert("columnStatistics".into(), serde_json::json!({}));
+            .column_statistics
+            .insert("id".into(), serde_json::json!({"nullsCount": 0}));
         table.invalidate_statistics();
-        assert!(!table.parameters.contains_key("numRows") && !table.extra.contains_key("columnStatistics"));
+        assert!(!table.parameters.contains_key("numRows") && table.column_statistics.is_empty());
+        // Trino 431 cannot read table metadata without these keys, even empty.
+        let json: serde_json::Value = serde_json::to_value(&table).unwrap();
+        assert_eq!(json["serdeParameters"], serde_json::json!({}));
+        assert_eq!(json["columnStatistics"], serde_json::json!({}));
 
         metastore.write_table("raw", "t", &table).await.unwrap();
         metastore
