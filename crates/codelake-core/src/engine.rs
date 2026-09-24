@@ -223,6 +223,8 @@ impl Engine {
         let dialect = state.config().options().sql_parser.dialect;
         let mut statement = state.sql_to_statement(sql, &dialect)?;
         let prepared = ddl::prepare(&mut statement)?;
+        // After `prepare`, which keeps a view's text as written.
+        crate::literals::rewrite_zoned_timestamps(&mut statement);
         if let Some(Prepared::AddColumn {
             table,
             column,
@@ -559,6 +561,51 @@ mod tests {
 
         assert!(engine.context().catalog("down").is_none());
         assert!(engine.context().catalog("opt").is_none());
+    }
+
+    /// Trino 431: `timestamp(3) with time zone`
+    /// `2026-01-01 10:00:00.123 America/Sao_Paulo`, the instant 13:00:00.123 UTC.
+    #[tokio::test]
+    async fn timestamp_literal_keeps_its_zone_and_precision() {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::{TimeUnit, TimestampMillisecondType, TimestampSecondType};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        let batches = engine
+            .sql("SELECT TIMESTAMP '2026-01-01 10:00:00.123 America/Sao_Paulo' p, TIMESTAMP '2026-01-01 10:00:00 +03:00' q, TIMESTAMP '2026-01-01 10:00:00.123' r")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let schema = batches[0].schema();
+        assert_eq!(
+            schema.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Millisecond, Some("America/Sao_Paulo".into()))
+        );
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_primitive::<TimestampMillisecondType>()
+                .value(0),
+            1_767_272_400_123
+        );
+        assert_eq!(
+            schema.field(1).data_type(),
+            &DataType::Timestamp(TimeUnit::Second, Some("+03:00".into()))
+        );
+        assert_eq!(
+            batches[0]
+                .column(1)
+                .as_primitive::<TimestampSecondType>()
+                .value(0),
+            1_767_250_800
+        );
+        // Without a zone: unchanged.
+        assert_eq!(
+            schema.field(2).data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
     }
 
     /// `<catalog>.information_schema` lists that catalog only.

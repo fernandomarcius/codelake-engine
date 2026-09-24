@@ -12,6 +12,7 @@ pub mod federation_guard;
 pub mod federation_policy;
 pub mod functions;
 pub mod information_schema;
+mod literals;
 pub mod overflow;
 pub mod runtime;
 pub mod session_properties;
