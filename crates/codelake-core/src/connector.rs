@@ -122,6 +122,15 @@ pub trait WritableCatalog: Send + Sync + Debug {
         Vec::new()
     }
 
+    /// Checks, before the statement's `WHERE` clause is looked at, that `call`
+    /// may run with `session` (Trino validates a procedure's session
+    /// properties when it resolves the table handle, before planning the
+    /// filter). The default accepts every call.
+    fn check_table_procedure(&self, call: &ProcedureCall, session: &CatalogSession) -> DfResult<()> {
+        let _ = (call, session);
+        Ok(())
+    }
+
     /// Runs a procedure from [`WritableCatalog::table_procedures`] on an existing
     /// table. The engine has already checked that the table exists and is not a
     /// view, and bound `call`'s arguments (defaults applied). `session` holds

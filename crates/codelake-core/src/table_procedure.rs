@@ -36,7 +36,9 @@ impl ProcedureArgument {
 /// A procedure registered by a catalog (`OPTIMIZE` for Hive).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableProcedure {
-    /// Upper-case name; calls match it case-insensitively.
+    /// Upper-case name. An unquoted call is upper-cased before the lookup, a
+    /// quoted one is not: `EXECUTE optimize` runs it, `EXECUTE "optimize"`
+    /// does not (Trino 431).
     pub name: String,
     /// In positional order.
     pub arguments: Vec<ProcedureArgument>,
@@ -94,16 +96,18 @@ impl ProcedureCall {
     }
 }
 
-/// Error message when `name` is not one of `procedures` (Trino's text).
+/// Error message when `name` (canonical, see [`find`]) is not one of
+/// `procedures` (Trino's text).
 pub fn not_registered(name: &str) -> String {
-    format!("Table procedure not registered: {}", name.to_ascii_uppercase())
+    format!("Table procedure not registered: {name}")
 }
 
-/// Finds a procedure by name, case-insensitively.
+/// Finds a procedure by its canonical name: the name as the statement spells
+/// it, upper-cased unless it was quoted.
 pub fn find<'a>(procedures: &'a [TableProcedure], name: &str) -> Result<&'a TableProcedure, String> {
     procedures
         .iter()
-        .find(|p| p.name.eq_ignore_ascii_case(name))
+        .find(|p| p.name == name)
         .ok_or_else(|| not_registered(name))
 }
 
@@ -344,11 +348,15 @@ mod tests {
     }
 
     #[test]
-    fn lookup_is_case_insensitive() {
+    fn lookup_uses_the_canonical_name() {
         let procedures = vec![optimize()];
-        assert!(find(&procedures, "Optimize").is_ok());
+        assert!(find(&procedures, "OPTIMIZE").is_ok());
         assert_eq!(
-            find(&procedures, "foo").unwrap_err(),
+            find(&procedures, "optimize").unwrap_err(),
+            "Table procedure not registered: optimize"
+        );
+        assert_eq!(
+            find(&procedures, "FOO").unwrap_err(),
             "Table procedure not registered: FOO"
         );
         assert_eq!(ArgumentValue::Null.display(), "null");

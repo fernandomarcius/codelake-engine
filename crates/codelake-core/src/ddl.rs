@@ -43,7 +43,8 @@ pub(crate) enum Prepared {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TableExecute {
     pub(crate) table: TableReference,
-    /// As written; procedures match case-insensitively.
+    /// Trino's canonical name: upper-cased unless quoted (`"optimize"` stays
+    /// lower case and matches no procedure, as in Trino).
     pub(crate) procedure: String,
     /// `(name, expression)`; `name` is lower-cased, `None` when positional.
     pub(crate) arguments: Vec<(Option<String>, SqlExpr)>,
@@ -71,7 +72,12 @@ pub(crate) fn parse_table_execute(sql: &str, dialect: &dyn Dialect) -> Result<Op
         return Ok(None);
     }
     let table = table_reference(&name)?;
-    let procedure = parser.parse_identifier().map_err(syntax)?.value;
+    let procedure = parser.parse_identifier().map_err(syntax)?;
+    let procedure = if procedure.quote_style.is_some() {
+        procedure.value
+    } else {
+        procedure.value.to_uppercase()
+    };
     let mut arguments = Vec::new();
     if parser.consume_token(&Token::LParen) && !parser.consume_token(&Token::RParen) {
         loop {
@@ -265,7 +271,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(plain.table, TableReference::full("hive", "raw", "orders"));
-        assert_eq!(plain.procedure, "optimize");
+        assert_eq!(plain.procedure, "OPTIMIZE");
         assert!(plain.arguments.is_empty() && plain.filter.is_none());
 
         let quoted = execute(
@@ -283,6 +289,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(partial.table, TableReference::partial("raw", "t"));
+        assert_eq!(partial.procedure, "OPTIMIZE");
+        let lower = execute("ALTER TABLE t EXECUTE \"optimize\"").unwrap().unwrap();
+        assert_eq!(lower.procedure, "optimize", "a quoted name is kept as written");
         assert_eq!(partial.arguments[0].0, None);
         assert_eq!(literal(&partial.arguments[0].1), "'1' || 'MB'");
 

@@ -94,6 +94,30 @@ pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + S
 
 /// Default `DataFusion` physical rules, preceded by the federation guard (it must
 /// run before `FilterPushdown`; see [`crate::federation_guard`]).
+/// A constant as Trino prints it in messages: the SQL literal of its type
+/// (`DECIMAL '1.5'`, `DATE '2020-01-01'`, `1.5E0` for a DOUBLE).
+fn trino_literal(value: &ScalarValue) -> String {
+    let text = value
+        .to_array()
+        .ok()
+        .and_then(|array| datafusion::arrow::util::display::array_value_to_string(&array, 0).ok())
+        .unwrap_or_else(|| value.to_string());
+    match value {
+        ScalarValue::Decimal32(..)
+        | ScalarValue::Decimal64(..)
+        | ScalarValue::Decimal128(..)
+        | ScalarValue::Decimal256(..) => format!("DECIMAL '{text}'"),
+        ScalarValue::Date32(_) | ScalarValue::Date64(_) => format!("DATE '{text}'"),
+        ScalarValue::TimestampSecond(..)
+        | ScalarValue::TimestampMillisecond(..)
+        | ScalarValue::TimestampMicrosecond(..)
+        | ScalarValue::TimestampNanosecond(..) => format!("TIMESTAMP '{}'", text.replace('T', " ")),
+        ScalarValue::Float64(Some(v)) => format!("{v:E}"),
+        ScalarValue::Float32(_) => format!("REAL '{text}'"),
+        _ => text,
+    }
+}
+
 fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = vec![Arc::new(FederationFilterGuard)];
     rules.extend(PhysicalOptimizer::new().rules);
@@ -286,7 +310,8 @@ impl Engine {
     }
 
     /// `ALTER TABLE … EXECUTE <procedure>`: checks run in Trino's order (table,
-    /// procedure, arguments, filter) with Trino's messages, then the catalog runs
+    /// procedure, arguments, the catalog's session properties, filter) with
+    /// Trino's messages, then the catalog runs
     /// the procedure. The answer is Trino's: an empty result with one `rows`
     /// column.
     async fn table_execute(
@@ -319,6 +344,10 @@ impl Engine {
             });
         }
         let call = table_procedure::bind(&catalog, procedure, arguments).map_err(DataFusionError::Plan)?;
+        let session = self.properties.catalog_session(&catalog, &options.properties);
+        if let Some(writable) = writable {
+            writable.check_table_procedure(&call, &session)?;
+        }
         if execute.filter.is_some() {
             return Err(DataFusionError::Plan(
                 "Unexpected FilterNode found in plan; probably connector was not able to handle provided WHERE expression".into(),
@@ -329,7 +358,6 @@ impl Engine {
                 &execute.procedure,
             )));
         };
-        let session = self.properties.catalog_session(&catalog, &options.properties);
         writable
             .execute_table_procedure(&schema, &table, &call, &session, ctx.task_ctx())
             .await?;
@@ -354,7 +382,14 @@ impl Engine {
                 "Constant expression cannot contain a subquery".into(),
             ));
         }
-        let batches = ctx.sql(&format!("SELECT {expr}")).await?.collect().await?;
+        // As in Trino, `1.5` is a DECIMAL literal (DataFusion's default is DOUBLE).
+        let mut state = ctx.state();
+        state.config_mut().options_mut().sql_parser.parse_float_as_decimal = true;
+        let batches = SessionContext::new_with_state(state)
+            .sql(&format!("SELECT {expr}"))
+            .await?
+            .collect()
+            .await?;
         let batch = batches
             .iter()
             .find(|b| b.num_rows() > 0)
@@ -372,7 +407,7 @@ impl Engine {
             ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) | ScalarValue::Utf8View(Some(s)) => {
                 ArgumentValue::Varchar(s)
             }
-            other => ArgumentValue::Other(other.to_string()),
+            other => ArgumentValue::Other(trino_literal(&other)),
         })
     }
 
@@ -614,6 +649,20 @@ mod tests {
         let guard = names.iter().position(|n| n == "federation_filter_guard").unwrap();
         let pushdown = names.iter().position(|n| n.contains("FilterPushdown")).unwrap();
         assert!(guard < pushdown, "{names:?}");
+    }
+
+    #[test]
+    fn constants_print_as_trino_literals() {
+        assert_eq!(
+            trino_literal(&ScalarValue::Decimal128(Some(15), 2, 1)),
+            "DECIMAL '1.5'"
+        );
+        assert_eq!(
+            trino_literal(&ScalarValue::Date32(Some(18_262))),
+            "DATE '2020-01-01'"
+        );
+        assert_eq!(trino_literal(&ScalarValue::Float64(Some(1.5))), "1.5E0");
+        assert_eq!(trino_literal(&ScalarValue::Int64(Some(10))), "10");
     }
 
     /// Servers run each statement on its own task (`tokio::spawn`), so the
@@ -981,6 +1030,18 @@ mod tests {
             (
                 "ALTER TABLE lake.public.t EXECUTE optimize WHERE id = 1",
                 "Unexpected FilterNode found in plan",
+            ),
+            (
+                "ALTER TABLE lake.public.t EXECUTE \"optimize\"",
+                "Table procedure not registered: optimize",
+            ),
+            (
+                "ALTER TABLE lake.public.t EXECUTE optimize(file_size_threshold => 1.5)",
+                "Cannot convert [DECIMAL '1.5'] to varchar",
+            ),
+            (
+                "ALTER TABLE lake.public.t EXECUTE optimize(file_size_threshold => DATE '2020-01-01')",
+                "Cannot convert [DATE '2020-01-01'] to varchar",
             ),
             ("ALTER TABLE lake.public.t EXECUTE optimize(", "Expected"),
         ] {
