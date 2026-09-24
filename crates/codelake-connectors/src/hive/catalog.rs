@@ -691,6 +691,10 @@ impl WritableCatalog for HiveCatalog {
         optimize::procedures()
     }
 
+    fn check_table_procedure(&self, call: &ProcedureCall, session: &CatalogSession) -> Result<()> {
+        Settings::new(call, session).map(|_| ())
+    }
+
     async fn execute_table_procedure(
         &self,
         schema: &str,
@@ -705,6 +709,7 @@ impl WritableCatalog for HiveCatalog {
             ));
         }
         let settings = Settings::new(call, session)?;
+        let (schema, table) = (&hive_name(schema), &hive_name(table));
         let metadata = self
             .metastore
             .table(schema, table)
