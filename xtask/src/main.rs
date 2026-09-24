@@ -17,6 +17,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("codelake-core", &[]),
     ("codelake-connectors", &["codelake-core"]),
     ("codelake-server", &["codelake-core", "codelake-connectors"]),
+    ("codelake-bench", &["codelake-core", "codelake-connectors"]),
     ("xtask", &[]),
 ];
 
