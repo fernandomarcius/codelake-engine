@@ -226,7 +226,8 @@ impl FromStr for TraceParent {
 pub struct QueryTrace {
     /// Caller's span (W3C `traceparent`): the query span becomes its child.
     pub parent: Option<TraceParent>,
-    /// W3C `tracestate`, passed on untouched. Ignored without `parent`.
+    /// W3C `tracestate`, validated whole (see [`QueryTrace::from_headers`]).
+    /// Ignored without `parent`.
     pub tracestate: Option<String>,
     /// Query id assigned by the protocol (Trino's `queryId`). When `None`,
     /// the engine assigns one with [`next_query_id`].
@@ -242,7 +243,8 @@ impl QueryTrace {
     /// `traceparent`, `tracestate` and `X-Trino-Trace-Token`.
     ///
     /// Follows W3C Trace Context: an invalid `traceparent` is ignored (the
-    /// query starts a new trace) and so is its `tracestate`. The trace token
+    /// query starts a new trace) and so is its `tracestate`; an invalid
+    /// `tracestate` is dropped whole, as Trino does. The trace token
     /// is kept only when it is printable ASCII of at most 256 characters, so a
     /// client cannot inflate every span it touches.
     pub fn from_headers(
@@ -251,13 +253,7 @@ impl QueryTrace {
         trace_token: Option<&str>,
     ) -> Self {
         let parent = traceparent.and_then(|value| TraceParent::parse(value).ok());
-        let tracestate = parent.and(tracestate).and_then(|state| {
-            let state = state.trim();
-            let valid = !state.is_empty()
-                && state.len() <= MAX_TRACESTATE
-                && state.bytes().all(|b| (0x20..0x7f).contains(&b));
-            valid.then(|| state.to_owned())
-        });
+        let tracestate = parent.and(tracestate).and_then(parse_tracestate);
         Self {
             parent,
             tracestate,
@@ -277,6 +273,73 @@ impl QueryTrace {
         self.correlation_id = sanitize_correlation_id(correlation_id);
         self
     }
+}
+
+/// Most list members a `tracestate` may have (W3C).
+const MAX_TRACESTATE_MEMBERS: usize = 32;
+/// Longest `tracestate` key and value (W3C).
+const MAX_TRACESTATE_KEY: usize = 256;
+const MAX_TRACESTATE_VALUE: usize = 256;
+
+/// A W3C `tracestate` header, all or nothing, with the rules Trino applies
+/// (OpenTelemetry Java's `W3CTraceContextPropagator`): more than 32 members,
+/// an empty or malformed member, an invalid key or value, or a duplicate key
+/// discards the whole header rather than passing on part of it. Members are
+/// returned in order, joined by `,` without optional whitespace.
+fn parse_tracestate(header: &str) -> Option<String> {
+    let header = header.trim_matches([' ', '\t']);
+    if header.is_empty() || header.len() > MAX_TRACESTATE {
+        return None;
+    }
+    let members: Vec<&str> = header.split(',').map(|m| m.trim_matches([' ', '\t'])).collect();
+    if members.len() > MAX_TRACESTATE_MEMBERS {
+        return None;
+    }
+    let mut keys = std::collections::HashSet::with_capacity(members.len());
+    for member in &members {
+        let (key, value) = member.split_once('=')?;
+        if !tracestate_key_is_valid(key) || !tracestate_value_is_valid(value) || !keys.insert(key) {
+            return None;
+        }
+    }
+    Some(members.join(","))
+}
+
+/// `key = simple-key / multi-tenant-key` (W3C Trace Context, section 3.3.1.3.1):
+/// lower-case letters, digits, `_ - * /`, starting with a letter or digit;
+/// at most one `@` separating a tenant id (≤ 241) from a system id (≤ 14,
+/// starting with a letter).
+fn tracestate_key_is_valid(key: &str) -> bool {
+    let allowed =
+        |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'*' | b'/');
+    let starts_well = |part: &str, letter_only: bool| {
+        part.bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || (!letter_only && b.is_ascii_digit()))
+    };
+    if key.len() > MAX_TRACESTATE_KEY {
+        return false;
+    }
+    match key.split_once('@') {
+        None => starts_well(key, false) && key.bytes().all(allowed),
+        Some((tenant, system)) => {
+            (1..=241).contains(&tenant.len())
+                && (1..=14).contains(&system.len())
+                && starts_well(tenant, false)
+                && starts_well(system, true)
+                && tenant.bytes().chain(system.bytes()).all(allowed)
+        }
+    }
+}
+
+/// `value = 0*255(chr) nblk-chr`: printable ASCII except `,` and `=`, not
+/// empty. (It cannot end in a space: members arrive trimmed.)
+fn tracestate_value_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_TRACESTATE_VALUE
+        && value
+            .bytes()
+            .all(|b| (0x20..0x7f).contains(&b) && b != b',' && b != b'=')
 }
 
 fn sanitize_correlation_id(value: &str) -> Option<String> {
@@ -828,6 +891,42 @@ mod tests {
             .with_correlation_id(" session-7 ");
         assert_eq!(trace.query_id.as_deref(), Some("q1"));
         assert_eq!(trace.correlation_id.as_deref(), Some("session-7"));
+    }
+
+    #[test]
+    fn tracestate_is_kept_whole_or_dropped_whole() {
+        let state = |value: &str| QueryTrace::from_headers(Some(EXAMPLE), Some(value), None).tracestate;
+        assert_eq!(
+            state("rojo=00f067aa0ba902b7 ,\tcongo=t61rcWkgMzE"),
+            Some("rojo=00f067aa0ba902b7,congo=t61rcWkgMzE".to_owned())
+        );
+        assert_eq!(
+            state("tenant@vendor=a b,1k=v"),
+            Some("tenant@vendor=a b,1k=v".to_owned())
+        );
+        let members = |n: usize| (0..n).map(|i| format!("k{i}=v{i}")).collect::<Vec<_>>().join(",");
+        assert_eq!(state(&members(32)), Some(members(32)));
+        for dropped in [
+            members(33),
+            members(40),
+            "=,,bad state".to_owned(),
+            "good=1,BAD KEY=2,other=3".to_owned(),
+            "a=1,,b=2".to_owned(),
+            "a=1,a=2".to_owned(),
+            "a=".to_owned(),
+            "a=b=c".to_owned(),
+            "novalue".to_owned(),
+            format!("a={}", "x".repeat(257)),
+            format!("{}=v", "k".repeat(257)),
+            "t@1vendor=v".to_owned(),
+            "t@vendorvendorvend=v".to_owned(),
+            "a@b@c=v".to_owned(),
+            "_k=v".to_owned(),
+            "k=v\u{e9}".to_owned(),
+            String::new(),
+        ] {
+            assert_eq!(state(&dropped), None, "{dropped:?}");
+        }
     }
 
     #[test]
