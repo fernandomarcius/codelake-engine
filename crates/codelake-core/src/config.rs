@@ -70,6 +70,10 @@ pub struct TrinoProtocolConfig {
     pub history_size: usize,
     #[serde(default = "default_trino_history_retention_secs")]
     pub history_retention_secs: u64,
+    /// Longest SQL text accepted, in characters; longer statements fail with
+    /// `QUERY_TEXT_TOO_LARGE`, as with Trino's `query.max-length`.
+    #[serde(default = "default_trino_max_query_length")]
+    pub max_query_length: usize,
 }
 
 const fn default_trino_max_active_queries() -> usize {
@@ -86,6 +90,11 @@ const fn default_trino_history_size() -> usize {
 
 const fn default_trino_history_retention_secs() -> u64 {
     900
+}
+
+/// Trino's `query.max-length` default.
+const fn default_trino_max_query_length() -> usize {
+    1_000_000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -471,6 +480,9 @@ impl Config {
         if trino.client_timeout_secs == 0 {
             errors.push("server.trino.client_timeout_secs must be > 0".into());
         }
+        if trino.max_query_length == 0 {
+            errors.push("server.trino.max_query_length must be > 0".into());
+        }
     }
 
     fn validate_memory(&self, errors: &mut Vec<String>) {
@@ -842,6 +854,7 @@ mod tests {
         let trino = validated.config.server.trino.unwrap();
         assert_eq!(trino.max_active_queries, 100);
         assert_eq!(trino.client_timeout_secs, 300);
+        assert_eq!(trino.max_query_length, 1_000_000);
 
         let errors = errors_of(&with("listen = \"0.0.0.0:8081\""), &full_env);
         assert_eq!(errors.len(), 1, "{errors:#?}");
@@ -854,10 +867,12 @@ mod tests {
         );
 
         let errors = errors_of(
-            &with("listen = \"127.0.0.1:8081\"\nmax_active_queries = 0\nclient_timeout_secs = 0"),
+            &with(
+                "listen = \"127.0.0.1:8081\"\nmax_active_queries = 0\nclient_timeout_secs = 0\nmax_query_length = 0",
+            ),
             &full_env,
         );
-        assert_eq!(errors.len(), 2, "{errors:#?}");
+        assert_eq!(errors.len(), 3, "{errors:#?}");
     }
 
     #[test]
