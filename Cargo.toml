@@ -63,6 +63,9 @@ thiserror = "2"
 secrecy = "0.10"
 clap = { version = "4.6", features = ["derive", "env"] }
 
+# Allocator of the server binary (ADR 0003: freed memory goes back to the OS).
+tikv-jemallocator = "0.6"
+
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

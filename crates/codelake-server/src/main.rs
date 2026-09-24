@@ -10,6 +10,14 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+/// ADR 0003: the memory ceiling is a limit on the process, so memory the
+/// engine frees must go back to the OS. glibc's allocator keeps freed memory in
+/// one arena per thread; after a spilling sort or aggregation the process
+/// stayed hundreds of MiB above what the pool held. jemalloc is built to
+/// purge freed pages at once (`JEMALLOC_SYS_WITH_MALLOC_CONF`, `.cargo/config.toml`).
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod hooks;
 mod ops;
 mod serve;

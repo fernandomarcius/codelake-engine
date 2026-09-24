@@ -274,7 +274,7 @@ fn assert_memory_error(error: &Value) {
 /// 4 read one page and cancel. Peak within the ADR 0003 budget; every page
 /// holds right rows or `EXCEEDED_LOCAL_MEMORY_LIMIT`; nothing stays reserved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-MEM8: Trino clients grow the process 350.8 MiB with memory.limit = 128 MiB"]
+#[ignore = "DEFECT-MEM8: Trino clients grow the process 187 MiB with memory.limit = 128 MiB: batches being produced and spilled are outside the pool (ADR 0003)"]
 async fn trino_slow_abandoned_and_canceled_clients_stay_under_the_ceiling() {
     let mut server = Server::start().await;
     let baseline = server.baseline().await;
@@ -416,7 +416,7 @@ fn wide_row(body: &[u8]) -> (i64, usize) {
 /// connection open. Peak within the ADR 0003 budget, right rows, and the
 /// memory is back once the connections close.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-MEM9: PostgreSQL clients grow the process 263.7 MiB with memory.limit = 128 MiB, no memory error"]
+#[ignore = "DEFECT-MEM9: PostgreSQL clients grow the process 227 MiB with memory.limit = 128 MiB: batches being produced and spilled are outside the pool (ADR 0003)"]
 async fn pg_wire_slow_and_stalled_clients_stay_under_the_ceiling() {
     let mut server = Server::start().await;
     let baseline = server.baseline().await;
@@ -560,7 +560,7 @@ async fn heavy(name: &str, sql: &str, expected: &[Value], must_spill: bool) -> (
 /// A full sort of ~330 MiB (`row_number` over the whole input) under 128 MiB:
 /// spills and returns the first and last rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-MEM4: a sort 2.6x the pool spills 302 MiB, then its merge fails with EXCEEDED_LOCAL_MEMORY_LIMIT"]
+#[ignore = "DEFECT-MEM4: the sort spills and returns the right rows, but row_number() is decimal(20, 0), not bigint (front/f4-functions), and the window keeps Utf8View buffers: 354 MiB (ADR 0003)"]
 async fn heavy_sort_spills_under_the_ceiling() {
     let (report, wrong) = heavy(
         "sort",
@@ -580,7 +580,7 @@ async fn heavy_sort_spills_under_the_ceiling() {
 /// 1,000,000 groups of ~210 B keys, each seen twice, under 128 MiB: spills and
 /// counts right.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-MEM6: aggregation spills 297 MiB then fails reserving its spill sort; process grows 179.8 MiB > 170.6"]
+#[ignore = "DEFECT-MEM6: aggregation spills 1.36 GiB within the budget (168 MiB), then fails merging its spill files under its fair share (ADR 0003)"]
 async fn heavy_aggregation_spills_under_the_ceiling() {
     let (report, wrong) = heavy(
         "aggregation",
@@ -599,7 +599,6 @@ async fn heavy_aggregation_spills_under_the_ceiling() {
 /// A hash join whose build side (either one) is ~220 MiB, under 128 MiB: the
 /// right numbers or `EXCEEDED_LOCAL_MEMORY_LIMIT`, within the budget either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-MEM7: a hash join that fails for memory still grows the process 176.7 MiB > 170.6"]
 async fn heavy_hash_join_fails_cleanly_under_the_ceiling() {
     // Digits of 1..=1,000,000: 9*1 + 90*2 + 900*3 + 9000*4 + 90000*5 + 900000*6 + 7.
     let digits: i64 = 5_888_896;

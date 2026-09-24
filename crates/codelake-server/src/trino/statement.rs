@@ -2,11 +2,20 @@
 //!
 //! Each query runs in its own task that plans it and pushes record batches into
 //! a small bounded channel, so execution moves ahead of the client by at most a
-//! few batches, like Trino's output buffer; the buffered batches are reserved
-//! in the engine's memory pool. `GET nextUri` drains the channel into a page of
-//! about 1 MiB of JSON. Pages are numbered by the token in the URI; asking again
-//! for the current token returns the same page (a client retry after a lost
-//! response), an older token is gone (`410`) and a later one unknown (`404`).
+//! few batches, like Trino's output buffer. `GET nextUri` drains the channel
+//! into a page of about 1 MiB of JSON. Pages are numbered by the token in the
+//! URI; asking again for the current token returns the same page (a client
+//! retry after a lost response), an older token is gone (`410`) and a later one
+//! unknown (`404`).
+//!
+//! Memory: every buffer between the engine and the client is reserved in the
+//! engine's pool — the batches in the channel and the one being paged, the
+//! rows of the page being built and the body kept for a retry. A reservation
+//! the pool refuses fails the query with `EXCEEDED_LOCAL_MEMORY_LIMIT` (a page
+//! that already has rows is sent short instead). A failed, canceled or
+//! abandoned query drops all of it at once — once the requests paging it at
+//! that moment have their (same) page — and so does a query whose final page
+//! has been sent: that page is not kept for a retry (`410` instead).
 //!
 //! Every operator of the physical plan is made cooperative, so a canceled,
 //! abandoned or timed-out query stops within one budget of batches even when
@@ -23,6 +32,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
+use codelake_core::output::ReservedOutputExec;
 use codelake_core::session_properties::parse_duration;
 use codelake_core::{Engine, PropertyType, QueryOptions};
 use datafusion::arrow::array::{Array, AsArray, RecordBatch, StringArray};
@@ -31,7 +41,7 @@ use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaPr
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
@@ -274,22 +284,32 @@ pub(crate) struct Exec {
     finished: bool,
     next_token: u64,
     last: Option<(u64, Bytes)>,
+    /// The rows of the page being built, then the body in `last`.
+    memory: MemoryReservation,
     warnings: Vec<Value>,
 }
 
 impl Release for Exec {
-    /// Drops every buffered batch (and its reservation) and stops the
-    /// producer, whose next send fails.
+    /// Drops every buffered batch and the last page (and their reservations)
+    /// and stops the producer, whose next send fails.
     fn release(&mut self) {
         self.events.close();
         while self.events.try_recv().is_ok() {}
         self.pending = None;
         self.finished = true;
+        self.last = None;
+        self.memory.free();
     }
 }
 
 impl Exec {
-    fn new(events: mpsc::Receiver<Event>, encoding: Encoding, warnings: Vec<Value>) -> Self {
+    fn new(
+        events: mpsc::Receiver<Event>,
+        encoding: Encoding,
+        warnings: Vec<Value>,
+        pool: &Arc<dyn MemoryPool>,
+        id: &str,
+    ) -> Self {
         Self {
             events,
             shape: Shape::Rows,
@@ -300,11 +320,14 @@ impl Exec {
             finished: false,
             next_token: 1,
             last: None,
+            memory: MemoryConsumer::new(format!("Trino page {id}")).register(pool),
             warnings,
         }
     }
 
-    /// Encodes pending rows until the page is full.
+    /// Encodes pending rows until the page is full, reserving each row. A row
+    /// the pool cannot hold ends the page early, or fails the query when the
+    /// page has no row yet.
     fn take_rows(
         &mut self,
         query: &TrinoQuery,
@@ -316,12 +339,17 @@ impl Exec {
         };
         let start = offset;
         let batch = &buffered.batch;
+        let mut refused = None;
         while offset < batch.num_rows() && *bytes < PAGE_TARGET_BYTES {
             let row = batch
                 .columns()
                 .iter()
                 .map(|column| types::value(column, offset, self.encoding))
                 .collect::<Result<Vec<_>, _>>()?;
+            if let Err(error) = self.memory.try_grow(row_memory(&row)) {
+                refused = Some(error);
+                break;
+            }
             *bytes += row.iter().map(approximate_size).sum::<usize>();
             rows.push(row);
             offset += 1;
@@ -330,7 +358,15 @@ impl Exec {
         if offset < batch.num_rows() {
             self.pending = Some((buffered, offset));
         }
-        Ok(())
+        match refused {
+            Some(error) if rows.is_empty() => Err(QueryError::from(&error)),
+            // Sent short: the next page starts at the refused row.
+            Some(_) => {
+                *bytes = PAGE_TARGET_BYTES;
+                Ok(())
+            }
+            None => Ok(()),
+        }
     }
 
     fn absorb(&mut self, event: Event) -> Result<(), QueryError> {
@@ -439,6 +475,14 @@ impl Exec {
                 .unwrap_or_else(|| QueryError::new(Code::GenericInternalError, "Query failed")),
         )
     }
+}
+
+/// Memory of one decoded row: its JSON text plus the `Value`s holding it.
+fn row_memory(row: &[Value]) -> usize {
+    row.iter()
+        .map(|value| approximate_size(value) + std::mem::size_of::<Value>())
+        .sum::<usize>()
+        + std::mem::size_of::<Vec<Value>>()
 }
 
 fn approximate_size(value: &Value) -> usize {
@@ -620,6 +664,10 @@ impl TrinoState {
         self.queries.sweep();
     }
 
+    fn pool(&self) -> Arc<dyn MemoryPool> {
+        Arc::clone(&self.engine.context().runtime_env().memory_pool)
+    }
+
     /// New submissions are refused; running queries keep paging.
     pub(crate) fn start_draining(&self) {
         self.draining.store(true, Ordering::SeqCst);
@@ -718,13 +766,9 @@ fn refuse(
     error: QueryError,
 ) -> Response {
     let (_, receiver) = mpsc::channel(1);
-    let query = Arc::new(Query::new(
-        state.queries.next_id(),
-        user,
-        source,
-        sql,
-        Exec::new(receiver, Encoding::MODERN, Vec::new()),
-    ));
+    let id = state.queries.next_id();
+    let exec = Exec::new(receiver, Encoding::MODERN, Vec::new(), &state.pool(), &id);
+    let query = Arc::new(Query::new(id, user, source, sql, exec));
     // A full registry reports its own error instead.
     let error = state.queries.insert(Arc::clone(&query)).err().unwrap_or(error);
     query.fail(error.clone());
@@ -801,13 +845,9 @@ async fn submit(State(state): State<Arc<TrinoState>>, request: Request) -> Respo
         .unwrap_or_default();
     let encoding = session.as_ref().map_or(Encoding::MODERN, |s| s.encoding);
     let (sender, receiver) = mpsc::channel(BUFFERED_BATCHES);
-    let query = Arc::new(Query::new(
-        state.queries.next_id(),
-        user,
-        source,
-        sql,
-        Exec::new(receiver, encoding, warnings),
-    ));
+    let id = state.queries.next_id();
+    let exec = Exec::new(receiver, encoding, warnings, &state.pool(), &id);
+    let query = Arc::new(Query::new(id, user, source, sql, exec));
     if let Err(error) = state.queries.insert(Arc::clone(&query)) {
         query.fail(error.clone());
         return json_response(
@@ -1110,7 +1150,11 @@ async fn run(
     let analysis = analysis.elapsed();
     let planning = Instant::now();
     let task = Arc::new(frame.task_ctx());
-    let physical = frame.create_physical_plan().await.map_err(error)?;
+    let mut physical = frame.create_physical_plan().await.map_err(error)?;
+    // This protocol reserves the batches it holds itself (`Buffered`).
+    if let Some(reserved) = physical.as_any().downcast_ref::<ReservedOutputExec>() {
+        physical = Arc::clone(reserved.input());
+    }
     let mut stream = execute_stream(cooperative(physical).map_err(error)?, task).map_err(error)?;
     query.record_timing(analysis, planning.elapsed());
     query.set_state(QueryState::Running);
@@ -1197,6 +1241,30 @@ async fn fetch(
     };
     query.heartbeat();
     let base = state.base_uri(&headers);
+    fetch_page(&query, &base, token).await
+}
+
+/// Counts a page request while it lives, also when the client goes away
+/// mid-request (the handler's future is dropped).
+struct Fetching<'a>(&'a TrinoQuery);
+
+impl<'a> Fetching<'a> {
+    fn new(query: &'a TrinoQuery) -> Self {
+        query.enter_fetch();
+        Self(query)
+    }
+}
+
+impl Drop for Fetching<'_> {
+    fn drop(&mut self) {
+        self.0.leave_fetch();
+    }
+}
+
+async fn fetch_page(query: &TrinoQuery, base: &str, token: u64) -> Response {
+    // Declared before the `exec` guard, so dropped after it: the last request
+    // out of a canceled query can then release what the cancel left.
+    let _fetching = Fetching::new(query);
     let mut exec = query.exec.lock().await;
     if let Some((last, body)) = &exec.last
         && *last == token
@@ -1209,16 +1277,34 @@ async fn fetch(
     if token < exec.next_token {
         return (StatusCode::GONE, "Invalid token").into_response();
     }
-    let page = exec.page(&query).await;
-    if query.error().is_some() {
-        // Failed while this page was built: nothing buffered is needed anymore.
+    let page = exec.page(query).await;
+    let failed = query.error().is_some();
+    if failed {
+        // Failed while this page was built: no buffered batch is needed anymore.
         exec.release();
     }
     let next = (!page.done).then_some(token + 1);
-    let body = TrinoState::body(&query, &base, &page, next, &exec.warnings);
-    exec.last = Some((token, body.clone()));
+    let body = TrinoState::body(query, base, &page, next, &exec.warnings);
+    drop(page);
+    if page_is_final(next, failed) {
+        // The query finished: nothing is kept for it, not even this page.
+        exec.last = None;
+        exec.memory.free();
+    } else {
+        // Kept for a retry of this token; a failed query drops it once no
+        // request for it is left (`Query::leave_fetch`).
+        exec.last = Some((token, body.clone()));
+        // The body replaces the rows it was encoded from (reserved above
+        // them) and the previous body.
+        exec.memory.resize(body.len());
+    }
     exec.next_token = token + 1;
     json_response(body, &[])
+}
+
+/// The last page of a query that finished (not failed).
+fn page_is_final(next: Option<u64>, failed: bool) -> bool {
+    next.is_none() && !failed
 }
 
 async fn cancel_statement(

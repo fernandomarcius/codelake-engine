@@ -14,7 +14,7 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -88,6 +88,8 @@ pub(crate) struct Query<E> {
     info: Mutex<Info>,
     pub(crate) exec: tokio::sync::Mutex<E>,
     cancel: CancellationToken,
+    /// Requests paging this query right now (holding or awaiting `exec`).
+    fetchers: AtomicUsize,
 }
 
 impl<E> std::fmt::Debug for Query<E> {
@@ -134,6 +136,7 @@ impl<E: Release> Query<E> {
             }),
             exec: tokio::sync::Mutex::new(exec),
             cancel: CancellationToken::new(),
+            fetchers: AtomicUsize::new(0),
         }
     }
 
@@ -191,8 +194,9 @@ impl<E: Release> Query<E> {
     }
 
     /// Records the first failure (later ones are consequences of it), stops
-    /// the execution and drops the buffered results. When a page is being
-    /// built right now, that request releases them when it ends.
+    /// the execution and drops the buffered results. When pages are being
+    /// requested right now, the last of those requests releases them as it
+    /// ends ([`Query::leave_fetch`]), so they all answer the same page.
     pub(crate) fn fail(&self, error: QueryError) {
         {
             let mut info = self.info();
@@ -203,7 +207,26 @@ impl<E: Release> Query<E> {
         }
         self.set_state(State::Failed);
         self.cancel.cancel();
-        if let Ok(mut exec) = self.exec.try_lock() {
+        self.release_if_idle();
+    }
+
+    /// A page request starts.
+    pub(crate) fn enter_fetch(&self) {
+        self.fetchers.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A page request ended (its `exec` guard dropped): the last one out of a
+    /// failed query releases what the failure could not.
+    pub(crate) fn leave_fetch(&self) {
+        if self.fetchers.fetch_sub(1, Ordering::SeqCst) == 1 && self.error().is_some() {
+            self.release_if_idle();
+        }
+    }
+
+    fn release_if_idle(&self) {
+        if self.fetchers.load(Ordering::SeqCst) == 0
+            && let Ok(mut exec) = self.exec.try_lock()
+        {
             exec.release();
         }
     }

@@ -255,7 +255,6 @@ async fn first_page(h: &Harness, probe: &Probe, sql: &str) -> Result<String, Val
 /// (`CoalescePartitionsExec`) above it hold batches in their channels that
 /// only the output buffer's own 2 + 1 batches account for.
 #[tokio::test]
-#[ignore = "DEFECT-MEM1: batches buffered inside the plan (merge and repartition channels) are not reserved: 96 MiB held, 32.4 MiB reserved"]
 async fn mem1_buffered_output_of_a_paused_client_is_reserved() {
     let h = harness_config(limits(), ByteSize::mib(256), &partitions(4));
     // 1 KiB rows: 8 MiB per 8192-row batch.
@@ -291,7 +290,6 @@ async fn mem1_buffered_output_of_a_paused_client_is_reserved() {
 /// inside its reservation or fails with `EXCEEDED_LOCAL_MEMORY_LIMIT`; no
 /// other error, and the rows that do arrive are the right ones.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-MEM2: 12 paused queries hold 96 MiB of payload under memory.limit = 64 MiB"]
 async fn mem2_concurrent_paused_clients_hold_at_most_the_limit() {
     let limit = 64 * MIB;
     let h = Arc::new(harness_config(limits(), ByteSize::mib(64), &partitions(4)));
@@ -354,7 +352,6 @@ async fn mem2_concurrent_paused_clients_hold_at_most_the_limit() {
 /// 100 x that row with 0 bytes reserved. Observed by asking for the last token
 /// again after the cancel: it is still served, in full.
 #[tokio::test]
-#[ignore = "DEFECT-MEM3: the history keeps canceled queries' last pages outside the pool: 64 MiB with 0 reserved"]
 async fn mem3_history_does_not_keep_page_bodies_outside_the_pool() {
     let limit = 64 * MIB;
     let h = harness_config(limits(), ByteSize::mib(64), &partitions(1));
@@ -483,7 +480,7 @@ async fn sort_under(limit_mib: u64, partitions_n: usize, rows: i64) -> Vec<Strin
 /// ~100 MiB sorted under 64 MiB with 2 partitions: it spills, then the merge
 /// of the spill files reserves more than the pool has left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-MEM4: a sort 1.5x the pool spills, then its merge fails with EXCEEDED_LOCAL_MEMORY_LIMIT"]
+#[ignore = "DEFECT-MEM4: the sort spills and finishes with the right rows, but row_number() is sent as decimal(20, 0), not bigint (fixed on front/f4-functions)"]
 async fn mem4_sort_of_1_5x_the_pool_spills_and_finishes() {
     let wrong = sort_under(64, 2, 400_000).await;
     assert!(wrong.is_empty(), "{wrong:#?}");
@@ -493,7 +490,7 @@ async fn mem4_sort_of_1_5x_the_pool_spills_and_finishes() {
 /// first reserves `sort_spill_reservation_bytes` (10 MiB) for its merge, and
 /// what is left is too little to buffer the one batch it could spill.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-MEM5: 10 MiB merge reservation per partition leaves the sort no room to spill"]
+#[ignore = "DEFECT-MEM5: the sort spills and finishes with the right rows, but row_number() is sent as decimal(20, 0), not bigint (fixed on front/f4-functions)"]
 async fn mem5_sort_spills_under_32_mib_with_2_partitions() {
     let wrong = sort_under(32, 2, 400_000).await;
     assert!(wrong.is_empty(), "{wrong:#?}");
@@ -502,7 +499,7 @@ async fn mem5_sort_spills_under_32_mib_with_2_partitions() {
 /// ~100 MiB sorted under 64 MiB with 8 partitions (a node with 8 cores and
 /// the default `target_partitions`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-MEM5: 10 MiB merge reservation per partition leaves the sort no room to spill"]
+#[ignore = "DEFECT-MEM5: the sort spills and finishes with the right rows, but row_number() is sent as decimal(20, 0), not bigint (fixed on front/f4-functions)"]
 async fn mem5_sort_spills_under_64_mib_with_8_partitions() {
     let wrong = sort_under(64, 8, 400_000).await;
     assert!(wrong.is_empty(), "{wrong:#?}");

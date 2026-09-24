@@ -126,7 +126,8 @@ pub struct ExecutionConfig {
     /// Rows per Arrow record batch. Smaller batches lower peak memory per operator.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
-    /// Parallelism per query. Defaults to the number of CPUs.
+    /// Parallelism per query, and the number of runtime workers of the server
+    /// (ADR 0003). Defaults to the number of CPUs.
     pub target_partitions: Option<usize>,
     /// Seconds allowed for connecting to every source at startup.
     #[serde(default = "default_startup_timeout_secs")]

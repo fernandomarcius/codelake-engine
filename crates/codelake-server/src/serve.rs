@@ -30,7 +30,15 @@ pub(crate) enum ServeError {
 }
 
 pub(crate) fn run(validated: ValidatedConfig) -> Result<(), ServeError> {
-    tokio::runtime::Builder::new_multi_thread()
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    // One worker per partition a query runs: the parallelism the
+    // configuration asks for. It also bounds the batches being produced at any
+    // instant (before their consumer reserves them), which the memory pool
+    // cannot see (ADR 0003).
+    if let Some(partitions) = validated.config.execution.target_partitions {
+        runtime.worker_threads(partitions);
+    }
+    runtime
         .enable_all()
         .thread_name("codelake")
         .build()?

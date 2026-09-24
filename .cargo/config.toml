@@ -6,3 +6,8 @@ xtask = "run --quiet --package xtask --"
 # already links with rust-lld by default since Rust 1.90.
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# Allocator of the server binary (ADR 0003): freed memory goes back to the OS at
+# once, so the process stays within the memory ceiling it is sized for.
+[env]
+JEMALLOC_SYS_WITH_MALLOC_CONF = "background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0"
