@@ -35,6 +35,13 @@ const LENIENT: &str = "connector.name=hive\n\
                        hive.metastore.catalog.dir=file:/warehouse\n\
                        hive.metastore.version-compatibility=UNSAFE_ASSUME_COMPATIBILITY\n";
 
+/// Same warehouse read and written at microsecond precision (a Trino catalog
+/// setting; `hive` reads milliseconds).
+const MICROSECONDS: &str = "connector.name=hive\n\
+                            hive.metastore=file\n\
+                            hive.metastore.catalog.dir=file:/warehouse\n\
+                            hive.timestamp-precision=MICROSECONDS\n";
+
 /// Starts Trino 431 with a file-metastore `hive` catalog over `/warehouse`,
 /// pre-filled with `files` (path relative to the warehouse, bytes).
 async fn trino(files: Vec<(String, Vec<u8>)>) -> ContainerAsync<GenericImage> {
@@ -48,6 +55,10 @@ async fn trino(files: Vec<(String, Vec<u8>)>) -> ContainerAsync<GenericImage> {
         .with_copy_to(
             "/etc/trino/catalog/lenient.properties",
             LENIENT.as_bytes().to_vec(),
+        )
+        .with_copy_to(
+            "/etc/trino/catalog/hive_us.properties",
+            MICROSECONDS.as_bytes().to_vec(),
         );
     for (path, bytes) in files {
         request = request.with_copy_to(format!("/warehouse/{path}"), bytes);
@@ -304,4 +315,45 @@ async fn optimize_round_trips_with_trino_431() {
         let files = trino_sql(&reader, &format!("SELECT count(DISTINCT \"$path\") FROM {table}")).await;
         assert_eq!(files.trim().lines().last(), Some("\"1\""), "{table}: {files}");
     }
+}
+
+/// A table Trino wrote through a `MICROSECONDS` catalog keeps every
+/// microsecond once `CodeLake` compacts it (scans read milliseconds, as
+/// Trino's default catalog does; compaction must not truncate). The Trino
+/// CLI declares parametric timestamps, so it prints all six digits.
+#[tokio::test]
+async fn optimize_keeps_microseconds_for_trino_431() {
+    let local = tempfile::tempdir().unwrap();
+    let warehouse: PathBuf = local.path().join("warehouse");
+    let spill = tempfile::tempdir().unwrap();
+    let rows = "SELECT id, ts FROM hive_us.us_side.t ORDER BY id";
+
+    let writer = trino(Vec::new()).await;
+    for sql in [
+        "CREATE SCHEMA hive.us_side",
+        "CREATE TABLE hive_us.us_side.t WITH (format = 'PARQUET') AS \
+         SELECT 1 AS id, TIMESTAMP '2026-01-01 10:00:00.123999' AS ts",
+        "INSERT INTO hive_us.us_side.t VALUES (2, TIMESTAMP '1700-06-01 00:00:00.000001')",
+        "INSERT INTO hive_us.us_side.t VALUES (3, TIMESTAMP '2026-01-01 10:00:00.000500')",
+    ] {
+        trino_sql(&writer, sql).await;
+    }
+    let reference = trino_sql(&writer, rows).await;
+    assert_eq!(
+        reference.trim(),
+        "\"id\",\"ts\"\n\"1\",\"2026-01-01 10:00:00.123999\"\n\"2\",\"1700-06-01 00:00:00.000001\"\n\
+         \"3\",\"2026-01-01 10:00:00.000500\""
+    );
+    copy_out(&writer, &warehouse).await;
+    drop(writer);
+
+    let lake = engine(&warehouse, spill.path()).await;
+    let table = warehouse.join("us_side/t");
+    assert_eq!(data_files(&table).len(), 3);
+    codelake(&lake, "ALTER TABLE hive.us_side.t EXECUTE optimize").await;
+    assert_eq!(data_files(&table).len(), 1);
+    drop(lake);
+
+    let reader = trino(read_tree(&warehouse)).await;
+    assert_eq!(trino_sql(&reader, rows).await, reference);
 }

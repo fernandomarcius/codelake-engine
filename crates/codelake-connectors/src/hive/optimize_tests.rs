@@ -613,3 +613,78 @@ async fn compaction_reserves_memory_and_fails_cleanly_when_it_is_short() {
     assert_eq!(data_files(&lake.table_dir("t")).len(), 1);
     assert_eq!(run(e, "SELECT count(*), sum(id) FROM hive.s.t").await, before);
 }
+
+/// A Trino catalog at `hive.timestamp-precision=MICROSECONDS` writes INT96
+/// microseconds; scans read milliseconds, but compaction must rewrite the
+/// stored values exactly.
+#[tokio::test]
+async fn microsecond_timestamps_are_rewritten_exactly() {
+    use datafusion::arrow::array::{Array, AsArray, Int64Array, RecordBatch, TimestampMicrosecondArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit, TimestampNanosecondType};
+    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    use super::trino_parquet::TrinoParquetWriter;
+
+    let lake = lake().await;
+    let e = &lake.engine;
+    run(e, "CREATE SCHEMA hive.s").await;
+    run(
+        e,
+        "CREATE TABLE hive.s.t WITH (format = 'PARQUET') AS SELECT CAST(0 AS BIGINT) AS id, \
+         CAST('2026-01-01T00:00:00' AS TIMESTAMP) AS ts",
+    )
+    .await;
+    let dir = lake.table_dir("t");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+    ]));
+    // 2026-01-01 10:00:00.123999, 1700-06-01 00:00:00.000001, 2026-01-01 10:00:00.000500
+    let values = [
+        (1_i64, 1_767_261_600_123_999_i64),
+        (2, -8_507_289_599_999_999),
+        (3, 1_767_261_600_000_500),
+    ];
+    for (id, micros) in values {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![id])),
+                Arc::new(TimestampMicrosecondArray::from(vec![micros])),
+            ],
+        )
+        .unwrap();
+        let mut buffer = Vec::new();
+        let mut writer = TrinoParquetWriter::try_new(&mut buffer, Arc::clone(&schema), 1024).unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+        std::fs::write(dir.join(format!("20200101_000000_{id}_micro")), buffer).unwrap();
+    }
+    optimize(e, "ALTER TABLE hive.s.t EXECUTE optimize")
+        .await
+        .unwrap();
+    let files = data_files(&dir);
+    assert_eq!(files.len(), 1, "{files:?}");
+    let file = std::fs::File::open(dir.join(files.keys().next().unwrap())).unwrap();
+    let mut stored: Vec<(i64, i64)> = Vec::new();
+    for batch in ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap()
+    {
+        let batch = batch.unwrap();
+        let ids = batch
+            .column(0)
+            .as_primitive::<datafusion::arrow::datatypes::Int64Type>();
+        // INT96 without a hint reads in nanoseconds: every digit is there.
+        let ts = batch.column(1).as_primitive::<TimestampNanosecondType>();
+        for row in 0..batch.num_rows() {
+            assert!(ts.is_valid(row));
+            stored.push((ids.value(row), ts.value(row)));
+        }
+    }
+    stored.sort_unstable();
+    let mut expected: Vec<(i64, i64)> = values.iter().map(|(id, micros)| (*id, micros * 1_000)).collect();
+    expected.insert(0, (0, 1_767_225_600_000_000_000));
+    assert_eq!(stored, expected);
+}
