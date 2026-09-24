@@ -6,6 +6,7 @@ mod catalog;
 mod crc;
 mod metastore;
 mod table;
+mod trino_parquet;
 mod types;
 
 use std::sync::Arc;

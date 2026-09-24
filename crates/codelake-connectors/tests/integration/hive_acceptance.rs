@@ -1100,7 +1100,6 @@ fn only_data_file(dir: &Path) -> PathBuf {
 }
 
 #[tokio::test]
-#[ignore = "F2 defect: timestamps land in SQL Server as bigint (epoch ms)"]
 #[allow(clippy::too_many_lines, reason = "one scenario, read top to bottom")]
 async fn sqlserver_2022_openrowset_reads_codelake_parquet() {
     let shared = shared().await;
@@ -1223,7 +1222,6 @@ async fn sqlserver_2022_openrowset_reads_codelake_parquet() {
 }
 
 #[tokio::test]
-#[ignore = "F2 defect: timestamps land in SQL Server as bigint (epoch ms)"]
 async fn sqlserver_2022_openrowset_reads_every_codelake_type() {
     let shared = shared().await;
     let spill = tempfile::tempdir().unwrap();

@@ -10,7 +10,8 @@
 //! a SQL Server sink downstream loads each file once, by name. The file is
 //! written under a hidden temporary name and renamed when complete, so no
 //! reader ever sees a partial file. The name starts with a UTC timestamp so
-//! that listing order is write order, as with Trino.
+//! that listing order is write order, as with Trino. Files are laid out like
+//! Trino's (`INT96` timestamps, see `trino_parquet.rs`).
 
 use std::any::Any;
 use std::fmt;
@@ -35,21 +36,14 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::parquet::arrow::AsyncArrowWriter;
 use datafusion::parquet::arrow::async_writer::ParquetObjectWriter;
-use datafusion::parquet::basic::Compression;
-use datafusion::parquet::file::properties::WriterProperties;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStoreExt};
 
 use super::metastore::FileMetastore;
-
-/// Rows per Parquet row group. Bounded so the writer's buffer stays small.
-const ROW_GROUP_ROWS: usize = 128 * 1024;
-/// Flush the in-progress row group once it holds this many bytes.
-const FLUSH_BYTES: usize = 64 * 1024 * 1024;
+use super::trino_parquet::{ROW_GROUP_ROWS, TrinoParquetWriter};
 
 static SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
@@ -240,14 +234,10 @@ impl HiveSink {
         temporary: &Path,
     ) -> Result<u64> {
         let store = Arc::clone(self.table.metastore.store());
-        let properties = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(ROW_GROUP_ROWS))
-            .set_compression(Compression::SNAPPY)
-            .build();
-        let mut writer = AsyncArrowWriter::try_new(
+        let mut writer = TrinoParquetWriter::try_new(
             ParquetObjectWriter::new(store, temporary.clone()),
             Arc::clone(&self.table.schema),
-            Some(properties),
+            ROW_GROUP_ROWS,
         )?;
         let reservation =
             MemoryConsumer::new(format!("HiveSink[{}]", self.table.table)).register(context.memory_pool());
@@ -259,9 +249,6 @@ impl HiveSink {
             }
             writer.write(&self.conform(&batch)?).await?;
             rows += batch.num_rows() as u64;
-            if writer.in_progress_size() >= FLUSH_BYTES {
-                writer.flush().await?;
-            }
             // The encoder buffers the open row group: account for it.
             reservation.try_resize(writer.memory_size())?;
         }
