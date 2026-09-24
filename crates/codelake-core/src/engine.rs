@@ -23,6 +23,7 @@ use crate::connector::{Connector, ConnectorError, ViewDefinition, WritableCatalo
 use crate::ddl::{self, Prepared, RelationKind, Rewrite, ViewSecurity};
 use crate::federation_guard::FederationFilterGuard;
 use crate::information_schema::CatalogList;
+use crate::output::AccountedOutput;
 use crate::runtime::{EngineRuntime, MemoryStats};
 use crate::session_properties::{PropertyRegistry, SessionProperties};
 
@@ -106,10 +107,13 @@ pub fn analyzer_rules() -> Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Sen
 }
 
 /// Default `DataFusion` physical rules, preceded by the federation guard (it must
-/// run before `FilterPushdown`; see [`crate::federation_guard`]).
+/// run before `FilterPushdown`; see [`crate::federation_guard`]) and followed by
+/// [`AccountedOutput`], which keeps the buffers between the plan and the client
+/// inside the memory pool.
 fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = vec![Arc::new(FederationFilterGuard)];
     rules.extend(PhysicalOptimizer::new().rules);
+    rules.push(Arc::new(AccountedOutput));
     rules
 }
 
@@ -159,6 +163,7 @@ impl Engine {
         let mut session = SessionConfig::new()
             .with_batch_size(execution.batch_size)
             .with_information_schema(false);
+        session = crate::runtime::sort_settings(session, memory);
         if let Some(partitions) = execution.target_partitions {
             session = session.with_target_partitions(partitions);
         }

@@ -17,6 +17,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit}
 use datafusion::catalog::{CatalogProvider, SchemaProvider, Session, TableProvider};
 use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -160,7 +161,17 @@ impl TableProvider for HiveView {
             .as_any()
             .downcast_ref::<SessionState>()
             .ok_or_else(|| DataFusionError::Internal("hive views need a SessionState".into()))?;
-        let mut view_state = state.clone();
+        // The view's plan becomes part of the outer one, which merges and
+        // reserves the output of the whole query (`codelake_core::output`).
+        let rules = state
+            .physical_optimizers()
+            .iter()
+            .filter(|rule| rule.name() != codelake_core::output::ACCOUNTED_OUTPUT)
+            .cloned()
+            .collect();
+        let mut view_state = SessionStateBuilder::new_from_existing(state.clone())
+            .with_physical_optimizer_rules(rules)
+            .build();
         let defaults = &mut view_state.config_mut().options_mut().catalog;
         if let Some(catalog) = &self.definition.catalog {
             defaults.default_catalog.clone_from(catalog);

@@ -2,7 +2,7 @@
 //!
 //! This is the reason `CodeLake` exists: a hard, observable memory ceiling. Every
 //! memory-hungry operator (hash join, sort, aggregation) must reserve from a
-//! [`FairSpillPool`] before allocating. When the pool is exhausted the operator
+//! [`CeilingPool`] before allocating. When the pool is exhausted the operator
 //! spills to disk; when spill is exhausted the *query* fails with a resources
 //! error. The *process* never grows past the limit.
 
@@ -11,14 +11,41 @@ use std::sync::Arc;
 
 use datafusion::error::Result;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
-use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool, TrackConsumersPool};
+use datafusion::execution::memory_pool::{MemoryPool, TrackConsumersPool};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion::prelude::SessionConfig;
 
 use crate::config::MemoryConfig;
+use crate::pool::CeilingPool;
 
 /// How many top memory consumers to name in an out-of-memory error. This is
 /// what turns "query failed" into "query failed because `HashJoin` held 1.8GiB".
 const TOP_CONSUMERS_IN_ERRORS: usize = 5;
+
+/// Sort settings sized to the pool (ADR 0003, "Sorts").
+///
+/// - `repartition_sorts = false`: a global `ORDER BY` runs one external sort
+///   over the merged input instead of one per partition. Per-partition sorts
+///   share the pool, and once spilled each one's final merge reserves as many
+///   spill files as the pool has room for: the first to get there takes the
+///   memory the others need to merge or to go on sorting, and they fail with
+///   `ResourcesExhausted` although spill was left. The single sort still sorts
+///   its batches in parallel tasks; only the final merge is one stream, as the
+///   merge of the per-partition sorts was.
+/// - `sort_spill_reservation_bytes`: headroom a sort keeps for merging its
+///   runs before it spills, `DataFusion`'s 10 MiB, but at most 1/16 of the
+///   pool so that a small pool still has room for the rows being sorted.
+pub(crate) fn sort_settings(session: SessionConfig, memory: &MemoryConfig) -> SessionConfig {
+    let headroom =
+        (memory.limit.as_usize() / SORT_HEADROOM_DIVISOR).clamp(MIN_SORT_HEADROOM, MAX_SORT_HEADROOM);
+    session
+        .with_repartition_sorts(false)
+        .with_sort_spill_reservation_bytes(headroom)
+}
+
+const SORT_HEADROOM_DIVISOR: usize = 16;
+const MIN_SORT_HEADROOM: usize = 1 << 20;
+const MAX_SORT_HEADROOM: usize = 10 << 20;
 
 /// Snapshot of engine memory, exported as metrics and on `/healthz`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -41,7 +68,7 @@ impl EngineRuntime {
     pub fn new(config: &MemoryConfig) -> Result<Self> {
         let limit = config.limit.as_usize();
         let top = NonZeroUsize::new(TOP_CONSUMERS_IN_ERRORS).unwrap_or(NonZeroUsize::MIN);
-        let pool: Arc<dyn MemoryPool> = Arc::new(TrackConsumersPool::new(FairSpillPool::new(limit), top));
+        let pool: Arc<dyn MemoryPool> = Arc::new(TrackConsumersPool::new(CeilingPool::new(limit), top));
 
         let disk = DiskManagerBuilder::default()
             .with_mode(DiskManagerMode::Directories(vec![config.spill_dir.clone()]))
