@@ -11,8 +11,6 @@ publish.workspace = true
 
 [features]
 default = []
-# Experimental; see crates/codelake-connectors/Cargo.toml.
-iceberg = ["codelake-connectors/iceberg"]
 
 [[bin]]
 name = "codelake"

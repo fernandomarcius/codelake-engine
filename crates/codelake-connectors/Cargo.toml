@@ -1,6 +1,6 @@
 [package]
 name = "codelake-connectors"
-description = "Source connectors (PostgreSQL, MongoDB, Iceberg on S3/MinIO)."
+description = "Source connectors (PostgreSQL, MySQL, SQL Server, MongoDB, Hive)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,8 +11,6 @@ publish.workspace = true
 
 [features]
 default = ["postgres", "mysql", "mongodb", "sqlserver", "hive"]
-# Not shipped: pulls quick-xml 0.39 (RUSTSEC-2026-0194/0195) through opendal 0.57,
-# pinned by iceberg-storage-opendal 0.10. See ROADMAP.md (M3).
 postgres = ["datafusion-table-providers/postgres-federation"]
 mysql = ["datafusion-table-providers/mysql-federation"]
 # Not shipped: object_store's S3 client pulls quick-xml 0.39 (RUSTSEC-2026-0194/0195)
@@ -21,16 +19,13 @@ hive-s3 = ["hive", "object_store/aws"]
 hive = ["dep:object_store", "dep:bytes", "dep:crc32fast", "dep:uuid", "dep:base64", "dep:serde", "dep:serde_json", "dep:futures"]
 sqlserver = ["dep:tiberius", "dep:bb8", "dep:tokio-util", "dep:futures", "dep:datafusion-federation"]
 mongodb = ["datafusion-table-providers/mongodb"]
-iceberg = ["dep:iceberg", "dep:iceberg-datafusion", "dep:iceberg-catalog-rest", "dep:iceberg-storage-opendal"]
+# No `iceberg` feature: the connector is parked in `parked/iceberg.rs`, outside
+# the build (docs/adr/0013).
 
 [dependencies]
 codelake-core.workspace = true
 datafusion.workspace = true
 datafusion-table-providers.workspace = true
-iceberg = { workspace = true, optional = true }
-iceberg-datafusion = { workspace = true, optional = true }
-iceberg-catalog-rest = { workspace = true, optional = true }
-iceberg-storage-opendal = { workspace = true, optional = true }
 tiberius = { workspace = true, optional = true }
 bb8 = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true, features = ["compat"] }

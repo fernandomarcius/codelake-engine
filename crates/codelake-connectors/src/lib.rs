@@ -14,8 +14,6 @@ use codelake_core::{Connector, ConnectorError, SourceKind};
 mod file_statistics;
 #[cfg(feature = "hive")]
 pub mod hive;
-#[cfg(feature = "iceberg")]
-pub mod iceberg;
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
 #[cfg(feature = "mysql")]
@@ -140,32 +138,6 @@ pub fn build(source: &SourceConfig, secrets: &Secrets) -> Result<Arc<dyn Connect
                 )
                 .with_timestamp_precision(*timestamp_precision),
             ))
-        }
-        #[cfg(feature = "iceberg")]
-        SourceKind::Iceberg {
-            catalog_uri,
-            warehouse,
-            s3_endpoint,
-            s3_region,
-            access_key_id_env,
-            secret_access_key_env,
-            s3_path_style,
-        } => {
-            let credentials = match (access_key_id_env, secret_access_key_env) {
-                (Some(key), Some(secret_key)) => Some((secret(key)?, secret(secret_key)?)),
-                _ => None,
-            };
-            Ok(Arc::new(iceberg::IcebergConnector::new(
-                name.clone(),
-                iceberg::IcebergParams {
-                    catalog_uri: catalog_uri.clone(),
-                    warehouse: warehouse.clone(),
-                    s3_endpoint: s3_endpoint.clone(),
-                    s3_region: s3_region.clone(),
-                    credentials,
-                    path_style: *s3_path_style,
-                },
-            )))
         }
         #[allow(
             unreachable_patterns,

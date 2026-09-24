@@ -26,6 +26,10 @@ versioning: [SemVer](https://semver.org/).
 - Session-property registry: system properties plus catalog properties declared by connectors;
   undeclared names are rejected, performance-only Trino knobs are accepted with a warning.
 
+### Removed
+- Experimental Iceberg connector and its `iceberg` feature, out of the build until an Iceberg
+  integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
+
 ### Fixed
 - `CREATE SCHEMA` without a catalog used the engine's default catalog instead of the session's.
 - `codelake-connectors` without the `hive-s3` feature failed to build under `-D warnings`.

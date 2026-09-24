@@ -1,7 +1,7 @@
 # CodeLake
 
 Federated SQL engine in Rust with a **hard memory ceiling**. Query SQL Server,
-PostgreSQL, MySQL, MongoDB and (experimental) Iceberg on S3/MinIO as one database, join
+PostgreSQL, MySQL, MongoDB and Hive-layout Parquet tables as one database, join
 across them, and never let the process grow past the memory you gave it.
 
 Built on [Apache DataFusion](https://datafusion.apache.org/) 53,
@@ -37,7 +37,7 @@ Goal: replace Trino in production workloads at a fraction of the memory
  │                 ─ cross-source joins run here, inside  │
  │                   CeilingPool(memory.limit) + spill    │
  ├───────────┬───────────┬────────────┬───────────────────┤
- │ sqlserver · postgres · mysql · mongodb · iceberg (exp.) │  codelake-connectors
+ │ sqlserver · postgres · mysql · mongodb · hive           │  codelake-connectors
  └───────────┴───────────┴────────────┴───────────────────┘
 ```
 

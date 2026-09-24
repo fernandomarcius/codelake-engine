@@ -98,11 +98,13 @@ Blocking items, in order:
   contribution to [`apache/datafusion-iceberg`](https://github.com/apache/datafusion-iceberg),
   which takes over the DataFusion integration that `iceberg-rust` removed from
   `main` (0.11.x is its last release with `iceberg-datafusion`), or a maintained fork.
-- Ship the Iceberg connector: blocked on an `iceberg-rust` release with
-  `opendal ≥ 0.58.1` (quick-xml ^0.41, clears RUSTSEC-2026-0194/0195). No such
-  release is published yet: 0.11.0 (DataFusion 54, opendal 0.58) is still at RC.
-- Dependency train (F11 survey, 2026-09-24): stay on DataFusion 53. Move to
-  DataFusion 54 in one train PR once `iceberg` 0.11.0 final is on crates.io, with
+- Ship the Iceberg connector: out of the build since 2026-09-24 (ADR 0013).
+  Returns with an Iceberg integration published for the train's DataFusion
+  major (`iceberg` 0.11.0 final, still at RC on 2026-09-24, or
+  `apache/datafusion-iceberg`) on `opendal ≥ 0.58.1` (quick-xml ^0.41, clears
+  RUSTSEC-2026-0194/0195).
+- Dependency train (F11 survey, 2026-09-24): move to DataFusion 54 in one
+  train PR without Iceberg (ADR 0013), with
   `datafusion-federation = "=0.5.5"`, the per-connector
   `datafusion-table-providers` 0.13.1 crates and `datafusion-postgres` 0.18.0,
   then the full `semantics` suite (string/number coercion, codepoint

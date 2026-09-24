@@ -62,7 +62,9 @@ federation guard exists because such a test caught a lost `WHERE` clause.
   (CycloneDX) and SLSA provenance. The same digest is promoted HML → PRD.
 - GitHub Actions are pinned by commit SHA; base images by digest.
 - Features that fail a supply-chain gate are kept out of `default` and out of the
-  release image (today: `iceberg`, see ROADMAP M3).
+  release image (today: `hive-s3`, see ROADMAP M3). A connector with no release
+  for the current DataFusion train is kept out of the build (today: `iceberg`,
+  ADR 0013).
 
 ## Exceptions
 
