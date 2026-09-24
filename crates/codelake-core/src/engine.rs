@@ -262,6 +262,8 @@ impl Engine {
         // After `prepare`, which keeps a view's text as written.
         crate::literals::rewrite_zoned_timestamps(&mut statement);
         crate::literals::rewrite_exponent_numbers(&mut statement);
+        let session_zone = state.config().options().execution.time_zone.clone();
+        crate::literals::rewrite_timestamp_types(&mut statement, session_zone.as_deref().unwrap_or("UTC"));
         match &prepared {
             Some(Prepared::AddColumn {
                 table,
@@ -376,8 +378,13 @@ impl Engine {
         let writable = self.writable(&catalog).ok_or_else(|| {
             DataFusionError::Plan(format!("catalog {catalog} does not support ALTER TABLE"))
         })?;
-        // Let the SQL planner translate the type name exactly as it would in a cast.
-        let probe = ctx.sql(&format!("SELECT CAST(NULL AS {sql_type}) AS t")).await?;
+        // Let the SQL planner translate the type name exactly as it would in a
+        // cast, with Trino's defaults (`timestamp` is `timestamp(3)`).
+        let state = ctx.state();
+        let dialect = state.config().options().sql_parser.dialect;
+        let mut probe = state.sql_to_statement(&format!("SELECT CAST(NULL AS {sql_type}) AS t"), &dialect)?;
+        crate::literals::rewrite_timestamp_types(&mut probe, "UTC");
+        let probe = state.statement_to_plan(probe).await?;
         let data_type = probe.schema().field(0).data_type().clone();
         writable.add_column(&schema, &name, column, &data_type).await?;
         Self::empty(ctx)
@@ -1163,6 +1170,96 @@ mod tests {
             ),
         ];
         assert_failures(&engine, &cases).await;
+    }
+
+    /// Trino 431: `CAST(<text> AS TIMESTAMP)` keeps the local time and ignores
+    /// the zone; `WITH TIME ZONE` keeps the zone and the precision.
+    #[tokio::test]
+    async fn text_to_timestamp_casts_match_trino() {
+        use datafusion::arrow::array::{Array, AsArray};
+        use datafusion::arrow::datatypes::{TimeUnit, TimestampMicrosecondType, TimestampMillisecondType};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        let ten_am_utc = 1_767_261_600_000_i64;
+        let batches = engine
+            .sql(
+                "SELECT CAST('2026-01-01 10:00:00 America/Sao_Paulo' AS TIMESTAMP) a, \
+                 CAST('2026-01-01 10:00:00 America/Sao_Paulo' AS TIMESTAMP(3) WITH TIME ZONE) b, \
+                 CAST('2026-01-01 10:00:00.1235' AS TIMESTAMP) c, \
+                 CAST('2026-01-01 10:00:00.123456 +02:00' AS TIMESTAMP(6) WITH TIME ZONE) d, \
+                 CAST('2026-01-01 10:00:00' AS TIMESTAMP WITH TIME ZONE) e",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let batch = &batches[0];
+        let schema = batch.schema();
+        let ms = |i: usize| {
+            batch
+                .column(i)
+                .as_primitive::<TimestampMillisecondType>()
+                .value(0)
+        };
+        assert_eq!(
+            schema.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Millisecond, None)
+        );
+        assert_eq!(ms(0), ten_am_utc);
+        assert_eq!(
+            schema.field(1).data_type(),
+            &DataType::Timestamp(TimeUnit::Millisecond, Some("America/Sao_Paulo".into()))
+        );
+        assert_eq!(ms(1), ten_am_utc + 3 * 3_600_000);
+        assert_eq!(ms(2), ten_am_utc + 124);
+        assert_eq!(
+            schema.field(3).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("+02:00".into()))
+        );
+        assert_eq!(
+            batch
+                .column(3)
+                .as_primitive::<TimestampMicrosecondType>()
+                .value(0),
+            (ten_am_utc - 2 * 3_600_000) * 1000 + 123_456
+        );
+        assert_eq!(
+            schema.field(4).data_type(),
+            &DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
+        );
+        assert_eq!(ms(4), ten_am_utc);
+        // Column values: the zone of each text is ignored without time zone.
+        let batches = engine
+            .sql(
+                "SELECT CAST(x AS TIMESTAMP) FROM (VALUES ('2026-01-01 10:00:00 America/Sao_Paulo'), \
+                 ('2026-01-01 10:00:00.5 +02:00'), (NULL)) t(x)",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let column = batches[0].column(0).as_primitive::<TimestampMillisecondType>();
+        assert_eq!(
+            (column.value(0), column.value(1), column.is_null(2)),
+            (ten_am_utc, ten_am_utc + 500, true)
+        );
+        let message = "Value cannot be cast to timestamp";
+        let cases = [
+            ("SELECT CAST('2026-01-01T10:00:00' AS TIMESTAMP)", message),
+            (
+                "SELECT CAST('2026-01-01 10:00:00 Mars/Olympus' AS TIMESTAMP)",
+                message,
+            ),
+            (
+                "SELECT CAST(x AS TIMESTAMP) FROM (VALUES ('garbage')) t(x)",
+                message,
+            ),
+        ];
+        assert_failures(&engine, &cases).await;
+        let (_, rows) = typed_rows(&engine, "SELECT TRY_CAST('garbage' AS TIMESTAMP)").await;
+        assert_eq!(rows, [["NULL"]]);
     }
 
     /// `<catalog>.information_schema` lists that catalog only.

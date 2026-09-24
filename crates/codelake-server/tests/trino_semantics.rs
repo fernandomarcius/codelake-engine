@@ -5,7 +5,8 @@
 //! protocol sends them, or the error name and message. Covered:
 //!
 //! - decimal arithmetic and aggregates (types, half-up rounding, overflow,
-//!   38 digits, scale 0, negatives), the shapes of TPC-H Q01, Q08, Q14, Q17.
+//!   38 digits, scale 0, negatives), the shapes of TPC-H Q01, Q08, Q14, Q17;
+//! - casts from text to `timestamp(p)` and `timestamp(p) with time zone`.
 //!
 //! `trino_431_answers_every_golden` runs every case on a real Trino 431
 //! (`codelake-sem-trino-<pid>`), so each golden is Trino's observed
@@ -149,6 +150,36 @@ const CASES: &[Case] = &[
         setup: &[],
         sql: "SELECT CAST(1 AS DECIMAL(5,2)) % CAST(0 AS DECIMAL(5,0))",
         expect: r#"{"error":"DIVISION_BY_ZERO","message":"Division by zero"}"#,
+    },
+    Case {
+        id: "ts_casts",
+        setup: &[],
+        sql: "SELECT CAST('2026-01-01 10:00:00 America/Sao_Paulo' AS TIMESTAMP), CAST('2026-01-01 10:00:00 America/Sao_Paulo' AS TIMESTAMP(3) WITH TIME ZONE), CAST('2026-01-01 10:00:00.1235' AS TIMESTAMP), CAST('2026-01-01 10:00:00.123456 +02:00' AS TIMESTAMP(6) WITH TIME ZONE), CAST('2026-01-01 10:00:00' AS TIMESTAMP WITH TIME ZONE), CAST('2026-01-01 23:59:59.9995' AS TIMESTAMP), CAST('2026-01-01 10:00:00.5' AS TIMESTAMP(0)), CAST('2026-1-1 1:2:3' AS TIMESTAMP), CAST(' 2026-01-01 10:00 ' AS TIMESTAMP(6)), CAST('2026-01-01 10:00:00 Etc/GMT+3' AS TIMESTAMP WITH TIME ZONE), CAST('2026-01-01 10:00:00 +00:00' AS TIMESTAMP(0) WITH TIME ZONE)",
+        expect: r#"{"types":["timestamp(3)","timestamp(3) with time zone","timestamp(3)","timestamp(6) with time zone","timestamp(3) with time zone","timestamp(3)","timestamp(0)","timestamp(3)","timestamp(6)","timestamp(3) with time zone","timestamp(0) with time zone"],"names":["_col0","_col1","_col2","_col3","_col4","_col5","_col6","_col7","_col8","_col9","_col10"],"rows":[["2026-01-01 10:00:00.000","2026-01-01 10:00:00.000 America/Sao_Paulo","2026-01-01 10:00:00.124","2026-01-01 10:00:00.123456 +02:00","2026-01-01 10:00:00.000 UTC","2026-01-02 00:00:00.000","2026-01-01 10:00:01","2026-01-01 01:02:03.000","2026-01-01 10:00:00.000000","2026-01-01 10:00:00.000 -03:00","2026-01-01 10:00:00 UTC"]]}"#,
+    },
+    Case {
+        id: "ts_cast_column",
+        setup: &[],
+        sql: "SELECT CAST(x AS TIMESTAMP) FROM (VALUES ('2026-01-01 10:00:00 America/Sao_Paulo'), ('2026-06-01 10:00:00.5 +02:00'), ('2026-01-01 10:00:00'), (NULL)) t(x) ORDER BY 1",
+        expect: r#"{"types":["timestamp(3)"],"names":["_col0"],"rows":[["2026-01-01 10:00:00.000"],["2026-01-01 10:00:00.000"],["2026-06-01 10:00:00.500"],[null]]}"#,
+    },
+    Case {
+        id: "ts_err_t_separator",
+        setup: &[],
+        sql: "SELECT CAST('2026-01-01T10:00:00' AS TIMESTAMP)",
+        expect: r#"{"error":"INVALID_CAST_ARGUMENT","message":"Value cannot be cast to timestamp: 2026-01-01T10:00:00"}"#,
+    },
+    Case {
+        id: "ts_err_unknown_zone",
+        setup: &[],
+        sql: "SELECT CAST('2026-01-01 10:00:00 Mars/Olympus' AS TIMESTAMP)",
+        expect: r#"{"error":"INVALID_CAST_ARGUMENT","message":"Value cannot be cast to timestamp: 2026-01-01 10:00:00 Mars/Olympus"}"#,
+    },
+    Case {
+        id: "ts_err_column",
+        setup: &[],
+        sql: "SELECT CAST(x AS TIMESTAMP) FROM (VALUES ('garbage')) t(x)",
+        expect: r#"{"error":"INVALID_CAST_ARGUMENT","message":"Value cannot be cast to timestamp: garbage"}"#,
     },
 ];
 

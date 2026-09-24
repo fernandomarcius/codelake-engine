@@ -19,6 +19,7 @@ pub mod session_properties;
 pub mod subquery;
 #[cfg(test)]
 mod testing;
+mod timestamps;
 
 pub use bytes::ByteSize;
 pub use config::{Config, SourceConfig, SourceKind, TrinoProtocolConfig, ValidatedConfig};

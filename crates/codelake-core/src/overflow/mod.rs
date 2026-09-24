@@ -179,7 +179,16 @@ fn check_arithmetic(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> 
         Expr::Negative(inner) if inner.get_type(schema)?.is_signed_integer() => {
             Transformed::yes(CHECKED_NEGATE.call(vec![*inner]))
         }
-        Expr::Cast(_) => return collapse_decimal_cast(expr, schema),
+        Expr::Cast(_) => {
+            let collapsed = collapse_decimal_cast(expr, schema)?;
+            if collapsed.transformed {
+                return Ok(collapsed);
+            }
+            return crate::timestamps::check_text_cast(collapsed.data, schema);
+        }
+        Expr::TryCast(_) | Expr::ScalarFunction(_) => {
+            return crate::timestamps::check_text_cast(expr, schema);
+        }
         other => Transformed::no(other),
     })
 }
@@ -265,8 +274,12 @@ fn check_node(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
             if collapsed.transformed {
                 return Ok(collapsed);
             }
-            let Expr::Cast(Cast { expr, data_type }) = collapsed.data else {
-                return Ok(collapsed);
+            let text = crate::timestamps::check_text_cast(collapsed.data, schema)?;
+            if text.transformed {
+                return Ok(text);
+            }
+            let Expr::Cast(Cast { expr, data_type }) = text.data else {
+                return Ok(text);
             };
             match rounded(&expr, &expr.get_type(schema)?, &data_type) {
                 Some(source) => Ok(Transformed::yes(Expr::Cast(Cast::new(
@@ -276,7 +289,7 @@ fn check_node(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                 None => Ok(Transformed::no(Expr::Cast(Cast { expr, data_type }))),
             }
         }
-        Expr::TryCast(TryCast { expr, data_type }) => {
+        Expr::TryCast(TryCast { expr, data_type }) if !matches!(data_type, DataType::Timestamp(..)) => {
             match rounded(&expr, &expr.get_type(schema)?, &data_type) {
                 Some(source) => Ok(Transformed::yes(Expr::TryCast(TryCast::new(
                     Box::new(source),
@@ -285,6 +298,7 @@ fn check_node(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                 None => Ok(Transformed::no(Expr::TryCast(TryCast { expr, data_type }))),
             }
         }
+        Expr::TryCast(_) | Expr::ScalarFunction(_) => crate::timestamps::check_text_cast(expr, schema),
         other => Ok(Transformed::no(other)),
     }
 }
@@ -319,6 +333,12 @@ fn unchecked_decimal(binary: &DecimalBinary, left: Expr, right: Expr, schema: &D
 
 /// Checked functions → the operators they replace (for SQL sources).
 fn uncheck_node(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
+    let expr = match crate::timestamps::uncheck_text_cast(expr) {
+        done @ Transformed {
+            transformed: true, ..
+        } => return Ok(done),
+        other => other.data,
+    };
     let Expr::ScalarFunction(ScalarFunction { func, mut args }) = expr else {
         return Ok(Transformed::no(expr));
     };
