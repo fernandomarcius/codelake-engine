@@ -1,0 +1,40 @@
+# Catalog queries as dbt and BI tools issue them on every run.
+workload = "metadata"
+
+[[case]]
+id = "meta_schemata"
+reps = 10
+sql = """
+SELECT schema_name FROM {cat}.information_schema.schemata
+WHERE catalog_name = '{cat}' AND schema_name LIKE 'tpch%'
+ORDER BY schema_name
+"""
+
+[[case]]
+id = "meta_tables"
+reps = 10
+sql = """
+SELECT table_name, table_type FROM {cat}.information_schema.tables
+WHERE table_catalog = '{cat}' AND table_schema = '{tpch}'
+ORDER BY table_name
+"""
+
+[[case]]
+id = "meta_columns"
+reps = 10
+sql = """
+SELECT table_name, column_name, ordinal_position FROM {cat}.information_schema.columns
+WHERE table_catalog = '{cat}' AND table_schema = '{tpch}'
+ORDER BY table_name, ordinal_position
+"""
+
+# dbt reads `data_type` to build its relation cache and to cast in snapshots
+# and incremental models: the spelling must match Trino's.
+[[case]]
+id = "meta_column_types"
+reps = 10
+sql = """
+SELECT table_name, column_name, data_type, is_nullable FROM {cat}.information_schema.columns
+WHERE table_catalog = '{cat}' AND table_schema = '{tpch}'
+ORDER BY table_name, ordinal_position
+"""
