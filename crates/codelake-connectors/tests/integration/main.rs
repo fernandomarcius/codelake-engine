@@ -20,6 +20,8 @@ mod hive_acceptance;
 #[cfg(feature = "hive")]
 mod hive_optimize;
 #[cfg(feature = "hive")]
+mod hive_redteam;
+#[cfg(feature = "hive")]
 mod hive_smoke;
 
 #[cfg(feature = "mongodb")]
