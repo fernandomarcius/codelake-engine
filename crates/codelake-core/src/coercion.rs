@@ -52,6 +52,7 @@ use datafusion::sql::sqlparser::ast::{
 };
 
 use crate::overflow::decimal::{MAX_PRECISION, as_decimal};
+use crate::trino_types::Declared;
 
 /// Name of the identity that marks a value of a `VALUES` list.
 const VALUES_CELL: &str = "codelake_values_cell";
@@ -516,8 +517,20 @@ fn retype_values(values: Values) -> Result<Transformed<LogicalPlan>> {
         for ((row, cells), t) in rows.iter_mut().zip(&cells).zip(&types) {
             row.push(cast_if_needed(cells[j].clone(), t, &target));
         }
+        // Text literals only: `varchar(n)`, `n` the longest (Trino).
+        let lengths: Option<Vec<usize>> = cells
+            .iter()
+            .filter(|row| !matches!(&row[j], Expr::Literal(v, _) if v.is_null()))
+            .map(|row| text_literal(&row[j]).map(|s| s.chars().count()))
+            .collect();
+        let metadata = match lengths.and_then(|l| l.into_iter().max()) {
+            Some(longest) if is_text_type(&target) => {
+                Declared::Varchar(u32::try_from(longest).unwrap_or(u32::MAX)).metadata()
+            }
+            _ => field.metadata().clone(),
+        };
         fields.push(Arc::new(
-            Field::new(field.name(), target, true).with_metadata(field.metadata().clone()),
+            Field::new(field.name(), target, true).with_metadata(metadata),
         ));
     }
     let schema = DFSchema::from_unqualified_fields(fields.into(), values.schema.metadata().clone())?;
@@ -525,6 +538,47 @@ fn retype_values(values: Values) -> Result<Transformed<LogicalPlan>> {
         schema: Arc::new(schema),
         values: rows,
     })))
+}
+
+/// The text of a text literal.
+fn text_literal(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Literal(
+            ScalarValue::Utf8(Some(text))
+            | ScalarValue::Utf8View(Some(text))
+            | ScalarValue::LargeUtf8(Some(text)),
+            _,
+        ) => Some(text),
+        _ => None,
+    }
+}
+
+/// A text literal selected as is (`SELECT 'abc'`) is `varchar(3)`, as in
+/// Trino; the type is recorded in the literal's metadata.
+fn typed_text_literal(expr: Expr) -> Expr {
+    let typed = |literal: Expr| -> Expr {
+        match literal {
+            Expr::Literal(value, None) => match text_literal(&Expr::Literal(value.clone(), None)) {
+                Some(text) => {
+                    let length = u32::try_from(text.chars().count()).unwrap_or(u32::MAX);
+                    let metadata = Declared::Varchar(length).metadata().into_iter().collect();
+                    Expr::Literal(
+                        value,
+                        Some(datafusion::common::metadata::FieldMetadata::new(metadata)),
+                    )
+                }
+                None => Expr::Literal(value, None),
+            },
+            other => other,
+        }
+    };
+    match expr {
+        Expr::Alias(mut alias) => {
+            alias.expr = Box::new(typed(*alias.expr));
+            Expr::Alias(alias)
+        }
+        other => typed(other),
+    }
 }
 
 /// The one type of all non-`NULL` values.
@@ -551,7 +605,114 @@ fn unmark(cell: Expr) -> Expr {
 }
 
 /// `UNION`: each input's columns cast to Trino's common type.
+fn is_text_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
+}
+
+/// Trino's common bounded text type: `varchar(max n)` of `varchar(n)`s, the
+/// one `char(n)` they all are, unbounded otherwise.
+fn common_text(declared: &[Option<Declared>]) -> Option<Declared> {
+    let first = (*declared.first()?)?;
+    if declared.iter().all(|d| *d == Some(first)) {
+        return Some(first);
+    }
+    let mut longest = 0;
+    for d in declared {
+        match d {
+            Some(Declared::Varchar(n)) => longest = longest.max(*n),
+            _ => return None,
+        }
+    }
+    Some(Declared::Varchar(longest))
+}
+
+/// The name [`crate::declared::TrinoTyped`] reads (`''`: no declared type).
+fn typed_name(declared: Option<Declared>) -> String {
+    declared.map_or_else(String::new, |d| d.name(&DataType::Utf8))
+}
+
+/// Text columns of a `UNION` declare one type in every input (`SELECT 'a'
+/// UNION ALL SELECT 'bcd'` is `varchar(3)`); `DataFusion` would keep the
+/// last input's.
+fn unify_union_text(union: Union) -> Result<Transformed<Union>> {
+    let columns = union.schema.fields().len();
+    let mut targets: Vec<Option<Option<Declared>>> = Vec::with_capacity(columns);
+    for j in 0..columns {
+        let fields: Vec<&Field> = union
+            .inputs
+            .iter()
+            .map(|i| i.schema().field(j).as_ref())
+            .collect();
+        if !fields.iter().all(|f| is_text_type(f.data_type())) {
+            targets.push(None);
+            continue;
+        }
+        let declared: Vec<Option<Declared>> =
+            fields.iter().map(|f| crate::trino_types::declared(f)).collect();
+        let common = common_text(&declared);
+        targets.push(declared.iter().any(|d| *d != common).then_some(common));
+    }
+    if targets.iter().all(Option::is_none) {
+        return Ok(Transformed::no(union));
+    }
+    let typed = crate::declared::trino_typed();
+    let mut inputs = Vec::with_capacity(union.inputs.len());
+    for input in union.inputs {
+        let exprs: Vec<Expr> = input
+            .schema()
+            .iter()
+            .zip(&targets)
+            .map(|((qualifier, field), target)| {
+                let column = Expr::Column(datafusion::common::Column::from((qualifier, field)));
+                match target {
+                    Some(declared) => typed
+                        .call(vec![
+                            column,
+                            Expr::Literal(ScalarValue::Utf8(Some(typed_name(*declared))), None),
+                        ])
+                        .alias(field.name()),
+                    None => column,
+                }
+            })
+            .collect();
+        inputs.push(Arc::new(LogicalPlan::Projection(
+            datafusion::logical_expr::Projection::try_new(exprs, input)?,
+        )));
+    }
+    let first = Arc::clone(&inputs[0]);
+    let fields: Vec<(Option<datafusion::sql::TableReference>, Arc<Field>)> = union
+        .schema
+        .iter()
+        .zip(first.schema().fields())
+        .map(|((qualifier, field), typed)| {
+            let metadata = typed.metadata().clone();
+            (
+                qualifier.cloned(),
+                Arc::new(field.as_ref().clone().with_metadata(metadata)),
+            )
+        })
+        .collect();
+    let schema = DFSchema::new_with_metadata(fields, union.schema.metadata().clone())?;
+    Ok(Transformed::yes(Union {
+        inputs,
+        schema: Arc::new(schema),
+    }))
+}
+
 fn unify_union(union: Union) -> Result<Transformed<LogicalPlan>> {
+    let text = unify_union_text(union)?;
+    let (union, text_changed) = (text.data, text.transformed);
+    let numeric = unify_union_numbers(union)?;
+    Ok(Transformed::new_transformed(
+        numeric.data,
+        numeric.transformed || text_changed,
+    ))
+}
+
+fn unify_union_numbers(union: Union) -> Result<Transformed<LogicalPlan>> {
     let columns = union.schema.fields().len();
     let mut targets: Vec<Option<DataType>> = Vec::with_capacity(columns);
     for j in 0..columns {
@@ -677,6 +838,7 @@ fn rewrite_expressions(plan: LogicalPlan, session_zone: &str) -> Result<Transfor
     }
     let schema = expression_schema(&plan)?;
     let names = NamePreserver::new(&plan);
+    let projection = matches!(plan, LogicalPlan::Projection(_));
     plan.map_expressions(|expr| {
         let name = names.save(&expr);
         expr.transform_up(|e| {
@@ -694,7 +856,14 @@ fn rewrite_expressions(plan: LogicalPlan, session_zone: &str) -> Result<Transfor
                     || outer.transformed,
             ))
         })
-        .map(|t| t.update_data(|e| name.restore(e)))
+        .map(|t| {
+            t.update_data(|e| {
+                // Before the name is restored: the metadata is part of a
+                // literal's name.
+                let e = if projection { typed_text_literal(e) } else { e };
+                name.restore(e)
+            })
+        })
     })
 }
 

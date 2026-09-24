@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use super::metastore::{ColumnMetadata, FileMetastore, MetastoreError, TableMetadata};
 use super::table::{HiveSink, HiveTable};
-use super::types::{arrow_type, hive_type};
+use super::types::{arrow_type, declared_text, hive_field, hive_field_type, hive_type};
 
 const VIEW_PREFIX: &str = "/* Presto View: ";
 const VIEW_SUFFIX: &str = " */";
@@ -168,9 +168,12 @@ impl TableProvider for HiveView {
         if let Some(schema) = &self.definition.schema {
             defaults.default_schema.clone_from(schema);
         }
-        let plan = view_state
-            .create_logical_plan(&self.definition.original_sql)
-            .await?;
+        // The same statement rewrites as any query the engine plans.
+        let dialect = view_state.config().options().sql_parser.dialect;
+        let mut statement = view_state.sql_to_statement(&self.definition.original_sql, &dialect)?;
+        let zone = view_state.config().options().execution.time_zone.clone();
+        codelake_core::engine::trino_statement(&mut statement, zone.as_deref().unwrap_or("UTC"));
+        let plan = view_state.statement_to_plan(statement).await?;
         let output = plan.schema().clone();
         if output.fields().len() != self.schema.fields().len() {
             return Err(DataFusionError::Plan(format!(
@@ -271,7 +274,13 @@ impl HiveCatalog {
             let fields = definition
                 .columns
                 .iter()
-                .map(|c| Ok(Field::new(&c.name, trino_to_arrow(&c.trino_type)?, true)))
+                .map(|c| {
+                    let field = Field::new(&c.name, trino_to_arrow(&c.trino_type)?, true);
+                    Ok(match declared_text(&c.trino_type) {
+                        Some(declared) => field.with_metadata(declared.metadata()),
+                        None => field,
+                    })
+                })
                 .collect::<Result<Vec<_>>>()?;
             return Ok(Some(Arc::new(HiveView {
                 definition,
@@ -295,7 +304,7 @@ impl HiveCatalog {
         let fields = metadata
             .data_columns
             .iter()
-            .map(|c| Ok(Field::new(&c.name, arrow_type(&c.hive_type)?, true)))
+            .map(|c| hive_field(&c.name, &c.hive_type))
             .collect::<Result<Vec<_>>>()?;
         Ok(HiveTable {
             metastore: self.metastore.clone(),
@@ -390,9 +399,14 @@ pub(crate) fn hive_name(name: &str) -> String {
 }
 
 fn column(name: &str, data_type: &DataType) -> Result<ColumnMetadata> {
+    column_of(&Field::new(name, data_type.clone(), true))
+}
+
+/// The metastore column of a field (its declared `varchar(n)` included).
+fn column_of(field: &Field) -> Result<ColumnMetadata> {
     Ok(ColumnMetadata {
-        name: hive_name(name),
-        hive_type: hive_type(data_type)?,
+        name: hive_name(field.name()),
+        hive_type: hive_field_type(field)?,
         comment: None,
         properties: BTreeMap::new(),
         extra: BTreeMap::new(),
@@ -480,7 +494,7 @@ impl WritableCatalog for HiveCatalog {
             .schema()
             .fields()
             .iter()
-            .map(|f| column(f.name(), f.data_type()))
+            .map(|f| column_of(f))
             .collect::<Result<Vec<_>>>()?;
         let mut names = BTreeSet::new();
         if let Some(twice) = columns.iter().find(|c| !names.insert(c.name.as_str())) {
@@ -602,7 +616,13 @@ impl WritableCatalog for HiveCatalog {
                 .map(|f| {
                     Ok(TrinoViewColumn {
                         name: f.name().clone(),
-                        trino_type: arrow_to_trino(f.data_type())?,
+                        trino_type: match codelake_core::trino_types::declared(f) {
+                            Some(
+                                declared @ (codelake_core::trino_types::Declared::Varchar(_)
+                                | codelake_core::trino_types::Declared::Char(_)),
+                            ) => declared.name(f.data_type()),
+                            _ => arrow_to_trino(f.data_type())?,
+                        },
                         extra: BTreeMap::new(),
                     })
                 })

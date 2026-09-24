@@ -27,12 +27,14 @@ mod testing;
 mod timestamp_casts;
 mod timestamps;
 mod trino_functions;
+mod trino_sql;
 pub mod trino_types;
 
 pub use bytes::ByteSize;
 pub use config::{Config, SourceConfig, SourceKind, TrinoProtocolConfig, ValidatedConfig};
 pub use connector::{BoxError, Connector, ConnectorError, ViewDefinition, ViewSecurity, WritableCatalog};
 pub use ddl::{RelationKind, update_type as ddl_update_type};
+pub use declared::trino_type_syntax;
 pub use engine::{Attach, Engine, EngineError, QueryOptions, SourceStatus};
 pub use runtime::MemoryStats;
 pub use session_properties::{Effect, PropertyRegistry, PropertyType, SessionProperties, SessionProperty};

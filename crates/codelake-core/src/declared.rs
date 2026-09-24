@@ -383,6 +383,129 @@ pub(crate) fn declared_columns(statement: &mut DFStatement) -> Vec<(String, Decl
     declared
 }
 
+/// Trino's type syntax in a `CREATE TABLE` column list, spelled the way the
+/// parser reads it: `array(T)` → `ARRAY<T>`, `row(a T, …)` → `STRUCT<a T,
+/// …>` (`map(K, V)` parses as it is). Any other statement is left alone.
+pub fn trino_type_syntax(sql: &str) -> std::borrow::Cow<'_, str> {
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
+    use datafusion::sql::sqlparser::keywords::Keyword;
+    use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
+    let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize() else {
+        return std::borrow::Cow::Borrowed(sql);
+    };
+    let significant: Vec<usize> = (0..tokens.len())
+        .filter(|i| !matches!(tokens[*i], Token::Whitespace(_)))
+        .collect();
+    let keyword = |k: usize| match significant.get(k).map(|i| &tokens[*i]) {
+        Some(Token::Word(w)) => w.keyword,
+        _ => Keyword::NoKeyword,
+    };
+    // CREATE [OR REPLACE] TABLE [IF NOT EXISTS] name[.name…] (
+    let mut k = 0;
+    if keyword(k) != Keyword::CREATE {
+        return std::borrow::Cow::Borrowed(sql);
+    }
+    k += 1;
+    if keyword(k) == Keyword::OR && keyword(k + 1) == Keyword::REPLACE {
+        k += 2;
+    }
+    if keyword(k) != Keyword::TABLE {
+        return std::borrow::Cow::Borrowed(sql);
+    }
+    k += 1;
+    if keyword(k) == Keyword::IF && keyword(k + 1) == Keyword::NOT && keyword(k + 2) == Keyword::EXISTS {
+        k += 3;
+    }
+    loop {
+        if !matches!(significant.get(k).map(|i| &tokens[*i]), Some(Token::Word(_))) {
+            return std::borrow::Cow::Borrowed(sql);
+        }
+        k += 1;
+        if matches!(significant.get(k).map(|i| &tokens[*i]), Some(Token::Period)) {
+            k += 1;
+        } else {
+            break;
+        }
+    }
+    let Some(&start) = significant.get(k).filter(|i| tokens[**i] == Token::LParen) else {
+        return std::borrow::Cow::Borrowed(sql);
+    };
+    let mut out: Vec<String> = tokens.iter().map(ToString::to_string).collect();
+    let (mut depth, mut angles, mut pending, mut changed) = (0_usize, Vec::new(), false, false);
+    for (position, &i) in significant.iter().enumerate().skip(k) {
+        match &tokens[i] {
+            Token::LParen => {
+                depth += 1;
+                if pending {
+                    out[i] = "<".into();
+                    angles.push(depth);
+                    pending = false;
+                }
+            }
+            Token::RParen => {
+                if angles.last() == Some(&depth) {
+                    out[i] = ">".into();
+                    angles.pop();
+                }
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    break;
+                }
+            }
+            Token::Word(w) if i > start => {
+                let next_is_paren = significant
+                    .get(position + 1)
+                    .is_some_and(|n| tokens[*n] == Token::LParen);
+                let spelled = match w.value.to_ascii_lowercase().as_str() {
+                    "array" if next_is_paren && w.quote_style.is_none() => Some("ARRAY"),
+                    "row" if next_is_paren && w.quote_style.is_none() => Some("STRUCT"),
+                    _ => None,
+                };
+                if let Some(spelled) = spelled {
+                    out[i] = spelled.into();
+                    pending = true;
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if changed {
+        std::borrow::Cow::Owned(out.concat())
+    } else {
+        std::borrow::Cow::Borrowed(sql)
+    }
+}
+
+/// `map(K, V)` and `varbinary` columns of a `CREATE TABLE`, which
+/// `DataFusion` cannot read: `varbinary` becomes `BYTEA` (binary); a map
+/// column becomes `BYTEA` too and is returned with its key and value types,
+/// for the engine to give the new table its Arrow map type.
+pub(crate) fn map_columns(statement: &mut DFStatement) -> Vec<(String, sql::DataType, sql::DataType)> {
+    let DFStatement::Statement(inner) = statement else {
+        return Vec::new();
+    };
+    let SqlStatement::CreateTable(create) = inner.as_mut() else {
+        return Vec::new();
+    };
+    let mut maps = Vec::new();
+    for column in &mut create.columns {
+        match &column.data_type {
+            sql::DataType::Varbinary(_) => column.data_type = sql::DataType::Bytea,
+            sql::DataType::Map(key, value) => {
+                maps.push((
+                    column.name.value.clone(),
+                    key.as_ref().clone(),
+                    value.as_ref().clone(),
+                ));
+                column.data_type = sql::DataType::Bytea;
+            }
+            _ => {}
+        }
+    }
+    maps
+}
+
 /// `schema` with each declared column's type recorded in its metadata.
 pub(crate) fn with_declared(
     schema: &datafusion::arrow::datatypes::Schema,
@@ -489,6 +612,37 @@ mod tests {
         let c3 = Declared::Char(3);
         assert_eq!(bounded(Mode::Cast, "abcdefg", c3, 3).unwrap(), "abc");
         assert_eq!(bounded(Mode::Cast, "a  ", c3, 3).unwrap(), "a");
+    }
+
+    #[test]
+    fn trino_type_names_parse() {
+        assert_eq!(
+            trino_type_syntax(
+                "CREATE TABLE s.t (a array(integer), r row(x integer, y array(varchar)), m map(varchar, bigint))"
+            ),
+            "CREATE TABLE s.t (a ARRAY<integer>, r STRUCT<x integer, y ARRAY<varchar>>, m map(varchar, bigint))"
+        );
+        // Only the column list of a CREATE TABLE.
+        for untouched in [
+            "SELECT row(1, 2), array(1)",
+            "CREATE TABLE t AS SELECT row(1, 2) AS r",
+            "CREATE TABLE t (\"array\" integer)",
+        ] {
+            assert_eq!(trino_type_syntax(untouched), untouched);
+        }
+        let mut create = datafusion::sql::parser::DFParser::parse_sql(
+            "CREATE TABLE t (m map(varchar, bigint), b varbinary, c int)",
+        )
+        .unwrap()
+        .pop_front()
+        .unwrap();
+        let maps = map_columns(&mut create);
+        assert_eq!(maps.len(), 1);
+        assert_eq!(
+            (maps[0].0.as_str(), maps[0].1.to_string(), maps[0].2.to_string()),
+            ("m", "VARCHAR".into(), "BIGINT".into())
+        );
+        assert_eq!(create.to_string(), "CREATE TABLE t (m BYTEA, b BYTEA, c INT)");
     }
 
     #[test]

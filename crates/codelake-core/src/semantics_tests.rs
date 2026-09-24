@@ -371,3 +371,88 @@ async fn bounded_text_types_are_kept_and_enforced() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn relations_describe_themselves_like_trino() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    for statement in [
+        "CREATE SCHEMA datafusion.vw",
+        "CREATE TABLE datafusion.vw.t (id bigint, dc decimal(12,3))",
+        "INSERT INTO datafusion.vw.t VALUES (1, 1.5)",
+        "CREATE VIEW datafusion.vw.v AS SELECT id, dc * 2 AS dc2, avg(dc) OVER () AS a FROM datafusion.vw.t",
+        "CREATE TABLE datafusion.vw.c AS SELECT 1.5 AS x, CAST(1 AS INTEGER) AS y, 'abc' AS z",
+        "CREATE TABLE datafusion.vw.k (arr array(integer), mp map(varchar, bigint), rw row(x integer, y varchar), vb varbinary)",
+    ] {
+        run(&engine, statement).await;
+    }
+    let columns = |table: &str| {
+        format!(
+            "SELECT column_name, is_nullable, data_type FROM datafusion.information_schema.columns \
+             WHERE table_schema = 'vw' AND table_name = '{table}' ORDER BY ordinal_position"
+        )
+    };
+    let text = &["varchar", "varchar", "varchar"];
+    assert_same(
+        &engine,
+        &[
+            (
+                &columns("v"),
+                answer(
+                    text,
+                    &[
+                        &["id", "YES", "bigint"],
+                        &["dc2", "YES", "decimal(22,3)"],
+                        &["a", "YES", "decimal(12,3)"],
+                    ],
+                ),
+            ),
+            (
+                "SELECT * FROM datafusion.vw.v",
+                answer(
+                    &["bigint", "decimal(22,3)", "decimal(12,3)"],
+                    &[&["1", "3.000", "1.500"]],
+                ),
+            ),
+            (
+                "SELECT view_definition FROM datafusion.information_schema.views WHERE table_schema = 'vw'",
+                answer(
+                    &["varchar"],
+                    &[&["SELECT\n  id\n, (dc * 2) dc2\n, avg(dc) OVER () a\nFROM\n  datafusion.vw.t\n"]],
+                ),
+            ),
+            (
+                &columns("c"),
+                answer(
+                    text,
+                    &[
+                        &["x", "YES", "decimal(2,1)"],
+                        &["y", "YES", "integer"],
+                        &["z", "YES", "varchar(3)"],
+                    ],
+                ),
+            ),
+            (
+                &columns("k"),
+                answer(
+                    text,
+                    &[
+                        &["arr", "YES", "array(integer)"],
+                        &["mp", "YES", "map(varchar, bigint)"],
+                        &["rw", "YES", "row(x integer, y varchar)"],
+                        &["vb", "YES", "varbinary"],
+                    ],
+                ),
+            ),
+            (
+                "SELECT 'abc', x FROM (VALUES ('a'), ('bc')) t(x) ORDER BY x",
+                answer(&["varchar(3)", "varchar(2)"], &[&["abc", "a"], &["abc", "bc"]]),
+            ),
+            (
+                "SELECT 'a' AS x UNION ALL SELECT 'bcd'",
+                answer(&["varchar(3)"], &[&["a"], &["bcd"]]),
+            ),
+        ],
+    )
+    .await;
+}

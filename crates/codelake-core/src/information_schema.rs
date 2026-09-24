@@ -19,7 +19,8 @@
 //! - `tables(table_catalog, table_schema, table_name, table_type)`, with
 //!   `BASE TABLE` or `VIEW` (`information_schema`'s own tables are
 //!   `BASE TABLE`, as in Trino);
-//! - `views(table_catalog, table_schema, table_name, view_definition)`;
+//! - `views(table_catalog, table_schema, table_name, view_definition)`, the
+//!   query printed as Trino prints it (`crate::trino_sql`);
 //! - `columns(table_catalog, table_schema, table_name, column_name,
 //!   ordinal_position, column_default, is_nullable, data_type)`, the position
 //!   counted from 1 and the type named as Trino names it
@@ -426,7 +427,9 @@ impl Rows {
                     let Some(provider) = provider.filter(|p| table_type(schema, p.as_ref()) == "VIEW") else {
                         return Ok(());
                     };
-                    let definition = provider.get_table_definition().map_or(NULL_TEXT, text);
+                    let definition = provider
+                        .get_table_definition()
+                        .map_or(NULL_TEXT, |sql| text(&crate::trino_sql::view_definition(sql)));
                     emit(vec![text(catalog), text(schema), text(table), definition])
                 })
                 .await?;

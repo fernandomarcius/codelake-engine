@@ -88,7 +88,7 @@ fn shape(sql: &str) -> Shape {
     if let Some(update_type) = codelake_core::ddl_update_type(sql) {
         return Shape::Ack(update_type);
     }
-    let Ok(mut statements) = DFParser::parse_sql(sql) else {
+    let Ok(mut statements) = DFParser::parse_sql(&codelake_core::trino_type_syntax(sql)) else {
         // The engine reports the parse error.
         return Shape::Rows;
     };
@@ -122,10 +122,14 @@ fn shape(sql: &str) -> Shape {
     }
 }
 
-/// The table of `DESCRIBE <table>` (Trino's columns `Column, Type, Extra, Comment`).
-fn describe_target(sql: &str) -> Option<String> {
+/// The table of `DESCRIBE <table>` or `SHOW COLUMNS FROM <table> [LIKE
+/// 'pattern']` (Trino answers both with `Column, Type, Extra, Comment`), and
+/// the pattern.
+fn describe_target(sql: &str) -> Option<(String, Option<Like>)> {
     use datafusion::sql::parser::{DFParser, Statement as DfStatement};
-    use datafusion::sql::sqlparser::ast::{DescribeAlias, Statement};
+    use datafusion::sql::sqlparser::ast::{
+        DescribeAlias, ShowStatementFilter, ShowStatementFilterPosition, ShowStatementIn, Statement,
+    };
     let mut statements = DFParser::parse_sql(sql).ok()?;
     match statements.pop_front()? {
         DfStatement::Statement(statement) => match *statement {
@@ -134,7 +138,32 @@ fn describe_target(sql: &str) -> Option<String> {
                 hive_format: None,
                 table_name,
                 ..
-            } => Some(table_name.to_string()),
+            } => Some((table_name.to_string(), None)),
+            Statement::ShowColumns {
+                extended: false,
+                full: false,
+                show_options,
+            } => {
+                let Some(ShowStatementIn {
+                    parent_name: Some(table),
+                    ..
+                }) = show_options.show_in
+                else {
+                    return None;
+                };
+                let like = match show_options.filter_position {
+                    None => None,
+                    Some(
+                        ShowStatementFilterPosition::Infix(ShowStatementFilter::Like(pattern))
+                        | ShowStatementFilterPosition::Suffix(ShowStatementFilter::Like(pattern)),
+                    ) => Some(Like {
+                        pattern,
+                        escape: None,
+                    }),
+                    Some(_) => return None,
+                };
+                Some((table.to_string(), like))
+            }
             _ => None,
         },
         _ => None,
@@ -260,7 +289,7 @@ enum Work {
         planned: Option<String>,
     },
     Frame(Box<DataFrame>),
-    Describe(String),
+    Describe(String, Option<Like>),
 }
 
 /// Paging state of one query, behind the query's async mutex.
@@ -934,8 +963,8 @@ fn start(
         Work::Frame(Box::new(
             show_session(&state.engine, &session, like).map_err(|e| QueryError::from(&e))?,
         ))
-    } else if let Some(table) = describe_target(sql) {
-        Work::Describe(table)
+    } else if let Some((table, like)) = describe_target(sql) {
+        Work::Describe(table, like)
     } else {
         Work::Sql {
             planned: rewrite::name_unnamed_columns(sql),
@@ -1032,9 +1061,15 @@ fn show_session(
     engine.context().read_batch(batch)
 }
 
-/// `DESCRIBE <table>` as Trino answers it: `Column, Type, Extra, Comment`, with
-/// Trino type names.
-async fn describe(engine: &Engine, options: &QueryOptions, table: &str) -> Result<DataFrame, QueryError> {
+/// `DESCRIBE <table>` and `SHOW COLUMNS` as Trino answers them: `Column,
+/// Type, Extra, Comment`, with Trino type names and empty `Extra` and
+/// `Comment`.
+async fn describe(
+    engine: &Engine,
+    options: &QueryOptions,
+    table: &str,
+    like: Option<&Like>,
+) -> Result<DataFrame, QueryError> {
     let names = EngineNames(engine);
     let target = engine
         .sql_with(options, &format!("SELECT * FROM {table}"))
@@ -1045,17 +1080,20 @@ async fn describe(engine: &Engine, options: &QueryOptions, table: &str) -> Resul
     let fields = schema.fields();
     let mut column_names = Vec::with_capacity(fields.len());
     let mut type_names = Vec::with_capacity(fields.len());
-    for field in fields {
+    for field in fields
+        .iter()
+        .filter(|f| like.is_none_or(|like| like.matches(f.name())))
+    {
         column_names.push(field.name().clone());
         type_names.push(codelake_core::trino_types::field_display_name(field));
     }
     let schema = Arc::new(Schema::new(vec![
         Field::new("Column", DataType::Utf8, false),
         Field::new("Type", DataType::Utf8, false),
-        Field::new("Extra", DataType::Utf8, true),
-        Field::new("Comment", DataType::Utf8, true),
+        Field::new("Extra", DataType::Utf8, false),
+        Field::new("Comment", DataType::Utf8, false),
     ]));
-    let empty = vec![None::<String>; column_names.len()];
+    let empty = vec![String::new(); column_names.len()];
     let batch = RecordBatch::try_new(
         schema,
         vec![
@@ -1076,7 +1114,7 @@ async fn plan(engine: &Engine, options: &QueryOptions, work: Work) -> Result<Dat
     let names = EngineNames(engine);
     match work {
         Work::Frame(frame) => Ok(*frame),
-        Work::Describe(table) => describe(engine, options, &table).await,
+        Work::Describe(table, like) => describe(engine, options, &table, like.as_ref()).await,
         Work::Sql { sql, planned } => {
             let Some(planned) = planned else {
                 return engine
@@ -1326,9 +1364,18 @@ mod tests {
         assert!(!like.matches("queryXmax_run_time"));
         assert!(show_session_filter("SHOW SESSION LIKE").is_err());
         assert_eq!(
-            describe_target("DESCRIBE system.runtime.queries").as_deref(),
-            Some("system.runtime.queries")
+            describe_target("DESCRIBE system.runtime.queries"),
+            Some(("system.runtime.queries".to_owned(), None))
         );
+        assert_eq!(
+            describe_target("SHOW COLUMNS FROM hive.s.t"),
+            Some(("hive.s.t".to_owned(), None))
+        );
+        let Some((table, Some(like))) = describe_target("SHOW COLUMNS FROM hive.s.t LIKE 'd%'") else {
+            panic!("SHOW COLUMNS … LIKE");
+        };
+        assert_eq!(table, "hive.s.t");
+        assert!(like.matches("dc") && !like.matches("id"));
         assert_eq!(describe_target("DESCRIBE SELECT 1"), None);
         assert_eq!(describe_target("SELECT 1"), None);
     }

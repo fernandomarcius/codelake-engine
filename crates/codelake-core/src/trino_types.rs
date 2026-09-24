@@ -42,7 +42,7 @@ impl Declared {
         let (name, rest) = lower.split_once('(')?;
         let argument: u32 = rest.strip_suffix(')')?.trim().parse().ok()?;
         match name.trim() {
-            "varchar" if (1..=MAX_VARCHAR).contains(&argument) => Some(Self::Varchar(argument)),
+            "varchar" if argument <= MAX_VARCHAR => Some(Self::Varchar(argument)),
             "char" if (1..=65_536).contains(&argument) => Some(Self::Char(argument)),
             "timestamp" if argument <= 12 => Some(Self::Timestamp(u8::try_from(argument).ok()?)),
             _ => None,

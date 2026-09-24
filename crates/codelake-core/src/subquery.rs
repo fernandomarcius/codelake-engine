@@ -142,6 +142,12 @@ fn literal_for(value: ScalarValue) -> Expr {
             binary_literal_expr(&bytes),
             datafusion::arrow::datatypes::DataType::FixedSizeBinary(size),
         ),
+        // A cast keeps the value `bigint`: a bare literal that fits 32 bits
+        // would become `integer` (see `crate::coercion`).
+        ScalarValue::Int64(value) => cast(
+            lit(ScalarValue::Int64(value)),
+            datafusion::arrow::datatypes::DataType::Int64,
+        ),
         other => lit(other),
     }
 }

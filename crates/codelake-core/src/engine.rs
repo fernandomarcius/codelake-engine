@@ -138,15 +138,39 @@ pub fn analyzed_schema(
     Ok(Arc::clone(analyzed.schema()))
 }
 
+/// Column types a `CREATE TABLE` declares beyond what `DataFusion` reads:
+/// `varchar(n)` and friends ([`crate::declared`]), and Arrow types it has no
+/// SQL for (`map(K, V)`).
+#[derive(Debug, Default)]
+struct NewColumns {
+    declared: Vec<(String, crate::trino_types::Declared)>,
+    types: Vec<(String, datafusion::arrow::datatypes::DataType)>,
+}
+
 /// The schema a new table gets from the rows that create it: the types its
 /// `CREATE TABLE` declares (`varchar(10)`, see [`crate::declared`]), and
 /// nullable columns when a query creates it, as in Trino.
 fn table_schema(
     rows: &datafusion::arrow::datatypes::SchemaRef,
-    declared: &[(String, crate::trino_types::Declared)],
+    columns: &NewColumns,
     from_query: bool,
 ) -> datafusion::arrow::datatypes::SchemaRef {
-    let schema = crate::declared::with_declared(rows, declared);
+    let fields: Vec<datafusion::arrow::datatypes::Field> = rows
+        .fields()
+        .iter()
+        .map(|f| {
+            match columns
+                .types
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(f.name()))
+            {
+                Some((_, data_type)) => f.as_ref().clone().with_data_type(data_type.clone()),
+                None => f.as_ref().clone(),
+            }
+        })
+        .collect();
+    let rows = datafusion::arrow::datatypes::Schema::new_with_metadata(fields, rows.metadata().clone());
+    let schema = crate::declared::with_declared(&rows, &columns.declared);
     if !from_query {
         return Arc::new(schema);
     }
@@ -173,6 +197,21 @@ fn with_schema(
         announced,
         stream.map(move |batch| batch.and_then(|b| Ok(b.with_schema(Arc::clone(&schema))?))),
     ))
+}
+
+/// Rewrites a parsed statement so `DataFusion` plans it with Trino's
+/// semantics: `TIMESTAMP` literals and types, numbers with an exponent,
+/// `VALUES` lists, `DECIMAL` without precision, `varchar(n)` and friends (see
+/// the modules `literals`, `coercion` and `declared`). Every statement the
+/// engine plans goes through it, and so must the SQL of a view a connector
+/// plans itself.
+pub fn trino_statement(statement: &mut datafusion::sql::parser::Statement, session_zone: &str) {
+    crate::literals::rewrite_zoned_timestamps(statement);
+    crate::literals::rewrite_exponent_numbers(statement);
+    crate::coercion::mark_values(statement);
+    crate::coercion::default_decimal_precision(statement);
+    crate::declared::rewrite_declared_casts(statement);
+    crate::literals::rewrite_timestamp_types(statement, session_zone);
 }
 
 /// Result of attaching one source at startup.
@@ -308,17 +347,14 @@ impl Engine {
             Some(Rewrite::ViewSecurity { sql, security }) => (std::borrow::Cow::Owned(sql), security),
             None => (std::borrow::Cow::Borrowed(sql), ViewSecurity::default()),
         };
+        let sql = crate::declared::trino_type_syntax(&sql);
         let mut statement = state.sql_to_statement(&sql, &dialect)?;
         let prepared = ddl::prepare(&mut statement, security)?;
         // After `prepare`, which keeps a view's text as written.
-        crate::literals::rewrite_zoned_timestamps(&mut statement);
-        crate::literals::rewrite_exponent_numbers(&mut statement);
-        crate::coercion::mark_values(&mut statement);
-        crate::coercion::default_decimal_precision(&mut statement);
         let declared = crate::declared::declared_columns(&mut statement);
-        crate::declared::rewrite_declared_casts(&mut statement);
+        let maps = crate::declared::map_columns(&mut statement);
         let session_zone = state.config().options().execution.time_zone.clone();
-        crate::literals::rewrite_timestamp_types(&mut statement, session_zone.as_deref().unwrap_or("UTC"));
+        trino_statement(&mut statement, session_zone.as_deref().unwrap_or("UTC"));
         match &prepared {
             Some(Prepared::AddColumn {
                 table,
@@ -335,7 +371,18 @@ impl Engine {
         }
         let plan = state.statement_to_plan(statement).await?;
         if ddl::is_routable(&plan)
-            && let Some(result) = self.route_ddl(ctx, user, &plan, prepared, &declared).await?
+            && let Some(result) = self
+                .route_ddl(
+                    ctx,
+                    user,
+                    &plan,
+                    prepared,
+                    &NewColumns {
+                        declared,
+                        types: Self::map_types(ctx, maps).await?,
+                    },
+                )
+                .await?
         {
             return Ok(result);
         }
@@ -378,7 +425,7 @@ impl Engine {
     async fn create_memory_table(
         ctx: &SessionContext,
         create: &datafusion::logical_expr::CreateMemoryTable,
-        declared: &[(String, crate::trino_types::Declared)],
+        columns: &NewColumns,
     ) -> Result<DataFrame, DataFusionError> {
         use datafusion::datasource::MemTable;
         if create.temporary {
@@ -408,7 +455,7 @@ impl Engine {
         // Columns of `CREATE TABLE AS` are nullable in Trino, whatever the query.
         let from_query = !matches!(input, LogicalPlan::EmptyRelation(_));
         let physical = DataFrame::new(ctx.state(), input).create_physical_plan().await?;
-        let schema = table_schema(&physical.schema(), declared, from_query);
+        let schema = table_schema(&physical.schema(), columns, from_query);
         let batches = datafusion::physical_plan::collect_partitioned(physical, ctx.task_ctx()).await?;
         let rows = batches
             .iter()
@@ -423,6 +470,88 @@ impl Engine {
         }
         ctx.register_table(create.name.clone(), Arc::new(table))?;
         Self::row_count(ctx, rows)
+    }
+
+    /// `CREATE VIEW` in `DataFusion`'s in-memory catalogs, as `DataFusion`
+    /// does it, but with the column types its query has once analyzed (Trino's
+    /// decimal types: `dc * 2` of a `decimal(12,3)` is `decimal(22,3)`, not
+    /// `DataFusion`'s `decimal(33,3)`) and its query as written for
+    /// `information_schema.views`.
+    fn create_memory_view(
+        ctx: &SessionContext,
+        view: &datafusion::logical_expr::CreateView,
+        sql: String,
+    ) -> Result<DataFrame, DataFusionError> {
+        use datafusion::catalog::view::ViewTable;
+        use datafusion::logical_expr::{Cast, Expr, LogicalPlanBuilder};
+        if view.temporary {
+            return Err(DataFusionError::NotImplemented(
+                "Temporary views not supported".into(),
+            ));
+        }
+        let analyzed = analyzed_schema(&ctx.state(), &view.input)?;
+        let input = view.input.as_ref().clone();
+        let columns: Vec<Expr> = input
+            .schema()
+            .iter()
+            .zip(analyzed.fields())
+            .map(|((qualifier, field), typed)| {
+                let column = Expr::Column(datafusion::common::Column::from((qualifier, field)));
+                let column = if field.data_type() == typed.data_type() {
+                    column
+                } else {
+                    Expr::Cast(Cast::new(Box::new(column), typed.data_type().clone()))
+                };
+                column.alias(field.name())
+            })
+            .collect();
+        let plan = LogicalPlanBuilder::from(input).project(columns)?.build()?;
+        let exists = ctx.table_exist(view.name.clone())?;
+        if exists && !view.or_replace {
+            return Err(DataFusionError::Execution(format!(
+                "Table '{}' already exists",
+                view.name
+            )));
+        }
+        if exists {
+            ctx.deregister_table(view.name.clone())?;
+        }
+        ctx.register_table(view.name.clone(), Arc::new(ViewTable::new(plan, Some(sql))))?;
+        Self::empty(ctx)
+    }
+
+    /// The Arrow type of each `map(K, V)` column (see
+    /// [`crate::declared::map_columns`]).
+    async fn map_types(
+        ctx: &SessionContext,
+        maps: Vec<(
+            String,
+            datafusion::sql::sqlparser::ast::DataType,
+            datafusion::sql::sqlparser::ast::DataType,
+        )>,
+    ) -> Result<Vec<(String, datafusion::arrow::datatypes::DataType)>, DataFusionError> {
+        use datafusion::arrow::datatypes::{DataType, Field, Fields};
+        let mut types = Vec::with_capacity(maps.len());
+        for (name, key, value) in maps {
+            let state = ctx.state();
+            let dialect = state.config().options().sql_parser.dialect;
+            let mut probe = state.sql_to_statement(
+                &format!("SELECT CAST(NULL AS {key}) AS k, CAST(NULL AS {value}) AS v"),
+                &dialect,
+            )?;
+            trino_statement(&mut probe, "UTC");
+            let probe = state.statement_to_plan(probe).await?;
+            let entries = Fields::from(vec![
+                Field::new("key", probe.schema().field(0).data_type().clone(), false),
+                Field::new("value", probe.schema().field(1).data_type().clone(), true),
+            ]);
+            let map = DataType::Map(
+                Arc::new(Field::new("entries", DataType::Struct(entries), false)),
+                false,
+            );
+            types.push((name, map));
+        }
+        Ok(types)
     }
 
     async fn add_column(
@@ -559,7 +688,7 @@ impl Engine {
         user: &str,
         plan: &LogicalPlan,
         prepared: Option<Prepared>,
-        declared: &[(String, crate::trino_types::Declared)],
+        columns: &NewColumns,
     ) -> Result<Option<DataFrame>, DataFusionError> {
         let LogicalPlan::Ddl(ddl) = plan else {
             return Ok(None);
@@ -568,7 +697,7 @@ impl Engine {
             DdlStatement::CreateMemoryTable(create) => {
                 let (catalog, schema, table) = Self::resolve(ctx, &create.name);
                 let Some(writable) = self.writable(&catalog) else {
-                    return Self::create_memory_table(ctx, create, declared).await.map(Some);
+                    return Self::create_memory_table(ctx, create, columns).await.map(Some);
                 };
                 if create.or_replace {
                     writable.drop_table(&schema, &table, true).await?;
@@ -578,7 +707,7 @@ impl Engine {
                         .await?;
                 let from_query = !matches!(input, LogicalPlan::EmptyRelation(_));
                 let rows = ctx.execute_logical_plan(input).await?.execute_stream().await?;
-                let announced = table_schema(&rows.schema(), declared, from_query);
+                let announced = table_schema(&rows.schema(), columns, from_query);
                 let rows = with_schema(rows, announced);
                 let written = writable
                     .create_table_as(&schema, &table, create.if_not_exists, user, rows, ctx.task_ctx())
@@ -596,7 +725,10 @@ impl Engine {
             DdlStatement::CreateView(view) => {
                 let (catalog, schema, name) = Self::resolve(ctx, &view.name);
                 let Some(writable) = self.writable(&catalog) else {
-                    return Ok(None);
+                    let Some(Prepared::View { sql, .. }) = prepared else {
+                        return Ok(None);
+                    };
+                    return Self::create_memory_view(ctx, view, sql).map(Some);
                 };
                 let Some(Prepared::View { sql, security }) = prepared else {
                     return Err(DataFusionError::Internal("view SQL was not captured".into()));
