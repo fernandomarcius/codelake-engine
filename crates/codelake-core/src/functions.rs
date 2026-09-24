@@ -21,7 +21,8 @@ pub const VARBINARY_LITERAL: &str = "codelake_varbinary";
 
 /// Decodes an even-length hexadecimal string (either case).
 pub fn decode_hex(hex: &str) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
+    // `from_str_radix` accepts a leading sign: check the digits first.
+    if !hex.len().is_multiple_of(2) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     (0..hex.len())
@@ -139,6 +140,7 @@ mod tests {
         assert_eq!(decode_hex(""), Some(vec![]));
         assert_eq!(decode_hex("0"), None);
         assert_eq!(decode_hex("zz"), None);
+        assert_eq!(decode_hex("+a"), None, "a sign is not a hex digit");
         assert_eq!(encode_hex(&[0, 255, 16]), "00ff10");
     }
 

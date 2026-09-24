@@ -22,7 +22,7 @@ use codelake_core::federation_policy::PushdownPolicy;
 use codelake_core::functions::{VARBINARY_LITERAL, as_binary_literal, binary_literal_expr, decode_hex};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
-use datafusion::common::{DFSchema, ScalarValue};
+use datafusion::common::{DFSchema, ExprSchema, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::expr::{AggregateFunction, Alias};
 use datafusion::logical_expr::{Aggregate, BinaryExpr, Expr, ExprSchemable, JoinType, LogicalPlan, Operator};
@@ -174,6 +174,13 @@ fn is_text(data_type: &DataType) -> bool {
     )
 }
 
+fn is_binary(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView | DataType::FixedSizeBinary(_)
+    )
+}
+
 fn is_integer(data_type: &DataType) -> bool {
     data_type.is_integer()
 }
@@ -184,6 +191,74 @@ fn is_float(data_type: &DataType) -> bool {
 
 fn type_of(expr: &Expr, schema: &DFSchema) -> Option<DataType> {
     expr.get_type(schema).ok()
+}
+
+/// SQL Server type of a column (field metadata written by the catalog).
+fn sql_type_of(expr: &Expr, schema: &DFSchema) -> Option<String> {
+    let Expr::Column(column) = expr else {
+        return None;
+    };
+    let field = schema.field_from_column(column).ok()?;
+    field.metadata().get(super::SQL_TYPE).cloned()
+}
+
+/// Byte width of a fixed-length binary operand: a `binary(n)` column or a
+/// binary literal. `None` for `varbinary` and anything else.
+fn binary_width(expr: &Expr, schema: &DFSchema) -> Option<usize> {
+    if let Some(hex) = as_binary_literal(expr) {
+        return Some(hex.len() / 2);
+    }
+    if let Expr::Literal(ScalarValue::Binary(Some(bytes)), _) = expr {
+        return Some(bytes.len());
+    }
+    let sql = sql_type_of(expr, schema)?;
+    sql.strip_prefix("binary(")?.strip_suffix(')')?.parse().ok()
+}
+
+/// Temporal SQL types whose values the engine truncates (100 ns → µs).
+fn is_truncated_temporal(sql_type: &str) -> bool {
+    sql_type.ends_with("(7)")
+}
+
+/// Whether `left <op> right` (comparison, grouping, join key) gives the same
+/// answer in SQL Server and in the engine.
+fn comparable(left: &Expr, left_schema: &DFSchema, right: &Expr, right_schema: &DFSchema) -> bool {
+    let (Some(lt), Some(rt)) = (type_of(left, left_schema), type_of(right, right_schema)) else {
+        return false;
+    };
+    if is_text(&lt) || is_text(&rt) || lt == DataType::Boolean || rt == DataType::Boolean {
+        // Collation (case, trailing spaces); T-SQL has no boolean comparisons.
+        return false;
+    }
+    if is_binary(&lt) || is_binary(&rt) {
+        // SQL Server pads the shorter operand with zeros: only equal widths agree.
+        return matches!(
+            (binary_width(left, left_schema), binary_width(right, right_schema)),
+            (Some(a), Some(b)) if a == b
+        );
+    }
+    if lt.is_temporal() || rt.is_temporal() {
+        // Same SQL type on both sides, and no precision the engine truncates.
+        return matches!(
+            (sql_type_of(left, left_schema), sql_type_of(right, right_schema)),
+            (Some(a), Some(b)) if a == b && !is_truncated_temporal(&a)
+        );
+    }
+    lt.is_numeric() && rt.is_numeric()
+}
+
+/// Single value usable as a grouping key or `DISTINCT`/`MIN`/`MAX` operand.
+fn groupable(data_type: &DataType, sql_type: Option<&str>) -> bool {
+    if is_text(data_type) || *data_type == DataType::Boolean {
+        return false;
+    }
+    if is_binary(data_type) {
+        return sql_type.is_some_and(|t| t.starts_with("binary("));
+    }
+    if data_type.is_temporal() {
+        return sql_type.is_some_and(|t| !is_truncated_temporal(t));
+    }
+    true
 }
 
 fn safe_literal(value: &ScalarValue) -> bool {
@@ -210,31 +285,62 @@ fn safe_literal(value: &ScalarValue) -> bool {
     }
 }
 
+fn integer_bits(data_type: &DataType) -> Option<u32> {
+    Some(match data_type {
+        DataType::Int8 | DataType::UInt8 => 8,
+        DataType::Int16 | DataType::UInt16 => 16,
+        DataType::Int32 | DataType::UInt32 => 32,
+        DataType::Int64 | DataType::UInt64 => 64,
+        _ => return None,
+    })
+}
+
+/// Only casts that cannot change a value: widening integers, integer to
+/// double, integer to a decimal with room for every digit.
+fn widening_cast(from: &DataType, to: &DataType) -> bool {
+    let Some(bits) = integer_bits(from) else {
+        return false;
+    };
+    let digits: u8 = match bits {
+        8 => 3,
+        16 => 5,
+        32 => 10,
+        _ => 19,
+    };
+    match to {
+        DataType::Float64 => bits <= 32,
+        DataType::Decimal128(p, s) => i16::from(*p) - i16::from(*s) >= i16::from(digits),
+        other => integer_bits(other).is_some_and(|to_bits| to_bits >= bits && other.is_signed_integer()),
+    }
+}
+
 /// Expression whose value SQL Server computes exactly like the engine.
 fn safe_expr(expr: &Expr, schema: &DFSchema) -> bool {
     match expr {
         Expr::Column(_) => true,
         Expr::Literal(value, _) => safe_literal(value),
-        // Binary comparisons are byte-wise on both sides. SQL Server pads the
-        // shorter operand with zeros, the engine treats a prefix as smaller:
-        // they differ only when comparing an all-zero value to a shorter one.
         Expr::ScalarFunction(_) => as_binary_literal(expr).is_some(),
         Expr::Alias(Alias { expr, .. }) => safe_expr(expr, schema),
         Expr::BinaryExpr(binary) => safe_binary(binary, schema),
         Expr::Not(inner) => safe_predicate(inner, schema),
         Expr::IsNull(inner) | Expr::IsNotNull(inner) => safe_expr(inner, schema),
-        Expr::Between(between) => [&*between.expr, &*between.low, &*between.high]
-            .iter()
-            .all(|e| safe_expr(e, schema) && type_of(e, schema).is_some_and(|t| !is_text(&t))),
+        Expr::Between(between) => {
+            [&*between.expr, &*between.low, &*between.high]
+                .iter()
+                .all(|e| safe_expr(e, schema))
+                && comparable(&between.expr, schema, &between.low, schema)
+                && comparable(&between.expr, schema, &between.high, schema)
+        }
         Expr::InList(list) => {
-            type_of(&list.expr, schema).is_some_and(|t| !is_text(&t))
-                && safe_expr(&list.expr, schema)
-                && list.list.iter().all(|e| safe_expr(e, schema))
+            safe_expr(&list.expr, schema)
+                && list
+                    .list
+                    .iter()
+                    .all(|e| safe_expr(e, schema) && comparable(&list.expr, schema, e, schema))
         }
         Expr::Cast(cast) => {
-            let from = type_of(&cast.expr, schema);
             safe_expr(&cast.expr, schema)
-                && from.is_some_and(|f| is_integer(&f) && (cast.data_type.is_numeric()))
+                && type_of(&cast.expr, schema).is_some_and(|from| widening_cast(&from, &cast.data_type))
         }
         _ => false,
     }
@@ -246,17 +352,20 @@ fn safe_binary(binary: &BinaryExpr, schema: &DFSchema) -> bool {
         return false;
     };
     let operands = safe_expr(left, schema) && safe_expr(right, schema);
+    let both_int = is_integer(&lt) && is_integer(&rt);
+    let both_float = is_float(&lt) && is_float(&rt);
     match binary.op {
         Operator::And | Operator::Or => safe_predicate(left, schema) && safe_predicate(right, schema),
         Operator::Eq | Operator::NotEq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
-            operands && !is_text(&lt) && !is_text(&rt) && lt != DataType::Boolean
+            operands && comparable(left, schema, right, schema)
         }
-        Operator::Plus | Operator::Minus | Operator::Multiply => {
-            operands && lt.is_numeric() && rt.is_numeric()
+        // Decimal arithmetic stays local: SQL Server reduces the scale when the
+        // result precision would pass 38; the engine keeps it.
+        Operator::Plus | Operator::Minus | Operator::Multiply | Operator::Divide => {
+            operands && (both_int || both_float)
         }
-        Operator::Divide | Operator::Modulo => {
-            operands && ((is_integer(&lt) && is_integer(&rt)) || (is_float(&lt) && is_float(&rt)))
-        }
+        // T-SQL has no modulo for float.
+        Operator::Modulo => operands && both_int,
         _ => false,
     }
 }
@@ -274,12 +383,27 @@ fn safe_predicate(expr: &Expr, schema: &DFSchema) -> bool {
     }
 }
 
+/// A projected value T-SQL can return: boolean expressions only as plain
+/// `bit` columns.
+fn safe_projection(expr: &Expr, schema: &DFSchema) -> bool {
+    let inner = match expr {
+        Expr::Alias(Alias { expr, .. }) => expr.as_ref(),
+        other => other,
+    };
+    let boolean = type_of(inner, schema).is_some_and(|t| t == DataType::Boolean);
+    safe_expr(inner, schema) && !has_binary_literal(inner) && (!boolean || matches!(inner, Expr::Column(_)))
+}
+
+fn groupable_expr(expr: &Expr, schema: &DFSchema) -> bool {
+    type_of(expr, schema).is_some_and(|t| groupable(&t, sql_type_of(expr, schema).as_deref()))
+}
+
 fn safe_aggregate(aggregate: &Aggregate) -> bool {
     let schema = aggregate.input.schema();
     let groups_ok = aggregate
         .group_expr
         .iter()
-        .all(|e| safe_expr(e, schema) && type_of(e, schema).is_some_and(|t| !is_text(&t)));
+        .all(|e| safe_expr(e, schema) && !has_binary_literal(e) && groupable_expr(e, schema));
     groups_ok
         && aggregate.aggr_expr.iter().all(|expr| {
             let expr = match expr {
@@ -292,23 +416,27 @@ fn safe_aggregate(aggregate: &Aggregate) -> bool {
             if params.filter.is_some() || !params.order_by.is_empty() {
                 return false;
             }
-            let args_ok = params
+            if !params
                 .args
                 .iter()
-                .all(|a| safe_expr(a, schema) && type_of(a, schema).is_some_and(|t| !is_text(&t)));
-            let arg_type = params.args.first().and_then(|a| type_of(a, schema));
-            args_ok
-                && match func.name() {
-                    "count" => true,
-                    "min" | "max" => !params.distinct,
-                    "sum" => {
-                        !params.distinct
-                            && arg_type.is_some_and(|t| {
-                                matches!(t, DataType::Int64 | DataType::Decimal128(..)) || is_float(&t)
-                            })
-                    }
-                    _ => false,
+                .all(|a| safe_expr(a, schema) && !has_binary_literal(a))
+            {
+                return false;
+            }
+            let first = params.args.first();
+            let arg_type = first.and_then(|a| type_of(a, schema));
+            match func.name() {
+                // NULLs are not counted on either side; DISTINCT compares values.
+                "count" => !params.distinct || params.args.iter().all(|a| groupable_expr(a, schema)),
+                "min" | "max" => first.is_some_and(|a| groupable_expr(a, schema)),
+                "sum" => {
+                    !params.distinct
+                        && arg_type.is_some_and(|t| {
+                            matches!(t, DataType::Int64 | DataType::Decimal128(..)) || is_float(&t)
+                        })
                 }
+                _ => false,
+            }
         })
 }
 
@@ -316,10 +444,7 @@ impl PushdownPolicy for SqlServerPolicy {
     fn node_is_pushable(&self, plan: &LogicalPlan) -> bool {
         match plan {
             LogicalPlan::TableScan(scan) => scan.filters.is_empty() && scan.fetch.is_none(),
-            LogicalPlan::Projection(p) => p
-                .expr
-                .iter()
-                .all(|e| safe_expr(e, p.input.schema()) && !has_binary_literal(e)),
+            LogicalPlan::Projection(p) => p.expr.iter().all(|e| safe_projection(e, p.input.schema())),
             LogicalPlan::Filter(f) => safe_predicate(&f.predicate, f.input.schema()),
             LogicalPlan::SubqueryAlias(_) | LogicalPlan::Union(_) => true,
             LogicalPlan::Join(join) => {
@@ -329,26 +454,25 @@ impl PushdownPolicy for SqlServerPolicy {
                 matches!(
                     join.join_type,
                     JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
-                ) && join.on.iter().all(|(l, r)| {
-                    safe_expr(l, left)
-                        && safe_expr(r, right)
-                        && type_of(l, left).is_some_and(|t| !is_text(&t))
-                        && type_of(r, right).is_some_and(|t| !is_text(&t))
-                }) && join.filter.as_ref().is_none_or(|f| safe_predicate(f, schema))
+                ) && join
+                    .on
+                    .iter()
+                    .all(|(l, r)| safe_expr(l, left) && safe_expr(r, right) && comparable(l, left, r, right))
+                    && join.filter.as_ref().is_none_or(|f| safe_predicate(f, schema))
             }
+            // TOP cannot apply to a set operation.
             LogicalPlan::Limit(limit) => {
                 limit.skip.is_none()
+                    && !matches!(limit.input.as_ref(), LogicalPlan::Union(_))
                     && matches!(limit.fetch.as_deref(), Some(Expr::Literal(ScalarValue::Int64(Some(n)), _)) if *n > 0)
             }
-            LogicalPlan::Aggregate(aggregate) => {
-                safe_aggregate(aggregate)
-                    && !aggregate
-                        .group_expr
-                        .iter()
-                        .chain(&aggregate.aggr_expr)
-                        .any(has_binary_literal)
-            }
-            LogicalPlan::Distinct(_) => plan.schema().fields().iter().all(|f| !is_text(f.data_type())),
+            LogicalPlan::Aggregate(aggregate) => safe_aggregate(aggregate),
+            LogicalPlan::Distinct(_) => plan.schema().fields().iter().all(|f| {
+                groupable(
+                    f.data_type(),
+                    f.metadata().get(super::SQL_TYPE).map(String::as_str),
+                )
+            }),
             _ => false,
         }
     }
@@ -361,6 +485,21 @@ impl PushdownPolicy for SqlServerPolicy {
     /// - the optimizer folds `codelake_varbinary('..')` into a binary literal
     ///   the unparser cannot render; predicate literals become the function again.
     fn prepare(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        // List columns explicitly: `SELECT *` would also return columns the
+        // catalog does not expose (unsupported types).
+        let plan = plan
+            .transform_up(|node| {
+                let LogicalPlan::TableScan(scan) = &node else {
+                    return Ok(Transformed::no(node));
+                };
+                if scan.projection.is_some() {
+                    return Ok(Transformed::no(node));
+                }
+                let mut scan = scan.clone();
+                scan.projection = Some((0..scan.source.schema().fields().len()).collect());
+                Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
+            })
+            .data()?;
         let plan = plan
             .transform_up(|node| {
                 let LogicalPlan::Aggregate(aggregate) = &node else {
@@ -574,15 +713,30 @@ mod tests {
         use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
         use datafusion::logical_expr::{LogicalPlanBuilder, col, lit, table_scan};
 
+        fn typed(name: &str, data_type: DataType, sql: &str) -> Field {
+            Field::new(name, data_type, true).with_metadata(std::collections::HashMap::from([(
+                super::super::super::SQL_TYPE.to_owned(),
+                sql.to_owned(),
+            )]))
+        }
+
         fn scan() -> LogicalPlanBuilder {
+            use datafusion::arrow::datatypes::TimeUnit;
+            let ts = DataType::Timestamp(TimeUnit::Microsecond, None);
             let schema = Schema::new(vec![
                 Field::new("id", DataType::Int64, false),
                 Field::new("small", DataType::Int32, true),
                 Field::new("amount", DataType::Decimal128(18, 2), true),
+                typed("valor", DataType::Decimal128(19, 4), "money"),
                 Field::new("ratio", DataType::Float64, true),
                 Field::new("name", DataType::Utf8, true),
-                Field::new("lsn", DataType::Binary, true),
-                Field::new("flag", DataType::Boolean, true),
+                typed("lsn", DataType::Binary, "binary(10)"),
+                typed("vb", DataType::Binary, "varbinary(16)"),
+                typed("flag", DataType::Boolean, "bit"),
+                typed("dt", ts.clone(), "datetime"),
+                typed("dt_b", ts.clone(), "datetime"),
+                typed("dt2", ts.clone(), "datetime2(7)"),
+                typed("dt2_b", ts, "datetime2(7)"),
             ]);
             table_scan(Some("t"), &schema, None).unwrap()
         }
@@ -625,7 +779,7 @@ mod tests {
 
         #[test]
         fn folded_binary_literals_are_pushed_in_predicates_only() {
-            let folded = lit(ScalarValue::Binary(Some(vec![0, 1])));
+            let folded = lit(ScalarValue::Binary(Some(vec![0; 10])));
             assert!(pushable(scan().filter(col("lsn").gt(folded.clone())).unwrap()));
             assert!(!pushable(scan().project(vec![folded.alias("b")]).unwrap()));
         }
@@ -644,7 +798,7 @@ mod tests {
 
         #[test]
         fn binary_watermark_literal_is_pushed() {
-            let watermark = codelake_core::functions::binary_literal_expr(&[0, 1]);
+            let watermark = codelake_core::functions::binary_literal_expr(&[0; 10]);
             assert!(pushable(scan().filter(col("lsn").gt(watermark)).unwrap()));
         }
 
@@ -748,6 +902,102 @@ mod tests {
                     .union(scan().project(vec![col("id")]).unwrap().build().unwrap())
                     .unwrap()
             ));
+        }
+
+        // Findings of the independent F1 audit: each must stay local.
+        #[test]
+        fn audit_money_and_decimal_arithmetic_stay_local() {
+            assert!(!pushable(
+                scan()
+                    .project(vec![(col("valor") / lit(3_i64)).alias("x")])
+                    .unwrap()
+            ));
+            assert!(!pushable(
+                scan()
+                    .project(vec![(col("valor") * col("valor")).alias("x")])
+                    .unwrap()
+            ));
+            assert!(!pushable(
+                scan()
+                    .project(vec![(col("amount") + col("amount")).alias("x")])
+                    .unwrap()
+            ));
+            assert!(pushable(
+                scan()
+                    .filter(col("valor").gt(lit(ScalarValue::Decimal128(Some(10_000), 19, 4))))
+                    .unwrap()
+            ));
+        }
+
+        #[test]
+        fn audit_variable_width_binary_stays_local() {
+            let short = lit(ScalarValue::Binary(Some(vec![1])));
+            assert!(
+                !pushable(scan().filter(col("vb").eq(short.clone())).unwrap()),
+                "0x01 = 0x0100 in SQL Server"
+            );
+            assert!(
+                !pushable(scan().filter(col("lsn").eq(short)).unwrap()),
+                "width 1 vs binary(10)"
+            );
+            assert!(!pushable(
+                scan().aggregate(vec![col("vb")], Vec::<Expr>::new()).unwrap()
+            ));
+            assert!(pushable(
+                scan().aggregate(vec![col("lsn")], Vec::<Expr>::new()).unwrap()
+            ));
+        }
+
+        #[test]
+        fn audit_temporal_comparisons() {
+            assert!(
+                pushable(scan().filter(col("dt").lt(col("dt_b"))).unwrap()),
+                "same SQL type"
+            );
+            assert!(
+                !pushable(scan().filter(col("dt").lt(col("dt2"))).unwrap()),
+                "datetime vs datetime2"
+            );
+            assert!(
+                !pushable(scan().filter(col("dt2").lt(col("dt2_b"))).unwrap()),
+                "100 ns precision"
+            );
+            assert!(!pushable(
+                scan()
+                    .aggregate(Vec::<Expr>::new(), vec![max(col("dt2"))])
+                    .unwrap()
+            ));
+        }
+
+        #[test]
+        fn audit_tsql_rejects_stay_local() {
+            assert!(!pushable(
+                scan()
+                    .project(vec![col("id").gt(lit(1_i64)).alias("alto")])
+                    .unwrap()
+            ));
+            assert!(
+                pushable(scan().project(vec![col("flag")]).unwrap()),
+                "plain bit column"
+            );
+            assert!(!pushable(
+                scan()
+                    .aggregate(Vec::<Expr>::new(), vec![max(col("flag"))])
+                    .unwrap()
+            ));
+            assert!(!pushable(
+                scan()
+                    .project(vec![(col("ratio") % lit(2.0)).alias("x")])
+                    .unwrap()
+            ));
+            let union = scan()
+                .project(vec![col("id")])
+                .unwrap()
+                .union(scan().project(vec![col("id")]).unwrap().build().unwrap())
+                .unwrap()
+                .limit(0, Some(1))
+                .unwrap();
+            assert!(!pushable(union), "TOP cannot apply to UNION");
         }
 
         #[test]

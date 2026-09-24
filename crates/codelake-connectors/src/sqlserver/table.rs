@@ -1,74 +1,157 @@
-//! Remote SQL Server table that renders its columns with their real spelling.
+//! Remote SQL Server table exposed with lower-case column names.
 //!
-//! Columns are exposed to SQL in lower case (Trino's convention), but a database
-//! with a case-sensitive collation rejects `[id]` for a column named `Id`. This
-//! table's AST analyzer maps its own column identifiers back to the real names.
+//! Queries reference columns in lower case (Trino's convention). A database
+//! with a case-sensitive collation rejects `[id]` for a column named `Id`, and
+//! renaming identifiers in the generated SQL is unsafe across aliases and
+//! derived tables. Instead, each reference to this table is replaced by a
+//! derived table that renames its columns once:
+//!
+//! ```sql
+//! FROM (SELECT [Id] AS [id], [Name] AS [name] FROM [dbo].[Customers]) AS [c]
+//! ```
+//!
+//! Every other part of the statement then refers to lower-case names that
+//! exist. SQL Server inlines derived tables, so the plan is unchanged.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::sql::TableReference;
-use datafusion::sql::sqlparser::ast::{Expr, Ident, Statement, VisitMut, VisitorMut};
+use datafusion::sql::sqlparser::ast::{
+    ObjectNamePart, SetExpr, Statement, TableFactor, VisitMut, VisitorMut,
+};
+use datafusion::sql::sqlparser::dialect::MsSqlDialect;
+use datafusion::sql::sqlparser::parser::Parser;
 use datafusion_federation::sql::{AstAnalyzer, RemoteTableRef, SQLTable};
 
 #[derive(Debug)]
 pub(crate) struct SqlServerTable {
     remote: RemoteTableRef,
     schema: SchemaRef,
-    /// lower-case name -> real name.
-    real_names: Arc<HashMap<String, String>>,
+    /// Real schema and table name.
+    real: (String, String),
+    /// lower-case name -> real name, only when at least one differs.
+    renames: Option<Arc<BTreeMap<String, String>>>,
 }
 
 impl SqlServerTable {
+    /// `real_names`: lower-case name -> real name of every exposed column.
+    /// Names must not contain `]` (filtered by the catalog).
     pub(crate) fn new(
-        remote: RemoteTableRef,
+        real_schema: &str,
+        real_table: &str,
         schema: SchemaRef,
-        real_names: HashMap<String, String>,
+        real_names: BTreeMap<String, String>,
     ) -> Self {
+        let needs_renames = real_names.iter().any(|(lower, real)| lower != real);
         Self {
-            remote,
+            remote: RemoteTableRef::from(TableReference::partial(real_schema, real_table)),
             schema,
-            real_names: Arc::new(real_names),
+            real: (real_schema.to_owned(), real_table.to_owned()),
+            renames: needs_renames.then(|| Arc::new(real_names)),
         }
     }
 }
 
-struct RealNames<'a>(&'a HashMap<String, String>);
+struct Renamer<'a> {
+    schema: &'a str,
+    table: &'a str,
+    renames: &'a BTreeMap<String, String>,
+}
 
-impl RealNames<'_> {
-    fn fix(&self, ident: &mut Ident) {
-        if let Some(real) = self.0.get(&ident.value)
-            && *real != ident.value
-        {
-            ident.value.clone_from(real);
-        }
+impl Renamer<'_> {
+    fn is_this_table(&self, factor: &TableFactor) -> bool {
+        let TableFactor::Table { name, .. } = factor else {
+            return false;
+        };
+        let parts: Vec<&str> = name
+            .0
+            .iter()
+            .filter_map(|p| match p {
+                ObjectNamePart::Identifier(ident) => Some(ident.value.as_str()),
+                ObjectNamePart::Function(_) => None,
+            })
+            .collect();
+        parts == [self.schema, self.table]
+    }
+
+    fn derived(&self, alias: &str) -> Result<TableFactor> {
+        let columns: Vec<String> = self
+            .renames
+            .iter()
+            .map(|(lower, real)| format!("[{real}] AS [{lower}]"))
+            .collect();
+        let sql = format!(
+            "SELECT * FROM (SELECT {} FROM [{}].[{}]) AS [{}]",
+            columns.join(", "),
+            self.schema,
+            self.table,
+            alias.replace(']', "]]")
+        );
+        let mut statements = Parser::parse_sql(&MsSqlDialect {}, &sql)
+            .map_err(|e| DataFusionError::Plan(format!("sqlserver: cannot build derived table: {e}")))?;
+        let Some(Statement::Query(query)) = statements.pop() else {
+            return Err(DataFusionError::Plan(
+                "sqlserver: derived table is not a query".into(),
+            ));
+        };
+        let SetExpr::Select(select) = *query.body else {
+            return Err(DataFusionError::Plan(
+                "sqlserver: derived table is not a select".into(),
+            ));
+        };
+        select
+            .from
+            .into_iter()
+            .next()
+            .map(|t| t.relation)
+            .ok_or_else(|| DataFusionError::Plan("sqlserver: derived table without FROM".into()))
     }
 }
 
-impl VisitorMut for RealNames<'_> {
-    type Break = ();
+impl VisitorMut for Renamer<'_> {
+    type Break = DataFusionError;
 
-    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
-        match expr {
-            Expr::Identifier(ident) => self.fix(ident),
-            Expr::CompoundIdentifier(parts) => {
-                if let Some(column) = parts.last_mut() {
-                    self.fix(column);
-                }
+    // Post-visit: the replacement is not visited again, so it is not re-wrapped.
+    fn post_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<Self::Break> {
+        if !self.is_this_table(factor) {
+            return ControlFlow::Continue(());
+        }
+        let alias = match factor {
+            TableFactor::Table {
+                alias: Some(alias), ..
+            } => alias.name.value.clone(),
+            _ => self.table.to_owned(),
+        };
+        match self.derived(&alias) {
+            Ok(derived) => {
+                *factor = derived;
+                ControlFlow::Continue(())
             }
-            _ => {}
+            Err(err) => ControlFlow::Break(err),
         }
-        ControlFlow::Continue(())
     }
 }
 
-/// Renames column identifiers of this table to their real spelling.
-pub(crate) fn restore_names(mut statement: Statement, real_names: &HashMap<String, String>) -> Statement {
-    let _ = statement.visit(&mut RealNames(real_names));
-    statement
+/// Replaces references to `schema.table` by the renaming derived table.
+pub(crate) fn expose_lower_case(
+    mut statement: Statement,
+    real: &(String, String),
+    renames: &BTreeMap<String, String>,
+) -> Result<Statement> {
+    let mut visitor = Renamer {
+        schema: &real.0,
+        table: &real.1,
+        renames,
+    };
+    match statement.visit(&mut visitor) {
+        ControlFlow::Continue(()) => Ok(statement),
+        ControlFlow::Break(err) => Err(err),
+    }
 }
 
 impl SQLTable for SqlServerTable {
@@ -85,33 +168,58 @@ impl SQLTable for SqlServerTable {
     }
 
     fn ast_analyzer(&self) -> Option<AstAnalyzer> {
-        let names = Arc::clone(&self.real_names);
-        Some(Box::new(move |statement| Ok(restore_names(statement, &names))))
+        let renames = Arc::clone(self.renames.as_ref()?);
+        let real = self.real.clone();
+        Some(Box::new(move |statement| {
+            expose_lower_case(statement, &real, &renames)
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::sql::sqlparser::dialect::MsSqlDialect;
-    use datafusion::sql::sqlparser::parser::Parser;
+
+    fn rewrite(sql: &str) -> String {
+        let renames = BTreeMap::from([
+            ("id".to_owned(), "Id".to_owned()),
+            ("saldo".to_owned(), "Saldo".to_owned()),
+        ]);
+        let statement = Parser::parse_sql(&MsSqlDialect {}, sql).unwrap().remove(0);
+        let out = expose_lower_case(statement, &("dbo".into(), "Parceiros".into()), &renames)
+            .unwrap()
+            .to_string();
+        Parser::parse_sql(&MsSqlDialect {}, &out).unwrap();
+        out
+    }
 
     #[test]
-    fn restores_real_spelling_of_bare_and_qualified_columns() {
-        let names = HashMap::from([
-            ("id".to_owned(), "Id".to_owned()),
-            ("__$start_lsn".to_owned(), "__$start_lsn".to_owned()),
-        ]);
-        let statement = Parser::parse_sql(
-            &MsSqlDialect {},
-            "SELECT [c].[id], [__$start_lsn], [other] FROM [dbo].[Contratos] AS [c] WHERE [id] > 1",
-        )
-        .unwrap()
-        .remove(0);
-        let out = restore_names(statement, &names).to_string();
+    fn aliased_and_unaliased_references_are_wrapped() {
         assert_eq!(
-            out,
-            "SELECT [c].[Id], [__$start_lsn], [other] FROM [dbo].[Contratos] AS [c] WHERE [Id] > 1"
+            rewrite("SELECT [c].[id] FROM [dbo].[Parceiros] AS [c] WHERE [c].[saldo] >= 200"),
+            "SELECT [c].[id] FROM (SELECT [Id] AS [id], [Saldo] AS [saldo] FROM [dbo].[Parceiros]) AS [c] \
+             WHERE [c].[saldo] >= 200"
+        );
+        assert_eq!(
+            rewrite("SELECT [Parceiros].[id] FROM [dbo].[Parceiros]"),
+            "SELECT [Parceiros].[id] FROM (SELECT [Id] AS [id], [Saldo] AS [saldo] FROM [dbo].[Parceiros]) AS [Parceiros]"
+        );
+    }
+
+    #[test]
+    fn other_tables_and_nested_queries() {
+        let out = rewrite(
+            "SELECT [x].[id] FROM (SELECT [p].[id] FROM [dbo].[Parceiros] AS [p] JOIN [dbo].[Outra] AS [o] ON [o].[id] = [p].[id]) AS [x]",
+        );
+        assert!(
+            out.contains("FROM (SELECT [Id] AS [id], [Saldo] AS [saldo] FROM [dbo].[Parceiros]) AS [p]"),
+            "{out}"
+        );
+        assert!(out.contains("JOIN [dbo].[Outra] AS [o]"), "{out}");
+        assert_eq!(
+            out.matches("FROM [dbo].[Parceiros]").count(),
+            1,
+            "wrapped exactly once: {out}"
         );
     }
 }

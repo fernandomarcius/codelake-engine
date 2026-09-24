@@ -7,7 +7,9 @@
 //!   the 7th fractional digit of `datetime2(7)` is truncated.
 //! - `datetimeoffset` is converted to UTC.
 //! - `uniqueidentifier` is rendered upper-case, like `CAST(x AS varchar)`.
-//! - `money`/`smallmoney` arrive as floating point from TDS and map to `Float64`.
+//! - `money`/`smallmoney` map to `Decimal128(19,4)`/`(10,4)`. TDS decodes them
+//!   to `f64`; values are converted back exactly and rejected beyond 2^53
+//!   ten-thousandths, where `f64` has already lost digits.
 //! - Unsupported types (`sql_variant`, `geography`, `hierarchyid`, …) are not
 //!   exposed, which is also Trino's default.
 //!
@@ -43,7 +45,9 @@ pub(crate) fn arrow_type(data_type: &str, precision: Option<u8>, scale: Option<i
         "int" => DataType::Int32,
         "bigint" => DataType::Int64,
         "real" => DataType::Float32,
-        "float" | "money" | "smallmoney" => DataType::Float64,
+        "float" => DataType::Float64,
+        "money" => DataType::Decimal128(19, 4),
+        "smallmoney" => DataType::Decimal128(10, 4),
         "decimal" | "numeric" => DataType::Decimal128(precision.unwrap_or(18), scale.unwrap_or(0)),
         "char" | "varchar" | "nchar" | "nvarchar" | "text" | "ntext" | "xml" | "uniqueidentifier" => {
             DataType::Utf8
@@ -120,6 +124,20 @@ fn integer(value: &ColumnData<'_>) -> Option<i64> {
         ColumnData::I64(Some(v)) => Some(*v),
         _ => None,
     }
+}
+
+/// Largest magnitude an `f64` holds exactly: beyond it TDS money has lost digits.
+const F64_EXACT: f64 = 9_007_199_254_740_992.0;
+
+/// `f64` → decimal at `scale`, only when the conversion is exact.
+fn exact_decimal(value: f64, scale: i8) -> Option<i128> {
+    let scaled = value * 10_f64.powi(i32::from(scale));
+    let rounded = scaled.round();
+    if !rounded.is_finite() || rounded.abs() >= F64_EXACT || (scaled - rounded).abs() > 1e-6 {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, reason = "bounded by F64_EXACT above")]
+    Some(rounded as i128)
 }
 
 pub(crate) fn date_days(date: Date) -> i32 {
@@ -271,6 +289,9 @@ impl Column {
             (Self::Decimal(b, _, scale), ColumnData::Numeric(Some(n))) => {
                 b.append_value(rescale(*n, *scale)?);
             }
+            (Self::Decimal(b, _, scale), ColumnData::F64(Some(v))) => {
+                b.append_value(exact_decimal(*v, *scale)?);
+            }
             (Self::Decimal(b, _, scale), v) => {
                 let factor = 10_i128.checked_pow(u32::try_from(*scale).ok()?)?;
                 b.append_value(i128::from(integer(v)?).checked_mul(factor)?);
@@ -412,7 +433,8 @@ mod tests {
             ("bigint", DataType::Int64),
             ("real", DataType::Float32),
             ("float", DataType::Float64),
-            ("money", DataType::Float64),
+            ("money", DataType::Decimal128(19, 4)),
+            ("smallmoney", DataType::Decimal128(10, 4)),
             ("nvarchar", DataType::Utf8),
             ("uniqueidentifier", DataType::Utf8),
             ("varbinary", DataType::Binary),
@@ -459,6 +481,19 @@ mod tests {
             smalldatetime_micros(SmallDateTime::new(25_567, 90)),
             5_400_000_000
         );
+    }
+
+    #[test]
+    fn money_converts_exactly_or_fails() {
+        assert_eq!(exact_decimal(1.2345, 4), Some(12_345));
+        assert_eq!(exact_decimal(-922_337.580_7, 4), Some(-9_223_375_807));
+        assert_eq!(exact_decimal(1.23456, 4), None, "a fifth decimal is not money");
+        assert_eq!(
+            exact_decimal(922_337_203_685_477.5, 4),
+            None,
+            "f64 already lost digits"
+        );
+        assert_eq!(exact_decimal(f64::NAN, 4), None);
     }
 
     #[test]

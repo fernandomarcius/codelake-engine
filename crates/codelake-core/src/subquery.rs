@@ -19,7 +19,7 @@
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DataFusionError, ScalarValue};
 use datafusion::error::Result;
-use datafusion::logical_expr::{Expr, LogicalPlan, Subquery, cast, lit};
+use datafusion::logical_expr::{Expr, LogicalPlan, Subquery, Volatility, cast, lit};
 use datafusion::prelude::SessionContext;
 
 use crate::functions::binary_literal_expr;
@@ -35,6 +35,26 @@ fn predicates(plan: &LogicalPlan) -> Vec<&Expr> {
     }
 }
 
+/// A subquery calling `now()`, `random()` or any non-immutable function would
+/// see a different value when evaluated separately from the main query.
+fn is_deterministic(plan: &LogicalPlan) -> bool {
+    let mut deterministic = true;
+    let _ = plan.apply_with_subqueries(|node| {
+        node.apply_expressions(|expr| {
+            expr.apply(|e| {
+                if let Expr::ScalarFunction(f) = e
+                    && f.func.signature().volatility != Volatility::Immutable
+                {
+                    deterministic = false;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })
+    });
+    deterministic
+}
+
 /// First uncorrelated scalar subquery found in a predicate of `plan`.
 fn find(plan: &LogicalPlan) -> Result<Option<Subquery>> {
     let mut found = None;
@@ -43,6 +63,7 @@ fn find(plan: &LogicalPlan) -> Result<Option<Subquery>> {
             predicate.apply(|expr| {
                 if let Expr::ScalarSubquery(subquery) = expr
                     && subquery.outer_ref_columns.is_empty()
+                    && is_deterministic(&subquery.subquery)
                 {
                     found = Some(subquery.clone());
                     return Ok(TreeNodeRecursion::Stop);
@@ -228,6 +249,22 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("more than one row"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn non_deterministic_subqueries_are_left_alone() {
+        let ctx = ctx().await;
+        let plan = prepared(
+            &ctx,
+            "SELECT column1 FROM src WHERE column1 > (SELECT max(column2) FROM wm WHERE now() IS NOT NULL)",
+        )
+        .await
+        .unwrap();
+        assert!(
+            plan.display_indent().to_string().contains("Subquery"),
+            "{}",
+            plan.display_indent()
+        );
     }
 
     #[tokio::test]

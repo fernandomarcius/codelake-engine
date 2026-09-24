@@ -55,13 +55,24 @@ fn external(err: impl std::error::Error + Send + Sync + 'static) -> DataFusionEr
     DataFusionError::External(Box::new(err))
 }
 
-async fn run(
-    pool: Pool,
-    sql: String,
-    schema: SchemaRef,
-    batch_size: usize,
-    tx: mpsc::Sender<Result<datafusion::arrow::array::RecordBatch>>,
-) -> Result<()> {
+/// Refuses anything but a single `SELECT`: generated SQL must never carry a
+/// second statement, whatever identifiers or aliases went into it.
+pub(crate) fn validate(sql: &str) -> Result<()> {
+    use datafusion::sql::sqlparser::ast::Statement as Ast;
+    use datafusion::sql::sqlparser::dialect::MsSqlDialect;
+    use datafusion::sql::sqlparser::parser::Parser;
+    let statements = Parser::parse_sql(&MsSqlDialect {}, sql).map_err(|e| {
+        DataFusionError::Plan(format!("sqlserver: generated SQL does not parse ({e}): {sql}"))
+    })?;
+    match statements.as_slice() {
+        [Ast::Query(_)] => Ok(()),
+        _ => Err(DataFusionError::Plan(format!(
+            "sqlserver: generated SQL must be exactly one query: {sql}"
+        ))),
+    }
+}
+
+async fn run(pool: Pool, sql: String, schema: SchemaRef, batch_size: usize, tx: &Sender) -> Result<()> {
     let mut conn = pool
         .get_owned()
         .await
@@ -69,20 +80,33 @@ async fn run(
     conn.poisoned = true;
     let mut builder = BatchBuilder::new(schema, batch_size)?;
     {
-        let mut rows = conn
-            .client
-            .simple_query(sql.as_str())
-            .await
-            .map_err(external)?
-            .into_row_stream();
-        while let Some(row) = rows.try_next().await.map_err(external)? {
-            // Consumer gone (query cancelled or LIMIT satisfied): the connection
-            // keeps `poisoned` and is discarded by the pool.
-            if let Some(batch) = builder.push(row)?
-                && tx.send(Ok(batch)).await.is_err()
-            {
-                return Ok(());
+        let query = async {
+            let mut rows = conn
+                .client
+                .simple_query(sql.as_str())
+                .await
+                .map_err(external)?
+                .into_row_stream();
+            while let Some(row) = rows.try_next().await.map_err(external)? {
+                // Consumer gone (query cancelled or LIMIT satisfied): stop; the
+                // connection keeps `poisoned` and is discarded by the pool.
+                if let Some(batch) = builder.push(row)?
+                    && tx.send(Ok(batch)).await.is_err()
+                {
+                    return Ok(false);
+                }
             }
+            Ok::<bool, DataFusionError>(true)
+        };
+        // A slow remote aggregate sends nothing for a long time: notice the
+        // cancellation while waiting instead of at the next batch.
+        tokio::select! {
+            finished = query => {
+                if !finished? {
+                    return Ok(());
+                }
+            }
+            () = tx.closed() => return Ok(()),
         }
     }
     conn.poisoned = false;
@@ -90,6 +114,42 @@ async fn run(
         let _ = tx.send(Ok(batch)).await;
     }
     Ok(())
+}
+
+type Sender = mpsc::Sender<Result<datafusion::arrow::array::RecordBatch>>;
+
+/// Starts the remote query when the stream is first polled. A hash join
+/// creates its probe-side stream before the build side finishes; taking a
+/// pooled connection that early could exhaust the pool while waiting.
+fn lazy_stream(
+    pool: Pool,
+    sql: String,
+    schema: SchemaRef,
+    batch_size: usize,
+) -> impl futures::Stream<Item = Result<datafusion::arrow::array::RecordBatch>> {
+    futures::stream::once(async move {
+        let (tx, rx) = mpsc::channel(IN_FLIGHT_BATCHES);
+        let worker = tokio::spawn({
+            let tx = tx.clone();
+            async move { run(pool, sql, schema, batch_size, &tx).await }
+        });
+        // Supervisor: an error or a panic in the worker must reach the
+        // consumer, never look like a clean end of stream.
+        tokio::spawn(async move {
+            let failure = match worker.await {
+                Ok(Ok(())) => None,
+                Ok(Err(err)) => Some(err),
+                Err(join) => Some(DataFusionError::Execution(format!(
+                    "sqlserver reader failed: {join}"
+                ))),
+            };
+            if let Some(err) = failure {
+                let _ = tx.send(Err(err)).await;
+            }
+        });
+        futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) })
+    })
+    .flatten()
 }
 
 #[async_trait]
@@ -123,20 +183,14 @@ impl SQLExecutor for SqlServerExecutor {
         schema: SchemaRef,
         _filters: &[Arc<dyn PhysicalExpr>],
     ) -> Result<SendableRecordBatchStream> {
-        let (tx, rx) = mpsc::channel(IN_FLIGHT_BATCHES);
-        let pool = self.pool.clone();
-        let sql = query.to_owned();
-        let task_schema = Arc::clone(&schema);
-        let batch_size = self.batch_size;
-        tracing::debug!(context = %self.context, sql = %sql, "sqlserver query");
-        tokio::spawn(async move {
-            let failure = tx.clone();
-            if let Err(err) = run(pool, sql, task_schema, batch_size, tx).await {
-                let _ = failure.send(Err(err)).await;
-            }
-        });
-        let stream =
-            futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
+        validate(query)?;
+        tracing::debug!(context = %self.context, sql = %query, "sqlserver query");
+        let stream = lazy_stream(
+            self.pool.clone(),
+            query.to_owned(),
+            Arc::clone(&schema),
+            self.batch_size,
+        );
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed())))
     }
 
@@ -150,5 +204,18 @@ impl SQLExecutor for SqlServerExecutor {
         Err(DataFusionError::NotImplemented(format!(
             "sqlserver: schema of {table_name} is resolved by the catalog"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate;
+
+    #[test]
+    fn only_single_queries_are_sent() {
+        assert!(validate("SELECT [a] FROM [dbo].[t] WHERE [a] > 1").is_ok());
+        assert!(validate("SELECT [a] FROM [dbo].[t]; DROP TABLE [dbo].[t]").is_err());
+        assert!(validate("SELECT [x]; DROP TABLE t;--] FROM [dbo].[t]").is_err());
+        assert!(validate("DELETE FROM [dbo].[t]").is_err());
     }
 }

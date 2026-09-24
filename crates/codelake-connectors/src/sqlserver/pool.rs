@@ -10,6 +10,10 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 pub(crate) type Pool = bb8::Pool<Manager>;
 
+const SESSION_OPTIONS: &str = "SET ANSI_NULLS ON; SET ANSI_WARNINGS ON; SET ARITHABORT ON; \
+    SET CONCAT_NULL_YIELDS_NULL ON; SET QUOTED_IDENTIFIER ON; SET ANSI_PADDING ON; \
+    SET NUMERIC_ROUNDABORT OFF";
+
 #[derive(Debug)]
 pub(crate) struct Manager {
     config: Config,
@@ -35,7 +39,10 @@ impl bb8::ManageConnection for Manager {
     async fn connect(&self) -> Result<Connection, Self::Error> {
         let tcp = TcpStream::connect(self.config.get_addr()).await?;
         tcp.set_nodelay(true)?;
-        let client = Client::connect(self.config.clone(), tcp.compat_write()).await?;
+        let mut client = Client::connect(self.config.clone(), tcp.compat_write()).await?;
+        // Pushed-down SQL relies on standard NULL, overflow and concatenation
+        // semantics; do not inherit whatever the login defaults are.
+        client.simple_query(SESSION_OPTIONS).await?.into_results().await?;
         Ok(Connection {
             client,
             poisoned: false,

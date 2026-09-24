@@ -23,9 +23,8 @@ use codelake_core::{BoxError, Connector, ConnectorError};
 use datafusion::arrow::datatypes::{Field, Schema};
 use datafusion::catalog::{CatalogProvider, TableProvider};
 use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::sql::TableReference;
 use datafusion_federation::FederatedTableProviderAdaptor;
-use datafusion_federation::sql::{RemoteTableRef, SQLFederationProvider, SQLTableSource};
+use datafusion_federation::sql::{SQLFederationProvider, SQLTableSource};
 use secrecy::{ExposeSecret, SecretString};
 use tiberius::{AuthMethod, Config, EncryptionLevel, Query};
 use tokio::sync::OnceCell;
@@ -41,9 +40,37 @@ const LIST_TABLES: &str = "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHE
      WHERE TABLE_SCHEMA NOT IN ('sys', 'INFORMATION_SCHEMA') \
      AND TABLE_TYPE IN ('BASE TABLE', 'VIEW')";
 
-const LIST_COLUMNS: &str = "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE \
+const LIST_COLUMNS: &str = "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, \
+     CHARACTER_MAXIMUM_LENGTH, DATETIME_PRECISION \
      FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = @P1 AND TABLE_NAME = @P2 \
      ORDER BY ORDINAL_POSITION";
+
+/// Field metadata key holding the column's SQL Server type, e.g. `binary(10)`
+/// or `datetime2(7)`. The pushdown policy relies on it.
+pub(crate) const SQL_TYPE: &str = "sqlserver.type";
+
+/// SQL Server type as written in DDL, from `INFORMATION_SCHEMA.COLUMNS`.
+fn sql_type(data_type: &str, max_length: Option<i32>, datetime_precision: Option<i16>) -> String {
+    let base = data_type.to_ascii_lowercase();
+    match base.as_str() {
+        "binary" | "varbinary" | "char" | "varchar" | "nchar" | "nvarchar" => match max_length {
+            Some(-1) => format!("{base}(max)"),
+            Some(n) => format!("{base}({n})"),
+            None => base,
+        },
+        "datetime2" | "datetimeoffset" | "time" => match datetime_precision {
+            Some(p) => format!("{base}({p})"),
+            None => base,
+        },
+        _ => base,
+    }
+}
+
+/// Object names are rendered in `[...]`; `]` would end the quote. Such names
+/// are not exposed instead of being escaped at every use site.
+fn safe_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(']')
+}
 
 #[derive(Debug, Clone)]
 pub struct SqlServerParams {
@@ -110,6 +137,12 @@ impl fmt::Debug for SqlServerConnector {
 
 impl SqlServerConnector {
     pub fn new(name: String, params: SqlServerParams) -> Self {
+        if params.encrypt == "off" {
+            tracing::warn!(source = %name, "encrypt = off: credentials and data travel in clear text");
+        }
+        if params.trust_server_certificate {
+            tracing::warn!(source = %name, "trust_server_certificate = true: server identity is not verified");
+        }
         Self {
             name,
             params,
@@ -160,6 +193,10 @@ impl SqlServerConnector {
         for row in rows {
             let schema: &str = row.get(0).unwrap_or_default();
             let table: &str = row.get(1).unwrap_or_default();
+            if !safe_name(schema) || !safe_name(table) {
+                tracing::warn!(source = %self.name, %schema, %table, "name contains `]`; not exposed");
+                continue;
+            }
             seen.entry((schema.to_lowercase(), table.to_lowercase()))
                 .or_default()
                 .push((schema.to_owned(), table.to_owned()));
@@ -196,8 +233,9 @@ fn metadata_error(source: &str, cause: impl fmt::Display) -> DataFusionError {
 }
 
 impl SqlServerResolver {
-    /// Arrow schema (lower-case names) and the real spelling of each column.
-    async fn schema_of(&self, schema: &str, table: &str) -> DfResult<(Schema, HashMap<String, String>)> {
+    /// Arrow schema (lower-case names, SQL type in field metadata) and the real
+    /// spelling of each exposed column.
+    async fn schema_of(&self, schema: &str, table: &str) -> DfResult<(Schema, BTreeMap<String, String>)> {
         let mut conn = self
             .pool
             .get()
@@ -213,23 +251,41 @@ impl SqlServerResolver {
             .into_first_result()
             .await
             .map_err(|e| metadata_error(&self.source, e))?;
-        let mut fields = Vec::with_capacity(rows.len());
-        let mut real_names = HashMap::with_capacity(rows.len());
+        let mut by_lower: BTreeMap<String, Vec<Field>> = BTreeMap::new();
+        let mut real_names = BTreeMap::new();
         for row in rows {
             let column: &str = row.get(0).unwrap_or_default();
             let data_type: &str = row.get(1).unwrap_or_default();
             let precision: Option<u8> = row.get(2);
-            let scale: Option<i32> = row.get(3);
+            let scale = row.get::<i32, _>(3).and_then(|s| i8::try_from(s).ok());
             let nullable = row.get::<&str, _>(4) != Some("NO");
-            let scale = scale.and_then(|s| i8::try_from(s).ok());
-            if let Some(arrow) = types::arrow_type(data_type, precision, scale) {
-                fields.push(Field::new(column.to_lowercase(), arrow, nullable));
-                real_names.insert(column.to_lowercase(), column.to_owned());
-            } else {
+            let max_length: Option<i32> = row.get(5);
+            let datetime_precision: Option<i16> = row.get(6);
+            if !safe_name(column) {
+                tracing::warn!(source = %self.source, %schema, %table, %column, "name contains `]`; column not exposed");
+                continue;
+            }
+            let Some(arrow) = types::arrow_type(data_type, precision, scale) else {
                 tracing::warn!(
                     source = %self.source, %schema, %table, %column, %data_type,
                     "unsupported column type; column not exposed"
                 );
+                continue;
+            };
+            let field = Field::new(column.to_lowercase(), arrow, nullable).with_metadata(HashMap::from([(
+                SQL_TYPE.to_owned(),
+                sql_type(data_type, max_length, datetime_precision),
+            )]));
+            by_lower.entry(column.to_lowercase()).or_default().push(field);
+            real_names.insert(column.to_lowercase(), column.to_owned());
+        }
+        let mut fields = Vec::with_capacity(by_lower.len());
+        for (lower, mut same) in by_lower {
+            if same.len() == 1 {
+                fields.extend(same.pop());
+            } else {
+                real_names.remove(&lower);
+                tracing::warn!(source = %self.source, %schema, %table, column = %lower, "columns differ only by case; not exposed");
             }
         }
         Ok((Schema::new(fields), real_names))
@@ -244,8 +300,7 @@ impl TableResolver for SqlServerResolver {
             return Ok(None);
         };
         let (arrow_schema, real_names) = self.schema_of(real_schema, real_table).await?;
-        let remote = RemoteTableRef::from(TableReference::partial(real_schema.as_str(), real_table.as_str()));
-        let table = SqlServerTable::new(remote, Arc::new(arrow_schema), real_names);
+        let table = SqlServerTable::new(real_schema, real_table, Arc::new(arrow_schema), real_names);
         let source = SQLTableSource::new_with_table(Arc::clone(&self.provider), Arc::new(table));
         Ok(Some(Arc::new(FederatedTableProviderAdaptor::new(Arc::new(
             source,
@@ -328,6 +383,21 @@ mod tests {
     #[test]
     fn config_carries_address() {
         assert_eq!(params().tiberius_config().get_addr(), "erp.internal:1433");
+    }
+
+    #[test]
+    fn sql_types_carry_length_and_precision() {
+        assert_eq!(sql_type("binary", Some(10), None), "binary(10)");
+        assert_eq!(sql_type("VARBINARY", Some(-1), None), "varbinary(max)");
+        assert_eq!(sql_type("datetime2", None, Some(7)), "datetime2(7)");
+        assert_eq!(sql_type("int", None, None), "int");
+    }
+
+    #[test]
+    fn bracket_in_names_is_refused() {
+        assert!(safe_name("Contratos"));
+        assert!(!safe_name("x]; DROP TABLE t;--"));
+        assert!(!safe_name(""));
     }
 
     #[test]
