@@ -53,6 +53,9 @@ base64 = "0.22"
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
 chrono-tz = "0.10.4"
 regex = "1.13"
+# Look-around and back-references of Trino (Joni) patterns; the `regex`
+# engine above keeps every other pattern (ADR 0008).
+fancy-regex = "0.19"
 num-traits = "0.2.19"
 twox-hash = { version = "2.1", default-features = false, features = ["xxhash64", "std"] }
 md5 = { package = "md-5", version = "0.10.6" }
