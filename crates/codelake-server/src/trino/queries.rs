@@ -215,9 +215,11 @@ impl<E: Release> Query<E> {
         self.fetchers.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// A page request ended (its `exec` guard dropped): the last one out of a
-    /// failed query releases what the failure could not.
+    /// A page request ended (its `exec` guard dropped): the client was there
+    /// until now, so the heartbeat moves to the end of the request. The last
+    /// request out of a failed query releases what the failure could not.
     pub(crate) fn leave_fetch(&self) {
+        self.heartbeat();
         if self.fetchers.fetch_sub(1, Ordering::SeqCst) == 1 && self.error().is_some() {
             self.release_if_idle();
         }
@@ -354,6 +356,12 @@ impl<E: Release> Registry<E> {
     }
 
     /// Cancels abandoned queries and forgets old completed ones.
+    ///
+    /// A query is abandoned when no page request came for `client_timeout`.
+    /// A request still being answered is the client waiting, not gone: a page
+    /// can take longer than the timeout when the node is busy (a spilling
+    /// aggregation kept every worker for seconds, and its client was told it
+    /// had abandoned the query while it waited for the answer).
     pub(crate) fn sweep(&self) {
         let queries: Vec<_> = self.map().values().cloned().collect();
         for query in &queries {
@@ -361,7 +369,8 @@ impl<E: Release> Registry<E> {
                 let info = query.info();
                 (info.state.is_done(), info.heartbeat_at)
             };
-            if !done && heartbeat.elapsed() > self.limits.client_timeout {
+            let fetching = query.fetchers.load(Ordering::SeqCst) > 0;
+            if !done && !fetching && heartbeat.elapsed() > self.limits.client_timeout {
                 query.fail(QueryError::new(
                     Code::AbandonedQuery,
                     format!(
@@ -571,6 +580,28 @@ mod tests {
         assert!(cancel.is_cancelled());
         // history_size = 2: the abandoned one plus the newest finished one stay.
         assert_eq!(registry.snapshot().len(), 2);
+    }
+
+    /// A client waiting for a page is not gone, however long the page takes;
+    /// the timeout counts from the end of its last request.
+    #[test]
+    fn a_page_request_in_progress_keeps_the_query_alive() {
+        let registry = registry(10);
+        let waiting = query(&registry);
+        registry.insert(Arc::clone(&waiting)).unwrap();
+        waiting.enter_fetch();
+        std::thread::sleep(Duration::from_millis(60));
+        registry.sweep();
+        assert!(
+            waiting.error().is_none(),
+            "abandoned while its page was being built"
+        );
+        waiting.leave_fetch();
+        registry.sweep();
+        assert!(waiting.error().is_none(), "the request just ended");
+        std::thread::sleep(Duration::from_millis(60));
+        registry.sweep();
+        assert_eq!(waiting.error().unwrap().name(), "ABANDONED_QUERY");
     }
 
     #[test]
