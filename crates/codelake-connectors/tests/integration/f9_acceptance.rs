@@ -592,7 +592,6 @@ fn verdict(expected: &Answer, actual: &Result<Vec<RecordBatch>, String>, syntax:
 /// Every argument, name, procedure and table variant answers like Trino 431:
 /// both succeed, or both fail and `CodeLake`'s message carries Trino's.
 #[tokio::test]
-#[ignore = "DEFECT-1: ALTER TABLE EXECUTE diverges from Trino 431 (quoted \"optimize\" runs, hive.\"S\".\"T\" is refused, WHERE is checked before the session property, 3 error texts)"]
 async fn statements_answer_like_trino_431() {
     let local = tempfile::tempdir().unwrap();
     let spill = tempfile::tempdir().unwrap();
@@ -648,7 +647,6 @@ async fn statements_answer_like_trino_431() {
 /// airlift `DataSize` rounds a fractional byte count to the nearest byte
 /// (`374.5B` is 375 bytes), so a file of exactly 375 bytes is compacted.
 #[tokio::test]
-#[ignore = "DEFECT-2: a fractional file_size_threshold is truncated, Trino 431 rounds it (374.5B compacts a 375-byte file)"]
 async fn fractional_threshold_rounds_like_trino_431() {
     let local = tempfile::tempdir().unwrap();
     let spill = tempfile::tempdir().unwrap();
@@ -881,7 +879,6 @@ async fn microsecond_timestamps_survive_compaction() {
 /// a file written by another tool with `ID`/`NOME` is read. Compaction must
 /// not turn those values into NULL.
 #[tokio::test]
-#[ignore = "DEFECT-4: Parquet columns whose names differ only in case are read as NULL and OPTIMIZE persists the NULLs"]
 async fn column_names_match_case_insensitively_like_trino() {
     let local = tempfile::tempdir().unwrap();
     let spill = tempfile::tempdir().unwrap();
@@ -939,7 +936,6 @@ async fn column_names_match_case_insensitively_like_trino() {
 /// read the old files (`Unsupported Trino column type`). Compaction must not
 /// turn the dropped integers into values of the new varchar column.
 #[tokio::test]
-#[ignore = "DEFECT-5: OPTIMIZE casts a dropped int column into the re-added varchar column that Trino 431 refuses to read"]
 async fn retyped_column_is_not_fabricated() {
     let local = tempfile::tempdir().unwrap();
     let spill = tempfile::tempdir().unwrap();
@@ -983,7 +979,6 @@ async fn retyped_column_is_not_fabricated() {
 /// Trino skips zero-byte files (left by writers that crashed) when reading
 /// and when compacting. `CodeLake` must answer the same and compact the rest.
 #[tokio::test]
-#[ignore = "DEFECT-6: a zero-byte file makes OPTIMIZE fail with a Parquet EOF, Trino 431 skips it"]
 async fn zero_byte_file_is_skipped_like_trino() {
     let local = tempfile::tempdir().unwrap();
     let spill = tempfile::tempdir().unwrap();
@@ -1527,7 +1522,6 @@ fn has_inprogress(dir: &Path) -> bool {
 /// waits for the first: the second one must compact the new file with the
 /// new column, not with the schema it saw when it was submitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-7: an OPTIMIZE queued behind another one compacts with the stale schema and drops a column added meanwhile"]
 async fn column_added_while_optimize_waits_keeps_its_values() {
     let warehouse = tempfile::tempdir().unwrap();
     let spill = tempfile::tempdir().unwrap();
@@ -1626,7 +1620,6 @@ async fn drop_table_during_optimize_leaves_nothing_behind() {
 /// this one compacts: its catalog open runs the crash recovery on the live
 /// swap. It must neither fail to start nor undo a swap in progress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-#[ignore = "DEFECT-9: a node opening the catalog during another node's OPTIMIZE undoes the swap and deletes every compacted row"]
 async fn node_restarting_during_another_nodes_optimize_loses_nothing() {
     let warehouse = tempfile::tempdir().unwrap();
     let spill = tempfile::tempdir().unwrap();
@@ -1829,7 +1822,6 @@ async fn every_crash_state_recovers_on_restart_with_rows_exactly_once() {
 /// of the catalog stay available (Trino keeps serving them too), and the
 /// damaged table refuses OPTIMIZE instead of guessing.
 #[tokio::test]
-#[ignore = "DEFECT-8: one unreadable OPTIMIZE marker makes the whole hive catalog fail to attach"]
 async fn unreadable_marker_only_affects_its_table() {
     let warehouse = tempfile::tempdir().unwrap();
     let spill = tempfile::tempdir().unwrap();
