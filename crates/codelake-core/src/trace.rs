@@ -493,41 +493,89 @@ pub fn sql_hash(redacted_sql: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// Error text safe for a span: quoted segments (`'…'`, `"…"`) and `0x…` hex
-/// are replaced by `?`, because engine and driver errors quote the values
-/// that failed. Truncated to 1 KiB.
+/// Letters, digits and `_`: characters that glue into one word, so a quote
+/// or digit next to them is part of that word (`Can't`, `Int32`).
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Error text safe for a span. Engine and driver errors quote or print the
+/// values that failed, so the message loses:
+///
+/// - every quoted segment (`'…'`, `"…"`) — the whole *outermost* one when
+///   quotes nest, as in a driver that wraps the server's message in quotes
+///   (`'…value 'X' to int.' on server …`): pairing quotes left to right there
+///   would leave `X` outside every pair;
+/// - every number, including hex (`0x…`) and anything else starting with a
+///   digit (`98765432101`, `1e10`, `10.5`). Digits inside a word (`Int32`,
+///   `col_2`) stay.
+///
+/// A quote opens a segment only at a word start (not in `Can't`) and closes
+/// one only at a word end; an unterminated segment runs to the end of the
+/// text. Truncated to 1 KiB.
 pub fn redact_message(message: &str) -> String {
     const MAX: usize = 1024;
+    let chars: Vec<char> = message.chars().collect();
     let mut out = String::with_capacity(message.len().min(MAX));
-    let mut chars = message.chars().peekable();
-    while let Some(c) = chars.next() {
+    // Quote characters of the segments currently open, outermost first.
+    let mut open: Vec<char> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
         if out.len() >= MAX {
             out.push('…');
-            break;
+            return out;
         }
-        match c {
-            '\'' | '"' => {
-                // Skip to the closing quote (doubled quotes stay inside).
-                while let Some(next) = chars.next() {
-                    if next == c {
-                        if chars.peek() == Some(&c) {
-                            chars.next();
-                            continue;
-                        }
-                        break;
-                    }
+        let c = chars[i];
+        let prev = i.checked_sub(1).map(|p| chars[p]);
+        let next = chars.get(i + 1).copied();
+        let starts_word = prev.is_none_or(|p| !is_word_char(p));
+        if c == '\'' || c == '"' {
+            let innermost = open.last() == Some(&c);
+            if innermost && next == Some(c) {
+                // Doubled quote: an escaped quote inside the segment.
+                i += 2;
+                continue;
+            }
+            if innermost && next.is_none_or(|n| !is_word_char(n)) {
+                open.pop();
+                if open.is_empty() {
+                    out.push(c);
+                    out.push('?');
+                    out.push(c);
                 }
-                out.push(c);
-                out.push('?');
+            } else if starts_word {
+                open.push(c);
+            } else if open.is_empty() {
                 out.push(c);
             }
-            '0' if matches!(chars.peek(), Some('x' | 'X')) => {
-                chars.next();
-                while chars.next_if(char::is_ascii_hexdigit).is_some() {}
-                out.push('?');
-            }
-            _ => out.push(c),
+            i += 1;
+            continue;
         }
+        if !open.is_empty() {
+            i += 1;
+            continue;
+        }
+        if c.is_numeric() && starts_word {
+            // The whole number: digits, letters (hex, exponents, suffixes)
+            // and a decimal part.
+            i += 1;
+            while let Some(&n) = chars.get(i) {
+                let decimal = n == '.' && chars.get(i + 1).is_some_and(char::is_ascii_digit);
+                if !(is_word_char(n) || decimal) {
+                    break;
+                }
+                i += 1;
+            }
+            out.push('?');
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    if let Some(&outermost) = open.first() {
+        // Unterminated: everything after the opening quote is dropped.
+        out.push(outermost);
+        out.push('?');
     }
     out
 }
@@ -854,11 +902,61 @@ mod tests {
         );
         assert_eq!(
             redact_message("column \"secret\" at 0xDEADbeef, line 3"),
-            "column \"?\" at ?, line 3"
+            "column \"?\" at ?, line ?"
         );
-        assert_eq!(redact_message("value 0 is fine"), "value 0 is fine");
         let long = redact_message(&"a".repeat(5000));
         assert!(long.len() < 1100 && long.ends_with('…'));
+    }
+
+    #[test]
+    fn messages_lose_values_inside_a_quoted_driver_message() {
+        // tiberius wraps the server message in quotes; the value SQL Server
+        // quotes sits inside: pairing left to right would expose it.
+        let tiberius = "Token error: 'Conversion failed when converting the nvarchar value \
+                        'CONFIDENTIAL-4711' to data type int.' on server db1 executing  on line 1 \
+                        (code: 245, state: 1, class: 16)";
+        let redacted = redact_message(tiberius);
+        assert_eq!(
+            redacted,
+            "Token error: '?' on server db1 executing  on line ? (code: ?, state: ?, class: ?)"
+        );
+        assert_eq!(
+            redact_message("expected '(', found 'a' and \"b\""),
+            "expected '?', found '?' and \"?\""
+        );
+        assert_eq!(redact_message("value 'O'Brien' here"), "value '?' here");
+        assert_eq!(redact_message("value '' here"), "value '?' here");
+        assert_eq!(redact_message("unterminated 'secret tail"), "unterminated '?");
+        assert_eq!(redact_message("Utf8(\"secret\")"), "Utf8(\"?\")");
+    }
+
+    #[test]
+    fn messages_lose_numbers_but_keep_words_with_digits() {
+        assert_eq!(
+            redact_message("Cast error: Can't cast value 98765432101 to type Int32"),
+            "Cast error: Can't cast value ? to type Int32"
+        );
+        assert_eq!(
+            redact_message("Int64(-42) / 10.5 at 1e10, col_2 v2 3f2a"),
+            "Int64(-?) / ? at ?, col_2 v2 ?"
+        );
+        assert_eq!(redact_message("users' table"), "users' table");
+    }
+
+    proptest! {
+        /// Whatever surrounds a value, quoted or bare, it never survives.
+        #[test]
+        fn redacted_messages_never_carry_the_value(
+            prefix in "[ -~]{0,30}",
+            quote in prop::sample::select(vec!["'", "\"", ""]),
+            outer in prop::sample::select(vec!["'", ""]),
+            suffix in "[ -~]{0,30}",
+        ) {
+            let value = if quote.is_empty() { "98765432101" } else { "SECRET-VALUE" };
+            let message = format!("{outer}{prefix} {quote}{value}{quote} {suffix}{outer} on server x");
+            let redacted = redact_message(&message);
+            prop_assert!(!redacted.contains(value), "{message:?} -> {redacted:?}");
+        }
     }
 
     #[test]
