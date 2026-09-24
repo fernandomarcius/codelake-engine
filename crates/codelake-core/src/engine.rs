@@ -90,11 +90,13 @@ pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + S
     rules
 }
 
-/// `DataFusion`'s analyzer rules followed by checked arithmetic
-/// ([`crate::overflow`]), which needs the types that type coercion settles.
+/// `DataFusion`'s analyzer rules followed by the engine's: checked arithmetic
+/// ([`crate::overflow`]) and the one-row rule of scalar subqueries
+/// ([`crate::subquery`]). Both need the types that type coercion settles.
 pub fn analyzer_rules() -> Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Send + Sync>> {
     let mut rules = datafusion::optimizer::Analyzer::new().rules;
     rules.push(Arc::new(crate::overflow::CheckedArithmetic));
+    rules.push(Arc::new(crate::subquery::EnforceScalarSubqueryRows));
     rules
 }
 

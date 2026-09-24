@@ -2,6 +2,7 @@
 //! `TrinoUserError` for `USER_ERROR`) and on `errorName`, so the mapping from
 //! `DataFusion` errors follows Trino's `StandardErrorCode`.
 
+use codelake_core::subquery::SubqueryMultipleRows;
 use datafusion::arrow::error::ArrowError;
 use datafusion::common::SchemaError;
 use datafusion::error::DataFusionError;
@@ -18,6 +19,7 @@ pub(crate) enum Code {
     NotSupported,
     InvalidSessionProperty,
     NumericValueOutOfRange,
+    SubqueryMultipleRows,
     CatalogNotFound,
     TableNotFound,
     ColumnNotFound,
@@ -39,6 +41,7 @@ impl Code {
             Self::NotSupported => (13, "NOT_SUPPORTED", "USER_ERROR"),
             Self::InvalidSessionProperty => (14, "INVALID_SESSION_PROPERTY", "USER_ERROR"),
             Self::NumericValueOutOfRange => (19, "NUMERIC_VALUE_OUT_OF_RANGE", "USER_ERROR"),
+            Self::SubqueryMultipleRows => (28, "SUBQUERY_MULTIPLE_ROWS", "USER_ERROR"),
             Self::CatalogNotFound => (44, "CATALOG_NOT_FOUND", "USER_ERROR"),
             Self::TableNotFound => (46, "TABLE_NOT_FOUND", "USER_ERROR"),
             Self::ColumnNotFound => (47, "COLUMN_NOT_FOUND", "USER_ERROR"),
@@ -148,6 +151,7 @@ fn code_of(error: &DataFusionError) -> Code {
         }
         DataFusionError::NotImplemented(_) => Code::NotSupported,
         DataFusionError::ResourcesExhausted(_) => Code::ExceededLocalMemoryLimit,
+        DataFusionError::External(error) if error.is::<SubqueryMultipleRows>() => Code::SubqueryMultipleRows,
         DataFusionError::ArrowError(arrow, _) => match arrow.as_ref() {
             ArrowError::DivideByZero => Code::DivisionByZero,
             ArrowError::ArithmeticOverflow(_) => Code::NumericValueOutOfRange,

@@ -189,7 +189,6 @@ async fn rt6_user_errors_keep_trino_names_and_type() {
 /// A dbt model gets a wrong number instead of an error. (Engine semantics,
 /// observed through the Trino protocol.)
 #[tokio::test]
-#[ignore = "DEFECT-RT15: bigint overflow and multi-row scalar subqueries return wrong rows instead of failing"]
 async fn rt15_statements_trino_rejects_do_not_return_rows() {
     let h = harness();
     let mut wrong = Vec::new();
@@ -320,7 +319,11 @@ async fn rt9_timestamp_keeps_its_zone() {
         .await;
     assert_eq!(out.state(), "FINISHED", "{}", out.last);
     let text = out.rows[0][0].as_str().unwrap_or_default().to_owned();
-    assert!(text.ends_with("America/Sao_Paulo"), "{text:?} ({})", out.columns[0].1);
+    assert!(
+        text.ends_with("America/Sao_Paulo"),
+        "{text:?} ({})",
+        out.columns[0].1
+    );
 }
 
 // ------------------------------------------------------- memory / CPU DoS ---
@@ -432,9 +435,7 @@ async fn rt12_registry_is_bounded_between_sweeps() {
         let out = h.run("SELECT 1 +", &[]).await;
         assert_eq!(out.error_name(), Some("SYNTAX_ERROR"));
     }
-    let listed = h
-        .run("SELECT count(*) FROM system.runtime.queries", &[])
-        .await;
+    let listed = h.run("SELECT count(*) FROM system.runtime.queries", &[]).await;
     let n = listed.rows[0][0].as_i64().unwrap();
     assert!(
         n <= 5 + 10 + 1,
@@ -494,8 +495,14 @@ async fn rt_pass_slug_is_required_for_statement_uris() {
     let slug = parts[5];
     assert_eq!(slug.len(), 32);
     let forged = format!("/v1/statement/executing/{}/{}/1", parts[4], "f".repeat(32));
-    assert_eq!(h.call(Method::DELETE, &forged, &[], "").await.status, StatusCode::NOT_FOUND);
-    assert_eq!(h.call(Method::GET, &forged, &[], "").await.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        h.call(Method::DELETE, &forged, &[], "").await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        h.call(Method::GET, &forged, &[], "").await.status,
+        StatusCode::NOT_FOUND
+    );
     let _ = h.call(Method::DELETE, &next, &[], "").await;
 }
 
@@ -521,7 +528,9 @@ async fn rt_pass_host_header_cannot_inject_paths() {
 async fn rt_pass_parallel_token_reuse_and_cancel_race() {
     let h = std::sync::Arc::new(harness());
     for _ in 0..20 {
-        let first = h.submit("SELECT value FROM generate_series(1, 3000000)", &[]).await;
+        let first = h
+            .submit("SELECT value FROM generate_series(1, 3000000)", &[])
+            .await;
         let one = path_of(first.body["nextUri"].as_str().unwrap());
         let mut tasks = Vec::new();
         for i in 0..6 {
@@ -545,7 +554,10 @@ async fn rt_pass_parallel_token_reuse_and_cancel_race() {
                 bodies.push(raw);
             }
         }
-        assert!(bodies.windows(2).all(|w| w[0] == w[1]), "same token, different pages");
+        assert!(
+            bodies.windows(2).all(|w| w[0] == w[1]),
+            "same token, different pages"
+        );
         let _ = h.call(Method::DELETE, &one, &[], "").await;
     }
 }

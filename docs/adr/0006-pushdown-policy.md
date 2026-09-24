@@ -37,11 +37,17 @@ dynamic filter, so the whole remote table would be read on every run.
    keeps the rest local.
 5. SQL Server tables expose lower-case names but restore the real spelling in
    the remote SQL, so case-sensitive collations work.
-6. `Engine::sql` pre-evaluates uncorrelated scalar subqueries in `WHERE`/`ON`
-   predicates (no row = NULL, more than one row = error) and substitutes the
-   value. Binary values travel as `codelake_varbinary('<hex>')`, which dialects
+6. `Engine::sql` pre-evaluates uncorrelated, deterministic scalar subqueries
+   in any expression of a statement except a view definition (no row = NULL,
+   more than one row = `SUBQUERY_MULTIPLE_ROWS`) and substitutes the value.
+   Binary values travel as `codelake_varbinary('<hex>')`, which dialects
    render natively (T-SQL `0x…`), because the DataFusion unparser cannot render
-   binary literals.
+   binary literals. DataFusion plans the other scalar subqueries (correlated
+   or non-deterministic) as joins, which repeat the outer row once per
+   subquery row and drop it when there is none; unless the plan already
+   yields one row (per outer row), the subquery is wrapped in an aggregation
+   by `codelake_single_row`: NULL without rows, `SUBQUERY_MULTIPLE_ROWS` on a
+   second row (`codelake_core::subquery`).
 7. Integer and decimal arithmetic is checked (`codelake_core::overflow`):
    DataFusion wraps around on overflow (`+ - *`, unary minus, `sum`) and lets
    decimals exceed their precision; Trino fails with

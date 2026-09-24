@@ -1810,7 +1810,6 @@ async fn defect_21_information_schema_is_catalog_scoped() {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-22: scalar subquery returning 2 rows yields 2 rows instead of SUBQUERY_MULTIPLE_ROWS"]
 async fn defect_22_scalar_subquery_multiple_rows() {
     assert_codelake(&["d_scalar_subquery_rows"]).await;
 }
