@@ -31,6 +31,7 @@ scripts/dev.sh scripts/gates.sh <gate>
 | coverage | `gates.sh coverage` | lines ≥ 75% | every PR |
 | mutation | `gates.sh mutants` | by criticality, below | PR (changed code), nightly (full) |
 | performance | `cargo xtask bench-gate` | < 10% PASS · 10–25% WARNING · > 25% **BLOCK** | every PR |
+| performance vs Trino | `scripts/bench/run.sh` + `cargo xtask bench-gate --e2e` ([benchmarks.md](benchmarks.md)) | same thresholds on CodeLake p50 per case; a case that stops matching Trino **BLOCKS** | before a release, on a reserved machine |
 | SAST | CodeQL Rust + Actions | no finding | every PR |
 | secrets / IaC | Trivy fs | no CRITICAL/HIGH | every PR + weekly |
 | image | Trivy image, `USER 65532` check | no CRITICAL/HIGH fixable CVE | every PR + release |

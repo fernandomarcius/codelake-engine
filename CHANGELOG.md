@@ -20,6 +20,14 @@ versioning: [SemVer](https://semver.org/).
 - `Engine::sql` pre-evaluates uncorrelated scalar subqueries in predicates so their values can
   be pushed down.
 
+- Trino client protocol (`[server.trino]`): `/v1/statement` with paging, idempotent retries and
+  cancel, `X-Trino-*` session headers, `USE`/`SET SESSION`/`RESET SESSION`/`SHOW SESSION`, Trino
+  error codes, `query_max_run_time`, `system.runtime.queries` (ADR 0012).
+- Session-property registry: system properties plus catalog properties declared by connectors;
+  undeclared names are rejected, performance-only Trino knobs are accepted with a warning.
+
 ### Fixed
+- `CREATE SCHEMA` without a catalog used the engine's default catalog instead of the session's.
+- `codelake-connectors` without the `hive-s3` feature failed to build under `-D warnings`.
 - Filters above cross-source joins now reach their source (extra `push_down_filter` before federation).
 - Wrong results when a filter sat above a federated scan in cross-source joins (datafusion-federation 0.5.3); see ADR 0005.

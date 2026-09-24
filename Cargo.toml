@@ -48,6 +48,7 @@ object_store = { version = "0.13", default-features = false, features = ["fs"] }
 crc32fast = "1.5"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
+bytes = "1"
 
 # Runtime
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }

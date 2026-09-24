@@ -1,0 +1,91 @@
+# TPC-H, 22 queries with the validation parameters of the specification.
+# Q15 uses a CTE instead of a view (same result, no DDL).
+workload = "tpch"
+
+[[case]]
+id = "tpch_q01"
+sql_file = "../queries/tpch/q01.sql"
+
+[[case]]
+id = "tpch_q02"
+sql_file = "../queries/tpch/q02.sql"
+
+[[case]]
+id = "tpch_q03"
+sql_file = "../queries/tpch/q03.sql"
+
+[[case]]
+id = "tpch_q04"
+sql_file = "../queries/tpch/q04.sql"
+
+[[case]]
+id = "tpch_q05"
+sql_file = "../queries/tpch/q05.sql"
+
+[[case]]
+id = "tpch_q06"
+sql_file = "../queries/tpch/q06.sql"
+
+[[case]]
+id = "tpch_q07"
+sql_file = "../queries/tpch/q07.sql"
+
+[[case]]
+id = "tpch_q08"
+sql_file = "../queries/tpch/q08.sql"
+
+[[case]]
+id = "tpch_q09"
+sql_file = "../queries/tpch/q09.sql"
+
+[[case]]
+id = "tpch_q10"
+sql_file = "../queries/tpch/q10.sql"
+
+[[case]]
+id = "tpch_q11"
+sql_file = "../queries/tpch/q11.sql"
+
+[[case]]
+id = "tpch_q12"
+sql_file = "../queries/tpch/q12.sql"
+
+[[case]]
+id = "tpch_q13"
+sql_file = "../queries/tpch/q13.sql"
+
+[[case]]
+id = "tpch_q14"
+sql_file = "../queries/tpch/q14.sql"
+
+[[case]]
+id = "tpch_q15"
+sql_file = "../queries/tpch/q15.sql"
+
+[[case]]
+id = "tpch_q16"
+sql_file = "../queries/tpch/q16.sql"
+
+[[case]]
+id = "tpch_q17"
+sql_file = "../queries/tpch/q17.sql"
+
+[[case]]
+id = "tpch_q18"
+sql_file = "../queries/tpch/q18.sql"
+
+[[case]]
+id = "tpch_q19"
+sql_file = "../queries/tpch/q19.sql"
+
+[[case]]
+id = "tpch_q20"
+sql_file = "../queries/tpch/q20.sql"
+
+[[case]]
+id = "tpch_q21"
+sql_file = "../queries/tpch/q21.sql"
+
+[[case]]
+id = "tpch_q22"
+sql_file = "../queries/tpch/q22.sql"

@@ -66,6 +66,21 @@ pub trait Connector: Send + Sync + Debug {
     }
 }
 
+/// A view to persist, as the client defined it.
+#[derive(Debug, Clone)]
+pub struct ViewDefinition {
+    /// Query text as written by the client.
+    pub sql: String,
+    /// Output columns of the query.
+    pub output: SchemaRef,
+    /// Session catalog the query was planned in. With `schema`, it resolves
+    /// the query's unqualified names whenever the view is read, whatever the
+    /// reader's session is (Trino semantics).
+    pub catalog: String,
+    /// Session schema the query was planned in.
+    pub schema: String,
+}
+
 /// Statement-level writes a catalog accepts. The engine routes the matching
 /// statements here instead of `DataFusion`'s in-memory DDL.
 #[async_trait]
@@ -86,15 +101,14 @@ pub trait WritableCatalog: Send + Sync + Debug {
 
     async fn drop_table(&self, schema: &str, table: &str, if_exists: bool) -> DfResult<()>;
 
-    /// Stores a view; `sql` is the definition as written by the client.
+    /// Stores a view.
     async fn create_view(
         &self,
         schema: &str,
         view: &str,
         or_replace: bool,
         owner: &str,
-        sql: &str,
-        output: SchemaRef,
+        definition: ViewDefinition,
     ) -> DfResult<()>;
 
     async fn drop_view(&self, schema: &str, view: &str, if_exists: bool) -> DfResult<()>;

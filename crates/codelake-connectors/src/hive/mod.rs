@@ -9,6 +9,7 @@ mod optimize;
 #[cfg(test)]
 mod optimize_tests;
 mod table;
+mod trino_parquet;
 mod types;
 
 use std::sync::Arc;
@@ -19,7 +20,9 @@ use datafusion::catalog::CatalogProvider;
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
-use secrecy::{ExposeSecret, SecretString};
+#[cfg(feature = "hive-s3")]
+use secrecy::ExposeSecret;
+use secrecy::SecretString;
 use tokio::sync::OnceCell;
 
 pub use self::catalog::HiveCatalog;
@@ -98,13 +101,13 @@ impl HiveConnector {
 
     fn metastore(&self) -> Result<FileMetastore, ConnectorError> {
         let location = parse_location(&self.params.warehouse).map_err(|e| self.misconfigured(e))?;
-        let (store, root): (Arc<dyn ObjectStore>, Path) = match location {
+        let (store, root, local): (Arc<dyn ObjectStore>, Path, _) = match location {
             Location::Local(path) => {
                 std::fs::create_dir_all(&path)
                     .map_err(|e| self.misconfigured(format!("{}: {e}", path.display())))?;
                 let store =
                     LocalFileSystem::new_with_prefix(&path).map_err(|e| self.misconfigured(e.to_string()))?;
-                (Arc::new(store), Path::default())
+                (Arc::new(store), Path::default(), Some(path))
             }
             #[cfg(not(feature = "hive-s3"))]
             Location::S3 { .. } => {
@@ -129,10 +132,14 @@ impl HiveConnector {
                         .with_secret_access_key(secret.expose_secret());
                 }
                 let store = builder.build().map_err(|e| self.misconfigured(e.to_string()))?;
-                (Arc::new(store), Path::from(prefix))
+                (Arc::new(store), Path::from(prefix), None)
             }
         };
-        Ok(FileMetastore::new(store, root))
+        let metastore = FileMetastore::new(store, root);
+        Ok(match local {
+            Some(dir) => metastore.with_local_dir(dir),
+            None => metastore,
+        })
     }
 
     async fn hive(&self) -> Result<Arc<HiveCatalog>, ConnectorError> {

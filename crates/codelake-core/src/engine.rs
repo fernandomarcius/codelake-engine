@@ -26,7 +26,7 @@ use serde::Serialize;
 use tracing::{info, warn};
 
 use crate::config::{ExecutionConfig, MemoryConfig};
-use crate::connector::{Connector, ConnectorError, WritableCatalog};
+use crate::connector::{Connector, ConnectorError, ViewDefinition, WritableCatalog};
 use crate::ddl::{self, Prepared, TableExecute};
 use crate::federation_guard::FederationFilterGuard;
 use crate::runtime::{EngineRuntime, MemoryStats};
@@ -420,9 +420,15 @@ impl Engine {
                 let Some(Prepared::ViewSql(sql)) = prepared else {
                     return Err(DataFusionError::Internal("view SQL was not captured".into()));
                 };
-                let output = Arc::new(view.input.schema().as_arrow().clone());
+                let session = ctx.state().config().options().catalog.clone();
+                let definition = ViewDefinition {
+                    sql,
+                    output: Arc::new(view.input.schema().as_arrow().clone()),
+                    catalog: session.default_catalog,
+                    schema: session.default_schema,
+                };
                 writable
-                    .create_view(&schema, &name, view.or_replace, user, &sql, output)
+                    .create_view(&schema, &name, view.or_replace, user, definition)
                     .await?;
                 Ok(Some(Self::empty(ctx)?))
             }
@@ -636,7 +642,10 @@ mod tests {
         }
         assert_eq!(answers[0], Ok(1));
         assert!(
-            answers[1].as_ref().unwrap_err().contains("Table 'nope.s.t' does not exist"),
+            answers[1]
+                .as_ref()
+                .unwrap_err()
+                .contains("Table 'nope.s.t' does not exist"),
             "{answers:?}"
         );
         assert!(answers[2].is_err(), "{answers:?}");
@@ -757,8 +766,7 @@ mod tests {
             _: &str,
             _: bool,
             _: &str,
-            _: &str,
-            _: datafusion::arrow::datatypes::SchemaRef,
+            _: ViewDefinition,
         ) -> datafusion::error::Result<()> {
             Ok(())
         }

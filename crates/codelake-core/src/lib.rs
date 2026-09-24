@@ -19,8 +19,8 @@ pub mod table_procedure;
 mod testing;
 
 pub use bytes::ByteSize;
-pub use config::{Config, SourceConfig, SourceKind, ValidatedConfig};
-pub use connector::{BoxError, Connector, ConnectorError, WritableCatalog};
+pub use config::{Config, SourceConfig, SourceKind, TrinoProtocolConfig, ValidatedConfig};
+pub use connector::{BoxError, Connector, ConnectorError, ViewDefinition, WritableCatalog};
 pub use engine::{Attach, Engine, EngineError, QueryOptions, SourceStatus};
 pub use runtime::MemoryStats;
 pub use session_properties::{

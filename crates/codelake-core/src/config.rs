@@ -47,6 +47,45 @@ pub struct ServerConfig {
     /// loopback (e.g. behind a sidecar proxy or a Kubernetes `NetworkPolicy`).
     #[serde(default)]
     pub allow_unauthenticated_network: bool,
+    /// Trino client protocol (`/v1/statement`). Disabled when absent.
+    pub trino: Option<TrinoProtocolConfig>,
+}
+
+/// Trino client protocol listener, for Trino clients (JDBC, the CLI, the
+/// Python client, dbt-trino) and plain HTTP scripts.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrinoProtocolConfig {
+    pub listen: SocketAddr,
+    /// Queries accepted and not yet finished; more are refused with
+    /// `QUERY_QUEUE_FULL`.
+    #[serde(default = "default_trino_max_active_queries")]
+    pub max_active_queries: usize,
+    /// A query whose client stops polling for this long is canceled
+    /// (`ABANDONED_QUERY`), as with Trino's `query.client.timeout`.
+    #[serde(default = "default_trino_client_timeout_secs")]
+    pub client_timeout_secs: u64,
+    /// Completed queries kept in `system.runtime.queries`.
+    #[serde(default = "default_trino_history_size")]
+    pub history_size: usize,
+    #[serde(default = "default_trino_history_retention_secs")]
+    pub history_retention_secs: u64,
+}
+
+const fn default_trino_max_active_queries() -> usize {
+    100
+}
+
+const fn default_trino_client_timeout_secs() -> u64 {
+    300
+}
+
+const fn default_trino_history_size() -> usize {
+    100
+}
+
+const fn default_trino_history_retention_secs() -> u64 {
+    900
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -399,6 +438,9 @@ impl Config {
         if server.pg_listen == server.http_listen {
             errors.push("server.pg_listen and server.http_listen must differ".into());
         }
+        if let Some(trino) = &server.trino {
+            Self::validate_trino(server, trino, errors);
+        }
         // datafusion-postgres silently falls back to plaintext when the TLS files
         // cannot be loaded. Refuse to start instead of downgrading.
         if let Some(tls) = &server.tls {
@@ -407,6 +449,27 @@ impl Config {
                     errors.push(format!("server.tls.{field} {} does not exist", path.display()));
                 }
             }
+        }
+    }
+
+    fn validate_trino(server: &ServerConfig, trino: &TrinoProtocolConfig, errors: &mut Vec<String>) {
+        // Same rule as the PostgreSQL listener: no client authentication yet.
+        if !trino.listen.ip().is_loopback() && !server.allow_unauthenticated_network {
+            errors.push(format!(
+                "server.trino.listen {} is not loopback and client authentication is not implemented yet; \
+                 bind to 127.0.0.1 or set server.allow_unauthenticated_network = true inside an isolated network",
+                trino.listen
+            ));
+        }
+        if trino.listen == server.pg_listen || trino.listen == server.http_listen {
+            errors
+                .push("server.trino.listen must differ from server.pg_listen and server.http_listen".into());
+        }
+        if trino.max_active_queries == 0 {
+            errors.push("server.trino.max_active_queries must be > 0".into());
+        }
+        if trino.client_timeout_secs == 0 {
+            errors.push("server.trino.client_timeout_secs must be > 0".into());
         }
     }
 
@@ -459,7 +522,7 @@ impl Config {
                     "source `{name}`: name must match [a-z_][a-z0-9_]* (max 63 chars)"
                 ));
             }
-            if name == "datafusion" || name == "information_schema" {
+            if name == "datafusion" || name == "information_schema" || name == "system" {
                 errors.push(format!("source `{name}`: name is reserved"));
             }
             if !seen.insert(name.as_str()) {
@@ -768,6 +831,33 @@ mod tests {
 
         let doc = doc.replace("[server]", "[server]\nallow_unauthenticated_network = true");
         assert!(parse(&doc).validate(&full_env, &|_| true).is_ok());
+    }
+
+    #[test]
+    fn trino_listener_is_validated() {
+        let with =
+            |section: &str| VALID.replace("[memory]", &format!("[server.trino]\n{section}\n\n[memory]"));
+        let ok = with("listen = \"127.0.0.1:8081\"");
+        let validated = parse(&ok).validate(&full_env, &|_| true).unwrap();
+        let trino = validated.config.server.trino.unwrap();
+        assert_eq!(trino.max_active_queries, 100);
+        assert_eq!(trino.client_timeout_secs, 300);
+
+        let errors = errors_of(&with("listen = \"0.0.0.0:8081\""), &full_env);
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(errors[0].contains("server.trino.listen"));
+
+        let errors = errors_of(&with("listen = \"127.0.0.1:5432\""), &full_env);
+        assert_eq!(
+            errors,
+            vec!["server.trino.listen must differ from server.pg_listen and server.http_listen"]
+        );
+
+        let errors = errors_of(
+            &with("listen = \"127.0.0.1:8081\"\nmax_active_queries = 0\nclient_timeout_secs = 0"),
+            &full_env,
+        );
+        assert_eq!(errors.len(), 2, "{errors:#?}");
     }
 
     #[test]

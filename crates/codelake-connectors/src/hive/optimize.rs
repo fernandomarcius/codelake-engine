@@ -33,7 +33,6 @@ use datafusion::datasource::listing::PartitionedFile;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion::parquet::arrow::AsyncArrowWriter;
 use datafusion::parquet::arrow::ParquetRecordBatchStreamBuilder;
 use datafusion::parquet::arrow::async_reader::ParquetObjectReader;
 use datafusion::parquet::arrow::async_writer::ParquetObjectWriter;
@@ -44,7 +43,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::metastore::MetastoreError;
-use super::table::{FLUSH_BYTES, HiveTable, conform, data_file_name, external, writer_properties};
+use super::table::{HiveTable, conform, data_file_name, external};
+use super::trino_parquet::{ROW_GROUP_ROWS, TrinoParquetWriter};
 
 pub(crate) const OPTIMIZE: &str = "OPTIMIZE";
 pub(crate) const FILE_SIZE_THRESHOLD: &str = "file_size_threshold";
@@ -240,7 +240,7 @@ async fn footer_rows(table: &HiveTable, files: &[ObjectMeta]) -> Result<u64> {
 
 /// Output file being written.
 struct Open {
-    writer: AsyncArrowWriter<ParquetObjectWriter>,
+    writer: TrinoParquetWriter<ParquetObjectWriter>,
     added: Added,
 }
 
@@ -257,10 +257,10 @@ impl Compactor<'_> {
     fn start(&self) -> Result<Open> {
         let name = data_file_name(SystemTime::now());
         let temporary = format!(".{name}.inprogress");
-        let writer = AsyncArrowWriter::try_new(
+        let writer = TrinoParquetWriter::try_new(
             ParquetObjectWriter::new(Arc::clone(store(self.table)), file(self.table, &temporary)),
             Arc::clone(&self.table.schema),
-            Some(writer_properties()),
+            ROW_GROUP_ROWS,
         )?;
         Ok(Open {
             writer,
@@ -283,15 +283,12 @@ impl Compactor<'_> {
         let written = async {
             open.writer.write(&conform(&self.table.schema, batch)?).await?;
             open.added.rows += batch.num_rows() as u64;
-            if open.writer.in_progress_size() >= FLUSH_BYTES {
-                open.writer.flush().await?;
-            }
             // The encoder buffers the open row group: account for it.
             self.reservation.try_resize(open.writer.memory_size())?;
             Ok::<_, DataFusionError>(())
         }
         .await;
-        let size = (open.writer.bytes_written() + open.writer.in_progress_size()) as u64;
+        let size = (open.writer.bytes_written() + open.writer.memory_size()) as u64;
         self.open = Some(open);
         written?;
         if size >= self.target {
@@ -307,9 +304,9 @@ impl Compactor<'_> {
         let added = open.added.clone();
         // Registered before closing so a failed close still cleans the file up.
         self.done.push(added.clone());
-        let metadata = open.writer.close().await?;
+        let rows = open.writer.close().await?;
         self.reservation.free();
-        let rows = u64::try_from(metadata.file_metadata().num_rows()).unwrap_or(u64::MAX);
+        let rows = u64::try_from(rows).unwrap_or(u64::MAX);
         if rows != added.rows {
             return Err(DataFusionError::Internal(format!(
                 "{} holds {rows} rows, {} were written",
