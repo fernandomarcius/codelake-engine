@@ -11,6 +11,7 @@ mod metastore;
 mod optimize;
 #[cfg(test)]
 mod optimize_tests;
+mod statistics;
 mod table;
 mod trino_parquet;
 mod types;

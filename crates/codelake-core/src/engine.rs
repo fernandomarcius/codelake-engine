@@ -38,6 +38,7 @@ use crate::plain_views::PlainViews;
 use crate::runtime::{EngineRuntime, MemoryStats};
 use crate::session_properties::{PropertyRegistry, SessionProperties};
 use crate::statement_policy::{self, ObjectKind, check_object_name};
+use crate::statistics_guard::guard_aggregate_statistics;
 use crate::table_procedure::{self, ArgumentValue, RawArgument};
 use crate::trace::{self, QueryTrace, TARGET, TracedStream};
 
@@ -243,14 +244,17 @@ fn trino_literal(value: &ScalarValue) -> String {
 }
 
 /// Default `DataFusion` physical rules, preceded by the federation guard (it must
-/// run before `FilterPushdown`; see [`crate::federation_guard`]) and followed by
+/// run before `FilterPushdown`; see [`crate::federation_guard`]), with
+/// aggregates answered from statistics only over exact sources (see
+/// [`crate::statistics_guard`]), and followed by
 /// [`PlainViews`], which keeps string views out of operators that retain rows
 /// (ADR 0003), [`ComputedBatches`], which sizes the batches of computed values
 /// in bytes, and [`AccountedOutput`], which keeps the buffers between the plan
 /// and the client inside the memory pool.
-fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
+pub(crate) fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = vec![Arc::new(FederationFilterGuard)];
     rules.extend(PhysicalOptimizer::new().rules);
+    let mut rules = guard_aggregate_statistics(rules);
     rules.extend(crate::trino_functions::physical_rules());
     rules.push(Arc::new(PlainViews));
     rules.push(Arc::new(ComputedBatches));

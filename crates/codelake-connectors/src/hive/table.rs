@@ -63,6 +63,7 @@ use super::catalog::refuse_unsupported;
 use super::columns::HiveColumns;
 use super::metastore::{ColumnMetadata, FileMetastore, TableMetadata};
 use super::optimize::MARKER;
+use super::statistics::{MetastoreStatistics, scan_statistics};
 use super::trino_parquet::{ROW_GROUP_ROWS, TrinoParquetWriter};
 use super::types::{char_column, column_field, declared_length, unsupported};
 
@@ -284,6 +285,8 @@ pub(crate) struct HiveTable {
     pub(crate) schema: SchemaRef,
     /// The columns as the metastore records them.
     pub(crate) columns: Vec<ColumnMetadata>,
+    /// Statistics recorded in the metastore when the table was resolved.
+    pub(crate) statistics: Arc<MetastoreStatistics>,
 }
 
 impl HiveTable {
@@ -318,6 +321,7 @@ impl HiveTable {
             table: table.to_owned(),
             schema: Arc::new(Schema::new(fields)),
             columns: metadata.data_columns.clone(),
+            statistics: Arc::new(MetastoreStatistics::from_metadata(metadata)),
         })
     }
 
@@ -394,7 +398,7 @@ impl HiveTable {
         Ok(files)
     }
 
-    /// A Parquet scan of `groups` in the table's schema: columns match by name
+    /// The configuration of a Parquet scan of `groups` in the table's schema: columns match by name
     /// ignoring case, a column a file lacks (added later) reads as NULL, one
     /// stored with a type the table's cannot hold is an error (`columns.rs`),
     /// timestamps round half up to the catalog's precision and `varchar(n)`
@@ -405,8 +409,8 @@ impl HiveTable {
         groups: Vec<Vec<PartitionedFile>>,
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.scan_files_as(
+    ) -> Result<FileScanConfigBuilder> {
+        self.scan_config(
             runtime,
             Arc::clone(&self.schema),
             false,
@@ -429,6 +433,21 @@ impl HiveTable {
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let config = self.scan_config(runtime, schema, raw, groups, projection, limit)?;
+        Ok(DataSourceExec::from_data_source(config.build()))
+    }
+
+    /// The scan configuration of [`HiveTable::scan_files_as`], for a caller
+    /// that adds to it (the planner's statistics).
+    fn scan_config(
+        &self,
+        runtime: &RuntimeEnv,
+        schema: SchemaRef,
+        raw: bool,
+        groups: Vec<Vec<PartitionedFile>>,
+        projection: Option<&Vec<usize>>,
+        limit: Option<usize>,
+    ) -> Result<FileScanConfigBuilder> {
         if runtime.object_store(&self.store_url).is_err() {
             runtime.register_object_store(self.store_url.as_ref(), Arc::clone(self.metastore.store()));
         }
@@ -453,13 +472,13 @@ impl HiveTable {
             table: format!("{}.{}", self.schema_name, self.table),
             raw,
         };
-        let config = FileScanConfigBuilder::new(self.store_url.clone(), Arc::new(source))
-            .with_file_groups(groups.into_iter().map(FileGroup::new).collect())
-            .with_projection_indices(projection.cloned())?
-            .with_limit(limit)
-            .with_expr_adapter(Some(Arc::new(columns)))
-            .build();
-        Ok(DataSourceExec::from_data_source(config))
+        Ok(
+            FileScanConfigBuilder::new(self.store_url.clone(), Arc::new(source))
+                .with_file_groups(groups.into_iter().map(FileGroup::new).collect())
+                .with_projection_indices(projection.cloned())?
+                .with_limit(limit)
+                .with_expr_adapter(Some(Arc::new(columns))),
+        )
     }
 
     pub(crate) async fn data_files(&self) -> Result<Vec<ObjectMeta>> {
@@ -536,13 +555,20 @@ impl TableProvider for HiveTable {
             .await
             .inspect_err(|err| trace::record_error(&span, err))?;
         record_files(&span, &files);
+        self.register_store(state);
+        let statistics = scan_statistics(self, state, &files).await;
         let partitions = state.config().target_partitions().max(1);
         let mut groups: Vec<Vec<PartitionedFile>> = vec![Vec::new(); partitions.min(files.len().max(1))];
         let group_count = groups.len();
         for (index, meta) in files.into_iter().enumerate() {
             groups[index % group_count].push(PartitionedFile::new_from_meta(meta));
         }
-        self.scan_files(state.runtime_env(), groups, projection, limit)
+        // Statistics are all inexact (see `statistics.rs`): they change the
+        // plan, never an answer.
+        let config = self
+            .scan_files(state.runtime_env(), groups, projection, limit)?
+            .with_statistics(statistics);
+        Ok(DataSourceExec::from_data_source(config.build()))
     }
 
     async fn insert_into(

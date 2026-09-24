@@ -25,6 +25,10 @@ mod hive_redteam;
 mod hive_redteam_w1;
 #[cfg(feature = "hive")]
 mod hive_smoke;
+#[cfg(feature = "hive")]
+mod hive_statistics;
+#[cfg(feature = "hive")]
+mod hive_statistics_acceptance;
 
 #[cfg(feature = "mongodb")]
 mod mongodb;

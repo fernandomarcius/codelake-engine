@@ -145,18 +145,13 @@ pub(crate) fn executor(context: &'static str) -> Arc<dyn SQLExecutor> {
 /// Session configured like the engine: federation rules plus the filter guard.
 pub(crate) fn federated_session() -> datafusion::prelude::SessionContext {
     use datafusion::execution::SessionStateBuilder;
-    use datafusion::physical_optimizer::PhysicalOptimizerRule;
-    use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 
-    let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> =
-        vec![Arc::new(crate::federation_guard::FederationFilterGuard)];
-    rules.extend(PhysicalOptimizer::new().rules);
     let state = SessionStateBuilder::new()
         .with_default_features()
         .with_analyzer_rules(crate::engine::analyzer_rules())
         .with_optimizer_rules(crate::engine::optimizer_rules())
         .with_query_planner(Arc::new(datafusion_federation::FederatedQueryPlanner::new()))
-        .with_physical_optimizer_rules(rules)
+        .with_physical_optimizer_rules(crate::engine::physical_rules())
         .build();
     datafusion::prelude::SessionContext::new_with_state(state)
 }

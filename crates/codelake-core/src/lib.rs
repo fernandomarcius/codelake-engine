@@ -26,6 +26,7 @@ pub mod runtime;
 mod semantics_tests;
 pub mod session_properties;
 pub mod statement_policy;
+pub mod statistics_guard;
 pub mod subquery;
 pub mod table_procedure;
 #[cfg(test)]
