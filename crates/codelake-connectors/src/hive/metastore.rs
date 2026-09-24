@@ -25,7 +25,11 @@ pub(crate) const MANAGED_TABLE: &str = "MANAGED_TABLE";
 pub(crate) const VIRTUAL_VIEW: &str = "VIRTUAL_VIEW";
 const METADATA_FILE: &str = ".trinoSchema";
 const PERMISSIONS_DIR: &str = ".trinoPermissions";
-const WRITER_VERSION: &str = "codelake";
+/// Trino's file metastore refuses metadata whose `writerVersion` is not its own
+/// version ("File metastore provides no compatibility for metadata written with
+/// a different version"). `CodeLake` shares the warehouse with Trino 431, so new
+/// metadata carries 431; rewrites keep the version already in the file.
+pub(crate) const TRINO_VERSION: &str = "431";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,7 +78,7 @@ impl TableMetadata {
     /// New managed Parquet table, the only kind `CodeLake` creates.
     pub(crate) fn managed_parquet(owner: &str, columns: Vec<ColumnMetadata>) -> Self {
         Self {
-            writer_version: Some(WRITER_VERSION.into()),
+            writer_version: Some(TRINO_VERSION.into()),
             owner: Some(owner.into()),
             table_type: MANAGED_TABLE.into(),
             data_columns: columns,
@@ -270,7 +274,7 @@ impl FileMetastore {
             return Err(MetastoreError::AlreadyExists(format!("schema {schema}")));
         }
         let metadata = SchemaMetadata {
-            writer_version: Some(WRITER_VERSION.into()),
+            writer_version: Some(TRINO_VERSION.into()),
             owner_name: Some(owner.into()),
             owner_type: Some("USER".into()),
             parameters: BTreeMap::new(),
@@ -417,6 +421,28 @@ mod tests {
             std::fs::read(dir.path().join("..pilot.trinoSchema.crc")).unwrap(),
             hadoop_crc(&schema_file)
         );
+    }
+
+    #[tokio::test]
+    async fn new_metadata_carries_the_trino_version() {
+        let (dir, metastore) = scratch();
+        metastore.create_schema("raw", "dbt").await.unwrap();
+        let table = TableMetadata::managed_parquet("dbt", Vec::new());
+        metastore.write_table("raw", "t", &table).await.unwrap();
+        for file in [".raw.trinoSchema", "raw/t/.trinoSchema"] {
+            let json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join(file)).unwrap()).unwrap();
+            assert_eq!(json["writerVersion"], "431", "{file}");
+        }
+        // A rewrite keeps the version of the Trino that wrote the file.
+        let mut written_by_other = table.clone();
+        written_by_other.writer_version = Some("440".into());
+        metastore
+            .write_table("raw", "t", &written_by_other)
+            .await
+            .unwrap();
+        let back = metastore.table("raw", "t").await.unwrap().unwrap();
+        assert_eq!(back.writer_version.as_deref(), Some("440"));
     }
 
     #[tokio::test]
