@@ -18,12 +18,14 @@ use futures::future::join_all;
 use serde::Serialize;
 use tracing::{info, warn};
 
+use crate::computed_batches::ComputedBatches;
 use crate::config::{ExecutionConfig, MemoryConfig};
 use crate::connector::{Connector, ConnectorError, ViewDefinition, WritableCatalog};
 use crate::ddl::{self, Prepared, RelationKind, Rewrite, ViewSecurity};
 use crate::federation_guard::FederationFilterGuard;
 use crate::information_schema::CatalogList;
 use crate::output::AccountedOutput;
+use crate::plain_views::PlainViews;
 use crate::runtime::{EngineRuntime, MemoryStats};
 use crate::session_properties::{PropertyRegistry, SessionProperties};
 
@@ -108,11 +110,15 @@ pub fn analyzer_rules() -> Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Sen
 
 /// Default `DataFusion` physical rules, preceded by the federation guard (it must
 /// run before `FilterPushdown`; see [`crate::federation_guard`]) and followed by
-/// [`AccountedOutput`], which keeps the buffers between the plan and the client
-/// inside the memory pool.
+/// [`PlainViews`], which keeps string views out of operators that retain rows
+/// (ADR 0003), [`ComputedBatches`], which sizes the batches of computed values
+/// in bytes, and [`AccountedOutput`], which keeps the buffers between the plan
+/// and the client inside the memory pool.
 fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = vec![Arc::new(FederationFilterGuard)];
     rules.extend(PhysicalOptimizer::new().rules);
+    rules.push(Arc::new(PlainViews));
+    rules.push(Arc::new(ComputedBatches));
     rules.push(Arc::new(AccountedOutput));
     rules
 }

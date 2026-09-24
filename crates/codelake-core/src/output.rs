@@ -26,7 +26,8 @@
 //!
 //! What stays outside the pool is the batch an operator is producing at this
 //! instant, before its consumer reserves it: at most one per running
-//! partition (see ADR 0003, "What the pool does not cover").
+//! partition, about 2 MiB when it holds computed values
+//! (`crate::computed_batches`; see ADR 0003, "What the pool does not cover").
 
 use std::any::Any;
 use std::fmt;
@@ -228,8 +229,62 @@ fn hold(batch: RecordBatch, reservation: &MemoryReservation, spill: &SpillManage
     if held.try_grow(batch.get_array_memory_size()).is_ok() {
         return Ok(Some(Held::Memory(batch, held)));
     }
-    let file = spill.spill_record_batch_and_finish(std::slice::from_ref(&batch), MERGE_CONSUMER)?;
-    Ok(file.map(Held::Spilled))
+    Ok(spill_in_chunks(&batch, spill)?.map(Held::Spilled))
+}
+
+/// Bytes of one spilled chunk.
+const SPILL_CHUNK_BYTES: usize = 1 << 20;
+
+/// Writes `batch` to disk in chunks of about [`SPILL_CHUNK_BYTES`]. The pool
+/// has just refused the batch, and the IPC writer encodes what it writes into a
+/// buffer of its own first: a 32 MiB batch written at once needed another
+/// 32 MiB, outside the pool, at the moment memory ran out.
+///
+/// A slice of a string view keeps every data buffer of the batch, which the
+/// writer would copy into each chunk: string and binary views are compacted
+/// per chunk, and a batch with a view nested in another type is written whole.
+fn spill_in_chunks(batch: &RecordBatch, spill: &SpillManager) -> Result<Option<RefCountedTempFile>> {
+    let rows = batch.num_rows();
+    let nested = batch.schema().fields().iter().any(|f| f.data_type().is_nested());
+    let bytes = batch.get_array_memory_size().max(1);
+    let per_chunk = if nested {
+        rows
+    } else {
+        rows.saturating_mul(SPILL_CHUNK_BYTES)
+            .div_ceil(bytes)
+            .clamp(1, rows.max(1))
+    };
+    let mut file = spill.create_in_progress_file(MERGE_CONSUMER)?;
+    let mut start = 0;
+    while start < rows {
+        let len = per_chunk.min(rows - start);
+        file.append_batch(&compact_views(&batch.slice(start, len))?)?;
+        start += len;
+    }
+    file.finish()
+}
+
+/// `batch` with its string and binary views holding only the bytes they use.
+fn compact_views(batch: &RecordBatch) -> Result<RecordBatch> {
+    use datafusion::arrow::array::{Array, ArrayRef, AsArray};
+    use datafusion::arrow::datatypes::DataType;
+    if !batch
+        .columns()
+        .iter()
+        .any(|c| matches!(c.data_type(), DataType::Utf8View | DataType::BinaryView))
+    {
+        return Ok(batch.clone());
+    }
+    let columns: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .map(|column| match column.data_type() {
+            DataType::Utf8View => Arc::new(column.as_string_view().gc()) as ArrayRef,
+            DataType::BinaryView => Arc::new(column.as_binary_view().gc()) as ArrayRef,
+            _ => Arc::clone(column),
+        })
+        .collect();
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
 /// Runs one input partition into the channel.
@@ -495,9 +550,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let limit = ByteSize::mib(16);
         let engine = engine(dir.path(), limit, 4);
-        // ~1 MiB batches; the merge's exchange slice is 2 MiB.
+        // Batches of up to 2 MiB (`computed_batches`); the merge's exchange
+        // slice is 2 MiB.
         let frame = engine
-            .sql("SELECT value, repeat('x', 120) AS pad FROM generate_series(1, 200000) WHERE value > 0")
+            .sql("SELECT value, repeat('x', 4000) AS pad FROM generate_series(1, 10000) WHERE value > 0")
             .await
             .unwrap();
         let plan = frame.clone().create_physical_plan().await.unwrap();
@@ -512,9 +568,63 @@ mod tests {
         while let Some(batch) = stream.next().await {
             batches.push(batch.unwrap());
         }
-        assert_eq!(values(&batches), (1..=200_000).collect::<Vec<i64>>());
+        assert_eq!(values(&batches), (1..=10_000).collect::<Vec<i64>>());
         drop(stream);
         assert_eq!(engine.memory().reserved_bytes, 0);
+    }
+
+    /// A refused batch is written in chunks of about 1 MiB, string views
+    /// compacted, and read back whole and in order.
+    #[tokio::test]
+    async fn a_refused_batch_is_spilled_in_chunks() {
+        use datafusion::arrow::array::{Array, AsArray, StringViewArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::execution::runtime_env::RuntimeEnv;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int64, false),
+            Field::new("s", DataType::Utf8View, false),
+        ]));
+        let rows: i64 = 8192;
+        let text = |v: i64| format!("{v:0>500}");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(1..=rows)),
+                Arc::new(StringViewArray::from_iter_values((1..=rows).map(text))),
+            ],
+        )
+        .unwrap();
+        let runtime = Arc::new(RuntimeEnv::default());
+        let metrics = ExecutionPlanMetricsSet::new();
+        let spill = SpillManager::new(runtime, SpillMetrics::new(&metrics, 0), schema);
+        let file = spill_in_chunks(&batch, &spill).unwrap().unwrap();
+        // ~4 MiB of strings: written once, not once per chunk.
+        let size = std::fs::metadata(file.path()).unwrap().len();
+        assert!(size < 6 << 20, "{size} bytes spilled");
+        let read: Vec<RecordBatch> = spill
+            .read_spill_as_stream_unbuffered(file, None)
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        // ~4.2 MiB in chunks of ~1 MiB: 5 chunks of at most ~2000 rows.
+        let sizes: Vec<usize> = read.iter().map(RecordBatch::num_rows).collect();
+        assert!(sizes.len() >= 4 && sizes.iter().all(|n| *n <= 2100), "{sizes:?}");
+        let mut next = 1;
+        for chunk in &read {
+            let v = chunk.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let s = chunk.column(1).as_string_view();
+            for row in 0..chunk.num_rows() {
+                assert_eq!(v.value(row), next);
+                assert_eq!(s.value(row), text(next));
+                next += 1;
+            }
+        }
+        assert_eq!(next, rows + 1);
+        assert!(read.iter().all(|b| b.column(1).len() == b.num_rows()));
     }
 
     #[tokio::test]

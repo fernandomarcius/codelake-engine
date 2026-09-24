@@ -4,6 +4,7 @@
 
 pub mod bytes;
 pub mod catalog;
+pub mod computed_batches;
 pub mod config;
 pub mod connector;
 mod ddl;
@@ -15,6 +16,7 @@ pub mod information_schema;
 mod literals;
 pub mod output;
 pub mod overflow;
+pub mod plain_views;
 pub mod pool;
 pub mod runtime;
 pub mod session_properties;
