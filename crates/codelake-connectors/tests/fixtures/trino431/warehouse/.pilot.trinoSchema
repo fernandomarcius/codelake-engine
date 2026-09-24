@@ -1,0 +1,8 @@
+{
+  "writerVersion" : "431",
+  "ownerName" : "trino",
+  "ownerType" : "USER",
+  "parameters" : {
+    "presto_query_id" : "20260923_235833_00002_h47gc"
+  }
+}

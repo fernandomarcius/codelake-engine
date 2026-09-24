@@ -1,0 +1,23 @@
+{
+  "writerVersion" : "431",
+  "owner" : "trino",
+  "tableType" : "VIRTUAL_VIEW",
+  "dataColumns" : [ {
+    "name" : "dummy",
+    "type" : "string",
+    "properties" : { }
+  } ],
+  "partitionColumns" : [ ],
+  "parameters" : {
+    "comment" : "Presto View",
+    "presto_view" : "true",
+    "trino_created_by" : "Trino Hive connector",
+    "presto_version" : "431",
+    "presto_query_id" : "20260923_235837_00005_h47gc"
+  },
+  "originalStorageFormat" : { },
+  "serdeParameters" : { },
+  "viewOriginalText" : "/* Presto View: eyJvcmlnaW5hbFNxbCI6IlNFTEVDVFxuICBpZFxuLCBub21lXG5GUk9NXG4gIGhpdmUucGlsb3QudDFcbldIRVJFIChpZCA+IDApXG4iLCJjYXRhbG9nIjoiaGl2ZSIsImNvbHVtbnMiOlt7Im5hbWUiOiJpZCIsInR5cGUiOiJiaWdpbnQifSx7Im5hbWUiOiJub21lIiwidHlwZSI6InZhcmNoYXIifV0sIm93bmVyIjoidHJpbm8iLCJydW5Bc0ludm9rZXIiOmZhbHNlLCJwYXRoIjpbXX0= */",
+  "viewExpandedText" : "/* Presto View */",
+  "columnStatistics" : { }
+}

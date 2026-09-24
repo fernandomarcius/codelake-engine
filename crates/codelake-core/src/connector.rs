@@ -8,7 +8,11 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::catalog::CatalogProvider;
+use datafusion::error::Result as DfResult;
+use datafusion::execution::TaskContext;
+use datafusion::physical_plan::SendableRecordBatchStream;
 
 /// Boxed error from a driver, kept opaque so connectors can wrap any client library.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -46,4 +50,47 @@ pub trait Connector: Send + Sync + Debug {
 
     /// Cheap reachability check used by the readiness probe. Must not scan data.
     async fn ping(&self) -> Result<(), ConnectorError>;
+
+    /// DDL and write support, for sources that accept `CREATE`, `DROP`, views
+    /// and `ALTER TABLE ADD COLUMN`. `INSERT` goes through the table provider.
+    fn writable(&self) -> Option<Arc<dyn WritableCatalog>> {
+        None
+    }
+}
+
+/// Statement-level writes a catalog accepts. The engine routes the matching
+/// statements here instead of `DataFusion`'s in-memory DDL.
+#[async_trait]
+pub trait WritableCatalog: Send + Sync + Debug {
+    async fn create_schema(&self, schema: &str, if_not_exists: bool, owner: &str) -> DfResult<()>;
+
+    /// Creates `schema.table` from a stream of rows. The table becomes visible
+    /// only after every row is durably written.
+    async fn create_table_as(
+        &self,
+        schema: &str,
+        table: &str,
+        if_not_exists: bool,
+        owner: &str,
+        rows: SendableRecordBatchStream,
+        context: Arc<TaskContext>,
+    ) -> DfResult<u64>;
+
+    async fn drop_table(&self, schema: &str, table: &str, if_exists: bool) -> DfResult<()>;
+
+    /// Stores a view; `sql` is the definition as written by the client.
+    async fn create_view(
+        &self,
+        schema: &str,
+        view: &str,
+        or_replace: bool,
+        owner: &str,
+        sql: &str,
+        output: SchemaRef,
+    ) -> DfResult<()>;
+
+    async fn drop_view(&self, schema: &str, view: &str, if_exists: bool) -> DfResult<()>;
+
+    async fn add_column(&self, schema: &str, table: &str, column: &str, data_type: &DataType)
+    -> DfResult<()>;
 }

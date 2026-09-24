@@ -43,6 +43,12 @@ codelake-connectors = { path = "crates/codelake-connectors" }
 tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "native-tls"] }
 bb8 = "0.9"
 
+# Hive catalog (Trino file metastore layout)
+object_store = { version = "0.13", default-features = false, features = ["fs"] }
+crc32fast = "1.5"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+
 # Runtime
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
 tokio-util = "0.7"

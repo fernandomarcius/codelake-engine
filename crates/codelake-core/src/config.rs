@@ -161,6 +161,20 @@ pub enum SourceKind {
         /// Name of the environment variable holding the full connection string.
         connection_string_env: String,
     },
+    /// Parquet warehouse in Trino's file-metastore layout (`hive.metastore=file`).
+    Hive {
+        /// Absolute local path (`/data/warehouse`, `file:/data/warehouse`) or
+        /// `s3://bucket/prefix`.
+        warehouse: String,
+        /// S3-compatible endpoint (`MinIO`); omit for AWS S3 or local disk.
+        s3_endpoint: Option<String>,
+        #[serde(default = "default_region")]
+        s3_region: String,
+        access_key_id_env: Option<String>,
+        secret_access_key_env: Option<String>,
+        #[serde(default)]
+        s3_path_style: bool,
+    },
     Iceberg {
         /// Iceberg REST catalog URI.
         catalog_uri: String,
@@ -187,6 +201,7 @@ impl SourceKind {
             Self::Sqlserver { .. } => "sqlserver",
             Self::Mongodb { .. } => "mongodb",
             Self::Iceberg { .. } => "iceberg",
+            Self::Hive { .. } => "hive",
         }
     }
 
@@ -202,6 +217,11 @@ impl SourceKind {
                 connection_string_env,
             } => vec![connection_string_env.as_str()],
             Self::Iceberg {
+                access_key_id_env,
+                secret_access_key_env,
+                ..
+            }
+            | Self::Hive {
                 access_key_id_env,
                 secret_access_key_env,
                 ..
@@ -473,6 +493,24 @@ impl Config {
                 } => {
                     if !(catalog_uri.starts_with("http://") || catalog_uri.starts_with("https://")) {
                         errors.push(format!("source `{name}`: catalog_uri must be an http(s) URL"));
+                    }
+                    if access_key_id_env.is_some() != secret_access_key_env.is_some() {
+                        errors.push(format!(
+                            "source `{name}`: set both access_key_id_env and secret_access_key_env, or neither"
+                        ));
+                    }
+                }
+                SourceKind::Hive {
+                    warehouse,
+                    access_key_id_env,
+                    secret_access_key_env,
+                    ..
+                } => {
+                    let local = warehouse.starts_with('/') || warehouse.starts_with("file:");
+                    if !local && !warehouse.starts_with("s3://") {
+                        errors.push(format!(
+                            "source `{name}`: warehouse must be an absolute path, file: or s3:// URL"
+                        ));
                     }
                     if access_key_id_env.is_some() != secret_access_key_env.is_some() {
                         errors.push(format!(
@@ -771,6 +809,23 @@ mod tests {
                 "missing `{expected}` in {errors:#?}"
             );
         }
+    }
+
+    #[test]
+    fn hive_sources_validate_their_warehouse() {
+        let doc = format!(
+            "{VALID}\n[[source]]\nname = \"hive\"\nkind = \"hive\"\nwarehouse = \"file:/data/DATAWAREHOUSE\"\n\
+             [[source]]\nname = \"lake2\"\nkind = \"hive\"\nwarehouse = \"s3://lake/wh\"\ns3_endpoint = \"http://minio:9000\"\n\
+             [[source]]\nname = \"bad\"\nkind = \"hive\"\nwarehouse = \"relative\"\naccess_key_id_env = \"K\"\n"
+        );
+        let errors = errors_of(&doc, &full_env);
+        assert_eq!(errors.len(), 2, "{errors:#?}");
+        assert!(
+            errors.iter().all(|e| e.starts_with("source `bad`")),
+            "{errors:#?}"
+        );
+        let cfg = parse(&doc);
+        assert_eq!(cfg.sources.last().unwrap().kind.label(), "hive");
     }
 
     #[test]

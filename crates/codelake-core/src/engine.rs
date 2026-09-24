@@ -1,21 +1,26 @@
 //! Query engine: one `DataFusion` session per node, federated across sources and
 //! bounded by [`EngineRuntime`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionStateBuilder;
+use datafusion::logical_expr::{DdlStatement, LogicalPlan};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::sql::TableReference;
 use datafusion_federation::FederatedQueryPlanner;
 use futures::future::join_all;
 use serde::Serialize;
 use tracing::{info, warn};
 
 use crate::config::{ExecutionConfig, MemoryConfig};
-use crate::connector::{Connector, ConnectorError};
+use crate::connector::{Connector, ConnectorError, WritableCatalog};
+use crate::ddl::{self, Prepared};
 use crate::federation_guard::FederationFilterGuard;
 use crate::runtime::{EngineRuntime, MemoryStats};
 
@@ -28,6 +33,9 @@ pub enum EngineError {
     #[error("source `{0}` did not answer within {1:?}")]
     Timeout(String, Duration),
 }
+
+/// Owner of objects created by statements that carry no user.
+pub const DEFAULT_USER: &str = "codelake";
 
 /// Logical rules: `DataFusion` defaults with federation right after scalar
 /// subquery decorrelation (upstream's position) and an extra `push_down_filter`
@@ -83,6 +91,7 @@ pub struct Engine {
     ctx: SessionContext,
     runtime: EngineRuntime,
     sources: Vec<(Arc<dyn Connector>, bool)>,
+    writable: HashMap<String, Arc<dyn WritableCatalog>>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -91,6 +100,7 @@ impl std::fmt::Debug for Engine {
             .field("session_id", &self.ctx.session_id())
             .field("runtime", &self.runtime)
             .field("sources", &self.sources)
+            .field("writable", &self.writable.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -118,16 +128,186 @@ impl Engine {
             ctx,
             runtime,
             sources: Vec::new(),
+            writable: HashMap::new(),
         })
     }
 
-    /// Plans a statement the way clients should run it: uncorrelated scalar
-    /// subqueries in predicates are evaluated first so their values can be
-    /// pushed down to the sources (see [`crate::subquery`]).
-    pub async fn sql(&self, sql: &str) -> Result<datafusion::dataframe::DataFrame, DataFusionError> {
-        let plan = self.ctx.state().create_logical_plan(sql).await?;
+    /// Runs a statement as the engine's own user. See [`Engine::sql_as`].
+    pub async fn sql(&self, sql: &str) -> Result<DataFrame, DataFusionError> {
+        self.sql_as(DEFAULT_USER, sql).await
+    }
+
+    /// Plans a statement the way clients should run it:
+    /// - DDL on a writable catalog (Hive) goes to that catalog, owned by `user`;
+    /// - uncorrelated scalar subqueries in predicates are evaluated first so
+    ///   their values can be pushed down (see [`crate::subquery`]).
+    pub async fn sql_as(&self, user: &str, sql: &str) -> Result<DataFrame, DataFusionError> {
+        // Planning futures are large; boxing keeps callers' futures small.
+        Box::pin(self.plan_and_run(user, sql)).await
+    }
+
+    async fn plan_and_run(&self, user: &str, sql: &str) -> Result<DataFrame, DataFusionError> {
+        let state = self.ctx.state();
+        let dialect = state.config().options().sql_parser.dialect;
+        let mut statement = state.sql_to_statement(sql, &dialect)?;
+        let prepared = ddl::prepare(&mut statement)?;
+        if let Some(Prepared::AddColumn {
+            table,
+            column,
+            sql_type,
+        }) = &prepared
+        {
+            return self.add_column(table, column, sql_type).await;
+        }
+        let plan = state.statement_to_plan(statement).await?;
+        if ddl::is_routable(&plan)
+            && let Some(result) = self.route_ddl(user, &plan, prepared).await?
+        {
+            return Ok(result);
+        }
         let plan = crate::subquery::pre_evaluate_scalar_subqueries(&self.ctx, plan).await?;
         self.ctx.execute_logical_plan(plan).await
+    }
+
+    fn resolve(&self, table: &TableReference) -> (String, String, String) {
+        let state = self.ctx.state();
+        let defaults = &state.config().options().catalog;
+        let resolved = table
+            .clone()
+            .resolve(&defaults.default_catalog, &defaults.default_schema);
+        (
+            resolved.catalog.to_string(),
+            resolved.schema.to_string(),
+            resolved.table.to_string(),
+        )
+    }
+
+    fn writable(&self, catalog: &str) -> Option<&Arc<dyn WritableCatalog>> {
+        self.writable.get(catalog)
+    }
+
+    fn empty(&self) -> Result<DataFrame, DataFusionError> {
+        self.ctx.read_empty()
+    }
+
+    fn row_count(&self, rows: u64) -> Result<DataFrame, DataFusionError> {
+        use datafusion::arrow::array::{RecordBatch, UInt64Array};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("rows", DataType::UInt64, false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![rows]))])?;
+        self.ctx.read_batch(batch)
+    }
+
+    async fn add_column(
+        &self,
+        table: &TableReference,
+        column: &str,
+        sql_type: &str,
+    ) -> Result<DataFrame, DataFusionError> {
+        let (catalog, schema, name) = self.resolve(table);
+        let writable = self.writable(&catalog).ok_or_else(|| {
+            DataFusionError::Plan(format!("catalog {catalog} does not support ALTER TABLE"))
+        })?;
+        // Let the SQL planner translate the type name exactly as it would in a cast.
+        let probe = self
+            .ctx
+            .sql(&format!("SELECT CAST(NULL AS {sql_type}) AS t"))
+            .await?;
+        let data_type = probe.schema().field(0).data_type().clone();
+        writable.add_column(&schema, &name, column, &data_type).await?;
+        self.empty()
+    }
+
+    async fn route_ddl(
+        &self,
+        user: &str,
+        plan: &LogicalPlan,
+        prepared: Option<Prepared>,
+    ) -> Result<Option<DataFrame>, DataFusionError> {
+        let LogicalPlan::Ddl(ddl) = plan else {
+            return Ok(None);
+        };
+        match ddl {
+            DdlStatement::CreateMemoryTable(create) => {
+                let (catalog, schema, table) = self.resolve(&create.name);
+                let Some(writable) = self.writable(&catalog) else {
+                    return Ok(None);
+                };
+                if create.or_replace {
+                    writable.drop_table(&schema, &table, true).await?;
+                }
+                let input =
+                    crate::subquery::pre_evaluate_scalar_subqueries(&self.ctx, create.input.as_ref().clone())
+                        .await?;
+                let rows = self
+                    .ctx
+                    .execute_logical_plan(input)
+                    .await?
+                    .execute_stream()
+                    .await?;
+                let written = writable
+                    .create_table_as(
+                        &schema,
+                        &table,
+                        create.if_not_exists,
+                        user,
+                        rows,
+                        self.ctx.task_ctx(),
+                    )
+                    .await?;
+                Ok(Some(self.row_count(written)?))
+            }
+            DdlStatement::DropTable(drop) => {
+                let (catalog, schema, table) = self.resolve(&drop.name);
+                let Some(writable) = self.writable(&catalog) else {
+                    return Ok(None);
+                };
+                writable.drop_table(&schema, &table, drop.if_exists).await?;
+                Ok(Some(self.empty()?))
+            }
+            DdlStatement::CreateView(view) => {
+                let (catalog, schema, name) = self.resolve(&view.name);
+                let Some(writable) = self.writable(&catalog) else {
+                    return Ok(None);
+                };
+                let Some(Prepared::ViewSql(sql)) = prepared else {
+                    return Err(DataFusionError::Internal("view SQL was not captured".into()));
+                };
+                let output = Arc::new(view.input.schema().as_arrow().clone());
+                writable
+                    .create_view(&schema, &name, view.or_replace, user, &sql, output)
+                    .await?;
+                Ok(Some(self.empty()?))
+            }
+            DdlStatement::DropView(drop) => {
+                let (catalog, schema, name) = self.resolve(&drop.name);
+                let Some(writable) = self.writable(&catalog) else {
+                    return Ok(None);
+                };
+                writable.drop_view(&schema, &name, drop.if_exists).await?;
+                Ok(Some(self.empty()?))
+            }
+            DdlStatement::CreateCatalogSchema(create) => {
+                let default_catalog = self
+                    .ctx
+                    .state()
+                    .config()
+                    .options()
+                    .catalog
+                    .default_catalog
+                    .clone();
+                let (catalog, schema) = create.schema_name.split_once('.').map_or(
+                    (default_catalog.as_str(), create.schema_name.as_str()),
+                    |(c, s)| (c, s),
+                );
+                let Some(writable) = self.writable(catalog) else {
+                    return Ok(None);
+                };
+                writable.create_schema(schema, create.if_not_exists, user).await?;
+                Ok(Some(self.empty()?))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Registers a source as a SQL catalog. Required sources abort startup on
@@ -142,6 +322,9 @@ impl Engine {
         let failure = match tokio::time::timeout(timeout, connector.catalog()).await {
             Ok(Ok(catalog)) => {
                 self.ctx.register_catalog(&name, catalog);
+                if let Some(writable) = connector.writable() {
+                    self.writable.insert(name.clone(), writable);
+                }
                 self.sources.push((connector, required));
                 info!(source = %name, "source attached");
                 return Ok(Attach::Attached);

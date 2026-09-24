@@ -6,6 +6,7 @@ pub mod bytes;
 pub mod catalog;
 pub mod config;
 pub mod connector;
+mod ddl;
 pub mod engine;
 pub mod federation_guard;
 pub mod federation_policy;
@@ -17,6 +18,6 @@ mod testing;
 
 pub use bytes::ByteSize;
 pub use config::{Config, SourceConfig, SourceKind, ValidatedConfig};
-pub use connector::{BoxError, Connector, ConnectorError};
+pub use connector::{BoxError, Connector, ConnectorError, WritableCatalog};
 pub use engine::{Attach, Engine, EngineError, SourceStatus};
 pub use runtime::MemoryStats;

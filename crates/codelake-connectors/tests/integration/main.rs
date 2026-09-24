@@ -11,6 +11,9 @@
 
 mod common;
 
+#[cfg(feature = "hive")]
+mod hive_smoke;
+
 #[cfg(feature = "mongodb")]
 mod mongodb;
 #[cfg(all(feature = "mysql", feature = "postgres"))]

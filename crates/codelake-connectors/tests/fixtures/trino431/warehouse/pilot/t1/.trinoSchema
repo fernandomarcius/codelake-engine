@@ -1,0 +1,130 @@
+{
+  "writerVersion" : "431",
+  "owner" : "trino",
+  "tableType" : "MANAGED_TABLE",
+  "dataColumns" : [ {
+    "name" : "id",
+    "type" : "bigint",
+    "properties" : { }
+  }, {
+    "name" : "nome",
+    "type" : "string",
+    "properties" : { }
+  }, {
+    "name" : "valor",
+    "type" : "decimal(18,2)",
+    "properties" : { }
+  }, {
+    "name" : "lsn",
+    "type" : "binary",
+    "properties" : { }
+  }, {
+    "name" : "ts",
+    "type" : "timestamp",
+    "properties" : { }
+  }, {
+    "name" : "d",
+    "type" : "date",
+    "properties" : { }
+  }, {
+    "name" : "flag",
+    "type" : "boolean",
+    "properties" : { }
+  }, {
+    "name" : "dbl",
+    "type" : "double",
+    "properties" : { }
+  }, {
+    "name" : "i",
+    "type" : "int",
+    "properties" : { }
+  }, {
+    "name" : "vc",
+    "type" : "varchar(10)",
+    "properties" : { }
+  } ],
+  "partitionColumns" : [ ],
+  "parameters" : {
+    "presto_version" : "431",
+    "presto_query_id" : "20260923_235834_00003_h47gc",
+    "transactional" : "false",
+    "auto.purge" : "false",
+    "STATS_GENERATED_VIA_STATS_TASK" : "workaround for potential lack of HIVE-12730",
+    "numFiles" : "2",
+    "numRows" : "2",
+    "rawDataSize" : "155",
+    "totalSize" : "3038"
+  },
+  "storageFormat" : "PARQUET",
+  "serdeParameters" : { },
+  "columnStatistics" : {
+    "flag" : {
+      "booleanStatistics" : {
+        "trueCount" : 1,
+        "falseCount" : 1
+      },
+      "nullsCount" : 0
+    },
+    "d" : {
+      "dateStatistics" : {
+        "min" : "2026-01-02",
+        "max" : "2026-01-03"
+      },
+      "nullsCount" : 0,
+      "distinctValuesCount" : 1
+    },
+    "lsn" : {
+      "maxValueSizeInBytes" : 10,
+      "totalSizeInBytes" : 20,
+      "nullsCount" : 0
+    },
+    "valor" : {
+      "decimalStatistics" : {
+        "min" : 1.00,
+        "max" : 10.50
+      },
+      "nullsCount" : 0,
+      "distinctValuesCount" : 1
+    },
+    "i" : {
+      "integerStatistics" : {
+        "min" : 7,
+        "max" : 8
+      },
+      "nullsCount" : 0,
+      "distinctValuesCount" : 1
+    },
+    "nome" : {
+      "maxValueSizeInBytes" : 6,
+      "totalSizeInBytes" : 7,
+      "nullsCount" : 0,
+      "distinctValuesCount" : 1
+    },
+    "id" : {
+      "integerStatistics" : {
+        "min" : 1,
+        "max" : 2
+      },
+      "nullsCount" : 0,
+      "distinctValuesCount" : 1
+    },
+    "vc" : {
+      "maxValueSizeInBytes" : 1,
+      "totalSizeInBytes" : 2,
+      "nullsCount" : 0,
+      "distinctValuesCount" : 1
+    },
+    "dbl" : {
+      "doubleStatistics" : {
+        "min" : 1.0,
+        "max" : 3.5
+      },
+      "nullsCount" : 0,
+      "distinctValuesCount" : 1
+    },
+    "ts" : {
+      "nullsCount" : 0,
+      "distinctValuesCount" : 1
+    }
+  }
+}

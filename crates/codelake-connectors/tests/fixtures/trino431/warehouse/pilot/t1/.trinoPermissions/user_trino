@@ -1,0 +1,29 @@
+[ {
+  "permission" : "SELECT",
+  "grantOption" : true,
+  "grantee" : {
+    "type" : "USER",
+    "name" : "trino"
+  }
+}, {
+  "permission" : "INSERT",
+  "grantOption" : true,
+  "grantee" : {
+    "type" : "USER",
+    "name" : "trino"
+  }
+}, {
+  "permission" : "UPDATE",
+  "grantOption" : true,
+  "grantee" : {
+    "type" : "USER",
+    "name" : "trino"
+  }
+}, {
+  "permission" : "DELETE",
+  "grantOption" : true,
+  "grantee" : {
+    "type" : "USER",
+    "name" : "trino"
+  }
+} ]

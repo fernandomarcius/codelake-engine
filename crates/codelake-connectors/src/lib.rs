@@ -10,6 +10,8 @@ use std::sync::Arc;
 use codelake_core::config::{Secrets, SourceConfig};
 use codelake_core::{Connector, ConnectorError, SourceKind};
 
+#[cfg(feature = "hive")]
+pub mod hive;
 #[cfg(feature = "iceberg")]
 pub mod iceberg;
 #[cfg(feature = "mongodb")]
@@ -109,6 +111,30 @@ pub fn build(source: &SourceConfig, secrets: &Secrets) -> Result<Arc<dyn Connect
             name.clone(),
             secret(connection_string_env)?,
         ))),
+        #[cfg(feature = "hive")]
+        SourceKind::Hive {
+            warehouse,
+            s3_endpoint,
+            s3_region,
+            access_key_id_env,
+            secret_access_key_env,
+            s3_path_style,
+        } => {
+            let credentials = match (access_key_id_env, secret_access_key_env) {
+                (Some(key), Some(secret_key)) => Some((secret(key)?, secret(secret_key)?)),
+                _ => None,
+            };
+            Ok(Arc::new(hive::HiveConnector::new(
+                name.clone(),
+                hive::HiveParams {
+                    warehouse: warehouse.clone(),
+                    s3_endpoint: s3_endpoint.clone(),
+                    s3_region: s3_region.clone(),
+                    credentials,
+                    path_style: *s3_path_style,
+                },
+            )))
+        }
         #[cfg(feature = "iceberg")]
         SourceKind::Iceberg {
             catalog_uri,

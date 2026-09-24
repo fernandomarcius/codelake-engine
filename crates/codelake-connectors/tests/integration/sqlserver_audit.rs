@@ -287,7 +287,10 @@ async fn seed_wrong_results(host: &str, port: u16) {
     .await;
 }
 
-#[allow(clippy::too_many_lines, reason = "one audit item per block, read top to bottom")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one audit item per block, read top to bottom"
+)]
 async fn wrong_results(tag: &str) {
     let mut checks = Checks::new();
     let mssql = start_mssql(tag).await;
@@ -320,7 +323,11 @@ async fn wrong_results(tag: &str) {
         div_type.as_deref().is_ok_and(|t| t.starts_with("Decimal")),
         format!("type={div_type:?}"),
     );
-    let mul = try_rows(&engine, "SELECT valor * valor FROM erp1.dbo.dinheiro WHERE id = 2").await;
+    let mul = try_rows(
+        &engine,
+        "SELECT valor * valor FROM erp1.dbo.dinheiro WHERE id = 2",
+    )
+    .await;
     let mul_ref = try_rows(
         &engine,
         "SELECT CAST(30.0000 AS DECIMAL(19,4)) * CAST(30.0000 AS DECIMAL(19,4))",
@@ -490,7 +497,9 @@ async fn wrong_results(tag: &str) {
     let dt2_group_remote = dt2_group_plan.as_deref().map(remote_sqls).unwrap_or_default();
     checks.check(
         "4b GROUP BY datetime2(7) is NOT pushed (engine truncates 100 ns)",
-        dt2_group_remote.iter().all(|s| !s.to_lowercase().contains("group by")),
+        dt2_group_remote
+            .iter()
+            .all(|s| !s.to_lowercase().contains("group by")),
         format!("remote={dt2_group_remote:?}"),
     );
     let cross = physical_plan(&engine, "SELECT id FROM erp1.dbo.temporal WHERE dt2 > dtm").await;
@@ -500,7 +509,11 @@ async fn wrong_results(tag: &str) {
         cross_remote.iter().all(|s| !s.contains("WHERE")),
         format!("remote={cross_remote:?}"),
     );
-    let cross_rows = try_rows(&engine, "SELECT id FROM erp1.dbo.temporal WHERE dt2 > dtm ORDER BY id").await;
+    let cross_rows = try_rows(
+        &engine,
+        "SELECT id FROM erp1.dbo.temporal WHERE dt2 > dtm ORDER BY id",
+    )
+    .await;
     checks.check(
         "4d dt2 > dtm still returns the correct rows (both, year 2026 > 2020)",
         cross_rows.as_ref() == Ok(&rows(&[&["1"], &["2"]])),
@@ -510,10 +523,16 @@ async fn wrong_results(tag: &str) {
     let same_remote = same.as_deref().map(remote_sqls).unwrap_or_default();
     checks.check(
         "4e comparison between two datetime columns (same type) IS pushed",
-        same_remote.iter().any(|s| s.contains("WHERE") && s.to_lowercase().contains("[dtm]")),
+        same_remote
+            .iter()
+            .any(|s| s.contains("WHERE") && s.to_lowercase().contains("[dtm]")),
         format!("remote={same_remote:?}"),
     );
-    let same_rows = try_rows(&engine, "SELECT id FROM erp1.dbo.temporal WHERE dtm > dtmb ORDER BY id").await;
+    let same_rows = try_rows(
+        &engine,
+        "SELECT id FROM erp1.dbo.temporal WHERE dtm > dtmb ORDER BY id",
+    )
+    .await;
     checks.check(
         "4f dtm > dtmb returns only row 1",
         same_rows.as_ref() == Ok(&rows(&[&["1"]])),
@@ -521,7 +540,11 @@ async fn wrong_results(tag: &str) {
     );
 
     // --- Item 8: session options -----------------------------------------
-    let not_in = try_rows(&engine, "SELECT count(*) FROM erp1.dbo.sessao WHERE id NOT IN (1, NULL)").await;
+    let not_in = try_rows(
+        &engine,
+        "SELECT count(*) FROM erp1.dbo.sessao WHERE id NOT IN (1, NULL)",
+    )
+    .await;
     checks.check(
         "8a WHERE id NOT IN (1, NULL) returns 0 rows (three-valued logic)",
         not_in.as_ref() == Ok(&rows(&[&["0"]])),
@@ -584,7 +607,9 @@ async fn injection(tag: &str) {
         "SELECT table_name FROM information_schema.tables WHERE table_schema = 'erp1'",
     )
     .await;
-    checks.note(format!("engine-visible catalog probe (may be unsupported): {tables:?}"));
+    checks.note(format!(
+        "engine-visible catalog probe (may be unsupported): {tables:?}"
+    ));
     // Selecting the bracketed table by its lower-case name must not resolve.
     let bad_table = try_rows(&engine, "SELECT id FROM erp1.dbo.\"x]; drop table dbo.alvo;--\"").await;
     checks.check(
@@ -729,16 +754,13 @@ async fn pool_and_cancel(tag: &str) {
         after.as_ref() == Ok(&rows(&[&["3000"]])),
         format!("got={after:?}"),
     );
-    let after2 = tokio::time::timeout(
-        CONCURRENCY_TIMEOUT,
-        async {
-            tokio::join!(
-                try_rows(&engine, "SELECT count(*) FROM erp1.dbo.muitas"),
-                try_rows(&engine, "SELECT id FROM erp1.dbo.muitas LIMIT 3 OFFSET 1"),
-                try_rows(&engine, "SELECT count(*) FROM erp1.dbo.a"),
-            )
-        },
-    )
+    let after2 = tokio::time::timeout(CONCURRENCY_TIMEOUT, async {
+        tokio::join!(
+            try_rows(&engine, "SELECT count(*) FROM erp1.dbo.muitas"),
+            try_rows(&engine, "SELECT id FROM erp1.dbo.muitas LIMIT 3 OFFSET 1"),
+            try_rows(&engine, "SELECT count(*) FROM erp1.dbo.a"),
+        )
+    })
     .await;
     checks.check(
         "10d repeated partial + full queries keep working (pool not exhausted by poisoning)",
@@ -786,16 +808,13 @@ async fn unsupported_types(tag: &str) {
     .await;
 
     // The exposed schema must contain only the normal columns.
-    let schema = engine
-        .sql("SELECT * FROM erp1.dbo.mistos")
-        .await
-        .map(|df| {
-            df.schema()
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect::<Vec<_>>()
-        });
+    let schema = engine.sql("SELECT * FROM erp1.dbo.mistos").await.map(|df| {
+        df.schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect::<Vec<_>>()
+    });
     checks.check(
         "7a geography and sql_variant are not exposed; only id and nome remain",
         schema.as_ref().is_ok_and(|s| *s == ["id", "nome"]),
@@ -953,7 +972,10 @@ async fn pre_evaluation(tag: &str) {
         "11c non-deterministic subquery (now()) is left in the plan (still a subquery/join)",
         nondet_plan.as_deref().is_ok_and(|p| {
             let p = p.to_lowercase();
-            p.contains("subquery") || p.contains("nestedloopjoin") || p.contains("hashjoin") || p.contains("join")
+            p.contains("subquery")
+                || p.contains("nestedloopjoin")
+                || p.contains("hashjoin")
+                || p.contains("join")
         }),
         format!("plan={nondet_plan:?}"),
     );
