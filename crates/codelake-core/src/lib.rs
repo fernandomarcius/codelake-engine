@@ -20,6 +20,7 @@ pub mod subquery;
 #[cfg(test)]
 mod testing;
 mod timestamps;
+pub mod trino_types;
 
 pub use bytes::ByteSize;
 pub use config::{Config, SourceConfig, SourceKind, TrinoProtocolConfig, ValidatedConfig};

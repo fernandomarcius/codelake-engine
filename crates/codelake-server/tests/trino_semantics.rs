@@ -6,7 +6,8 @@
 //!
 //! - decimal arithmetic and aggregates (types, half-up rounding, overflow,
 //!   38 digits, scale 0, negatives), the shapes of TPC-H Q01, Q08, Q14, Q17;
-//! - casts from text to `timestamp(p)` and `timestamp(p) with time zone`.
+//! - casts from text to `timestamp(p)` and `timestamp(p) with time zone`;
+//! - the `information_schema` tables dbt reads.
 //!
 //! `trino_431_answers_every_golden` runs every case on a real Trino 431
 //! (`codelake-sem-trino-<pid>`), so each golden is Trino's observed
@@ -47,6 +48,13 @@ struct Case {
 }
 
 const LINEITEM: &str = "(VALUES (1, CAST(17 AS decimal(15,2)), CAST(21168.23 AS decimal(15,2)), CAST(0.04 AS decimal(15,2)), CAST(0.02 AS decimal(15,2))), (1, CAST(36 AS decimal(15,2)), CAST(45983.16 AS decimal(15,2)), CAST(0.09 AS decimal(15,2)), CAST(0.06 AS decimal(15,2))), (2, CAST(8 AS decimal(15,2)), CAST(13309.60 AS decimal(15,2)), CAST(0.10 AS decimal(15,2)), CAST(0.02 AS decimal(15,2))), (2, CAST(28 AS decimal(15,2)), CAST(28955.64 AS decimal(15,2)), CAST(0.09 AS decimal(15,2)), CAST(0.06 AS decimal(15,2))), (2, CAST(24 AS decimal(15,2)), CAST(22824.48 AS decimal(15,2)), CAST(0.10 AS decimal(15,2)), CAST(0.04 AS decimal(15,2))), (3, CAST(32 AS decimal(15,2)), CAST(49620.16 AS decimal(15,2)), CAST(0.07 AS decimal(15,2)), CAST(0.02 AS decimal(15,2))), (3, CAST(38 AS decimal(15,2)), CAST(44694.46 AS decimal(15,2)), CAST(0.00 AS decimal(15,2)), CAST(0.05 AS decimal(15,2)))) l(k, qty, price, disc, tax)";
+
+/// A schema with a table of every type both engines create, and a view.
+const IS_SETUP: &[&str] = &[
+    "CREATE SCHEMA {c}.sem_is",
+    "CREATE TABLE {c}.sem_is.t (a bigint, b integer, c smallint, d tinyint, e boolean, f real, g double, h decimal(10,2), i decimal(38,0), j varchar, m date, n timestamp, o timestamp(6))",
+    "CREATE VIEW {c}.sem_is.v AS SELECT a, h, n FROM {c}.sem_is.t",
+];
 
 const CASES: &[Case] = &[
     Case {
@@ -180,6 +188,66 @@ const CASES: &[Case] = &[
         setup: &[],
         sql: "SELECT CAST(x AS TIMESTAMP) FROM (VALUES ('garbage')) t(x)",
         expect: r#"{"error":"INVALID_CAST_ARGUMENT","message":"Value cannot be cast to timestamp: garbage"}"#,
+    },
+    Case {
+        id: "is_columns",
+        setup: IS_SETUP,
+        sql: "SELECT table_catalog = '{c}', table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type FROM {c}.information_schema.columns WHERE table_schema = 'sem_is' ORDER BY table_name, ordinal_position",
+        expect: r#"{"types":["boolean","varchar","varchar","varchar","bigint","varchar","varchar","varchar"],"names":["_col0","table_schema","table_name","column_name","ordinal_position","column_default","is_nullable","data_type"],"rows":[[true,"sem_is","t","a",1,null,"YES","bigint"],[true,"sem_is","t","b",2,null,"YES","integer"],[true,"sem_is","t","c",3,null,"YES","smallint"],[true,"sem_is","t","d",4,null,"YES","tinyint"],[true,"sem_is","t","e",5,null,"YES","boolean"],[true,"sem_is","t","f",6,null,"YES","real"],[true,"sem_is","t","g",7,null,"YES","double"],[true,"sem_is","t","h",8,null,"YES","decimal(10,2)"],[true,"sem_is","t","i",9,null,"YES","decimal(38,0)"],[true,"sem_is","t","j",10,null,"YES","varchar"],[true,"sem_is","t","m",11,null,"YES","date"],[true,"sem_is","t","n",12,null,"YES","timestamp(3)"],[true,"sem_is","t","o",13,null,"YES","timestamp(6)"],[true,"sem_is","v","a",1,null,"YES","bigint"],[true,"sem_is","v","h",2,null,"YES","decimal(10,2)"],[true,"sem_is","v","n",3,null,"YES","timestamp(3)"]]}"#,
+    },
+    Case {
+        id: "is_columns_shape",
+        setup: IS_SETUP,
+        sql: "SELECT * FROM {c}.information_schema.columns WHERE table_schema = 'no_such_schema'",
+        expect: r#"{"types":["varchar","varchar","varchar","varchar","bigint","varchar","varchar","varchar"],"names":["table_catalog","table_schema","table_name","column_name","ordinal_position","column_default","is_nullable","data_type"],"rows":[]}"#,
+    },
+    Case {
+        id: "is_tables",
+        setup: IS_SETUP,
+        sql: "SELECT table_catalog = '{c}', table_schema, table_name, table_type FROM {c}.information_schema.tables WHERE table_schema IN ('sem_is', 'information_schema') ORDER BY table_schema, table_name",
+        expect: r#"{"types":["boolean","varchar","varchar","varchar"],"names":["_col0","table_schema","table_name","table_type"],"rows":[[true,"information_schema","applicable_roles","BASE TABLE"],[true,"information_schema","columns","BASE TABLE"],[true,"information_schema","enabled_roles","BASE TABLE"],[true,"information_schema","roles","BASE TABLE"],[true,"information_schema","schemata","BASE TABLE"],[true,"information_schema","table_privileges","BASE TABLE"],[true,"information_schema","tables","BASE TABLE"],[true,"information_schema","views","BASE TABLE"],[true,"sem_is","t","BASE TABLE"],[true,"sem_is","v","VIEW"]]}"#,
+    },
+    Case {
+        id: "is_tables_shape",
+        setup: IS_SETUP,
+        sql: "SELECT * FROM {c}.information_schema.tables WHERE table_schema = 'no_such_schema'",
+        expect: r#"{"types":["varchar","varchar","varchar","varchar"],"names":["table_catalog","table_schema","table_name","table_type"],"rows":[]}"#,
+    },
+    Case {
+        id: "is_views",
+        setup: IS_SETUP,
+        sql: "SELECT table_catalog = '{c}', table_schema, table_name FROM {c}.information_schema.views WHERE table_schema = 'sem_is'",
+        expect: r#"{"types":["boolean","varchar","varchar"],"names":["_col0","table_schema","table_name"],"rows":[[true,"sem_is","v"]]}"#,
+    },
+    Case {
+        id: "is_views_shape",
+        setup: IS_SETUP,
+        sql: "SELECT * FROM {c}.information_schema.views WHERE table_schema = 'no_such_schema'",
+        expect: r#"{"types":["varchar","varchar","varchar","varchar"],"names":["table_catalog","table_schema","table_name","view_definition"],"rows":[]}"#,
+    },
+    Case {
+        id: "is_schemata",
+        setup: IS_SETUP,
+        sql: "SELECT catalog_name = '{c}', schema_name FROM {c}.information_schema.schemata WHERE schema_name IN ('sem_is', 'information_schema') ORDER BY schema_name",
+        expect: r#"{"types":["boolean","varchar"],"names":["_col0","schema_name"],"rows":[[true,"information_schema"],[true,"sem_is"]]}"#,
+    },
+    Case {
+        id: "is_schemata_shape",
+        setup: IS_SETUP,
+        sql: "SELECT * FROM {c}.information_schema.schemata WHERE schema_name = 'no_such_schema'",
+        expect: r#"{"types":["varchar","varchar"],"names":["catalog_name","schema_name"],"rows":[]}"#,
+    },
+    Case {
+        id: "is_info_schema_columns",
+        setup: IS_SETUP,
+        sql: "SELECT table_name, column_name, ordinal_position, is_nullable, data_type FROM {c}.information_schema.columns WHERE table_schema = 'information_schema' ORDER BY table_name, ordinal_position",
+        expect: r#"{"types":["varchar","varchar","bigint","varchar","varchar"],"names":["table_name","column_name","ordinal_position","is_nullable","data_type"],"rows":[["applicable_roles","grantee",1,"YES","varchar"],["applicable_roles","grantee_type",2,"YES","varchar"],["applicable_roles","role_name",3,"YES","varchar"],["applicable_roles","is_grantable",4,"YES","varchar"],["columns","table_catalog",1,"YES","varchar"],["columns","table_schema",2,"YES","varchar"],["columns","table_name",3,"YES","varchar"],["columns","column_name",4,"YES","varchar"],["columns","ordinal_position",5,"YES","bigint"],["columns","column_default",6,"YES","varchar"],["columns","is_nullable",7,"YES","varchar"],["columns","data_type",8,"YES","varchar"],["enabled_roles","role_name",1,"YES","varchar"],["roles","role_name",1,"YES","varchar"],["schemata","catalog_name",1,"YES","varchar"],["schemata","schema_name",2,"YES","varchar"],["table_privileges","grantor",1,"YES","varchar"],["table_privileges","grantor_type",2,"YES","varchar"],["table_privileges","grantee",3,"YES","varchar"],["table_privileges","grantee_type",4,"YES","varchar"],["table_privileges","table_catalog",5,"YES","varchar"],["table_privileges","table_schema",6,"YES","varchar"],["table_privileges","table_name",7,"YES","varchar"],["table_privileges","privilege_type",8,"YES","varchar"],["table_privileges","is_grantable",9,"YES","varchar"],["table_privileges","with_hierarchy",10,"YES","varchar"],["tables","table_catalog",1,"YES","varchar"],["tables","table_schema",2,"YES","varchar"],["tables","table_name",3,"YES","varchar"],["tables","table_type",4,"YES","varchar"],["views","table_catalog",1,"YES","varchar"],["views","table_schema",2,"YES","varchar"],["views","table_name",3,"YES","varchar"],["views","view_definition",4,"YES","varchar"]]}"#,
+    },
+    Case {
+        id: "is_empty_tables",
+        setup: IS_SETUP,
+        sql: "SELECT (SELECT count(*) FROM {c}.information_schema.table_privileges), (SELECT count(*) FROM {c}.information_schema.roles), (SELECT count(*) FROM {c}.information_schema.enabled_roles), (SELECT count(*) FROM {c}.information_schema.applicable_roles)",
+        expect: r#"{"types":["bigint","bigint","bigint","bigint"],"names":["_col0","_col1","_col2","_col3"],"rows":[[0,0,0,0]]}"#,
     },
 ];
 

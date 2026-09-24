@@ -1282,9 +1282,10 @@ mod tests {
                 "SELECT count(*) FROM datafusion.information_schema.tables WHERE table_catalog <> 'datafusion'",
                 0,
             ),
+            // `public` and, as in Trino, `information_schema` itself.
             (
                 "SELECT count(*) FROM erp.information_schema.schemata WHERE catalog_name = 'erp'",
-                1,
+                2,
             ),
             (
                 "SELECT count(*) FROM erp.information_schema.schemata WHERE catalog_name <> 'erp'",
