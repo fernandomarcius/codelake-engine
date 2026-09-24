@@ -1,3 +1,7 @@
+[default]
+# The W3C Trace Context specification's example `tracestate` value.
+extend-ignore-re = ["00f067aa0ba902b7"]
+
 [default.extend-words]
 # Portuguese words used in docs.
 [files]

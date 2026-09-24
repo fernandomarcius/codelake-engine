@@ -51,6 +51,7 @@ testcontainers-modules.workspace = true
 secrecy.workspace = true
 tiberius.workspace = true
 tokio-util = { workspace = true, features = ["compat"] }
+futures.workspace = true
 
 [lints]
 workspace = true

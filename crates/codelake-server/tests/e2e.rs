@@ -19,6 +19,9 @@ const BIN: &str = env!("CARGO_BIN_EXE_codelake");
 #[path = "e2e/otlp.rs"]
 mod otlp;
 
+#[path = "e2e/f7_acceptance.rs"]
+mod f7_acceptance;
+
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
