@@ -4,7 +4,8 @@
 //! default (`hive.timestamp-precision=MILLISECONDS`), `varchar` without length
 //! as `string`, and `integer` as `int`.
 
-use datafusion::arrow::datatypes::{DataType, TimeUnit};
+use codelake_core::trino_types::{Declared, declared};
+use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::error::{DataFusionError, Result};
 
 fn parse_decimal(args: &str) -> Option<DataType> {
@@ -41,6 +42,31 @@ pub(crate) fn arrow_type(hive: &str) -> Result<DataType> {
     })
 }
 
+/// A column read from a Hive type: `varchar(10)` and `char(3)` are text
+/// that records its declared type (see [`codelake_core::trino_types::Declared`]).
+pub(crate) fn hive_field(name: &str, hive: &str) -> Result<Field> {
+    let field = Field::new(name, arrow_type(hive)?, true);
+    Ok(match declared_text(hive) {
+        Some(declared) => field.with_metadata(declared.metadata()),
+        None => field,
+    })
+}
+
+/// `varchar(n)` / `char(n)` of a type name.
+pub(crate) fn declared_text(name: &str) -> Option<Declared> {
+    Declared::parse(name).filter(|d| matches!(d, Declared::Varchar(_) | Declared::Char(_)))
+}
+
+/// Hive type name of a column, as Trino would record it: its declared
+/// `varchar(n)` / `char(n)`, or its Arrow type's.
+pub(crate) fn hive_field_type(field: &Field) -> Result<String> {
+    match declared(field) {
+        Some(Declared::Varchar(n)) => Ok(format!("varchar({n})")),
+        Some(Declared::Char(n)) => Ok(format!("char({n})")),
+        _ => hive_type(field.data_type()),
+    }
+}
+
 /// Hive type name for an Arrow type, as Trino would record it.
 pub(crate) fn hive_type(arrow: &DataType) -> Result<String> {
     Ok(match arrow {
@@ -67,6 +93,19 @@ pub(crate) fn hive_type(arrow: &DataType) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_text_keeps_its_declared_type() {
+        let field = hive_field("v10", "varchar(10)").unwrap();
+        assert_eq!(field.data_type(), &DataType::Utf8);
+        assert_eq!(declared(&field), Some(Declared::Varchar(10)));
+        assert_eq!(hive_field_type(&field).unwrap(), "varchar(10)");
+        let field = hive_field("c3", "char(3)").unwrap();
+        assert_eq!(hive_field_type(&field).unwrap(), "char(3)");
+        let plain = hive_field("v", "string").unwrap();
+        assert_eq!(declared(&plain), None);
+        assert_eq!(hive_field_type(&plain).unwrap(), "string");
+    }
 
     #[test]
     fn reads_every_type_trino_writes() {

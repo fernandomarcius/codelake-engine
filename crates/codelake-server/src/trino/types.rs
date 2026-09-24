@@ -234,6 +234,33 @@ pub(crate) fn trino_type(data_type: &DataType, encoding: Encoding) -> Result<(St
     })
 }
 
+/// Trino type name and signature of a field: its Arrow type's, or the
+/// narrower type it declares (`varchar(5)`, `char(3)`, `timestamp(1)`, see
+/// [`codelake_core::trino_types::Declared`]).
+pub(crate) fn field_type(field: &Field, encoding: Encoding) -> Result<(String, Value)> {
+    use codelake_core::trino_types::{Declared, declared};
+    Ok(match declared(field) {
+        Some(Declared::Varchar(n)) => (
+            format!("varchar({n})"),
+            signature("varchar", &[long_arg(i64::from(n))]),
+        ),
+        Some(Declared::Char(n)) => (format!("char({n})"), signature("char", &[long_arg(i64::from(n))])),
+        Some(Declared::Timestamp(p)) if encoding.parametric_datetime => {
+            let zoned = matches!(field.data_type(), DataType::Timestamp(_, Some(_)));
+            let (raw, name) = if zoned {
+                (
+                    "timestamp with time zone",
+                    format!("timestamp({p}) with time zone"),
+                )
+            } else {
+                ("timestamp", format!("timestamp({p})"))
+            };
+            (name, signature(raw, &[long_arg(i64::from(p))]))
+        }
+        _ => trino_type(field.data_type(), encoding)?,
+    })
+}
+
 /// Output columns; the names given to unnamed expressions (see
 /// [`super::rewrite`]) become Trino's `_col<position>`.
 pub(crate) fn columns(schema: &Schema, encoding: Encoding) -> Result<Vec<Column>> {
@@ -242,7 +269,7 @@ pub(crate) fn columns(schema: &Schema, encoding: Encoding) -> Result<Vec<Column>
         .iter()
         .enumerate()
         .map(|(position, field)| {
-            let (trino_type, type_signature) = trino_type(field.data_type(), encoding)?;
+            let (trino_type, type_signature) = field_type(field, encoding)?;
             let name = if field.name().starts_with(UNNAMED) {
                 format!("_col{position}")
             } else {
@@ -401,6 +428,17 @@ fn timestamp_value(
     zone: Option<&str>,
     encoding: Encoding,
 ) -> Result<Value> {
+    timestamp_value_digits(array, row, unit, zone, encoding.digits(precision(unit)))
+}
+
+/// A timestamp value shown with `digits` fraction digits.
+fn timestamp_value_digits(
+    array: &ArrayRef,
+    row: usize,
+    unit: TimeUnit,
+    zone: Option<&str>,
+    digits: u32,
+) -> Result<Value> {
     let (raw, factor) = match unit {
         TimeUnit::Second => (
             array.as_primitive::<TimestampSecondType>().value(row),
@@ -413,7 +451,6 @@ fn timestamp_value(
         TimeUnit::Microsecond => (array.as_primitive::<TimestampMicrosecondType>().value(row), 1_000),
         TimeUnit::Nanosecond => (array.as_primitive::<TimestampNanosecondType>().value(row), 1),
     };
-    let digits = encoding.digits(precision(unit));
     let instant = round_nanos(i128::from(raw) * factor, digits);
     Ok(json!(match zone {
         // Stored as UTC instants; shown as the local time in their zone, like Trino.
@@ -445,6 +482,39 @@ fn values(list: &ArrayRef, encoding: Encoding) -> Result<Value> {
             .map(|i| value(list, i, encoding))
             .collect::<Result<_>>()?,
     ))
+}
+
+/// [`value`] of a column declaring a narrower Trino type: a `timestamp(p)`
+/// shows `p` fraction digits, a `char(n)` its padding.
+pub(crate) fn declared_value(
+    array: &ArrayRef,
+    row: usize,
+    encoding: Encoding,
+    declared: Option<codelake_core::trino_types::Declared>,
+) -> Result<Value> {
+    use codelake_core::trino_types::Declared;
+    if array.is_null(row) {
+        return Ok(Value::Null);
+    }
+    match (declared, array.data_type()) {
+        (Some(Declared::Timestamp(p)), DataType::Timestamp(unit, zone)) => {
+            let digits = if encoding.parametric_datetime {
+                u32::from(p)
+            } else {
+                3
+            };
+            timestamp_value_digits(array, row, *unit, zone.as_deref(), digits)
+        }
+        (Some(Declared::Char(n)), _) => match value(array, row, encoding)? {
+            Value::String(text) => {
+                let width = usize::try_from(n).unwrap_or(usize::MAX);
+                let padding = width.saturating_sub(text.chars().count());
+                Ok(json!(format!("{text}{}", " ".repeat(padding))))
+            }
+            other => Ok(other),
+        },
+        _ => value(array, row, encoding),
+    }
 }
 
 /// JSON value of row `row` of `array`, as Trino encodes it.

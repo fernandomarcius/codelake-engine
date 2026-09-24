@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use super::metastore::{ColumnMetadata, FileMetastore, MetastoreError, TableMetadata};
 use super::table::{HiveSink, HiveTable};
-use super::types::{arrow_type, hive_type};
+use super::types::{arrow_type, declared_text, hive_field, hive_field_type, hive_type};
 
 const VIEW_PREFIX: &str = "/* Presto View: ";
 const VIEW_SUFFIX: &str = " */";
@@ -93,8 +93,11 @@ impl TrinoView {
 pub(crate) fn trino_to_arrow(trino: &str) -> Result<DataType> {
     let lower = trino.trim().to_ascii_lowercase();
     if let Some(precision) = lower.strip_prefix("timestamp(").and_then(|r| r.strip_suffix(')')) {
+        // The smallest unit that holds the precision; 1 and 2 (like 4, 5, 7
+        // and 8) also declare it in the field (see `view_declared`).
         let unit = match precision.parse::<u8>().unwrap_or(3) {
-            0..=3 => TimeUnit::Millisecond,
+            0 => TimeUnit::Second,
+            1..=3 => TimeUnit::Millisecond,
             4..=6 => TimeUnit::Microsecond,
             _ => TimeUnit::Nanosecond,
         };
@@ -108,6 +111,15 @@ pub(crate) fn trino_to_arrow(trino: &str) -> Result<DataType> {
     }
 }
 
+/// The type a view column declares beyond its Arrow type: `varchar(n)`,
+/// `char(n)`, and a timestamp precision no Arrow unit has (`timestamp(1)`).
+fn view_declared(trino: &str) -> Option<codelake_core::trino_types::Declared> {
+    use codelake_core::trino_types::Declared;
+    declared_text(trino).or_else(|| {
+        Declared::parse(trino).filter(|d| matches!(d, Declared::Timestamp(p) if ![0, 3, 6, 9].contains(p)))
+    })
+}
+
 /// Arrow → Trino type name (view columns).
 pub(crate) fn arrow_to_trino(data_type: &DataType) -> Result<String> {
     Ok(match data_type {
@@ -115,7 +127,8 @@ pub(crate) fn arrow_to_trino(data_type: &DataType) -> Result<String> {
         DataType::Float32 => "real".into(),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "varchar".into(),
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "varbinary".into(),
-        DataType::Timestamp(TimeUnit::Second | TimeUnit::Millisecond, None) => "timestamp(3)".into(),
+        DataType::Timestamp(TimeUnit::Second, None) => "timestamp(0)".into(),
+        DataType::Timestamp(TimeUnit::Millisecond, None) => "timestamp(3)".into(),
         DataType::Timestamp(TimeUnit::Microsecond, None) => "timestamp(6)".into(),
         DataType::Timestamp(TimeUnit::Nanosecond, None) => "timestamp(9)".into(),
         other => hive_type(other)?,
@@ -179,9 +192,13 @@ impl TableProvider for HiveView {
         if let Some(schema) = &self.definition.schema {
             defaults.default_schema.clone_from(schema);
         }
-        let plan = view_state
-            .create_logical_plan(&self.definition.original_sql)
-            .await?;
+        // The same statement rewrites as any query the engine plans.
+        let dialect = view_state.config().options().sql_parser.dialect;
+        let sql = codelake_core::engine::trino_text(&self.definition.original_sql);
+        let mut statement = view_state.sql_to_statement(&sql, &dialect)?;
+        let zone = view_state.config().options().execution.time_zone.clone();
+        codelake_core::engine::trino_statement(&mut statement, zone.as_deref().unwrap_or("UTC"));
+        let plan = view_state.statement_to_plan(statement).await?;
         let output = plan.schema().clone();
         if output.fields().len() != self.schema.fields().len() {
             return Err(DataFusionError::Plan(format!(
@@ -282,7 +299,13 @@ impl HiveCatalog {
             let fields = definition
                 .columns
                 .iter()
-                .map(|c| Ok(Field::new(&c.name, trino_to_arrow(&c.trino_type)?, true)))
+                .map(|c| {
+                    let field = Field::new(&c.name, trino_to_arrow(&c.trino_type)?, true);
+                    Ok(match view_declared(&c.trino_type) {
+                        Some(declared) => field.with_metadata(declared.metadata()),
+                        None => field,
+                    })
+                })
                 .collect::<Result<Vec<_>>>()?;
             return Ok(Some(Arc::new(HiveView {
                 definition,
@@ -306,7 +329,7 @@ impl HiveCatalog {
         let fields = metadata
             .data_columns
             .iter()
-            .map(|c| Ok(Field::new(&c.name, arrow_type(&c.hive_type)?, true)))
+            .map(|c| hive_field(&c.name, &c.hive_type))
             .collect::<Result<Vec<_>>>()?;
         Ok(HiveTable {
             metastore: self.metastore.clone(),
@@ -401,9 +424,14 @@ pub(crate) fn hive_name(name: &str) -> String {
 }
 
 fn column(name: &str, data_type: &DataType) -> Result<ColumnMetadata> {
+    column_of(&Field::new(name, data_type.clone(), true))
+}
+
+/// The metastore column of a field (its declared `varchar(n)` included).
+fn column_of(field: &Field) -> Result<ColumnMetadata> {
     Ok(ColumnMetadata {
-        name: hive_name(name),
-        hive_type: hive_type(data_type)?,
+        name: hive_name(field.name()),
+        hive_type: hive_field_type(field)?,
         comment: None,
         properties: BTreeMap::new(),
         extra: BTreeMap::new(),
@@ -491,7 +519,7 @@ impl WritableCatalog for HiveCatalog {
             .schema()
             .fields()
             .iter()
-            .map(|f| column(f.name(), f.data_type()))
+            .map(|f| column_of(f))
             .collect::<Result<Vec<_>>>()?;
         let mut names = BTreeSet::new();
         if let Some(twice) = columns.iter().find(|c| !names.insert(c.name.as_str())) {
@@ -613,7 +641,16 @@ impl WritableCatalog for HiveCatalog {
                 .map(|f| {
                     Ok(TrinoViewColumn {
                         name: f.name().clone(),
-                        trino_type: arrow_to_trino(f.data_type())?,
+                        trino_type: match codelake_core::trino_types::declared(f) {
+                            Some(
+                                declared @ (codelake_core::trino_types::Declared::Varchar(_)
+                                | codelake_core::trino_types::Declared::Char(_)
+                                | codelake_core::trino_types::Declared::Timestamp(_)),
+                            ) if !matches!(f.data_type(), DataType::Timestamp(_, Some(_))) => {
+                                declared.name(f.data_type())
+                            }
+                            _ => arrow_to_trino(f.data_type())?,
+                        },
                         extra: BTreeMap::new(),
                     })
                 })
@@ -792,6 +829,8 @@ mod tests {
             ("date", DataType::Date32),
             ("decimal(18,2)", DataType::Decimal128(18, 2)),
             ("varbinary", DataType::Binary),
+            ("timestamp(0)", DataType::Timestamp(TimeUnit::Second, None)),
+            ("timestamp(1)", DataType::Timestamp(TimeUnit::Millisecond, None)),
             ("timestamp(3)", DataType::Timestamp(TimeUnit::Millisecond, None)),
             ("timestamp(6)", DataType::Timestamp(TimeUnit::Microsecond, None)),
         ] {
@@ -802,6 +841,10 @@ mod tests {
         assert_eq!(
             arrow_to_trino(&DataType::Timestamp(TimeUnit::Millisecond, None)).unwrap(),
             "timestamp(3)"
+        );
+        assert_eq!(
+            arrow_to_trino(&DataType::Timestamp(TimeUnit::Second, None)).unwrap(),
+            "timestamp(0)"
         );
     }
 }

@@ -578,7 +578,7 @@ mod tests {
             let t = b.column(1).as_string_view();
             let r = b
                 .column(2)
-                .as_primitive::<datafusion::arrow::datatypes::UInt64Type>();
+                .as_primitive::<datafusion::arrow::datatypes::Int64Type>();
             let f = b.column(3).as_string_view();
             for i in 0..b.num_rows() {
                 rows.push((
@@ -590,7 +590,7 @@ mod tests {
             }
         }
         // Per t, s descending as text: "8" > "6" > "4" > "2" > "12" > "10".
-        let order = |t: &str, list: &[&str]| -> Vec<(String, String, u64, String)> {
+        let order = |t: &str, list: &[&str]| -> Vec<(String, String, i64, String)> {
             list.iter()
                 .zip(1..)
                 .map(|(s, r)| ((*s).to_owned(), t.to_owned(), r, t.to_owned()))

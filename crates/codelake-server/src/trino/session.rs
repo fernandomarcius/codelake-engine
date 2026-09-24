@@ -24,6 +24,7 @@ pub(crate) const SET_SCHEMA: &str = "x-trino-set-schema";
 pub(crate) const SET_SESSION: &str = "x-trino-set-session";
 pub(crate) const CLEAR_SESSION: &str = "x-trino-clear-session";
 pub(crate) const CLIENT_CAPABILITIES: &str = "x-trino-client-capabilities";
+pub(crate) const TIME_ZONE: &str = "x-trino-time-zone";
 pub(crate) const PREPARED_STATEMENT: &str = "x-trino-prepared-statement";
 pub(crate) const ADDED_PREPARE: &str = "x-trino-added-prepare";
 pub(crate) const DEALLOCATED_PREPARE: &str = "x-trino-deallocated-prepare";
@@ -43,6 +44,8 @@ pub(crate) struct ClientSession {
     pub(crate) encoding: Encoding,
     /// From `X-Trino-Prepared-Statement`: name → SQL.
     pub(crate) prepared: BTreeMap<String, String>,
+    /// From `X-Trino-Time-Zone`, as Trino names the zone.
+    pub(crate) time_zone: Option<String>,
 }
 
 impl Default for ClientSession {
@@ -55,6 +58,7 @@ impl Default for ClientSession {
             properties: SessionProperties::default(),
             encoding: Encoding::MODERN,
             prepared: BTreeMap::new(),
+            time_zone: None,
         }
     }
 }
@@ -126,6 +130,16 @@ impl ClientSession {
             .any(|capability| capability.trim().eq_ignore_ascii_case("PARAMETRIC_DATETIME"));
         let prepared = prepared::parse_header(texts(headers, PREPARED_STATEMENT)?.into_iter())
             .map_err(SessionError::BadRequest)?;
+        let time_zone = header(headers, TIME_ZONE)?
+            .map(|zone| {
+                codelake_core::trino_time_zone(&zone).ok_or_else(|| {
+                    SessionError::Query(QueryError::new(
+                        Code::NotSupported,
+                        format!("Time zone not supported: {zone}"),
+                    ))
+                })
+            })
+            .transpose()?;
         Ok(Self {
             user,
             source: header(headers, SOURCE)?,
@@ -136,6 +150,7 @@ impl ClientSession {
                 .map_err(|e| SessionError::Query(invalid_property(e)))?,
             encoding: Encoding { parametric_datetime },
             prepared,
+            time_zone,
         })
     }
 }
@@ -421,6 +436,36 @@ mod tests {
                 ClientSession::from_headers(&headers(malformed), &registry),
                 Err(SessionError::BadRequest(_))
             ));
+        }
+    }
+
+    /// Trino 431 names the zone as it prints it and refuses unknown ones
+    /// (`NOT_SUPPORTED: Time zone not supported: Mars/Olympus`).
+    #[test]
+    fn the_session_zone_comes_from_its_header() {
+        let registry = registry();
+        let zone = |value: &str| {
+            ClientSession::from_headers(
+                &headers(&[("X-Trino-User", "u"), ("X-Trino-Time-Zone", value)]),
+                &registry,
+            )
+        };
+        let plain = ClientSession::from_headers(&headers(&[("X-Trino-User", "u")]), &registry).unwrap();
+        assert_eq!(plain.time_zone, None);
+        for (value, expected) in [
+            ("America/Sao_Paulo", "America/Sao_Paulo"),
+            ("-03:00", "-03:00"),
+            ("Etc/GMT+3", "-03:00"),
+            ("UTC", "UTC"),
+        ] {
+            assert_eq!(
+                zone(value).unwrap().time_zone.as_deref(),
+                Some(expected),
+                "{value}"
+            );
+        }
+        for unknown in ["Mars/Olympus", "america/sao_paulo"] {
+            assert_eq!(query_error(zone(unknown)), "NOT_SUPPORTED", "{unknown}");
         }
     }
 
