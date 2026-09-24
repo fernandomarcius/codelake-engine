@@ -417,16 +417,43 @@ impl WritableCatalog for HiveCatalog {
             .collect::<Result<Vec<_>>>()?;
         let metadata = TableMetadata::managed_parquet(owner, columns);
         let hive = self.table_provider(schema, table, &metadata)?;
-        // Data first, metadata last: a failure leaves no visible table.
-        let written = HiveSink { table: hive }.write_data(rows, &context).await?;
-        self.metastore
-            .write_table(schema, table, &metadata)
+        // Trino refuses a target directory that exists without a table (left
+        // by another writer); taking it over could mix foreign files in.
+        if self
+            .metastore
+            .table_location_exists(schema, table)
             .await
-            .map_err(metastore_error)?;
-        self.metastore
-            .write_owner_permissions(schema, table, owner)
-            .await
-            .map_err(metastore_error)?;
+            .map_err(metastore_error)?
+        {
+            return Err(DataFusionError::Plan(format!(
+                "target directory for table {}.{schema}.{table} already exists",
+                self.name
+            )));
+        }
+        // Data first, metadata last: a failure leaves no visible table, and
+        // the directory this statement created is removed, as Trino does.
+        let created = async {
+            let written = HiveSink { table: hive }.write_data(rows, &context).await?;
+            self.metastore
+                .write_table(schema, table, &metadata)
+                .await
+                .map_err(metastore_error)?;
+            self.metastore
+                .write_owner_permissions(schema, table, owner)
+                .await
+                .map_err(metastore_error)?;
+            Ok::<_, DataFusionError>(written)
+        }
+        .await;
+        let written = match created {
+            Ok(written) => written,
+            Err(err) => {
+                if let Err(cleanup) = self.metastore.remove_table_location(schema, table).await {
+                    tracing::warn!(%schema, %table, error = %cleanup, "failed CTAS left files behind");
+                }
+                return Err(err);
+            }
+        };
         self.refresh().await?;
         Ok(written)
     }

@@ -1358,7 +1358,6 @@ async fn failures_leave_nothing_visible_and_are_errors() {
 }
 
 #[tokio::test]
-#[ignore = "F2 defect: DROP TABLE and failed CTAS leave the table directory"]
 async fn trino_can_recreate_a_table_codelake_dropped_or_failed_to_create() {
     let shared = shared().await;
     let spill = tempfile::tempdir().unwrap();

@@ -12,7 +12,9 @@
 //! by a newer Trino survives a round trip through `CodeLake`.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::TryStreamExt;
 use object_store::path::Path;
@@ -23,6 +25,9 @@ use super::crc::{crc_name, hadoop_crc};
 
 pub(crate) const MANAGED_TABLE: &str = "MANAGED_TABLE";
 pub(crate) const VIRTUAL_VIEW: &str = "VIRTUAL_VIEW";
+/// Data lives at `externalLocation`, owned by someone else: dropping the table
+/// removes only its metadata.
+const EXTERNAL_TABLE: &str = "EXTERNAL_TABLE";
 const METADATA_FILE: &str = ".trinoSchema";
 const PERMISSIONS_DIR: &str = ".trinoPermissions";
 /// Trino's file metastore refuses metadata whose `writerVersion` is not its own
@@ -196,6 +201,8 @@ pub(crate) enum MetastoreError {
     AlreadyExists(String),
     #[error("{0} does not exist")]
     NotFound(String),
+    #[error("local warehouse: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Metadata access for one catalog root.
@@ -203,11 +210,53 @@ pub(crate) enum MetastoreError {
 pub(crate) struct FileMetastore {
     store: Arc<dyn ObjectStore>,
     root: Path,
+    /// Directory of `root` when the warehouse is a local file system. Object
+    /// stores have no directories, but Trino on a local warehouse does: it
+    /// refuses to create a table whose directory exists, even empty.
+    local_dir: Option<PathBuf>,
+}
+
+/// Removes a local directory tree; absent is fine. Retries briefly because an
+/// abandoned upload may still be deleting its staging file inside it.
+async fn remove_local_dir(path: PathBuf) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut attempt = 0;
+        loop {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(_) if attempt < 10 => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 impl FileMetastore {
     pub(crate) fn new(store: Arc<dyn ObjectStore>, root: Path) -> Self {
-        Self { store, root }
+        Self {
+            store,
+            root,
+            local_dir: None,
+        }
+    }
+
+    /// Declares that `root` is the local directory `dir`.
+    pub(crate) fn with_local_dir(mut self, dir: PathBuf) -> Self {
+        self.local_dir = Some(dir);
+        self
+    }
+
+    /// Local file-system path of `path`, for a local warehouse.
+    fn local_path(&self, path: &Path) -> Option<PathBuf> {
+        let dir = self.local_dir.as_ref()?;
+        let relative = path.prefix_match(&self.root)?;
+        Some(relative.fold(dir.clone(), |acc, part| acc.join(part.as_ref())))
     }
 
     pub(crate) fn store(&self) -> &Arc<dyn ObjectStore> {
@@ -323,7 +372,12 @@ impl FileMetastore {
             parameters: BTreeMap::new(),
             extra: BTreeMap::new(),
         };
-        self.write_json(&self.schema_file(schema), &metadata).await
+        self.write_json(&self.schema_file(schema), &metadata).await?;
+        // Trino creates the schema directory and requires it for new tables.
+        if let Some(dir) = self.local_path(&self.root.clone().join(schema)) {
+            std::fs::create_dir_all(dir)?;
+        }
+        Ok(())
     }
 
     /// Commit point of a table: once this file exists, the table is visible.
@@ -373,18 +427,63 @@ impl FileMetastore {
         Ok(())
     }
 
-    /// Removes the table directory: metadata first (the table disappears
-    /// atomically), then data files.
-    pub(crate) async fn drop_table(&self, schema: &str, table: &str) -> MetastoreResult<()> {
-        let metadata = self.table_file(schema, table);
-        if self.store.head(&metadata).await.is_err() {
-            return Err(MetastoreError::NotFound(format!("table {schema}.{table}")));
-        }
-        self.store.delete(&metadata).await?;
+    /// Whether anything, even an empty directory, exists where the table's
+    /// files would go. Trino refuses to create a table over it.
+    pub(crate) async fn table_location_exists(&self, schema: &str, table: &str) -> MetastoreResult<bool> {
         let dir = self.table_dir(schema, table);
-        let objects: Vec<_> = self.store.list(Some(&dir)).try_collect().await?;
+        if let Some(path) = self.local_path(&dir) {
+            return Ok(path.try_exists()?);
+        }
+        Ok(self.store.list(Some(&dir)).try_next().await?.is_some())
+    }
+
+    async fn delete_all(&self, prefix: &Path) -> MetastoreResult<()> {
+        let objects: Vec<_> = self.store.list(Some(prefix)).try_collect().await?;
         for object in objects {
-            self.store.delete(&object.location).await?;
+            match self.store.delete(&object.location).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes everything under the table's location, directory included.
+    pub(crate) async fn remove_table_location(&self, schema: &str, table: &str) -> MetastoreResult<()> {
+        let dir = self.table_dir(schema, table);
+        self.delete_all(&dir).await?;
+        if let Some(path) = self.local_path(&dir) {
+            remove_local_dir(path).await?;
+        }
+        Ok(())
+    }
+
+    /// Drops a table or view: metadata first (it disappears atomically), then
+    /// its directory. A managed table's data goes with it, as in Trino; an
+    /// external table keeps its data and loses only what the metastore wrote.
+    pub(crate) async fn drop_table(&self, schema: &str, table: &str) -> MetastoreResult<()> {
+        let Some(metadata) = self.table(schema, table).await? else {
+            return Err(MetastoreError::NotFound(format!("table {schema}.{table}")));
+        };
+        let file = self.table_file(schema, table);
+        self.store.delete(&file).await?;
+        if metadata.table_type != EXTERNAL_TABLE {
+            return self.remove_table_location(schema, table).await;
+        }
+        let dir = self.table_dir(schema, table);
+        self.delete_all(&dir.clone().join(PERMISSIONS_DIR)).await?;
+        match self
+            .store
+            .delete(&dir.clone().join(crc_name(METADATA_FILE)))
+            .await
+        {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+            Err(err) => return Err(err.into()),
+        }
+        if let Some(path) = self.local_path(&dir) {
+            // Only empty directories go; data under the table directory stays.
+            let _ = std::fs::remove_dir(path.join(PERMISSIONS_DIR));
+            let _ = std::fs::remove_dir(path);
         }
         Ok(())
     }
@@ -406,7 +505,9 @@ mod tests {
     fn scratch() -> (tempfile::TempDir, FileMetastore) {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
-        (dir, FileMetastore::new(Arc::new(store), Path::default()))
+        let metastore =
+            FileMetastore::new(Arc::new(store), Path::default()).with_local_dir(dir.path().into());
+        (dir, metastore)
     }
 
     #[tokio::test]
@@ -553,6 +654,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_an_external_table_keeps_its_data() {
+        let (dir, metastore) = scratch();
+        metastore.create_schema("raw", "dbt").await.unwrap();
+        let mut table = TableMetadata::managed_parquet("dbt", Vec::new());
+        table.table_type = EXTERNAL_TABLE.into();
+        metastore.write_table("raw", "ext", &table).await.unwrap();
+        metastore
+            .write_owner_permissions("raw", "ext", "dbt")
+            .await
+            .unwrap();
+        std::fs::write(dir.path().join("raw/ext/part-0"), b"data").unwrap();
+        metastore.drop_table("raw", "ext").await.unwrap();
+        assert_eq!(metastore.table("raw", "ext").await.unwrap(), None);
+        let left: Vec<_> = std::fs::read_dir(dir.path().join("raw/ext"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(left, vec!["part-0"], "only metastore files removed");
+    }
+
+    #[tokio::test]
+    async fn removing_a_table_location_removes_the_directory() {
+        let (dir, metastore) = scratch();
+        metastore.create_schema("raw", "dbt").await.unwrap();
+        std::fs::create_dir_all(dir.path().join("raw/t/.hidden")).unwrap();
+        std::fs::write(dir.path().join("raw/t/.hidden/x"), b"x").unwrap();
+        std::fs::write(dir.path().join("raw/t/f"), b"x").unwrap();
+        metastore.remove_table_location("raw", "t").await.unwrap();
+        assert!(!dir.path().join("raw/t").exists());
+        metastore.remove_table_location("raw", "t").await.unwrap();
+        // An object store without directories: listing decides.
+        let bare = FileMetastore::new(
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()),
+            Path::default(),
+        );
+        assert!(!bare.table_location_exists("raw", "t").await.unwrap());
+        std::fs::create_dir_all(dir.path().join("raw/u")).unwrap();
+        std::fs::write(dir.path().join("raw/u/f"), b"x").unwrap();
+        assert!(bare.table_location_exists("raw", "u").await.unwrap());
+        bare.remove_table_location("raw", "u").await.unwrap();
+        assert!(!bare.table_location_exists("raw", "u").await.unwrap());
+    }
+
+    #[tokio::test]
     async fn schema_and_table_lifecycle() {
         let (dir, metastore) = scratch();
         metastore.create_schema("raw", "dbt").await.unwrap();
@@ -591,9 +736,16 @@ mod tests {
         assert_eq!(grants.as_array().unwrap().len(), 4);
         assert_eq!(grants[0]["grantee"]["name"], "dbt");
 
+        assert!(dir.path().join("raw").is_dir(), "schema directory, as Trino");
+        assert!(metastore.table_location_exists("raw", "t").await.unwrap());
         metastore.drop_table("raw", "t").await.unwrap();
         assert!(metastore.list_tables("raw").await.unwrap().is_empty());
-        assert!(!dir.path().join("raw/t/20260101_000000_x_y").exists());
+        assert!(
+            !dir.path().join("raw/t").exists(),
+            "Trino recreates the name only if the directory is gone"
+        );
+        assert!(!metastore.table_location_exists("raw", "t").await.unwrap());
+        assert!(dir.path().join("raw").is_dir(), "the schema stays");
         assert!(matches!(
             metastore.drop_table("raw", "t").await,
             Err(MetastoreError::NotFound(_))
