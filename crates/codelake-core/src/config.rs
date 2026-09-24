@@ -24,6 +24,9 @@ pub struct Config {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub execution: ExecutionConfig,
+    /// Distributed tracing over OTLP. Off unless `otlp_endpoint` is set.
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
 }
@@ -92,6 +95,60 @@ impl Default for ExecutionConfig {
             target_partitions: None,
             source_startup_timeout_secs: default_startup_timeout_secs(),
         }
+    }
+}
+
+/// `[telemetry]`: OpenTelemetry traces exported over OTLP.
+///
+/// Disabled by default. When `otlp_endpoint` is absent no exporter, no
+/// background thread and no OpenTelemetry layer exist; the engine's spans only
+/// feed the JSON logs, as before.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// Base URL of an OTLP/HTTP receiver, e.g. `http://otel-collector:4318`.
+    /// Spans go to `<endpoint>/v1/traces`. Plain `http://` only: point it at a
+    /// collector agent on the node or in the pod, which handles TLS upstream.
+    pub otlp_endpoint: Option<String>,
+    /// OTLP transport. Only `http/protobuf` is supported; `grpc` is refused
+    /// instead of silently falling back.
+    #[serde(default = "default_otlp_protocol")]
+    pub protocol: String,
+    /// `service.name` resource attribute.
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+    /// Fraction of new traces recorded, `0.0`–`1.0`. A query that arrives with
+    /// a W3C `traceparent` follows the caller's sampling decision instead.
+    #[serde(default = "default_sampling_ratio")]
+    pub sampling_ratio: f64,
+    /// Seconds allowed for one export request before it is dropped.
+    #[serde(default = "default_export_timeout_secs")]
+    pub export_timeout_secs: u64,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            otlp_endpoint: None,
+            protocol: default_otlp_protocol(),
+            service_name: default_service_name(),
+            sampling_ratio: default_sampling_ratio(),
+            export_timeout_secs: default_export_timeout_secs(),
+        }
+    }
+}
+
+impl TelemetryConfig {
+    /// `<endpoint>/v1/traces`, when tracing is enabled.
+    pub fn traces_url(&self) -> Option<String> {
+        self.otlp_endpoint.as_ref().map(|endpoint| {
+            let base = endpoint.trim_end_matches('/');
+            if base.ends_with("/v1/traces") {
+                base.to_owned()
+            } else {
+                format!("{base}/v1/traces")
+            }
+        })
     }
 }
 
@@ -276,6 +333,18 @@ fn default_mssql_encrypt() -> String {
 fn default_region() -> String {
     "us-east-1".to_owned()
 }
+fn default_otlp_protocol() -> String {
+    OTLP_PROTOCOLS[0].to_owned()
+}
+fn default_service_name() -> String {
+    "codelake".to_owned()
+}
+const fn default_sampling_ratio() -> f64 {
+    1.0
+}
+const fn default_export_timeout_secs() -> u64 {
+    10
+}
 
 /// Every validation problem found, reported together.
 #[derive(Debug, thiserror::Error)]
@@ -319,6 +388,9 @@ const PG_SSL_MODES: [&str; 5] = ["disable", "prefer", "require", "verify-ca", "v
 const MYSQL_SSL_MODES: [&str; 3] = ["disabled", "preferred", "required"];
 const MSSQL_ENCRYPT: [&str; 3] = ["required", "on", "off"];
 const MAX_POOL_SIZE: u32 = 256;
+const OTLP_PROTOCOLS: [&str; 1] = ["http/protobuf"];
+const MAX_EXPORT_TIMEOUT_SECS: u64 = 300;
+const MAX_SERVICE_NAME: usize = 255;
 
 fn is_identifier(name: &str) -> bool {
     let mut chars = name.chars();
@@ -370,6 +442,7 @@ impl Config {
         self.validate_server(file_exists, &mut errors);
         self.validate_memory(&mut errors);
         self.validate_execution(&mut errors);
+        self.validate_telemetry(&mut errors);
         let secrets = self.validate_sources(env, &mut errors);
         if errors.is_empty() {
             Ok(ValidatedConfig {
@@ -446,6 +519,46 @@ impl Config {
         }
         if exec.source_startup_timeout_secs == 0 {
             errors.push("execution.source_startup_timeout_secs must be > 0".into());
+        }
+    }
+
+    fn validate_telemetry(&self, errors: &mut Vec<String>) {
+        let telemetry = &self.telemetry;
+        if !OTLP_PROTOCOLS.contains(&telemetry.protocol.as_str()) {
+            errors.push(format!(
+                "telemetry.protocol `{}` is not supported; use one of {OTLP_PROTOCOLS:?}",
+                telemetry.protocol
+            ));
+        }
+        if !(0.0..=1.0).contains(&telemetry.sampling_ratio) {
+            errors.push(format!(
+                "telemetry.sampling_ratio {} must be between 0.0 and 1.0",
+                telemetry.sampling_ratio
+            ));
+        }
+        let name = telemetry.service_name.trim();
+        if name.is_empty() || name.len() > MAX_SERVICE_NAME {
+            errors.push(format!(
+                "telemetry.service_name must be 1 to {MAX_SERVICE_NAME} characters"
+            ));
+        }
+        if telemetry.export_timeout_secs == 0 || telemetry.export_timeout_secs > MAX_EXPORT_TIMEOUT_SECS {
+            errors.push(format!(
+                "telemetry.export_timeout_secs must be between 1 and {MAX_EXPORT_TIMEOUT_SECS}"
+            ));
+        }
+        if let Some(endpoint) = &telemetry.otlp_endpoint {
+            match endpoint.strip_prefix("http://") {
+                Some(rest) if !rest.is_empty() && !rest.starts_with('/') && !rest.contains(char::is_whitespace) => {}
+                Some(_) => errors.push(format!("telemetry.otlp_endpoint `{endpoint}` has no host")),
+                None if endpoint.starts_with("https://") => errors.push(format!(
+                    "telemetry.otlp_endpoint `{endpoint}`: TLS to the collector is not supported; \
+                     export to a collector agent over http:// on the node or in the pod"
+                )),
+                None => errors.push(format!(
+                    "telemetry.otlp_endpoint `{endpoint}` must be an http:// URL (OTLP/HTTP, port 4318 by default)"
+                )),
+            }
         }
     }
 
@@ -826,6 +939,78 @@ mod tests {
         );
         let cfg = parse(&doc);
         assert_eq!(cfg.sources.last().unwrap().kind.label(), "hive");
+    }
+
+    #[test]
+    fn telemetry_is_off_by_default() {
+        let validated = parse(VALID).validate(&full_env, &|_| true).unwrap();
+        let telemetry = &validated.config.telemetry;
+        assert_eq!(telemetry.otlp_endpoint, None);
+        assert_eq!(telemetry.traces_url(), None);
+        assert_eq!(telemetry.protocol, "http/protobuf");
+        assert_eq!(telemetry.service_name, "codelake");
+        assert!((telemetry.sampling_ratio - 1.0).abs() < f64::EPSILON);
+        assert_eq!(telemetry.export_timeout_secs, 10);
+    }
+
+    #[test]
+    fn telemetry_accepts_an_http_collector() {
+        for (endpoint, url) in [
+            (
+                "http://otel-collector:4318",
+                "http://otel-collector:4318/v1/traces",
+            ),
+            ("http://127.0.0.1:4318/", "http://127.0.0.1:4318/v1/traces"),
+            ("http://c:4318/v1/traces", "http://c:4318/v1/traces"),
+        ] {
+            let doc = format!(
+                "{VALID}\n[telemetry]\notlp_endpoint = \"{endpoint}\"\nservice_name = \"lake\"\nsampling_ratio = 0.0\nexport_timeout_secs = 300\n"
+            );
+            let validated = parse(&doc).validate(&full_env, &|_| true).unwrap();
+            assert_eq!(validated.config.telemetry.traces_url().as_deref(), Some(url));
+        }
+    }
+
+    #[test]
+    fn telemetry_rejects_every_bad_setting_at_once() {
+        let doc = format!(
+            "{VALID}\n[telemetry]\notlp_endpoint = \"https://collector:4318\"\nprotocol = \"grpc\"\n\
+             service_name = \" \"\nsampling_ratio = 1.5\nexport_timeout_secs = 0\n"
+        );
+        let errors = errors_of(&doc, &full_env);
+        assert_eq!(errors.len(), 5, "{errors:#?}");
+        for expected in [
+            "telemetry.protocol `grpc` is not supported",
+            "telemetry.sampling_ratio 1.5 must be between",
+            "telemetry.service_name must be",
+            "telemetry.export_timeout_secs must be between 1 and 300",
+            "TLS to the collector is not supported",
+        ] {
+            assert!(
+                errors.iter().any(|e| e.contains(expected)),
+                "missing `{expected}` in {errors:#?}"
+            );
+        }
+        for (endpoint, expected) in [
+            ("otel:4318", "must be an http:// URL"),
+            ("http://", "has no host"),
+            ("http:///v1/traces", "has no host"),
+            ("http://a b", "has no host"),
+        ] {
+            let doc = format!("{VALID}\n[telemetry]\notlp_endpoint = \"{endpoint}\"\n");
+            let errors = errors_of(&doc, &full_env);
+            assert_eq!(errors.len(), 1, "{endpoint}: {errors:#?}");
+            assert!(errors[0].contains(expected), "{endpoint}: {errors:#?}");
+        }
+        let nan = format!("{VALID}\n[telemetry]\nsampling_ratio = nan\n");
+        assert_eq!(errors_of(&nan, &full_env).len(), 1);
+        let long = format!("{VALID}\n[telemetry]\nservice_name = \"{}\"\n", "s".repeat(256));
+        assert_eq!(errors_of(&long, &full_env).len(), 1);
+        let unknown = format!("{VALID}\n[telemetry]\nendpoint = \"http://x:4318\"\n");
+        assert!(
+            toml::from_str::<Config>(&unknown).is_err(),
+            "typos must not disable tracing silently"
+        );
     }
 
     #[test]
