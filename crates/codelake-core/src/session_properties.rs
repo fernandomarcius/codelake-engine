@@ -149,19 +149,27 @@ pub fn parse_data_size(text: &str) -> Result<u64, String> {
         "PB" => 5,
         other => return Err(format!("Unknown unit: {other}")),
     };
-    // Exact integer arithmetic; a fraction rounds down to whole bytes.
+    // airlift keeps whole numbers exact and rounds a fraction to the nearest
+    // byte, half up (`374.5B` is 375 bytes). Digits past the 19th cannot move
+    // the result by a byte and are ignored.
+    let too_large = || format!("size is too large to be represented in bytes: {text}");
     let multiplier = 1_u128 << (10 * exponent);
     let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
-    let whole: u128 = whole.parse().map_err(|_| invalid())?;
-    let mut bytes = whole.checked_mul(multiplier).ok_or_else(invalid)?;
+    let whole: u128 = whole.parse().map_err(|_| too_large())?;
+    let mut bytes = whole.checked_mul(multiplier).ok_or_else(too_large)?;
     if !fraction.is_empty() {
-        let digits = u32::try_from(fraction.len()).map_err(|_| invalid())?;
-        let scale = 10_u128.checked_pow(digits).ok_or_else(invalid)?;
-        let numerator: u128 = fraction.parse().map_err(|_| invalid())?;
-        let part = numerator.checked_mul(multiplier).ok_or_else(invalid)? / scale;
-        bytes = bytes.checked_add(part).ok_or_else(invalid)?;
+        let kept = &fraction[..fraction.len().min(19)];
+        let digits = u32::try_from(kept.len()).map_err(|_| invalid())?;
+        let scale = 10_u128.pow(digits);
+        let numerator: u128 = kept.parse().map_err(|_| invalid())?;
+        let scaled = numerator * multiplier;
+        let rounded = scaled / scale + u128::from(2 * (scaled % scale) >= scale);
+        bytes = bytes.checked_add(rounded).ok_or_else(too_large)?;
     }
-    u64::try_from(bytes).map_err(|_| invalid())
+    if bytes > u128::from(i64::MAX.unsigned_abs()) {
+        return Err(too_large());
+    }
+    u64::try_from(bytes).map_err(|_| too_large())
 }
 
 pub const QUERY_MAX_RUN_TIME: &str = "query_max_run_time";
@@ -520,7 +528,11 @@ mod tests {
         assert_eq!(parse_data_size("10 MB"), Ok(10 << 20));
         assert_eq!(parse_data_size(" 10MB "), Ok(10 << 20));
         assert_eq!(parse_data_size("1.5MB"), Ok(1_572_864));
-        assert_eq!(parse_data_size("0.5B"), Ok(0));
+        // Fractions round to the nearest byte, half up (Trino 431).
+        assert_eq!(parse_data_size("0.5B"), Ok(1));
+        assert_eq!(parse_data_size("374.5B"), Ok(375));
+        assert_eq!(parse_data_size("374.4B"), Ok(374));
+        assert_eq!(parse_data_size("0.36572265625kB"), Ok(375));
         assert_eq!(parse_data_size("0B"), Ok(0));
         assert_eq!(parse_data_size("1PB"), Ok(1 << 50));
         assert_eq!(parse_data_size("10mb"), Err("Unknown unit: mb".into()));
@@ -534,8 +546,16 @@ mod tests {
             );
         }
         assert_eq!(parse_data_size(""), Err("size is empty".into()));
-        assert!(parse_data_size("99999999PB").is_err());
-        assert!(parse_data_size("1.99999999999999999999999999999999999PB").is_err());
+        assert_eq!(
+            parse_data_size("99999999999PB"),
+            Err("size is too large to be represented in bytes: 99999999999PB".into())
+        );
+        assert_eq!(parse_data_size("8191PB"), Ok(8191 << 50));
+        assert!(parse_data_size("8192PB").is_err());
+        assert_eq!(
+            parse_data_size("1.99999999999999999999999999999999999PB"),
+            Ok(2 << 50)
+        );
         assert_eq!(parse_data_size("0.001kB"), Ok(1));
     }
 
