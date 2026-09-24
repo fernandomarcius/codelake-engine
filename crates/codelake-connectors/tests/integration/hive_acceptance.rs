@@ -192,7 +192,28 @@ impl Trino {
             .start()
             .await
             .unwrap();
-        Self(container)
+        let trino = Self(container);
+        trino.wait_until_it_runs_queries().await;
+        trino
+    }
+
+    /// "SERVER STARTED" comes before the coordinator registers itself as a
+    /// worker; a query sent in between fails with "No nodes available".
+    async fn wait_until_it_runs_queries(&self) {
+        let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            match self.try_sql_in(None, "SELECT 1").await {
+                Ok(_) => return,
+                Err(error) if std::time::Instant::now() < deadline => {
+                    assert!(
+                        error.contains("No nodes available"),
+                        "Trino failed to start: {error}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(error) => panic!("Trino did not accept queries in time: {error}"),
+            }
+        }
     }
 
     async fn try_sql_in(&self, schema: Option<&str>, sql: &str) -> Result<Rows, String> {
