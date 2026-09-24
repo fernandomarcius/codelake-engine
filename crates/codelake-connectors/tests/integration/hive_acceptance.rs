@@ -1531,7 +1531,6 @@ async fn trino_partitioned_table_is_a_clear_error() {
 }
 
 #[tokio::test]
-#[ignore = "F2 defect: quoted mixed-case table is invisible to Trino"]
 async fn mixed_case_table_name_stays_visible_to_trino() {
     let shared = shared().await;
     let spill = tempfile::tempdir().unwrap();

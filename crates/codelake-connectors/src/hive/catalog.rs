@@ -249,7 +249,7 @@ impl HiveCatalog {
     fn schema_provider(self: &Arc<Self>, schema: &str) -> Arc<dyn SchemaProvider> {
         Arc::new(HiveSchema {
             catalog: Arc::clone(self),
-            schema: schema.to_owned(),
+            schema: hive_name(schema),
         })
     }
 
@@ -369,20 +369,29 @@ impl SchemaProvider for HiveSchema {
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        self.catalog.resolve(&self.schema, name).await
+        self.catalog.resolve(&self.schema, &hive_name(name)).await
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.catalog
-            .listing
-            .read()
-            .is_ok_and(|l| l.tables.get(&self.schema).is_some_and(|t| t.contains(name)))
+        self.catalog.listing.read().is_ok_and(|l| {
+            l.tables
+                .get(&self.schema)
+                .is_some_and(|t| t.contains(&hive_name(name)))
+        })
     }
+}
+
+/// Name as the Hive connector stores it. Trino folds identifiers to lower
+/// case, so its Hive catalog only knows lower-case schemas, tables and
+/// columns: a quoted `"MixedCase"` is the table `mixedcase`. Every entry of
+/// this catalog folds, so directory, metadata and lookup always agree.
+pub(crate) fn hive_name(name: &str) -> String {
+    name.to_lowercase()
 }
 
 fn column(name: &str, data_type: &DataType) -> Result<ColumnMetadata> {
     Ok(ColumnMetadata {
-        name: name.to_owned(),
+        name: hive_name(name),
         hive_type: hive_type(data_type)?,
         comment: None,
         properties: BTreeMap::new(),
@@ -393,6 +402,7 @@ fn column(name: &str, data_type: &DataType) -> Result<ColumnMetadata> {
 #[async_trait]
 impl WritableCatalog for HiveCatalog {
     async fn create_schema(&self, schema: &str, if_not_exists: bool, owner: &str) -> Result<()> {
+        let schema = &hive_name(schema);
         match self.metastore.create_schema(schema, owner).await {
             Ok(()) => {}
             Err(MetastoreError::AlreadyExists(_)) if if_not_exists => return Ok(()),
@@ -410,6 +420,7 @@ impl WritableCatalog for HiveCatalog {
         rows: SendableRecordBatchStream,
         context: Arc<TaskContext>,
     ) -> Result<u64> {
+        let (schema, table) = (&hive_name(schema), &hive_name(table));
         self.require_schema(schema).await?;
         if self
             .metastore
@@ -432,6 +443,13 @@ impl WritableCatalog for HiveCatalog {
             .iter()
             .map(|f| column(f.name(), f.data_type()))
             .collect::<Result<Vec<_>>>()?;
+        let mut names = BTreeSet::new();
+        if let Some(twice) = columns.iter().find(|c| !names.insert(c.name.as_str())) {
+            return Err(DataFusionError::Plan(format!(
+                "duplicate column name `{}` in {schema}.{table} (hive column names are case-insensitive)",
+                twice.name
+            )));
+        }
         let metadata = TableMetadata::managed_parquet(owner, columns);
         let hive = self.table_provider(schema, table, &metadata)?;
         // Trino refuses a target directory that exists without a table (left
@@ -476,6 +494,7 @@ impl WritableCatalog for HiveCatalog {
     }
 
     async fn drop_table(&self, schema: &str, table: &str, if_exists: bool) -> Result<()> {
+        let (schema, table) = (&hive_name(schema), &hive_name(table));
         match self
             .metastore
             .table(schema, table)
@@ -511,6 +530,7 @@ impl WritableCatalog for HiveCatalog {
         owner: &str,
         definition: ViewDefinition,
     ) -> Result<()> {
+        let (schema, view) = (&hive_name(schema), &hive_name(view));
         self.require_schema(schema).await?;
         if let Some(existing) = self
             .metastore
@@ -564,6 +584,7 @@ impl WritableCatalog for HiveCatalog {
     }
 
     async fn drop_view(&self, schema: &str, view: &str, if_exists: bool) -> Result<()> {
+        let (schema, view) = (&hive_name(schema), &hive_name(view));
         match self
             .metastore
             .table(schema, view)
@@ -592,6 +613,7 @@ impl WritableCatalog for HiveCatalog {
     }
 
     async fn add_column(&self, schema: &str, table: &str, name: &str, data_type: &DataType) -> Result<()> {
+        let (schema, table, name) = (&hive_name(schema), &hive_name(table), &hive_name(name));
         let mut metadata = self
             .metastore
             .table(schema, table)
@@ -603,11 +625,7 @@ impl WritableCatalog for HiveCatalog {
         if metadata.is_view() {
             return Err(DataFusionError::Plan(format!("{schema}.{table} is a view")));
         }
-        if metadata
-            .data_columns
-            .iter()
-            .any(|c| c.name.eq_ignore_ascii_case(name))
-        {
+        if metadata.data_columns.iter().any(|c| hive_name(&c.name) == *name) {
             return Err(DataFusionError::Plan(format!(
                 "column {name} already exists in {schema}.{table}"
             )));
@@ -687,6 +705,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(back, json);
+    }
+
+    #[test]
+    fn names_fold_like_trino() {
+        assert_eq!(hive_name("MixedCase"), "mixedcase");
+        assert_eq!(hive_name("Pedidos_2026"), "pedidos_2026");
+        assert_eq!(hive_name("AÇÃO"), "ação");
+        assert_eq!(column("Id", &DataType::Int64).unwrap().name, "id");
     }
 
     #[test]

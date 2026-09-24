@@ -227,3 +227,62 @@ async fn views_resolve_unqualified_names_in_their_own_session() {
             .unwrap();
     assert_eq!(definition["tableType"], "VIRTUAL_VIEW");
 }
+
+/// Hive names are lower case (Trino folds identifiers): a quoted mixed-case
+/// name is the same table everywhere, and columns are case-insensitive.
+#[tokio::test]
+async fn names_are_folded_to_lower_case() {
+    let dir = tempfile::tempdir().unwrap();
+    let warehouse = dir.path().join("warehouse");
+    let spill = tempfile::tempdir().unwrap();
+    let engine = open_engine(&warehouse, spill.path()).await;
+    run(&engine, "CREATE SCHEMA hive.\"Vendas\"").await;
+    run(
+        &engine,
+        "CREATE TABLE hive.\"Vendas\".\"MixedCase\" AS SELECT CAST(2 AS BIGINT) AS \"Id\"",
+    )
+    .await;
+    assert!(warehouse.join("vendas/mixedcase/.trinoSchema").exists());
+    assert!(warehouse.join(".vendas.trinoSchema").exists());
+    for name in [
+        "hive.vendas.mixedcase",
+        "hive.\"Vendas\".\"MixedCase\"",
+        "hive.vendas.MixedCase",
+    ] {
+        let rows = run(&engine, &format!("SELECT id FROM {name}")).await;
+        assert!(rows.contains("| 2  |"), "{name}: {rows}");
+    }
+    run(&engine, "INSERT INTO hive.vendas.\"MIXEDCASE\" VALUES (3)").await;
+    run(
+        &engine,
+        "ALTER TABLE hive.vendas.\"MixedCase\" ADD COLUMN \"Origem\" varchar",
+    )
+    .await;
+    let columns = run(
+        &engine,
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_catalog = 'hive' AND table_schema = 'vendas' AND table_name = 'mixedcase' \
+         ORDER BY ordinal_position",
+    )
+    .await;
+    assert!(
+        columns.contains("| id ") && columns.contains("| origem "),
+        "{columns}"
+    );
+    let duplicate = engine
+        .sql("CREATE TABLE hive.vendas.dup AS SELECT 1 AS \"A\", 2 AS a")
+        .await;
+    let duplicate = match duplicate {
+        Ok(frame) => frame.collect().await.map(|_| ()),
+        Err(err) => Err(err),
+    };
+    assert!(
+        duplicate
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("duplicate column")),
+        "{duplicate:?}"
+    );
+    assert!(!warehouse.join("vendas/dup").exists());
+    run(&engine, "DROP TABLE hive.\"Vendas\".\"MixedCase\"").await;
+    assert!(!warehouse.join("vendas/mixedcase").exists());
+}
