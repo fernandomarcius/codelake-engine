@@ -16,10 +16,12 @@ pub mod session_properties;
 pub mod subquery;
 #[cfg(test)]
 mod testing;
+pub mod trace;
 
 pub use bytes::ByteSize;
 pub use config::{Config, SourceConfig, SourceKind, ValidatedConfig};
 pub use connector::{BoxError, Connector, ConnectorError, WritableCatalog};
-pub use engine::{Attach, Engine, EngineError, QueryOptions, SourceStatus};
+pub use engine::{Attach, Engine, EngineError, Query, QueryOptions, SourceStatus};
 pub use runtime::MemoryStats;
 pub use session_properties::{Effect, PropertyRegistry, PropertyType, SessionProperties, SessionProperty};
+pub use trace::{QueryTrace, TraceParent};
