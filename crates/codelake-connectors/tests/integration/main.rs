@@ -20,4 +20,6 @@ mod postgres;
 #[cfg(all(feature = "sqlserver", feature = "postgres"))]
 mod sqlserver_acceptance;
 #[cfg(all(feature = "sqlserver", feature = "postgres"))]
+mod sqlserver_audit;
+#[cfg(all(feature = "sqlserver", feature = "postgres"))]
 mod sqlserver_smoke;
