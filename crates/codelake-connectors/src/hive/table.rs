@@ -102,6 +102,11 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 fn is_data_file(dir: &Path, meta: &ObjectMeta) -> bool {
+    // An empty file (a writer that died before its first byte) holds no rows
+    // and is no Parquet file: Trino skips it when reading and compacting.
+    if meta.size == 0 {
+        return false;
+    }
     let Some(relative) = meta.location.prefix_match(dir) else {
         return false;
     };
@@ -475,5 +480,13 @@ mod tests {
             &meta("pilot/t1/.trinoPermissions/user_trino")
         ));
         assert!(!is_data_file(&dir, &meta("pilot/t2/file")));
+        let empty = ObjectMeta {
+            size: 0,
+            ..meta("pilot/t1/20260923_235834_00004_h47gc_74f5")
+        };
+        assert!(
+            !is_data_file(&dir, &empty),
+            "zero-byte files are skipped, as in Trino"
+        );
     }
 }
