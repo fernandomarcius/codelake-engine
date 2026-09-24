@@ -41,6 +41,9 @@ pub(crate) struct ColumnMetadata {
     pub(crate) comment: Option<String>,
     #[serde(default)]
     pub(crate) properties: BTreeMap<String, String>,
+    /// Fields this version does not model, kept on rewrite.
+    #[serde(flatten)]
+    pub(crate) extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -65,7 +68,16 @@ pub(crate) struct TableMetadata {
     pub(crate) view_original_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) view_expanded_text: Option<String>,
-    /// Fields this version does not model (statistics, serde parameters, …).
+    /// Always written: Trino 431 rejects metadata without it
+    /// (`serdeParameters is null`).
+    #[serde(default)]
+    pub(crate) serde_parameters: BTreeMap<String, String>,
+    /// Always written: Trino 431 rejects metadata without it
+    /// (`columnStatistics is null`). Values are kept as Trino wrote them.
+    #[serde(default)]
+    pub(crate) column_statistics: BTreeMap<String, serde_json::Value>,
+    /// Fields this version does not model (`originalStorageFormat`,
+    /// `bucketProperty`, …), kept on rewrite.
     #[serde(flatten)]
     pub(crate) extra: BTreeMap<String, serde_json::Value>,
 }
@@ -75,7 +87,9 @@ impl TableMetadata {
         self.table_type == VIRTUAL_VIEW
     }
 
-    /// New managed Parquet table, the only kind `CodeLake` creates.
+    /// New managed Parquet table, the only kind `CodeLake` creates. Same fields
+    /// as Trino 431 writes for `CREATE TABLE … WITH (format = 'PARQUET')`;
+    /// statistics start unknown (Trino then treats them as missing).
     pub(crate) fn managed_parquet(owner: &str, columns: Vec<ColumnMetadata>) -> Self {
         Self {
             writer_version: Some(TRINO_VERSION.into()),
@@ -84,6 +98,7 @@ impl TableMetadata {
             data_columns: columns,
             partition_columns: Vec::new(),
             parameters: BTreeMap::from([
+                ("presto_version".into(), TRINO_VERSION.into()),
                 ("transactional".into(), "false".into()),
                 ("auto.purge".into(), "false".into()),
             ]),
@@ -91,21 +106,49 @@ impl TableMetadata {
             external_location: None,
             view_original_text: None,
             view_expanded_text: None,
+            serde_parameters: BTreeMap::new(),
+            column_statistics: BTreeMap::new(),
             extra: BTreeMap::new(),
         }
     }
 
-    /// Statistics describe the files at the time they were computed; after a
-    /// write they would lie to Trino's cost-based optimizer. Drop them.
+    /// New Trino view (`VIRTUAL_VIEW`), laid out as Trino 431 writes it.
+    pub(crate) fn trino_view(owner: &str, original_text: String) -> Self {
+        Self {
+            writer_version: Some(TRINO_VERSION.into()),
+            owner: Some(owner.into()),
+            table_type: VIRTUAL_VIEW.into(),
+            data_columns: vec![ColumnMetadata {
+                name: "dummy".into(),
+                hive_type: "string".into(),
+                comment: None,
+                properties: BTreeMap::new(),
+                extra: BTreeMap::new(),
+            }],
+            partition_columns: Vec::new(),
+            parameters: BTreeMap::from([
+                ("comment".into(), "Presto View".into()),
+                ("presto_view".into(), "true".into()),
+                ("presto_version".into(), TRINO_VERSION.into()),
+            ]),
+            storage_format: None,
+            external_location: None,
+            view_original_text: Some(original_text),
+            view_expanded_text: Some("/* Presto View */".into()),
+            serde_parameters: BTreeMap::new(),
+            column_statistics: BTreeMap::new(),
+            extra: BTreeMap::from([("originalStorageFormat".into(), serde_json::json!({}))]),
+        }
+    }
+
+    /// After new data files, the table's statistics no longer describe it.
+    /// `CodeLake` does not compute statistics, so they become unknown exactly
+    /// as Trino records unknown statistics when it merges an insert without
+    /// them: basic counters removed, column statistics empty (the field stays,
+    /// Trino needs it). Every other field is kept as it was.
     pub(crate) fn invalidate_statistics(&mut self) {
-        self.extra.remove("columnStatistics");
-        for key in [
-            "numFiles",
-            "numRows",
-            "rawDataSize",
-            "totalSize",
-            "STATS_GENERATED_VIA_STATS_TASK",
-        ] {
+        self.column_statistics.clear();
+        for key in ["numFiles", "numRows", "rawDataSize", "totalSize"] {
             self.parameters.remove(key);
         }
     }
@@ -394,10 +437,8 @@ mod tests {
                 ("vc", "varchar(10)"),
             ]
         );
-        assert!(
-            table.extra.contains_key("columnStatistics"),
-            "unknown fields are kept"
-        );
+        assert_eq!(table.column_statistics.len(), 10, "statistics are read");
+        assert!(table.serde_parameters.is_empty());
         let view = metastore.table("pilot", "v1").await.unwrap().unwrap();
         assert!(view.is_view());
         assert!(view.view_original_text.unwrap().starts_with("/* Presto View: "));
@@ -421,6 +462,72 @@ mod tests {
             std::fs::read(dir.path().join("..pilot.trinoSchema.crc")).unwrap(),
             hadoop_crc(&schema_file)
         );
+    }
+
+    fn written_json(dir: &tempfile::TempDir, file: &str) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(dir.path().join(file)).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn metadata_has_every_field_trino_431_requires() {
+        let (dir, metastore) = scratch();
+        metastore.create_schema("raw", "dbt").await.unwrap();
+        let table = TableMetadata::managed_parquet("dbt", Vec::new());
+        metastore.write_table("raw", "t", &table).await.unwrap();
+        let view = TableMetadata::trino_view("dbt", "/* Presto View: e30= */".into());
+        metastore.write_table("raw", "v", &view).await.unwrap();
+        for file in ["raw/t/.trinoSchema", "raw/v/.trinoSchema"] {
+            let json = written_json(&dir, file);
+            for field in [
+                "dataColumns",
+                "partitionColumns",
+                "parameters",
+                "serdeParameters",
+                "columnStatistics",
+            ] {
+                assert!(
+                    json[field].is_object() || json[field].is_array(),
+                    "{file}: {field} in {json}"
+                );
+            }
+        }
+        let view = written_json(&dir, "raw/v/.trinoSchema");
+        assert_eq!(view["originalStorageFormat"], serde_json::json!({}));
+        assert_eq!(view["parameters"]["presto_view"], "true");
+    }
+
+    #[tokio::test]
+    async fn insert_keeps_every_field_and_marks_statistics_unknown() {
+        let (dir, metastore) = scratch();
+        let mut original = fixture().table("pilot", "t1").await.unwrap().unwrap();
+        original
+            .extra
+            .insert("bucketProperty".into(), serde_json::json!({"bucketCount": 4}));
+        metastore.create_schema("pilot", "trino").await.unwrap();
+        metastore.write_table("pilot", "t1", &original).await.unwrap();
+
+        metastore.invalidate_statistics("pilot", "t1").await.unwrap();
+        let json = written_json(&dir, "pilot/t1/.trinoSchema");
+        assert_eq!(json["columnStatistics"], serde_json::json!({}), "present, empty");
+        assert_eq!(json["serdeParameters"], serde_json::json!({}));
+        assert_eq!(json["bucketProperty"]["bucketCount"], 4, "unknown field kept");
+        assert_eq!(json["writerVersion"], "431");
+        let parameters = &json["parameters"];
+        for kept in [
+            "presto_version",
+            "presto_query_id",
+            "transactional",
+            "auto.purge",
+            "STATS_GENERATED_VIA_STATS_TASK",
+        ] {
+            assert_eq!(parameters[kept], original.parameters[kept], "{kept}");
+        }
+        for unknown in ["numFiles", "numRows", "rawDataSize", "totalSize"] {
+            assert!(parameters.get(unknown).is_none(), "{unknown} would be stale");
+        }
+        let back = metastore.table("pilot", "t1").await.unwrap().unwrap();
+        assert_eq!(back.data_columns, original.data_columns);
+        assert_eq!(back.storage_format, original.storage_format);
     }
 
     #[tokio::test]
@@ -460,14 +567,15 @@ mod tests {
                 hive_type: "bigint".into(),
                 comment: None,
                 properties: BTreeMap::new(),
+                extra: BTreeMap::new(),
             }],
         );
         table.parameters.insert("numRows".into(), "10".into());
         table
-            .extra
-            .insert("columnStatistics".into(), serde_json::json!({}));
+            .column_statistics
+            .insert("id".into(), serde_json::json!({"nullsCount": 0}));
         table.invalidate_statistics();
-        assert!(!table.parameters.contains_key("numRows") && !table.extra.contains_key("columnStatistics"));
+        assert!(!table.parameters.contains_key("numRows") && table.column_statistics.is_empty());
 
         metastore.write_table("raw", "t", &table).await.unwrap();
         metastore

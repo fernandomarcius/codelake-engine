@@ -619,7 +619,6 @@ async fn seed_trino_table(trino: &Trino) {
 }
 
 #[tokio::test]
-#[ignore = "F2 defect: INSERT drops columnStatistics; Trino 431 cannot read the table"]
 async fn codelake_insert_into_trino_table_keeps_it_readable_by_trino() {
     let shared = shared().await;
     let trino = Trino::start(&shared).await;
@@ -661,7 +660,6 @@ async fn codelake_insert_into_trino_table_keeps_it_readable_by_trino() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "F2 defect: Trino 431 rejects CodeLake metadata (writerVersion, columnStatistics, serdeParameters)"]
 async fn codelake_writes_trino_reads_table_and_view() {
     codelake_to_trino(Metadata::AsWritten).await;
 }

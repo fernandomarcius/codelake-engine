@@ -24,7 +24,7 @@ use datafusion::logical_expr::{Expr, LogicalPlanBuilder, cast, col};
 use datafusion::physical_plan::ExecutionPlan;
 use serde::{Deserialize, Serialize};
 
-use super::metastore::{ColumnMetadata, FileMetastore, MetastoreError, TableMetadata, VIRTUAL_VIEW};
+use super::metastore::{ColumnMetadata, FileMetastore, MetastoreError, TableMetadata};
 use super::table::{HiveSink, HiveTable};
 use super::types::{arrow_type, hive_type};
 
@@ -369,6 +369,7 @@ fn column(name: &str, data_type: &DataType) -> Result<ColumnMetadata> {
         hive_type: hive_type(data_type)?,
         comment: None,
         properties: BTreeMap::new(),
+        extra: BTreeMap::new(),
     })
 }
 
@@ -502,15 +503,7 @@ impl WritableCatalog for HiveCatalog {
             run_as_invoker: false,
             path: Vec::new(),
         };
-        let mut metadata = TableMetadata::managed_parquet(owner, vec![column("dummy", &DataType::Utf8)?]);
-        metadata.table_type = VIRTUAL_VIEW.into();
-        metadata.storage_format = None;
-        metadata.parameters = BTreeMap::from([
-            ("comment".into(), "Presto View".into()),
-            ("presto_view".into(), "true".into()),
-        ]);
-        metadata.view_original_text = Some(definition.encode()?);
-        metadata.view_expanded_text = Some("/* Presto View */".into());
+        let metadata = TableMetadata::trino_view(owner, definition.encode()?);
         self.metastore
             .write_table(schema, view, &metadata)
             .await
