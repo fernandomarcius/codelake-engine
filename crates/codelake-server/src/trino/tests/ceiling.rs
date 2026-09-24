@@ -480,7 +480,6 @@ async fn sort_under(limit_mib: u64, partitions_n: usize, rows: i64) -> Vec<Strin
 /// ~100 MiB sorted under 64 MiB with 2 partitions: it spills, then the merge
 /// of the spill files reserves more than the pool has left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-MEM4: the sort spills and finishes with the right rows, but row_number() is sent as decimal(20, 0), not bigint (fixed on front/f4-functions)"]
 async fn mem4_sort_of_1_5x_the_pool_spills_and_finishes() {
     let wrong = sort_under(64, 2, 400_000).await;
     assert!(wrong.is_empty(), "{wrong:#?}");
@@ -490,7 +489,6 @@ async fn mem4_sort_of_1_5x_the_pool_spills_and_finishes() {
 /// first reserves `sort_spill_reservation_bytes` (10 MiB) for its merge, and
 /// what is left is too little to buffer the one batch it could spill.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-MEM5: the sort spills and finishes with the right rows, but row_number() is sent as decimal(20, 0), not bigint (fixed on front/f4-functions)"]
 async fn mem5_sort_spills_under_32_mib_with_2_partitions() {
     let wrong = sort_under(32, 2, 400_000).await;
     assert!(wrong.is_empty(), "{wrong:#?}");
@@ -499,7 +497,6 @@ async fn mem5_sort_spills_under_32_mib_with_2_partitions() {
 /// ~100 MiB sorted under 64 MiB with 8 partitions (a node with 8 cores and
 /// the default `target_partitions`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-MEM5: the sort spills and finishes with the right rows, but row_number() is sent as decimal(20, 0), not bigint (fixed on front/f4-functions)"]
 async fn mem5_sort_spills_under_64_mib_with_8_partitions() {
     let wrong = sort_under(64, 8, 400_000).await;
     assert!(wrong.is_empty(), "{wrong:#?}");

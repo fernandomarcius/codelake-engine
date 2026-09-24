@@ -558,7 +558,6 @@ async fn heavy(name: &str, sql: &str, expected: &[Value], must_spill: bool) -> (
 /// A full sort of ~330 MiB (`row_number` over the whole input) under 128 MiB:
 /// spills and returns the first and last rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-MEM4: the sort spills and returns the right rows within the budget (115 MiB), but row_number() is decimal(20, 0), not bigint (front/f4-functions)"]
 async fn heavy_sort_spills_under_the_ceiling() {
     let (report, wrong) = heavy(
         "sort",
