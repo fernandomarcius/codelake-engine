@@ -12,6 +12,9 @@
 mod common;
 
 #[cfg(feature = "hive")]
+mod f4_acceptance;
+
+#[cfg(feature = "hive")]
 mod hive_smoke;
 
 #[cfg(feature = "mongodb")]
