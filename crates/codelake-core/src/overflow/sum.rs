@@ -5,6 +5,8 @@
 //! `bigint addition overflow` / `Decimal overflow`. [`CheckedSum`] keeps the
 //! name, signature and result type of `DataFusion`'s `sum` (so plans, column
 //! names and pushed-down SQL do not change) and replaces only the arithmetic.
+//! [`CheckedSum::trino`] also takes Trino's result type for decimals,
+//! `decimal(38,s)`.
 
 use std::any::Any;
 use std::fmt::Display;
@@ -363,6 +365,18 @@ pub(super) fn is_checked_sum_type(data_type: &DataType) -> bool {
 #[derive(Debug, PartialEq, Eq, Hash, Default)]
 pub(crate) struct CheckedSum {
     inner: Sum,
+    /// Trino's result type for `decimal(p,s)`: `decimal(38,s)`.
+    trino_decimal: bool,
+}
+
+impl CheckedSum {
+    /// `sum` typed like Trino: `decimal(p,s)` sums to `decimal(38,s)`.
+    pub(crate) fn trino() -> Self {
+        Self {
+            inner: Sum::new(),
+            trino_decimal: true,
+        }
+    }
 }
 
 impl AggregateUDFImpl for CheckedSum {
@@ -379,7 +393,12 @@ impl AggregateUDFImpl for CheckedSum {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        self.inner.return_type(arg_types)
+        match arg_types.first() {
+            Some(DataType::Decimal128(_, s)) if self.trino_decimal && *s >= 0 => {
+                Ok(DataType::Decimal128(super::decimal::MAX_PRECISION, *s))
+            }
+            _ => self.inner.return_type(arg_types),
+        }
     }
 
     fn accumulator(&self, args: AccumulatorArgs<'_>) -> Result<Box<dyn Accumulator>> {

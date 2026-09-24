@@ -95,11 +95,17 @@ pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + S
     rules
 }
 
-/// `DataFusion`'s analyzer rules followed by the engine's: checked arithmetic
-/// ([`crate::overflow`]) and the one-row rule of scalar subqueries
-/// ([`crate::subquery`]). Both need the types that type coercion settles.
+/// `DataFusion`'s analyzer rules with the engine's: Trino's decimal types
+/// right before type coercion (which then recomputes every schema), then
+/// checked arithmetic ([`crate::overflow`]) and the one-row rule of scalar
+/// subqueries ([`crate::subquery`]), which need the types coercion settles.
 pub fn analyzer_rules() -> Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Send + Sync>> {
     let mut rules = datafusion::optimizer::Analyzer::new().rules;
+    let coercion = rules
+        .iter()
+        .position(|r| r.name() == "type_coercion")
+        .unwrap_or(rules.len());
+    rules.insert(coercion, Arc::new(crate::overflow::TrinoDecimalTypes));
     rules.push(Arc::new(crate::overflow::CheckedArithmetic));
     rules.push(Arc::new(crate::subquery::EnforceScalarSubqueryRows));
     rules
@@ -111,6 +117,19 @@ fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = vec![Arc::new(FederationFilterGuard)];
     rules.extend(PhysicalOptimizer::new().rules);
     rules
+}
+
+/// Output schema of `plan` once analyzed: the analyzer settles some types
+/// after SQL planning (Trino's decimal types, see [`crate::overflow`]), so
+/// the schema of a freshly planned `DataFrame` can differ from its rows'.
+pub fn analyzed_schema(
+    state: &datafusion::execution::SessionState,
+    plan: &LogicalPlan,
+) -> Result<datafusion::common::DFSchemaRef, DataFusionError> {
+    let analyzed = state
+        .analyzer()
+        .execute_and_check(plan.clone(), state.config_options(), |_, _| {})?;
+    Ok(Arc::clone(analyzed.schema()))
 }
 
 /// Result of attaching one source at startup.
@@ -159,6 +178,8 @@ impl Engine {
         let mut session = SessionConfig::new()
             .with_batch_size(execution.batch_size)
             .with_information_schema(false);
+        // `1.5` is `decimal(2,1)`, as in Trino (and PostgreSQL), not a double.
+        session.options_mut().sql_parser.parse_float_as_decimal = true;
         if let Some(partitions) = execution.target_partitions {
             session = session.with_target_partitions(partitions);
         }
@@ -240,6 +261,7 @@ impl Engine {
         let prepared = ddl::prepare(&mut statement, security)?;
         // After `prepare`, which keeps a view's text as written.
         crate::literals::rewrite_zoned_timestamps(&mut statement);
+        crate::literals::rewrite_exponent_numbers(&mut statement);
         match &prepared {
             Some(Prepared::AddColumn {
                 table,
@@ -323,8 +345,11 @@ impl Engine {
         }
         let input =
             crate::subquery::pre_evaluate_scalar_subqueries(ctx, create.input.as_ref().clone()).await?;
-        let schema = Arc::clone(input.schema().inner());
-        let batches = DataFrame::new(ctx.state(), input).collect_partitioned().await?;
+        // The executed plan's schema: the analyzer settles some types (Trino's
+        // decimal types, see `crate::overflow`) after SQL planning.
+        let physical = DataFrame::new(ctx.state(), input).create_physical_plan().await?;
+        let schema = physical.schema();
+        let batches = datafusion::physical_plan::collect_partitioned(physical, ctx.task_ctx()).await?;
         let rows = batches
             .iter()
             .flatten()
@@ -508,10 +533,11 @@ impl Engine {
                     return Err(DataFusionError::Internal("view SQL was not captured".into()));
                 };
                 let session = ctx.state().config().options().catalog.clone();
+                let output = analyzed_schema(&ctx.state(), &view.input)?;
                 let definition = ViewDefinition {
                     sql,
                     security,
-                    output: Arc::new(view.input.schema().as_arrow().clone()),
+                    output: Arc::new(output.as_arrow().clone()),
                     catalog: session.default_catalog,
                     schema: session.default_schema,
                 };
@@ -794,6 +820,349 @@ mod tests {
             schema.field(2).data_type(),
             &DataType::Timestamp(TimeUnit::Nanosecond, None)
         );
+    }
+
+    /// Result types and values as text (Arrow's display: decimals exact).
+    async fn typed_rows(engine: &Engine, sql: &str) -> (Vec<DataType>, Vec<Vec<String>>) {
+        use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
+        let frame = engine.sql(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let expected = analyzed_schema(&engine.context().state(), frame.logical_plan()).unwrap();
+        let batches = frame.collect().await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let types: Vec<DataType> = batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.data_type().clone())
+            .collect();
+        let analyzed: Vec<DataType> = expected.fields().iter().map(|f| f.data_type().clone()).collect();
+        assert_eq!(types, analyzed, "{sql}: analyzed schema and rows differ");
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let options = FormatOptions::default().with_null("NULL");
+            let formatters: Vec<ArrayFormatter<'_>> = batch
+                .columns()
+                .iter()
+                .map(|c| ArrayFormatter::try_new(c.as_ref(), &options).unwrap())
+                .collect();
+            for row in 0..batch.num_rows() {
+                rows.push(formatters.iter().map(|f| f.value(row).to_string()).collect());
+            }
+        }
+        (types, rows)
+    }
+
+    /// Each query's first value, with its type.
+    async fn assert_first_values(engine: &Engine, cases: &[(String, DataType, &str)]) {
+        for (sql, data_type, value) in cases {
+            let (types, rows) = typed_rows(engine, sql).await;
+            assert_eq!((&types[0], rows[0][0].as_str()), (data_type, *value), "{sql}");
+        }
+    }
+
+    /// Each query fails with an error containing its message.
+    async fn assert_failures(engine: &Engine, cases: &[(&str, &str)]) {
+        for (sql, message) in cases {
+            let result = match engine.sql(sql).await {
+                Ok(frame) => frame.collect().await.map(|_| ()),
+                Err(e) => Err(e),
+            };
+            let error = result.expect_err(sql).to_string();
+            assert!(error.contains(message), "{sql}: {error}");
+        }
+    }
+
+    const LINEITEM: &str = "(VALUES \
+        (1, CAST(17 AS decimal(15,2)), CAST(21168.23 AS decimal(15,2)), CAST(0.04 AS decimal(15,2)), CAST(0.02 AS decimal(15,2))), \
+        (1, CAST(36 AS decimal(15,2)), CAST(45983.16 AS decimal(15,2)), CAST(0.09 AS decimal(15,2)), CAST(0.06 AS decimal(15,2))), \
+        (2, CAST(8 AS decimal(15,2)), CAST(13309.60 AS decimal(15,2)), CAST(0.10 AS decimal(15,2)), CAST(0.02 AS decimal(15,2))), \
+        (2, CAST(28 AS decimal(15,2)), CAST(28955.64 AS decimal(15,2)), CAST(0.09 AS decimal(15,2)), CAST(0.06 AS decimal(15,2))), \
+        (2, CAST(24 AS decimal(15,2)), CAST(22824.48 AS decimal(15,2)), CAST(0.10 AS decimal(15,2)), CAST(0.04 AS decimal(15,2))), \
+        (3, CAST(32 AS decimal(15,2)), CAST(49620.16 AS decimal(15,2)), CAST(0.07 AS decimal(15,2)), CAST(0.02 AS decimal(15,2))), \
+        (3, CAST(38 AS decimal(15,2)), CAST(44694.46 AS decimal(15,2)), CAST(0.00 AS decimal(15,2)), CAST(0.05 AS decimal(15,2))) \
+        ) l(k, qty, price, disc, tax)";
+
+    /// TPC-H Q01, Q08, Q14 and Q17 shapes; every type and value observed on
+    /// Trino 431 with the same rows.
+    #[tokio::test]
+    async fn decimal_aggregates_and_division_match_trino() {
+        use DataType::Decimal128 as D;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        let (types, rows) = typed_rows(
+            &engine,
+            &format!(
+                "SELECT k, sum(qty), sum(price), sum(price * (1 - disc)), sum(price * (1 - disc) * (1 + tax)), \
+                 avg(qty), avg(price), avg(disc) FROM {LINEITEM} GROUP BY k ORDER BY k"
+            ),
+        )
+        .await;
+        assert_eq!(
+            types[1..],
+            [
+                D(38, 2),
+                D(38, 2),
+                D(38, 4),
+                D(38, 6),
+                D(15, 2),
+                D(15, 2),
+                D(15, 2)
+            ]
+        );
+        assert_eq!(
+            rows,
+            [
+                [
+                    "1",
+                    "53.00",
+                    "67151.39",
+                    "62166.1764",
+                    "65083.286952",
+                    "26.50",
+                    "33575.70",
+                    "0.07"
+                ],
+                [
+                    "2",
+                    "60.00",
+                    "65089.72",
+                    "58870.3044",
+                    "61512.536424",
+                    "20.00",
+                    "21696.57",
+                    "0.10"
+                ],
+                [
+                    "3",
+                    "70.00",
+                    "94314.62",
+                    "90841.2088",
+                    "93998.866776",
+                    "35.00",
+                    "47157.31",
+                    "0.04"
+                ],
+            ]
+        );
+        let cases = [
+            (
+                format!(
+                    "SELECT 100.00 * sum(CASE WHEN k = 2 THEN price * (1 - disc) ELSE 0 END) \
+                     / sum(price * (1 - disc)) FROM {LINEITEM}"
+                ),
+                D(38, 6),
+                "27.785042",
+            ),
+            (
+                format!(
+                    "SELECT sum(CASE WHEN k = 3 THEN price * (1 - disc) ELSE 0 END) / sum(price * (1 - disc)) \
+                     FROM {LINEITEM}"
+                ),
+                D(38, 4),
+                "0.4287",
+            ),
+            (
+                format!("SELECT sum(price) / 7.0 FROM {LINEITEM} WHERE qty < 0.2 * 150"),
+                D(38, 2),
+                "12322.56",
+            ),
+            (
+                format!("SELECT avg(DISTINCT disc) FROM {LINEITEM}"),
+                D(15, 2),
+                "0.06",
+            ),
+        ];
+        assert_first_values(&engine, &cases).await;
+    }
+
+    /// Trino 431: a sliding window `avg` over decimals rounds like `avg`.
+    #[tokio::test]
+    async fn decimal_window_average_matches_trino() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        let (types, rows) = typed_rows(
+            &engine,
+            &format!(
+                "SELECT avg(price) OVER (ORDER BY price ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+                 FROM {LINEITEM} ORDER BY price"
+            ),
+        )
+        .await;
+        assert_eq!(types, [DataType::Decimal128(15, 2)]);
+        let window: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(
+            window,
+            [
+                "13309.60", "17238.92", "21996.36", "25890.06", "36825.05", "45338.81", "47801.66"
+            ]
+        );
+    }
+
+    /// Trino 431: `1.5` is `decimal(2,1)`, `1e5` a `double`.
+    #[tokio::test]
+    async fn decimal_literals_match_trino() {
+        use DataType::Decimal128 as D;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        let (types, rows) = typed_rows(
+            &engine,
+            "SELECT 1.5, 100.00, 007.50, 0.2, .5, 0.00, -1.5, 1e5, 2.5E-1",
+        )
+        .await;
+        assert_eq!(
+            types,
+            [
+                D(2, 1),
+                D(5, 2),
+                D(3, 2),
+                D(1, 1),
+                D(1, 1),
+                D(2, 2),
+                D(2, 1),
+                DataType::Float64,
+                DataType::Float64
+            ]
+        );
+        assert_eq!(rows[0][7..], ["100000.0", "0.25"]);
+    }
+
+    /// Trino 431: decimal division rounds half away from zero.
+    #[tokio::test]
+    async fn decimal_division_rounds_like_trino() {
+        use DataType::Decimal128 as D;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        let cases = [
+            (
+                "SELECT CAST(10 AS DECIMAL(5,0)) / CAST(3 AS DECIMAL(5,0))",
+                D(5, 0),
+                "3",
+            ),
+            (
+                "SELECT CAST(20 AS DECIMAL(5,0)) / CAST(3 AS DECIMAL(5,0))",
+                D(5, 0),
+                "7",
+            ),
+            (
+                "SELECT CAST(-20 AS DECIMAL(5,0)) / CAST(3 AS DECIMAL(5,0))",
+                D(5, 0),
+                "-7",
+            ),
+            (
+                "SELECT CAST(-1 AS DECIMAL(5,1)) / CAST(4 AS DECIMAL(5,0))",
+                D(5, 1),
+                "-0.3",
+            ),
+            (
+                "SELECT CAST(1 AS DECIMAL(5,2)) / CAST(8 AS DECIMAL(5,0))",
+                D(5, 2),
+                "0.13",
+            ),
+            (
+                "SELECT CAST(-1 AS DECIMAL(5,2)) / CAST(8 AS DECIMAL(5,0))",
+                D(5, 2),
+                "-0.13",
+            ),
+            ("SELECT CAST(1.25 AS DECIMAL(5,2)) / 2", D(5, 2), "0.63"),
+        ];
+        let cases: Vec<(String, DataType, &str)> = cases
+            .into_iter()
+            .map(|(sql, t, v)| (sql.to_owned(), t, v))
+            .collect();
+        assert_first_values(&engine, &cases).await;
+    }
+
+    /// Trino 431: 38 digits, modulus, mixed integer operands and `avg`.
+    #[tokio::test]
+    async fn decimal_edges_match_trino() {
+        use DataType::Decimal128 as D;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        let cases = [
+            (
+                "SELECT CAST(1 AS DECIMAL(38,0)) / CAST(3 AS DECIMAL(38,18))",
+                D(38, 18),
+                "0.333333333333333333",
+            ),
+            (
+                "SELECT CAST(1 AS DECIMAL(38,1)) / CAST(3 AS DECIMAL(38,19))",
+                D(38, 19),
+                "0.3333333333333333333",
+            ),
+            (
+                "SELECT CAST(7.5 AS DECIMAL(5,1)) % CAST(2 AS DECIMAL(5,0))",
+                D(5, 1),
+                "1.5",
+            ),
+            ("SELECT CAST(-7.5 AS DECIMAL(5,1)) % 2", D(5, 1), "-1.5"),
+            (
+                "SELECT CAST(1 AS DECIMAL(20,10)) * CAST(1 AS DECIMAL(20,10))",
+                D(38, 20),
+                "1.00000000000000000000",
+            ),
+            ("SELECT CAST(1 AS DECIMAL(12,2)) + 1", D(13, 2), "2.00"),
+            (
+                "SELECT CAST(1 AS DECIMAL(12,2)) * CAST(1 AS SMALLINT)",
+                D(17, 2),
+                "1.00",
+            ),
+            (
+                "SELECT CAST(1 AS DECIMAL(12,2)) * CAST(1 AS TINYINT)",
+                D(15, 2),
+                "1.00",
+            ),
+            (
+                "SELECT avg(x) FROM (VALUES (CAST(-1.25 AS DECIMAL(5,2))), (CAST(-1.26 AS DECIMAL(5,2)))) t(x)",
+                D(5, 2),
+                "-1.26",
+            ),
+            (
+                "SELECT avg(x) FROM (VALUES (CAST(1 AS DECIMAL(3,0))), (CAST(2 AS DECIMAL(3,0)))) t(x)",
+                D(3, 0),
+                "2",
+            ),
+            (
+                "SELECT avg(x) FROM (VALUES (CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))), \
+                 (CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0)))) t(x)",
+                D(38, 0),
+                "99999999999999999999999999999999999999",
+            ),
+        ];
+        let cases: Vec<(String, DataType, &str)> = cases
+            .into_iter()
+            .map(|(sql, t, v)| (sql.to_owned(), t, v))
+            .collect();
+        assert_first_values(&engine, &cases).await;
+    }
+
+    /// Trino 431: `Decimal overflow` and division by zero.
+    #[tokio::test]
+    async fn decimal_failures_match_trino() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        let cases = [
+            (
+                "SELECT CAST(1 AS DECIMAL(38,0)) / CAST(3 AS DECIMAL(38,19))",
+                "Decimal overflow",
+            ),
+            (
+                "SELECT CAST(0 AS DECIMAL(38,0)) / CAST(3 AS DECIMAL(38,19))",
+                "Decimal overflow",
+            ),
+            (
+                "SELECT CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0)) + 1",
+                "Decimal overflow",
+            ),
+            (
+                "SELECT sum(x) FROM (VALUES (CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))), \
+                 (CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0)))) t(x)",
+                "Decimal overflow",
+            ),
+            (
+                "SELECT CAST(1 AS DECIMAL(5,0)) / CAST(0 AS DECIMAL(5,0))",
+                "Divide by zero error",
+            ),
+        ];
+        assert_failures(&engine, &cases).await;
     }
 
     /// `<catalog>.information_schema` lists that catalog only.

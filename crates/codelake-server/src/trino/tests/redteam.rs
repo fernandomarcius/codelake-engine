@@ -116,7 +116,7 @@ async fn rt3_query_text_limit_matches_trino() {
 async fn rt4_real_values_encode_like_trino() {
     let h = harness();
     let out = h
-        .run("SELECT CAST(0.1 AS REAL) AS a, CAST(1.0 / 3 AS REAL) AS b", &[])
+        .run("SELECT CAST(0.1 AS REAL) AS a, CAST(1.0E0 / 3 AS REAL) AS b", &[])
         .await;
     assert_eq!(out.columns[0].1, "real");
     assert_eq!(out.rows[0][0].to_string(), "0.1", "{:?}", out.rows);

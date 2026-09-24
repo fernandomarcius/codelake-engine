@@ -13,13 +13,19 @@
 //! (0 → seconds, 1–3 → milliseconds, 4–6 → microseconds, 7–9 → nanoseconds).
 //! Literals without a zone, and anything this does not recognise, are left to
 //! `DataFusion`.
+//!
+//! Numbers: the engine reads `1.5` as `decimal(2,1)`, like Trino
+//! (`sql_parser.parse_float_as_decimal`), but a number with an exponent
+//! (`1e5`, `2.5E-3`) is a `double` in Trino; [`rewrite_exponent_numbers`]
+//! turns it into `CAST('<number>' AS DOUBLE)` before planning.
 
 use std::ops::ControlFlow;
 
 use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
-    DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
-    ObjectName, TimezoneInfo, TypedString, Value, visit_expressions_mut,
+    CastKind, DataType, ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
+    FunctionArguments, Ident, ObjectName, TimezoneInfo, TypedString, Value, ValueWithSpan,
+    visit_expressions_mut,
 };
 
 /// A timestamp literal split into its parts.
@@ -183,9 +189,53 @@ pub(crate) fn rewrite_zoned_timestamps(statement: &mut DFStatement) {
     });
 }
 
+/// Whether a numeric literal has an exponent (`1e5`): a `double` in Trino.
+fn has_exponent(number: &str) -> bool {
+    number.contains(['e', 'E'])
+}
+
+/// Rewrites every number with an exponent of `statement` as a `double` (see
+/// the module documentation).
+pub(crate) fn rewrite_exponent_numbers(statement: &mut DFStatement) {
+    let DFStatement::Statement(inner) = statement else {
+        return;
+    };
+    let _ = visit_expressions_mut(inner.as_mut(), |expr| {
+        if let Expr::Value(ValueWithSpan {
+            value: Value::Number(number, _),
+            ..
+        }) = expr
+            && has_exponent(number)
+        {
+            *expr = Expr::Cast {
+                kind: CastKind::Cast,
+                expr: Box::new(Expr::value(Value::SingleQuotedString(number.clone()))),
+                data_type: DataType::Double(ExactNumberInfo::None),
+                array: false,
+                format: None,
+            };
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_numbers_with_an_exponent_become_double() {
+        use datafusion::sql::parser::DFParser;
+        let mut statements =
+            DFParser::parse_sql("SELECT 1e5, 2.5E-3, -1e0, 1.5, 10, x FROM t WHERE y > 1e3").unwrap();
+        let mut statement = statements.pop_front().unwrap();
+        rewrite_exponent_numbers(&mut statement);
+        assert_eq!(
+            statement.to_string(),
+            "SELECT CAST('1e5' AS DOUBLE), CAST('2.5E-3' AS DOUBLE), -CAST('1e0' AS DOUBLE), 1.5, 10, x \
+             FROM t WHERE y > CAST('1e3' AS DOUBLE)"
+        );
+    }
 
     fn zoned(local: &str, precision: usize, zone: &str) -> ZonedTimestamp {
         ZonedTimestamp {

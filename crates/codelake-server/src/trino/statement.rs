@@ -1027,7 +1027,9 @@ async fn describe(engine: &Engine, options: &QueryOptions, table: &str) -> Resul
         .sql_with(options, &format!("SELECT * FROM {table}"))
         .await
         .map_err(|e| QueryError::from_engine(e.find_root(), "", &names))?;
-    let fields = target.schema().fields();
+    let schema = codelake_core::engine::analyzed_schema(&engine.context().state(), target.logical_plan())
+        .map_err(|e| QueryError::from_engine(e.find_root(), "", &names))?;
+    let fields = schema.fields();
     let mut column_names = Vec::with_capacity(fields.len());
     let mut type_names = Vec::with_capacity(fields.len());
     for field in fields {
