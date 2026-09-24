@@ -38,7 +38,8 @@ Blocking items, in order:
    green against SQL Server 2019 and 2022 with real CDC.
    Follow-up: route the PostgreSQL wire path through `Engine::sql`; apply a
    pushdown policy to MySQL (same collation hazard) before any reference use.
-2. **Hive-style Parquet catalog** (R4–R7): directory per table on local disk or
+2. 🔧 **Hive-style Parquet catalog** (R4–R7, F2) — implemented; red-team findings
+   still open: directory per table on local disk or
    S3/MinIO, file-based metastore; `CREATE SCHEMA`, CTAS `WITH (format='PARQUET')`,
    `INSERT INTO … SELECT` appending **one new file per insert**, `DROP TABLE`,
    `CREATE/DROP VIEW`, `ALTER TABLE ADD COLUMN`. Output readable by SQL Server 2022
@@ -51,14 +52,19 @@ Blocking items, in order:
    session-property registry that connectors extend (ADR 0012). Proven with the
    Trino 431 CLI and the Python `trino` client (dbt-trino's DB-API).
    Follow-up: prepared statements (`EXECUTE IMMEDIATE`), TLS on the listener.
-4. **Trino function library** (R-SQL): Trino 431's functions by category
+4. ✅ **Trino function library** (R-SQL, F4): Trino 431's functions by category
    (date/time, string, binary, math, conditional, aggregate, array/map, JSON,
    URL) with Trino semantics, each with a golden test against Trino 431. Every
-   function the acceptance pipelines use is the minimum, not the scope.
+   function the acceptance pipelines use is the minimum, not the scope (ADR 0008).
+   Evidence: `scripts/gates.sh integration` on integ/wave1 9f8950a →
+   `f4_acceptance` 39/39 passed; `scripts/gates.sh test` → every
+   `trino_functions` golden and unit test passed.
 5. **Client authentication** on both listeners (SCRAM-SHA-256 for PostgreSQL wire,
    password/JWT for the Trino protocol) and table ownership semantics (R11).
 6. **Query governance** (R12): per-query timeout, admission queue, per-user limits.
-7. **OTLP traces** with correlation ID across client → engine → source.
+7. ✅ **OTLP traces** (F7) with correlation ID across client → engine → source
+   (ADR 0010). Evidence: `scripts/gates.sh integration` on integ/wave1 9f8950a →
+   `f7_acceptance` 9/9 and `otlp` 2/2 passed.
 
 **DoD:**
 - `gates.sh fast` + `integration` green, including SQL Server and Hive catalog suites.
@@ -71,8 +77,15 @@ Blocking items, in order:
 
 - Canary: CodeLake serves the 2-minute micro-batch while Trino keeps the heavy
   21h/03h runs; compare end-to-end latency (target ≤ 5 min, median today 2.5 min).
-- Compaction without `docker exec` (R9): built-in `ALTER TABLE … EXECUTE compact`
-  that preserves row count and columns, and re-seeds the sink checkpoint.
+- ✅ Compaction without `docker exec` (R9, F9): Trino's `ALTER TABLE … EXECUTE
+  optimize`, rewriting with the same Trino 431 Parquet writer (INT96) as
+  `INSERT`, preserving row count and columns, crash-safe (ADR 0009).
+  Evidence: `scripts/gates.sh integration` on integ/wave1 9f8950a →
+  `hive_optimize` 2/2 (Trino 431 round trip) and `f9_acceptance` 10/16 passed;
+  the 6 failures are test SQL Trino 431 rejects since F4 (`md5(varchar)`,
+  `to_timestamp_millis` stored in hive), not OPTIMIZE, and wait on the
+  testers (with Trino SQL, 15/16 passed). Not in F9: re-seeding the sink
+  checkpoint after a compaction.
 - Runbooks: memory tuning, spill disk sizing, source outage, rollback to Trino.
 
 **DoD:** 14 days serving production with zero wrong-result incidents and SLO met.
