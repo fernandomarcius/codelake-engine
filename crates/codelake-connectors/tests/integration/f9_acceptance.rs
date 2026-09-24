@@ -1022,7 +1022,7 @@ fn generated(from: u64, to: u64) -> String {
          to_timestamp_millis(value * 1000003) AS ts, \
          CAST(to_timestamp_millis(value * 86400000) AS DATE) AS day, \
          value % 2 = 0 AS even, \
-         md5(CAST(value AS VARCHAR)) AS digest \
+         lower(to_hex(md5(to_utf8(CAST(value AS VARCHAR))))) AS digest \
          FROM generate_series({from}, {to})"
     )
 }
@@ -1106,8 +1106,8 @@ async fn memory_pool_bounds_the_compaction() {
     // ~200 bytes per row in memory, 150 000 rows: ~30 MB, twice the pool.
     let rows = |from: u64, to: u64| {
         format!(
-            "SELECT CAST(value AS BIGINT) AS id, concat(md5(CAST(value AS VARCHAR)), md5(CAST(value + 1 AS VARCHAR)), \
-             md5(CAST(value + 2 AS VARCHAR)), md5(CAST(value + 3 AS VARCHAR)), md5(CAST(value + 4 AS VARCHAR))) AS payload \
+            "SELECT CAST(value AS BIGINT) AS id, concat(lower(to_hex(md5(to_utf8(CAST(value AS VARCHAR))))), lower(to_hex(md5(to_utf8(CAST(value + 1 AS VARCHAR))))), \
+             lower(to_hex(md5(to_utf8(CAST(value + 2 AS VARCHAR))))), lower(to_hex(md5(to_utf8(CAST(value + 3 AS VARCHAR))))), lower(to_hex(md5(to_utf8(CAST(value + 4 AS VARCHAR)))))) AS payload \
              FROM generate_series({from}, {to})"
         )
     };
@@ -1173,7 +1173,7 @@ async fn threshold_selects_exactly_the_small_files() {
     sql(&lake, "CREATE SCHEMA hive.s").await;
     let rows = |from: u64, to: u64| {
         format!(
-            "SELECT CAST(value AS BIGINT) AS id, md5(CAST(value AS VARCHAR)) AS h FROM generate_series({from}, {to})"
+            "SELECT CAST(value AS BIGINT) AS id, lower(to_hex(md5(to_utf8(CAST(value AS VARCHAR))))) AS h FROM generate_series({from}, {to})"
         )
     };
     sql(
@@ -1487,7 +1487,7 @@ async fn readers_and_inserts_during_optimize_never_see_wrong_rows() {
 async fn seed_large(lake: &Engine, table: &str, files: u64, rows_per_file: u64) {
     let rows = |from: u64, to: u64| {
         format!(
-            "SELECT CAST(value AS BIGINT) AS id, concat(md5(CAST(value AS VARCHAR)), md5(CAST(value + 7 AS VARCHAR))) AS payload \
+            "SELECT CAST(value AS BIGINT) AS id, concat(lower(to_hex(md5(to_utf8(CAST(value AS VARCHAR))))), lower(to_hex(md5(to_utf8(CAST(value + 7 AS VARCHAR)))))) AS payload \
              FROM generate_series({from}, {to})"
         )
     };
@@ -1629,7 +1629,7 @@ async fn node_restarting_during_another_nodes_optimize_loses_nothing() {
     sql(&node_a, "CREATE SCHEMA hive.s").await;
     let rows = |k: u64| {
         format!(
-            "SELECT CAST(value AS BIGINT) AS id, md5(CAST(value AS VARCHAR)) AS h FROM generate_series({}, {})",
+            "SELECT CAST(value AS BIGINT) AS id, lower(to_hex(md5(to_utf8(CAST(value AS VARCHAR))))) AS h FROM generate_series({}, {})",
             k * 300,
             k * 300 + 299
         )

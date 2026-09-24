@@ -987,7 +987,7 @@ async fn a_pool_that_refuses_the_footer_read_only_loses_the_statistics() {
     cl(
         &writer,
         "CREATE TABLE hive.hs.big AS SELECT CAST(value AS BIGINT) AS k, CAST(value % 25 AS BIGINT) AS g, \
-         md5(CAST(value AS VARCHAR)) AS h FROM generate_series(0, 49999)",
+         lower(to_hex(md5(to_utf8(CAST(value AS VARCHAR))))) AS h FROM generate_series(0, 49999)",
     )
     .await;
     cl(

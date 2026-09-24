@@ -1291,7 +1291,7 @@ async fn sqlserver_2022_openrowset_reads_every_codelake_type() {
 // ---------------------------------------------------------------------------
 
 /// Fails with a division by zero at row 1 400 000 of 1 500 000.
-const FAILING_SELECT: &str = "SELECT value AS id, md5(CAST(value AS VARCHAR)) AS h, \
+const FAILING_SELECT: &str = "SELECT value AS id, lower(to_hex(md5(to_utf8(CAST(value AS VARCHAR))))) AS h, \
      CAST(1 AS BIGINT) / (value - 1400000) AS q FROM generate_series(1, 1500000)";
 
 #[tokio::test]
