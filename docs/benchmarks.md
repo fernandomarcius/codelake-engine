@@ -125,6 +125,12 @@ Caveats that apply to every number:
   tail latency.
 - Memory is sampled every 20 ms: spikes shorter than that are missed, for both
   engines alike.
+- Peak memory is the container's, not the query's: memory an engine keeps
+  after earlier cases (JVM heap committed by Trino, allocator caches in
+  CodeLake) is included, so later cases read higher. It is what the host must
+  provision, which is the question the ROADMAP's RSS target asks.
+- Cases run through the `embedded` driver also carry the bench client in the
+  measured container (small: it only collects the rows).
 - Trino runs with image defaults (no tuning); CodeLake with the documented
   defaults. Both are "out of the box" on the same limits.
 - On macOS, Docker runs in a VM: absolute numbers include virtualization cost;
