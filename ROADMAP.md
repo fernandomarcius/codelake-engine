@@ -38,8 +38,10 @@ Blocking items, in order:
    green against SQL Server 2019 and 2022 with real CDC.
    Follow-up: route the PostgreSQL wire path through `Engine::sql`; apply a
    pushdown policy to MySQL (same collation hazard) before any reference use.
-2. 🔧 **Hive-style Parquet catalog** (R4–R7, F2) — implemented; red-team findings
-   still open: directory per table on local disk or
+2. 🔧 **Hive-style Parquet catalog** (R4–R7, F2) — implemented; the red-team's
+   critical and high findings are fixed (ADR 0007, "Red-team corrections";
+   probes in `hive_redteam.rs`), except owner-based security (R11), which
+   waits on authentication (item 5, F5): directory per table on local disk or
    S3/MinIO, file-based metastore; `CREATE SCHEMA`, CTAS `WITH (format='PARQUET')`,
    `INSERT INTO … SELECT` appending **one new file per insert**, `DROP TABLE`,
    `CREATE/DROP VIEW`, `ALTER TABLE ADD COLUMN`. Output readable by SQL Server 2022
