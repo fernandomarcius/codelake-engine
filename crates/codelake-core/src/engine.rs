@@ -25,6 +25,7 @@ use crate::federation_guard::FederationFilterGuard;
 use crate::information_schema::CatalogList;
 use crate::runtime::{EngineRuntime, MemoryStats};
 use crate::session_properties::{PropertyRegistry, SessionProperties};
+use crate::statistics_guard::guard_aggregate_statistics;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -102,11 +103,13 @@ pub fn analyzer_rules() -> Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Sen
 }
 
 /// Default `DataFusion` physical rules, preceded by the federation guard (it must
-/// run before `FilterPushdown`; see [`crate::federation_guard`]).
-fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
+/// run before `FilterPushdown`; see [`crate::federation_guard`]), with
+/// aggregates answered from statistics only over exact sources (see
+/// [`crate::statistics_guard`]).
+pub(crate) fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = vec![Arc::new(FederationFilterGuard)];
     rules.extend(PhysicalOptimizer::new().rules);
-    rules
+    guard_aggregate_statistics(rules)
 }
 
 /// Result of attaching one source at startup.

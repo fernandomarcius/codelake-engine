@@ -1054,8 +1054,6 @@ async fn wrong_rows(engine: &Engine, checks: &[(&str, &[&[&str]])]) -> Vec<Strin
 /// into an exact 0 (`Statistics::with_fetch` treats an inexact count as an
 /// upper bound), which `count(*)` is then answered from.
 #[tokio::test]
-#[ignore = "DEFECT-HS1: numRows=0 in the metastore with matching numFiles/totalSize: \
-            count(*) of fact JOIN t expected 50000, obtained 0"]
 async fn a_recorded_row_count_of_zero_does_not_empty_the_table() {
     let (_dir, _spill, warehouse, engine) = small_warehouse().await;
     cl(
@@ -1091,8 +1089,6 @@ async fn a_recorded_row_count_of_zero_does_not_empty_the_table() {
 /// counters match, the column bounds still describe the old rows. The join
 /// estimate calls the inputs disjoint and `count(*)` is answered with 0.
 #[tokio::test]
-#[ignore = "DEFECT-HS2: stale metastore column bounds with refreshed counters: count(*) of t JOIN late \
-            and of late WHERE f_id IN (SELECT f_id FROM t) expected 10000, obtained 0"]
 async fn stale_column_bounds_do_not_empty_a_join() {
     let (_dir, _spill, warehouse, engine) = small_warehouse().await;
     cl(
@@ -1178,8 +1174,6 @@ async fn empty_parquet(engine: &Engine, path: &Path) {
 /// with many empty tasks) the estimate is 0 rows, which `DataFusion` makes
 /// exact, and `count(*)` returns 0.
 #[tokio::test]
-#[ignore = "DEFECT-HS3: >256 files whose footer sample is all empty files (estimate Rows=Inexact(0)): \
-            count(*) of fact JOIN t expected 10000, obtained 0"]
 async fn an_empty_footer_sample_does_not_empty_the_table() {
     let (dir, _spill, warehouse, engine) = small_warehouse().await;
     cl(
@@ -1218,8 +1212,6 @@ async fn an_empty_footer_sample_does_not_empty_the_table() {
 /// larger than the estimate is then taken as skipping every row
 /// (`Statistics::with_fetch`), and `count(*)` returns 0.
 #[tokio::test]
-#[ignore = "DEFECT-HS4: footer extrapolation underestimates (Rows=Inexact(3066) for 2744256 rows); \
-            count(*) over OFFSET 100000 expected 2644256, obtained 0"]
 async fn an_underestimate_does_not_empty_an_offset() {
     let (dir, _spill, warehouse, engine) = small_warehouse().await;
     cl(
@@ -1262,7 +1254,6 @@ async fn an_underestimate_does_not_empty_an_offset() {
 /// The same `OFFSET` over a metastore row count that is too low (garbage in,
 /// but the rule is the same: an inexact count must not skip rows).
 #[tokio::test]
-#[ignore = "DEFECT-HS4: numRows=1 recorded for 50000 rows: count(*) over OFFSET 5 expected 49995, obtained 0"]
 async fn a_low_recorded_row_count_does_not_empty_an_offset() {
     let (_dir, _spill, warehouse, engine) = small_warehouse().await;
     cl(

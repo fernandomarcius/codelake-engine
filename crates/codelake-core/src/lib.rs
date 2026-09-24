@@ -16,6 +16,7 @@ mod literals;
 pub mod overflow;
 pub mod runtime;
 pub mod session_properties;
+pub mod statistics_guard;
 pub mod subquery;
 #[cfg(test)]
 mod testing;
