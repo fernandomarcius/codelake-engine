@@ -1124,6 +1124,35 @@ mod tests {
             }
         }
 
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_query_failing_while_streaming_is_an_error_not_a_cancellation() {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = traced_engine(dir.path());
+            let (capture, _guard) = capture();
+            // Fails at id 42 while the results stream.
+            let err = engine
+                .query(
+                    &QueryOptions::for_user("frank"),
+                    "SELECT 10 / (id - 42) AS x FROM t",
+                )
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap_err();
+            assert!(err.to_string().to_lowercase().contains("divide by zero"), "{err}");
+
+            let spans = capture.spans();
+            for name in ["codelake.query", "codelake.fetch"] {
+                let (_, span) = only(&spans, name);
+                let field = |key: &str| span.fields.get(key).map(String::as_str);
+                assert_eq!(field("otel.status_code"), Some("ERROR"), "{name}: {span:#?}");
+                assert_eq!(field("codelake.cancelled"), None, "{name}: {span:#?}");
+                assert!(field("db.response.returned_rows").is_some(), "{name}: {span:#?}");
+                assert!(span.closed, "{name}");
+            }
+        }
+
         #[derive(Debug, Default)]
         struct RecordingBackend(Mutex<Vec<(TraceParent, Option<String>)>>);
 

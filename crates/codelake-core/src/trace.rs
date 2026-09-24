@@ -610,7 +610,8 @@ pub fn record_error(span: &Span, err: &dyn fmt::Display) {
 /// A record-batch stream polled inside `span`. Counts rows into
 /// [`field::ROWS`], records the first error, and closes the span (and every
 /// span passed to [`TracedStream::keep_alive`]) when the stream ends. A stream
-/// dropped before its end records [`field::CANCELLED`].
+/// dropped before its end records [`field::CANCELLED`], unless it had failed:
+/// a failed query is an error, not a cancellation.
 ///
 /// It buffers nothing: batches pass through as they come.
 pub struct TracedStream {
@@ -708,8 +709,13 @@ impl RecordBatchStream for TracedStream {
 impl Drop for TracedStream {
     fn drop(&mut self) {
         if !self.finished {
+            // A stream that failed is dropped by its consumer too: that is
+            // the error already recorded, not a cancellation.
+            let cancelled = !self.failed;
             for span in self.spans() {
-                span.record(field::CANCELLED, true);
+                if cancelled {
+                    span.record(field::CANCELLED, true);
+                }
                 span.record(field::ROWS, self.rows);
             }
         }
