@@ -10,8 +10,8 @@
 //!
 //! - [`CheckedArithmetic`] (analyzer, after type coercion) replaces integer and
 //!   decimal `+ - * / %` and integer negation with the checked functions of
-//!   [`arith`], integer `abs` with a checked `abs`, `sum` over exact numbers
-//!   with [`sum::CheckedSum`], and makes casts from floating point or decimal
+//!   `arith`, integer `abs` with a checked `abs`, `sum` over exact numbers
+//!   with `sum::CheckedSum`, and makes casts from floating point or decimal
 //!   to an integer round first. Constant folding then fails to fold an
 //!   overflowing constant and the error surfaces when the query runs.
 //! - Sub-plans sent to a SQL source are rendered back to SQL, which does not
@@ -69,7 +69,7 @@ fn checked_op(op: Operator) -> Option<&'static Arc<ScalarUDF>> {
     CHECKED_OPS.iter().find(|(o, _)| *o == op).map(|(_, udf)| udf)
 }
 
-/// Whether `a <op> b` with these operand types is evaluated by [`arith`].
+/// Whether `a <op> b` with these operand types is evaluated by `arith`.
 fn needs_check(op: Operator, left: &DataType, right: &DataType) -> bool {
     is_arithmetic(op) && ((is_integer(left) && left == right) || (is_decimal(left) && is_decimal(right)))
 }
