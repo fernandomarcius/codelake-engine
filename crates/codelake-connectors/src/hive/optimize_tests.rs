@@ -152,27 +152,27 @@ async fn five_files(lake: &Lake) -> String {
         e,
         "CREATE TABLE hive.s.t WITH (format = 'PARQUET') AS SELECT CAST(1 AS BIGINT) AS id, \
          'ação' AS nome, CAST(10.50 AS DECIMAL(18,2)) AS valor, X'0000000000000000002A' AS lsn, \
-         CAST('2026-01-01T10:00:00.123' AS TIMESTAMP) AS ts, CAST('2026-01-02' AS DATE) AS d",
+         CAST('2026-01-01 10:00:00.123' AS TIMESTAMP) AS ts, CAST('2026-01-02' AS DATE) AS d",
     )
     .await;
     run(
         e,
         "INSERT INTO hive.s.t VALUES (2, 'b', 1.00, X'00000000000000000030', \
-         CAST('2026-01-03T00:00:00' AS TIMESTAMP), CAST('2026-01-03' AS DATE)), \
-         (3, 'c', 2.25, X'00000000000000000031', CAST('2026-01-04T00:00:00' AS TIMESTAMP), CAST('2026-01-04' AS DATE))",
+         CAST('2026-01-03 00:00:00' AS TIMESTAMP), CAST('2026-01-03' AS DATE)), \
+         (3, 'c', 2.25, X'00000000000000000031', CAST('2026-01-04 00:00:00' AS TIMESTAMP), CAST('2026-01-04' AS DATE))",
     )
     .await;
     run(e, "INSERT INTO hive.s.t VALUES (4, NULL, NULL, NULL, NULL, NULL)").await;
     run(
         e,
         "INSERT INTO hive.s.t SELECT 5 AS id, 'e' AS nome, CAST(5 AS DECIMAL(18,2)) AS valor, X'01' AS lsn, \
-         CAST('2026-02-01T00:00:00' AS TIMESTAMP) AS ts, CAST('2026-02-01' AS DATE) AS d",
+         CAST('2026-02-01 00:00:00' AS TIMESTAMP) AS ts, CAST('2026-02-01' AS DATE) AS d",
     )
     .await;
     run(e, "ALTER TABLE hive.s.t ADD COLUMN origem varchar").await;
     run(
         e,
-        "INSERT INTO hive.s.t VALUES (6, 'f', 6.00, X'02', CAST('2026-02-02T00:00:00' AS TIMESTAMP), \
+        "INSERT INTO hive.s.t VALUES (6, 'f', 6.00, X'02', CAST('2026-02-02 00:00:00' AS TIMESTAMP), \
          CAST('2026-02-02' AS DATE), 'cdc')",
     )
     .await;
@@ -262,7 +262,7 @@ async fn files_above_the_threshold_are_left_alone() {
     run(
         e,
         "CREATE TABLE hive.s.t WITH (format = 'PARQUET') AS \
-         SELECT CAST(value AS BIGINT) AS id, repeat(CAST(value AS VARCHAR), 20) AS pad FROM range(0, 20000)",
+         SELECT CAST(value AS BIGINT) AS id, array_join(repeat(CAST(value AS VARCHAR), 20), '') AS pad FROM range(0, 20000)",
     )
     .await;
     for id in [20_000, 20_001, 20_002] {
@@ -519,7 +519,7 @@ async fn an_insert_during_optimize_is_kept() {
     let (table, manifest) = prepared(&lake).await;
     run(
         &lake.engine,
-        "INSERT INTO hive.s.t VALUES (7, 'g', 7.00, X'03', CAST('2026-03-01T00:00:00' AS TIMESTAMP), \
+        "INSERT INTO hive.s.t VALUES (7, 'g', 7.00, X'03', CAST('2026-03-01 00:00:00' AS TIMESTAMP), \
          CAST('2026-03-01' AS DATE), 'late')",
     )
     .await;
@@ -585,8 +585,8 @@ async fn compaction_reserves_memory_and_fails_cleanly_when_it_is_short() {
     let e = &lake.engine;
     run(e, "CREATE SCHEMA hive.s").await;
     // Incompressible text: the writer buffers about as much as it writes.
-    let rows = "SELECT CAST(value AS BIGINT) AS id, sha256(CAST(value AS VARCHAR)) AS h, \
-                sha256(CAST(value + 1 AS VARCHAR)) AS h2 FROM range(0, 20000)";
+    let rows = "SELECT CAST(value AS BIGINT) AS id, sha256(to_utf8(CAST(value AS VARCHAR))) AS h, \
+                sha256(to_utf8(CAST(value + 1 AS VARCHAR))) AS h2 FROM range(0, 20000)";
     run(
         e,
         &format!("CREATE TABLE hive.s.t WITH (format = 'PARQUET') AS {rows}"),
@@ -631,7 +631,7 @@ async fn microsecond_timestamps_are_rewritten_exactly() {
     run(
         e,
         "CREATE TABLE hive.s.t WITH (format = 'PARQUET') AS SELECT CAST(0 AS BIGINT) AS id, \
-         CAST('2026-01-01T00:00:00' AS TIMESTAMP) AS ts",
+         CAST('2026-01-01 00:00:00' AS TIMESTAMP) AS ts",
     )
     .await;
     let dir = lake.table_dir("t");

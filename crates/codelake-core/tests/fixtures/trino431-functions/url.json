@@ -1,0 +1,205 @@
+{
+  "category": "url",
+  "cases": [
+    {
+      "name": "url_parts",
+      "sql": "SELECT url_extract_protocol('https://user@example.com:8080/a%20b/c?x=1&y=%C3%A7#frag'), url_extract_host('https://user@example.com:8080/a%20b/c?x=1&y=%C3%A7#frag'), url_extract_port('https://user@example.com:8080/a%20b/c?x=1&y=%C3%A7#frag'), url_extract_path('https://user@example.com:8080/a%20b/c?x=1&y=%C3%A7#frag'), url_extract_query('https://user@example.com:8080/a%20b/c?x=1&y=%C3%A7#frag'), url_extract_fragment('https://user@example.com:8080/a%20b/c?x=1&y=%C3%A7#frag')",
+      "trino": {
+        "types": [
+          "varchar(55)",
+          "varchar(55)",
+          "bigint",
+          "varchar(55)",
+          "varchar(55)",
+          "varchar(55)"
+        ],
+        "rows": [
+          [
+            "https",
+            "example.com",
+            8080,
+            "/a b/c",
+            "x=1&y=ç",
+            "frag"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "url_parameter",
+      "sql": "SELECT url_extract_parameter('http://a.com/p?x=1&y=a+b&z', 'y'), url_extract_parameter('http://a.com/p?x=1&x=2', 'x'), url_extract_parameter('http://a.com/p?z', 'z'), url_extract_parameter('http://a.com/p', 'x')",
+      "trino": {
+        "types": [
+          "varchar(26)",
+          "varchar(22)",
+          "varchar(16)",
+          "varchar(14)"
+        ],
+        "rows": [
+          [
+            "a b",
+            "1",
+            "",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "url_no_port_invalid",
+      "sql": "SELECT url_extract_port('http://a.com/p'), url_extract_host('http://a b.com/'), url_extract_path('mailto:x@y.com'), url_extract_host('/relative/path')",
+      "trino": {
+        "types": [
+          "bigint",
+          "varchar(15)",
+          "varchar(14)",
+          "varchar(14)"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            "",
+            ""
+          ]
+        ]
+      }
+    },
+    {
+      "name": "url_encode_decode",
+      "sql": "SELECT url_encode('a b/ç*~'), url_decode('a+b%2F%C3%A7'), url_encode(CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "varchar(84)",
+          "varchar(12)",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "a+b%2F%C3%A7*%7E",
+            "a b/ç",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "url_decode_invalid",
+      "sql": "SELECT url_decode('%zz')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "URLDecoder: Illegal hex characters in escape (%) pattern - Error at index 0 in: \"zz\""
+      }
+    },
+    {
+      "name": "url_extract_null",
+      "sql": "SELECT url_extract_host(CAST(NULL AS varchar)), url_extract_protocol(CAST(NULL AS varchar)), url_extract_path(CAST(NULL AS varchar)), url_extract_query(CAST(NULL AS varchar)), url_extract_fragment(CAST(NULL AS varchar)), url_extract_port(CAST(NULL AS varchar)), url_extract_parameter(CAST(NULL AS varchar), 'a')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar",
+          "bigint",
+          "varchar"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "url_extract_edge",
+      "sql": "SELECT url_extract_protocol('HTTP://a.com'), url_extract_query('http://a.com/p?'), url_extract_fragment('http://a.com/p#'), url_extract_path('http://a.com'), url_extract_host('http://[::1]:80/'), url_extract_port('http://a.com:65536/')",
+      "trino": {
+        "types": [
+          "varchar(12)",
+          "varchar(15)",
+          "varchar(15)",
+          "varchar(12)",
+          "varchar(16)",
+          "bigint"
+        ],
+        "rows": [
+          [
+            "HTTP",
+            "",
+            "",
+            "",
+            "[::1]",
+            65536
+          ]
+        ]
+      }
+    },
+    {
+      "name": "url_encode_decode_edge",
+      "sql": "SELECT url_encode(''), url_decode(''), url_decode(CAST(NULL AS varchar)), url_encode('😀'), url_decode('%F0%9F%98%80')",
+      "trino": {
+        "types": [
+          "varchar(0)",
+          "varchar(0)",
+          "varchar",
+          "varchar(12)",
+          "varchar(12)"
+        ],
+        "rows": [
+          [
+            "",
+            "",
+            null,
+            "%F0%9F%98%80",
+            "😀"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "url_parameter_edge",
+      "sql": "SELECT url_extract_parameter('http://a.com/p?a=1', CAST(NULL AS varchar)), url_extract_parameter('http://a.com/p', 'a'), url_extract_parameter('http://a.com/p?a=%C3%A7', 'a'), url_extract_parameter('http://a.com/p?a=1#b=2', 'b')",
+      "trino": {
+        "types": [
+          "varchar(18)",
+          "varchar(14)",
+          "varchar(23)",
+          "varchar(22)"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            "ç",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "url_encode_more",
+      "sql": "SELECT url_encode('a+b=c&d'), url_encode('~-_.'), url_encode(CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "varchar(84)",
+          "varchar(48)",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "a%2Bb%3Dc%26d",
+            "%7E-_.",
+            null
+          ]
+        ]
+      }
+    }
+  ]
+}

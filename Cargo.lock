@@ -1300,19 +1300,34 @@ name = "codelake-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "chrono-tz",
+ "crc32fast",
  "criterion",
  "datafusion",
  "datafusion-federation",
+ "fancy-regex",
  "futures",
+ "libm",
+ "md-5 0.10.6",
+ "num-traits",
  "proptest",
+ "regex",
  "secrecy",
  "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "twox-hash",
+ "unicode-normalization",
+ "uuid",
 ]
 
 [[package]]
@@ -2909,6 +2924,17 @@ name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
+
+[[package]]
+name = "fancy-regex"
+version = "0.19.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d301f5bf187b3c295fce6468d3875037a0bccc5f6b151c63cac2f85babf21912"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
 
 [[package]]
 name = "fastnum"

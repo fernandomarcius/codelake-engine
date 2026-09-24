@@ -1,0 +1,358 @@
+{
+  "category": "conditional",
+  "cases": [
+    {
+      "name": "if_fn",
+      "sql": "SELECT if(true, 'a', 'b'), if(false, 1), if(CAST(NULL AS boolean), 1, 2), if(1 > 0, 1.5E0, 2)",
+      "trino": {
+        "types": [
+          "varchar(1)",
+          "integer",
+          "integer",
+          "double"
+        ],
+        "rows": [
+          [
+            "a",
+            null,
+            2,
+            1.5
+          ]
+        ]
+      }
+    },
+    {
+      "name": "if_lazy",
+      "sql": "SELECT if(x = 0, NULL, 10 / x) FROM (VALUES 0, 5) t(x) ORDER BY x",
+      "trino": {
+        "types": [
+          "integer"
+        ],
+        "rows": [
+          [
+            null
+          ],
+          [
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "case_count_filter",
+      "sql": "SELECT COUNT(*) FILTER (WHERE x > 1), count_if(x > 1), sum(x) FILTER (WHERE x < 3) FROM (VALUES 1, 2, 3) t(x)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            2,
+            2,
+            3
+          ]
+        ]
+      }
+    },
+    {
+      "name": "typeof_fn",
+      "sql": "SELECT typeof(CAST(1 AS bigint)), typeof(1E0), typeof(DATE '2024-01-01'), typeof(X'00'), typeof(true)",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "bigint",
+            "double",
+            "date",
+            "varbinary",
+            "boolean"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "try_cast_fn",
+      "sql": "SELECT TRY_CAST('x' AS integer), TRY_CAST('12' AS integer), TRY_CAST(NULL AS integer)",
+      "trino": {
+        "types": [
+          "integer",
+          "integer",
+          "integer"
+        ],
+        "rows": [
+          [
+            null,
+            12,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "if_null_types",
+      "sql": "SELECT if(false, 1), typeof(if(true, 1, 2.5E0)), if(NULL, 'a', 'b')",
+      "trino": {
+        "types": [
+          "integer",
+          "varchar",
+          "varchar(1)"
+        ],
+        "rows": [
+          [
+            null,
+            "double",
+            "b"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "try_fn",
+      "sql": "SELECT try(1 / 0), try(CAST('x' AS integer)), try(5), try(CAST(NULL AS integer))",
+      "trino": {
+        "types": [
+          "integer",
+          "integer",
+          "integer",
+          "integer"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            5,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "try_per_row",
+      "sql": "SELECT x, try(10 / x) FROM (VALUES 0, 2, 5) t(x) ORDER BY x",
+      "trino": {
+        "types": [
+          "integer",
+          "integer"
+        ],
+        "rows": [
+          [
+            0,
+            null
+          ],
+          [
+            2,
+            5
+          ],
+          [
+            5,
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "try_function_errors",
+      "sql": "SELECT try(from_hex('zz')), try(date_add('hour', 1, DATE '2024-01-01')), try(abs(CAST(-9223372036854775808 AS bigint))), try(json_parse('{'))",
+      "trino": {
+        "types": [
+          "varbinary",
+          "date",
+          "bigint",
+          "json"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "try_coalesce",
+      "sql": "SELECT coalesce(try(CAST(s AS bigint)), -1) FROM (VALUES '12', '12x', NULL) t(s) ORDER BY 1",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            -1
+          ],
+          [
+            -1
+          ],
+          [
+            12
+          ]
+        ]
+      }
+    },
+    {
+      "name": "try_in_where",
+      "sql": "SELECT count(*) FROM (VALUES '1', 'x', '3') t(s) WHERE try(CAST(s AS integer)) > 0",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "typeof_more",
+      "sql": "SELECT typeof(ARRAY[1]), typeof(MAP(ARRAY[1], ARRAY[1.5E0])), typeof(DECIMAL '1.50'), typeof(TIMESTAMP '2024-01-01 00:00:00.123456'), typeof(CAST(NULL AS varchar)), typeof(NULL), typeof(ROW(1, 2.5E0)), typeof(CAST(NULL AS timestamp(3) with time zone))",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "array(integer)",
+            "map(integer, double)",
+            "decimal(3,2)",
+            "timestamp(6)",
+            "varchar",
+            "unknown",
+            "row(integer, double)",
+            "timestamp(3) with time zone"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "coalesce_types",
+      "sql": "SELECT coalesce(NULL, 1, 2), coalesce(CAST(NULL AS varchar), NULL), typeof(coalesce(1, 2.5E0)), nullif(CAST(NULL AS bigint), 1), nullif('a', 'a')",
+      "trino": {
+        "types": [
+          "integer",
+          "varchar",
+          "varchar",
+          "bigint",
+          "varchar(1)"
+        ],
+        "rows": [
+          [
+            1,
+            null,
+            "double",
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "case_simple_types",
+      "sql": "SELECT CASE 2 WHEN 1 THEN 'a' WHEN 2 THEN 'b' END, CASE WHEN false THEN 1 END, typeof(CASE WHEN true THEN 1 ELSE 2.5E0 END)",
+      "trino": {
+        "types": [
+          "varchar(1)",
+          "integer",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "b",
+            null,
+            "double"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "uuid_fn",
+      "sql": "SELECT length(CAST(uuid() AS varchar)), regexp_like(CAST(uuid() AS varchar), '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'), CAST(uuid() AS varchar) <> CAST(uuid() AS varchar)",
+      "trino": {
+        "types": [
+          "bigint",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            36,
+            true,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "uuid_per_row",
+      "sql": "SELECT count(DISTINCT CAST(uuid() AS varchar)), count(*) FROM (VALUES 1, 2, 3) t(x)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            3,
+            3
+          ]
+        ]
+      }
+    },
+    {
+      "name": "uuid_cast_varchar_csf",
+      "sql": "SELECT typeof(CAST(uuid() AS varchar)), CAST(uuid() AS varchar) IS NOT NULL",
+      "trino": {
+        "types": [
+          "varchar",
+          "boolean"
+        ],
+        "rows": [
+          [
+            "varchar",
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "typeof_scalars",
+      "sql": "SELECT typeof(1), typeof(CAST(1 AS tinyint)), typeof(1.5), typeof(1.5E0), typeof(CAST('a' AS varchar)), typeof(DATE '2024-01-01')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "integer",
+            "tinyint",
+            "decimal(2,1)",
+            "double",
+            "varchar",
+            "date"
+          ]
+        ]
+      }
+    }
+  ]
+}

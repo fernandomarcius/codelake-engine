@@ -1,0 +1,767 @@
+{
+  "category": "json",
+  "cases": [
+    {
+      "name": "json_parse_canonical",
+      "sql": "SELECT json_parse('{\"b\": 1.10, \"a\": [1e2, -0, \"x\"], \"c\": null}'), json_parse('[1, 2.5, true]'), json_parse('\"text\"')",
+      "trino": {
+        "types": [
+          "json",
+          "json",
+          "json"
+        ],
+        "rows": [
+          [
+            "{\"a\":[100.0,0,\"x\"],\"b\":1.1,\"c\":null}",
+            "[1,2.5,true]",
+            "\"text\""
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_parse_invalid",
+      "sql": "SELECT json_parse('{a: 1}')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Cannot convert value to JSON: '{a: 1}'"
+      }
+    },
+    {
+      "name": "json_format_fn",
+      "sql": "SELECT json_format(json_parse('{\"b\":1,\"a\":2}')), json_format(json_parse('[]'))",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "{\"a\":2,\"b\":1}",
+            "[]"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_extract_fn",
+      "sql": "SELECT json_extract('{\"a\": {\"b\": [10, 20]}, \"c\": \"x\"}', '$.a.b'), json_extract('{\"a\": {\"b\": [10, 20]}}', '$.a.b[1]'), json_extract('{\"a\": 1}', '$.z'), json_extract('{\"b\": 1, \"a\": 2}', '$')",
+      "trino": {
+        "types": [
+          "json",
+          "json",
+          "json",
+          "json"
+        ],
+        "rows": [
+          [
+            "[10,20]",
+            "20",
+            null,
+            "{\"b\":1,\"a\":2}"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_extract_scalar_fn",
+      "sql": "SELECT json_extract_scalar('{\"a\": {\"b\": 1.10}, \"s\": \"xç\", \"t\": true, \"n\": null}', '$.a.b'), json_extract_scalar('{\"s\": \"xç\"}', '$.s'), json_extract_scalar('{\"t\": true}', '$.t'), json_extract_scalar('{\"n\": null}', '$.n'), json_extract_scalar('{\"a\": [1]}', '$.a')",
+      "trino": {
+        "types": [
+          "varchar(51)",
+          "varchar(11)",
+          "varchar(11)",
+          "varchar(11)",
+          "varchar(10)"
+        ],
+        "rows": [
+          [
+            "1.10",
+            "xç",
+            "true",
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_extract_bracket",
+      "sql": "SELECT json_extract_scalar('{\"x.y\": 5}', '$[\"x.y\"]'), json_extract_scalar('[1, [2, 3]]', '$[1][0]')",
+      "trino": {
+        "types": [
+          "varchar(10)",
+          "varchar(11)"
+        ],
+        "rows": [
+          [
+            "5",
+            "2"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_extract_invalid_doc",
+      "sql": "SELECT json_extract_scalar('not json', '$.a'), json_extract('{', '$')",
+      "trino": {
+        "types": [
+          "varchar(8)",
+          "json"
+        ],
+        "rows": [
+          [
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_extract_bad_path",
+      "sql": "SELECT json_extract_scalar('{\"a\": 1}', 'a')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Invalid JSON path: 'a'"
+      }
+    },
+    {
+      "name": "json_array_fns",
+      "sql": "SELECT json_array_length('[1, 2, 3]'), json_array_length('{\"a\": 1}'), json_array_get('[1, [2], \"x\"]', 1), json_array_get('[1, 2]', -1), json_array_get('[1]', 5)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "json",
+          "json",
+          "json"
+        ],
+        "rows": [
+          [
+            3,
+            null,
+            "[2]",
+            "2",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_array_contains_fn",
+      "sql": "SELECT json_array_contains('[1, 2, 3]', 2), json_array_contains('[\"a\", \"b\"]', 'b'), json_array_contains('[true]', false), json_array_contains('[1.5]', 1.5E0), json_array_contains('{}', 1)",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            true,
+            false,
+            true,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_size_fn",
+      "sql": "SELECT json_size('{\"a\": {\"b\": 1, \"c\": 2}}', '$.a'), json_size('[1, 2]', '$'), json_size('{\"a\": 1}', '$.a'), json_size('{\"a\": 1}', '$.z')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            2,
+            2,
+            0,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "is_json_scalar_fn",
+      "sql": "SELECT is_json_scalar('1'), is_json_scalar('\"a\"'), is_json_scalar('[1]'), is_json_scalar('{}')",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            true,
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_parse_null_edge",
+      "sql": "SELECT json_parse(CAST(NULL AS varchar)), json_parse('null'), json_parse('[]'), json_parse('{\"a\":{\"b\":[1,{\"c\":2}]}}')",
+      "trino": {
+        "types": [
+          "json",
+          "json",
+          "json",
+          "json"
+        ],
+        "rows": [
+          [
+            null,
+            "null",
+            "[]",
+            "{\"a\":{\"b\":[1,{\"c\":2}]}}"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_parse_numbers",
+      "sql": "SELECT json_parse('-0.0'), json_parse('12345678901234567890'), json_parse('1.0'), json_parse('1e2')",
+      "trino": {
+        "types": [
+          "json",
+          "json",
+          "json",
+          "json"
+        ],
+        "rows": [
+          [
+            "-0.0",
+            "12345678901234567890",
+            "1.0",
+            "100.0"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_format_null_edge",
+      "sql": "SELECT json_format(CAST(NULL AS json)), json_format(json_parse('\"a\\u00e7\"')), json_format(json_parse('[1,\"x\",null]'))",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            null,
+            "\"aç\"",
+            "[1,\"x\",null]"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_extract_null_edge",
+      "sql": "SELECT json_extract(CAST(NULL AS varchar), '$'), json_extract('{\"a\": null}', '$.a'), json_extract('[1,2,3]', '$[5]'), json_extract('{\"a\": {\"b\": 1}}', '$.a')",
+      "trino": {
+        "types": [
+          "json",
+          "json",
+          "json",
+          "json"
+        ],
+        "rows": [
+          [
+            null,
+            "null",
+            null,
+            "{\"b\":1}"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_extract_scalar_null",
+      "sql": "SELECT json_extract_scalar(CAST(NULL AS varchar), '$.a'), json_extract_scalar('{\"a\": [1]}', '$.a'), json_extract_scalar('{\"a\": 1e2}', '$.a'), json_extract_scalar('{\"a\": 12345678901234567890}', '$.a')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar(10)",
+          "varchar(10)",
+          "varchar(27)"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            "1e2",
+            "12345678901234567890"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_array_null_edge",
+      "sql": "SELECT json_array_length(CAST(NULL AS varchar)), json_array_length('[]'), json_array_length('not json'), json_array_get(CAST(NULL AS varchar), 0), json_array_get('[]', 0), json_array_contains(CAST(NULL AS varchar), 1), json_array_contains('[1, \"1\"]', '1')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "json",
+          "json",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            null,
+            0,
+            null,
+            null,
+            null,
+            null,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_array_json_type",
+      "sql": "SELECT json_array_length(json_parse('[1, [2, 3]]')), json_array_get(json_parse('[\"a\", {\"b\": 1}]'), 1), json_array_contains(json_parse('[1.0]'), 1)",
+      "trino": {
+        "types": [
+          "bigint",
+          "json",
+          "boolean"
+        ],
+        "rows": [
+          [
+            2,
+            "{\"b\":1}",
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_size_null_edge",
+      "sql": "SELECT json_size(CAST(NULL AS varchar), '$'), json_size('[]', '$'), json_size('not json', '$')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            null,
+            0,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "is_json_scalar_null_edge",
+      "sql": "SELECT is_json_scalar(CAST(NULL AS varchar)), is_json_scalar('null'), is_json_scalar(json_parse('true'))",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            null,
+            true,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "is_json_scalar_invalid",
+      "sql": "SELECT is_json_scalar('{a')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Invalid JSON value: {a"
+      }
+    },
+    {
+      "name": "json_cast_to_json",
+      "sql": "SELECT CAST(ARRAY[1, 2] AS json), CAST(MAP(ARRAY['b', 'a'], ARRAY[1, 2]) AS json), CAST('x' AS json), CAST(1.5E0 AS json), CAST(true AS json), CAST(CAST(NULL AS varchar) AS json)",
+      "trino": {
+        "types": [
+          "json",
+          "json",
+          "json",
+          "json",
+          "json",
+          "json"
+        ],
+        "rows": [
+          [
+            "[1,2]",
+            "{\"a\":2,\"b\":1}",
+            "\"x\"",
+            "1.5",
+            "true",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_cast_from_json",
+      "sql": "SELECT CAST(json_parse('[1, 2]') AS array(bigint)), CAST(json_parse('{\"a\": 1}') AS map(varchar, bigint)), CAST(json_parse('\"x\"') AS varchar), CAST(json_parse('12') AS bigint), CAST(json_parse('true') AS boolean)",
+      "trino": {
+        "types": [
+          "array(bigint)",
+          "map(varchar, bigint)",
+          "varchar",
+          "bigint",
+          "boolean"
+        ],
+        "rows": [
+          [
+            [
+              1,
+              2
+            ],
+            {
+              "a": 1
+            },
+            "x",
+            12,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_cast_from_json_invalid",
+      "sql": "SELECT CAST(json_parse('\"x\"') AS bigint)",
+      "trino": {
+        "error": "INVALID_CAST_ARGUMENT",
+        "message": "Cannot cast 'x' to BIGINT"
+      }
+    },
+    {
+      "name": "json_literal",
+      "sql": "SELECT JSON '{\"a\": 1}', json_extract_scalar(JSON '{\"a\": 1}', '$.a')",
+      "trino": {
+        "types": [
+          "json",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "{\"a\":1}",
+            "1"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_cast_to_json_more",
+      "sql": "SELECT CAST(DATE '2024-01-02' AS json), CAST(DECIMAL '1.50' AS json), CAST(ARRAY[1, NULL] AS json), CAST(REAL '1.1' AS json), CAST(ARRAY[ARRAY['a'], NULL] AS json), CAST(CAST(7 AS bigint) AS json)",
+      "trino": {
+        "types": [
+          "json",
+          "json",
+          "json",
+          "json",
+          "json",
+          "json"
+        ],
+        "rows": [
+          [
+            "\"2024-01-02\"",
+            "1.50",
+            "[1,null]",
+            "1.1",
+            "[[\"a\"],null]",
+            "7"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_cast_row_to_json",
+      "sql": "SELECT CAST(ROW(1, 'a') AS json), CAST(CAST(ROW(1, 'a') AS row(x integer, y varchar)) AS json)",
+      "trino": {
+        "types": [
+          "json",
+          "json"
+        ],
+        "rows": [
+          [
+            "{\"\":1,\"\":\"a\"}",
+            "{\"x\":1,\"y\":\"a\"}"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_cast_map_to_json",
+      "sql": "SELECT CAST(MAP(ARRAY[2, 1], ARRAY['b', 'a']) AS json), CAST(MAP(ARRAY['k'], ARRAY[ARRAY[1.5E0]]) AS json)",
+      "trino": {
+        "types": [
+          "json",
+          "json"
+        ],
+        "rows": [
+          [
+            "{\"1\":\"a\",\"2\":\"b\"}",
+            "{\"k\":[1.5]}"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_cast_to_varchar",
+      "sql": "SELECT CAST(json_parse('\"abc\"') AS varchar), CAST(json_parse('1.5') AS varchar), CAST(json_parse('12') AS varchar), CAST(json_parse('true') AS varchar), CAST(json_parse('null') AS varchar)",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "abc",
+            "1.5E0",
+            "12",
+            "true",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_cast_extract_to_varchar",
+      "sql": "SELECT CAST(json_extract('{\"a\": \"x\", \"b\": 2}', '$.a') AS varchar), CAST(json_extract('{\"a\": \"x\", \"b\": 2}', '$.b') AS varchar), json_extract_scalar('{\"a\": \"x\"}', '$.a')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar(10)"
+        ],
+        "rows": [
+          [
+            "x",
+            "2",
+            "x"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_cast_to_numbers",
+      "sql": "SELECT CAST(json_parse('1.5') AS bigint), CAST(json_parse('\"12\"') AS integer), CAST(json_parse('true') AS bigint), CAST(json_parse('2') AS double), CAST(json_parse('\"1.25\"') AS double), CAST(json_parse('1.255') AS decimal(4,2))",
+      "trino": {
+        "types": [
+          "bigint",
+          "integer",
+          "bigint",
+          "double",
+          "double",
+          "decimal(4, 2)"
+        ],
+        "rows": [
+          [
+            2,
+            12,
+            1,
+            2.0,
+            1.25,
+            "1.26"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_cast_to_boolean",
+      "sql": "SELECT CAST(json_parse('0') AS boolean), CAST(json_parse('1.5') AS boolean), CAST(json_parse('\"true\"') AS boolean), CAST(json_parse('false') AS boolean)",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            false,
+            true,
+            true,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_cast_to_containers",
+      "sql": "SELECT CAST(json_parse('[1, null, 3]') AS array(integer)), CAST(json_parse('{\"b\": [1], \"a\": []}') AS map(varchar, array(bigint))), CAST(json_parse('[\"a\", 1, true]') AS array(varchar)), CAST(json_parse('null') AS array(bigint))",
+      "trino": {
+        "types": [
+          "array(integer)",
+          "map(varchar, array(bigint))",
+          "array(varchar)",
+          "array(bigint)"
+        ],
+        "rows": [
+          [
+            [
+              1,
+              null,
+              3
+            ],
+            {
+              "a": [],
+              "b": [
+                1
+              ]
+            },
+            [
+              "a",
+              "1",
+              "true"
+            ],
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_cast_to_row",
+      "sql": "SELECT CAST(json_parse('[1, \"x\"]') AS row(a integer, b varchar)), CAST(json_parse('{\"b\": \"y\", \"a\": 2}') AS row(a integer, b varchar))",
+      "trino": {
+        "types": [
+          "row(a integer, b varchar)",
+          "row(a integer, b varchar)"
+        ],
+        "rows": [
+          [
+            [
+              1,
+              "x"
+            ],
+            [
+              2,
+              "y"
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_cast_array_mismatch",
+      "sql": "SELECT CAST(json_parse('{\"a\": 1}') AS array(bigint))",
+      "trino": {
+        "error": "INVALID_CAST_ARGUMENT",
+        "message": "Cannot cast to array(bigint). Expected a json array, but got {\n{\"a\":1}"
+      }
+    },
+    {
+      "name": "json_cast_object_to_varchar",
+      "sql": "SELECT CAST(json_parse('[1]') AS varchar)",
+      "trino": {
+        "error": "INVALID_CAST_ARGUMENT",
+        "message": "Cannot cast '[1]' to varchar"
+      }
+    },
+    {
+      "name": "json_cast_bigint_overflow",
+      "sql": "SELECT CAST(json_parse('9223372036854775808') AS bigint)",
+      "trino": {
+        "error": "INVALID_CAST_ARGUMENT",
+        "message": "Cannot cast '9223372036854775808' to bigint"
+      }
+    },
+    {
+      "name": "json_column_cast",
+      "sql": "SELECT CAST(j AS varchar), CAST(j AS bigint) FROM (SELECT json_extract(doc, '$.v') AS j FROM (VALUES '{\"v\": \"7\"}', '{\"v\": 8}') t(doc)) ORDER BY 2",
+      "trino": {
+        "types": [
+          "varchar",
+          "bigint"
+        ],
+        "rows": [
+          [
+            "7",
+            7
+          ],
+          [
+            "8",
+            8
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_typeof",
+      "sql": "SELECT typeof(json_parse('1')), typeof(JSON '[1]'), typeof(json_extract('{}', '$'))",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "json",
+            "json",
+            "json"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_format_more",
+      "sql": "SELECT json_format(json_parse('{\"b\": {\"d\": 1, \"c\": 2}}')), json_format(json_parse('1.0')), json_format(JSON '\"ç\"')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "{\"b\":{\"c\":2,\"d\":1}}",
+            "1.0",
+            "\"ç\""
+          ]
+        ]
+      }
+    },
+    {
+      "name": "json_size_more",
+      "sql": "SELECT json_size('{\"a\": [1, 2, 3]}', '$.a'), json_size('{\"a\": {}}', '$.a'), json_size('{\"a\": \"x\"}', '$.a')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            3,
+            0,
+            0
+          ]
+        ]
+      }
+    }
+  ]
+}

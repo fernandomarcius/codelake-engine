@@ -184,6 +184,7 @@ pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + S
         Arc::new(datafusion::optimizer::push_down_filter::PushDownFilter::new()),
     );
     rules.insert(position, Arc::new(crate::overflow::UncheckBeforeFederation));
+    rules.extend(crate::trino_functions::optimizer_rules());
     rules
 }
 
@@ -226,6 +227,7 @@ fn trino_literal(value: &ScalarValue) -> String {
 fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = vec![Arc::new(FederationFilterGuard)];
     rules.extend(PhysicalOptimizer::new().rules);
+    rules.extend(crate::trino_functions::physical_rules());
     rules
 }
 
@@ -366,6 +368,7 @@ impl Engine {
         if let Some(partitions) = execution.target_partitions {
             session = session.with_target_partitions(partitions);
         }
+        let session = crate::trino_functions::session_config(session);
         let state = SessionStateBuilder::new()
             .with_config(session)
             .with_runtime_env(runtime.env())
@@ -376,8 +379,9 @@ impl Engine {
             .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
             .with_physical_optimizer_rules(physical_rules())
             .build();
-        let ctx = SessionContext::new_with_state(state);
+        let mut ctx = SessionContext::new_with_state(state);
         ctx.register_udf(crate::functions::varbinary_literal());
+        crate::trino_functions::install(&mut ctx)?;
         Ok(Self {
             ctx,
             runtime,
@@ -464,17 +468,24 @@ impl Engine {
         let parsed = parse
             .in_scope(|| {
                 let dialect = state.config().options().sql_parser.dialect;
+                // Trino syntax the SQL parser rejects (`VALUES 1, 2`, …).
+                let sql = crate::trino_functions::preprocess_sql(sql);
                 // The parser's dialect is a `Box<dyn Dialect>` (not `Send`): it
                 // must be gone before any `.await`, or callers cannot spawn
                 // this future.
                 if let Some(parser_dialect) = dialect_from_str(dialect)
-                    && let Some(execute) = ddl::parse_table_execute(sql, parser_dialect.as_ref())?
+                    && let Some(execute) = ddl::parse_table_execute(&sql, parser_dialect.as_ref())?
                 {
                     return Ok(Parsed::TableExecute(Box::new(execute)));
                 }
-                let mut statement = state.sql_to_statement(sql, &dialect)?;
+                let mut statement = state.sql_to_statement(&sql, &dialect)?;
                 let prepared = ddl::prepare(&mut statement)?;
-                // After `prepare`, which keeps a view's text as written.
+                // After `prepare`, which keeps a view's text as written. The
+                // function library's literal rewrites (precision of
+                // `TIMESTAMP '…'`, zones, `DECIMAL '…'`) come first; zoned
+                // timestamp literals it does not recognise are left to
+                // `literals`.
+                crate::trino_functions::rewrite_statement(&mut statement)?;
                 crate::literals::rewrite_zoned_timestamps(&mut statement);
                 Ok::<_, DataFusionError>(Parsed::Statement(Box::new(statement), prepared))
             })
@@ -503,6 +514,7 @@ impl Engine {
         traced(Phase::Plan, async {
             // Uncorrelated scalar subqueries run here, against the sources.
             let plan = crate::subquery::pre_evaluate_scalar_subqueries(ctx, plan).await?;
+            let plan = crate::trino_functions::analyze(ctx, plan)?;
             ctx.execute_logical_plan(plan).await
         })
         .await
@@ -566,6 +578,8 @@ impl Engine {
         }
         let input =
             crate::subquery::pre_evaluate_scalar_subqueries(ctx, create.input.as_ref().clone()).await?;
+        // The table takes the Trino result types the batches will have.
+        let input = crate::trino_functions::analyze(ctx, input)?;
         let schema = Arc::clone(input.schema().inner());
         let batches = DataFrame::new(ctx.state(), input).collect_partitioned().await?;
         let rows = batches
@@ -725,6 +739,7 @@ impl Engine {
                 let input =
                     crate::subquery::pre_evaluate_scalar_subqueries(ctx, create.input.as_ref().clone())
                         .await?;
+                let input = crate::trino_functions::analyze(ctx, input)?;
                 let rows = ctx.execute_logical_plan(input).await?.execute_stream().await?;
                 let written = writable
                     .create_table_as(&schema, &table, create.if_not_exists, user, rows, ctx.task_ctx())
@@ -1069,10 +1084,52 @@ mod tests {
                 .value(0),
             1_767_250_800
         );
-        // Without a zone: unchanged.
+        // Without a zone: no zone, at the precision of its digits
+        // (`timestamp(3)` in Trino 431; typed by the function library).
         assert_eq!(
             schema.field(2).data_type(),
-            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+            &DataType::Timestamp(TimeUnit::Millisecond, None)
+        );
+    }
+
+    /// `CREATE TABLE AS` stores the Trino result types the function library
+    /// gives (`decimal(10,2) * decimal(10,2)` is `decimal(20,4)` in Trino 431)
+    /// and the rows the query returns.
+    #[tokio::test]
+    async fn create_table_as_keeps_trino_result_types() {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Decimal128Type;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        let select = "SELECT CAST(1.50 AS DECIMAL(10,2)) * CAST(2.25 AS DECIMAL(10,2)) AS m";
+        let direct = engine.sql(select).await.unwrap().collect().await.unwrap();
+        assert_eq!(
+            direct[0].schema().field(0).data_type(),
+            &DataType::Decimal128(20, 4)
+        );
+        engine
+            .sql(&format!(
+                "CREATE TABLE datafusion.public.ctas_decimal AS {select}"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let stored = engine
+            .sql("SELECT m FROM datafusion.public.ctas_decimal")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            stored[0].schema().field(0).data_type(),
+            &DataType::Decimal128(20, 4)
+        );
+        assert_eq!(
+            stored[0].column(0).as_primitive::<Decimal128Type>().value(0),
+            33_750
         );
     }
 

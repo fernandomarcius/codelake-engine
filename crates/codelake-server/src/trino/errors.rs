@@ -7,8 +7,15 @@
 //! with each engine message worth a Trino name. A missing table is refined into
 //! `CATALOG_NOT_FOUND` / `SCHEMA_NOT_FOUND` by asking a [`Namespace`] which part
 //! of the name is missing, as Trino reports it.
+//!
+//! The Trino function library (`codelake_core::trino_functions`) raises errors
+//! whose message starts with the Trino name (`INVALID_FUNCTION_ARGUMENT: …`):
+//! that name wins, and the client sees the message after it, as Trino words
+//! it. Errors this module would call `GENERIC_INTERNAL_ERROR` take the
+//! library's classification ([`trino_error_name`]) when it knows better.
 
 use codelake_core::subquery::SubqueryMultipleRows;
+use codelake_core::trino_functions::trino_error_name;
 use datafusion::arrow::error::ArrowError;
 use datafusion::common::SchemaError;
 use datafusion::error::DataFusionError;
@@ -22,6 +29,7 @@ pub(crate) enum Code {
     UserCanceled,
     NotFound,
     FunctionNotFound,
+    InvalidFunctionArgument,
     DivisionByZero,
     InvalidCastArgument,
     NotSupported,
@@ -29,6 +37,7 @@ pub(crate) enum Code {
     NumericValueOutOfRange,
     QueryTextTooLarge,
     SubqueryMultipleRows,
+    ExceededFunctionMemoryLimit,
     CatalogNotFound,
     SchemaNotFound,
     TableNotFound,
@@ -37,6 +46,7 @@ pub(crate) enum Code {
     TableAlreadyExists,
     ColumnAlreadyExists,
     TypeMismatch,
+    InvalidLiteral,
     AmbiguousName,
     InvalidParameterUsage,
     QueryQueueFull,
@@ -54,6 +64,7 @@ impl Code {
             Self::UserCanceled => (3, "USER_CANCELED", "USER_ERROR"),
             Self::NotFound => (5, "NOT_FOUND", "USER_ERROR"),
             Self::FunctionNotFound => (6, "FUNCTION_NOT_FOUND", "USER_ERROR"),
+            Self::InvalidFunctionArgument => (7, "INVALID_FUNCTION_ARGUMENT", "USER_ERROR"),
             Self::DivisionByZero => (8, "DIVISION_BY_ZERO", "USER_ERROR"),
             Self::InvalidCastArgument => (9, "INVALID_CAST_ARGUMENT", "USER_ERROR"),
             Self::NotSupported => (13, "NOT_SUPPORTED", "USER_ERROR"),
@@ -61,6 +72,7 @@ impl Code {
             Self::NumericValueOutOfRange => (19, "NUMERIC_VALUE_OUT_OF_RANGE", "USER_ERROR"),
             Self::QueryTextTooLarge => (35, "QUERY_TEXT_TOO_LARGE", "USER_ERROR"),
             Self::SubqueryMultipleRows => (28, "SUBQUERY_MULTIPLE_ROWS", "USER_ERROR"),
+            Self::ExceededFunctionMemoryLimit => (37, "EXCEEDED_FUNCTION_MEMORY_LIMIT", "USER_ERROR"),
             Self::CatalogNotFound => (44, "CATALOG_NOT_FOUND", "USER_ERROR"),
             Self::SchemaNotFound => (45, "SCHEMA_NOT_FOUND", "USER_ERROR"),
             Self::TableNotFound => (46, "TABLE_NOT_FOUND", "USER_ERROR"),
@@ -69,6 +81,7 @@ impl Code {
             Self::TableAlreadyExists => (50, "TABLE_ALREADY_EXISTS", "USER_ERROR"),
             Self::ColumnAlreadyExists => (51, "COLUMN_ALREADY_EXISTS", "USER_ERROR"),
             Self::TypeMismatch => (58, "TYPE_MISMATCH", "USER_ERROR"),
+            Self::InvalidLiteral => (59, "INVALID_LITERAL", "USER_ERROR"),
             Self::AmbiguousName => (62, "AMBIGUOUS_NAME", "USER_ERROR"),
             Self::InvalidParameterUsage => (80, "INVALID_PARAMETER_USAGE", "USER_ERROR"),
             Self::GenericInternalError => (65_536, "GENERIC_INTERNAL_ERROR", "INTERNAL_ERROR"),
@@ -167,8 +180,15 @@ impl QueryError {
             let location = parser_location(&text).or_else(|| text.contains("EOF").then(|| end_of(sql)));
             return Self::new(Code::SyntaxError, text).at(location);
         }
-        let code = code_of(root);
-        let message = raw_message(root);
+        let (code, message) = library_error(root).unwrap_or_else(|| {
+            let code = match code_of(root) {
+                Code::GenericInternalError => {
+                    named(trino_error_name(error)).unwrap_or(Code::GenericInternalError)
+                }
+                code => code,
+            };
+            (code, raw_message(root))
+        });
         let (code, message) = match code {
             Code::TableNotFound => missing_table(&message, names).unwrap_or((code, message)),
             _ => (code, message),
@@ -249,6 +269,46 @@ fn parser_location(message: &str) -> Option<ErrorLocation> {
         column_number: column.parse().ok()?,
     };
     (location.line_number > 0).then_some(location)
+}
+
+/// The code for a Trino error name, for the names the function library uses.
+fn named(name: &str) -> Option<Code> {
+    Some(match name {
+        "GENERIC_USER_ERROR" => Code::GenericUserError,
+        "SYNTAX_ERROR" => Code::SyntaxError,
+        "FUNCTION_NOT_FOUND" => Code::FunctionNotFound,
+        "INVALID_FUNCTION_ARGUMENT" => Code::InvalidFunctionArgument,
+        "DIVISION_BY_ZERO" => Code::DivisionByZero,
+        "INVALID_CAST_ARGUMENT" => Code::InvalidCastArgument,
+        "NOT_SUPPORTED" => Code::NotSupported,
+        "NUMERIC_VALUE_OUT_OF_RANGE" => Code::NumericValueOutOfRange,
+        "EXCEEDED_FUNCTION_MEMORY_LIMIT" => Code::ExceededFunctionMemoryLimit,
+        "COLUMN_NOT_FOUND" => Code::ColumnNotFound,
+        "TYPE_MISMATCH" => Code::TypeMismatch,
+        "INVALID_LITERAL" => Code::InvalidLiteral,
+        "GENERIC_INTERNAL_ERROR" => Code::GenericInternalError,
+        "EXCEEDED_LOCAL_MEMORY_LIMIT" => Code::ExceededLocalMemoryLimit,
+        _ => return None,
+    })
+}
+
+/// An error of the Trino function library: `NAME: message`, with `NAME` a
+/// Trino error name. Returns the code and the message after the name.
+fn library_error(error: &DataFusionError) -> Option<(Code, String)> {
+    let message = match error {
+        DataFusionError::Plan(message)
+        | DataFusionError::Execution(message)
+        | DataFusionError::NotImplemented(message) => message.clone(),
+        DataFusionError::ArrowError(arrow, _) => match arrow.as_ref() {
+            ArrowError::ComputeError(message) | ArrowError::InvalidArgumentError(message) => message.clone(),
+            _ => return None,
+        },
+        DataFusionError::External(inner) => inner.to_string(),
+        _ => return None,
+    };
+    let (name, rest) = message.split_once(": ")?;
+    let code = named(name)?;
+    Some((code, rest.to_owned()))
 }
 
 /// The message without `DataFusion`'s variant prefix ("Error during planning: ").
@@ -410,6 +470,67 @@ mod tests {
                 column_number: 14
             }
         );
+    }
+
+    /// Errors of the function library keep their Trino name, and the client
+    /// sees Trino's message without it.
+    #[test]
+    fn function_library_errors_keep_their_trino_name() {
+        let cases = [
+            (
+                DataFusionError::Execution("INVALID_FUNCTION_ARGUMENT: Invalid format: \"x\"".into()),
+                "INVALID_FUNCTION_ARGUMENT",
+                7,
+                "Invalid format: \"x\"",
+            ),
+            (
+                DataFusionError::Context(
+                    "while running".into(),
+                    Box::new(DataFusionError::Execution(
+                        "NUMERIC_VALUE_OUT_OF_RANGE: Value 300 exceeds MAX_BYTE".into(),
+                    )),
+                ),
+                "NUMERIC_VALUE_OUT_OF_RANGE",
+                19,
+                "Value 300 exceeds MAX_BYTE",
+            ),
+            (
+                DataFusionError::Plan(
+                    "FUNCTION_NOT_FOUND: Unexpected parameters (varchar) for function abs".into(),
+                ),
+                "FUNCTION_NOT_FOUND",
+                6,
+                "Unexpected parameters (varchar) for function abs",
+            ),
+            (
+                DataFusionError::from(ArrowError::ComputeError("INVALID_LITERAL: bad".into())),
+                "INVALID_LITERAL",
+                59,
+                "bad",
+            ),
+            (
+                DataFusionError::Execution("EXCEEDED_FUNCTION_MEMORY_LIMIT: too big".into()),
+                "EXCEEDED_FUNCTION_MEMORY_LIMIT",
+                37,
+                "too big",
+            ),
+        ];
+        for (error, name, code, message) in cases {
+            let mapped = QueryError::from(&error);
+            assert_eq!(mapped.name(), name, "{error}");
+            assert_eq!(mapped.kind(), "USER_ERROR", "{error}");
+            assert_eq!(mapped.0.error_code, code, "{error}");
+            assert_eq!(mapped.message(), message, "{error}");
+        }
+        // A message that only looks like it: not a Trino name.
+        let other = QueryError::from(&DataFusionError::Execution("boom: x".into()));
+        assert_eq!(other.name(), "GENERIC_INTERNAL_ERROR");
+        assert_eq!(other.message(), "boom: x");
+        // What this module calls internal, the library may classify.
+        let decimal = QueryError::from(&DataFusionError::from(ArrowError::InvalidArgumentError(
+            "12345 is too large to store in a Decimal128 of precision 3. Max is 999".into(),
+        )));
+        assert_eq!(decimal.name(), "INVALID_CAST_ARGUMENT");
     }
 
     #[test]

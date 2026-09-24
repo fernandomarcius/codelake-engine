@@ -124,7 +124,7 @@ async fn reads_trino_warehouse_and_writes_compatible_tables() {
     assert!(table_dir.join(".trinoSchema").exists() && table_dir.join("..trinoSchema.crc").exists());
     assert!(table_dir.join(".trinoPermissions/user_codelake").exists());
 
-    run(&engine, "INSERT INTO hive.raw.orders SELECT 3, CAST(7.25 AS DECIMAL(18,2)), CAST('2026-02-01T00:00:00' AS TIMESTAMP)").await;
+    run(&engine, "INSERT INTO hive.raw.orders SELECT 3, CAST(7.25 AS DECIMAL(18,2)), CAST('2026-02-01 00:00:00' AS TIMESTAMP)").await;
     let after = data_files(&table_dir);
     assert_eq!(after.len(), 2, "one new file per INSERT");
     for (name, crc) in &before {
@@ -139,7 +139,7 @@ async fn reads_trino_warehouse_and_writes_compatible_tables() {
 
     // Schema evolution: old files read the new column as NULL.
     run(&engine, "ALTER TABLE hive.raw.orders ADD COLUMN origem varchar").await;
-    run(&engine, "INSERT INTO hive.raw.orders SELECT 4, CAST(1 AS DECIMAL(18,2)), CAST('2026-02-02T00:00:00' AS TIMESTAMP), 'cdc'").await;
+    run(&engine, "INSERT INTO hive.raw.orders SELECT 4, CAST(1 AS DECIMAL(18,2)), CAST('2026-02-02 00:00:00' AS TIMESTAMP), 'cdc'").await;
     let evolved = run(&engine, "SELECT id, origem FROM hive.raw.orders ORDER BY id").await;
     assert!(
         evolved.contains("| 1  |        |") && evolved.contains("| 4  | cdc    |"),

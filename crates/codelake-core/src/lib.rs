@@ -21,6 +21,7 @@ pub mod table_procedure;
 #[cfg(test)]
 mod testing;
 pub mod trace;
+pub mod trino_functions;
 
 pub use bytes::ByteSize;
 pub use config::{Config, SourceConfig, SourceKind, TrinoProtocolConfig, ValidatedConfig};

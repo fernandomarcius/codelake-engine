@@ -298,12 +298,12 @@ async fn optimize_round_trips_with_trino_431() {
         "CREATE SCHEMA hive.codelake_side",
         "CREATE TABLE hive.codelake_side.t WITH (format = 'PARQUET') AS SELECT CAST(1 AS BIGINT) AS id, \
          'ação' AS nome, CAST(10.50 AS DECIMAL(18,2)) AS valor, X'2A' AS lsn, \
-         CAST('2026-01-01T10:00:00.123' AS TIMESTAMP) AS ts, CAST('2026-01-02' AS DATE) AS d",
-        "INSERT INTO hive.codelake_side.t VALUES (2, 'b', 1.00, X'30', CAST('2026-01-03T00:00:00' AS TIMESTAMP), \
+         CAST('2026-01-01 10:00:00.123' AS TIMESTAMP) AS ts, CAST('2026-01-02' AS DATE) AS d",
+        "INSERT INTO hive.codelake_side.t VALUES (2, 'b', 1.00, X'30', CAST('2026-01-03 00:00:00' AS TIMESTAMP), \
          CAST('2026-01-03' AS DATE))",
         "INSERT INTO hive.codelake_side.t VALUES (3, NULL, NULL, NULL, NULL, NULL)",
         "ALTER TABLE hive.codelake_side.t ADD COLUMN origem varchar",
-        "INSERT INTO hive.codelake_side.t VALUES (4, 'd', -2.75, X'FF', CAST('1999-12-31T23:59:59.999' AS TIMESTAMP), \
+        "INSERT INTO hive.codelake_side.t VALUES (4, 'd', -2.75, X'FF', CAST('1999-12-31 23:59:59.999' AS TIMESTAMP), \
          CAST('1900-01-01' AS DATE), 'cdc')",
     ] {
         codelake(&lake, sql).await;

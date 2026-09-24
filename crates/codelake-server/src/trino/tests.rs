@@ -177,7 +177,7 @@ async fn select_returns_typed_rows() {
     let h = harness();
     let out = h
         .run(
-            "SELECT 1 AS a, 'ação' AS b, CAST(NULL AS BIGINT) AS c, CAST(12.50 AS DECIMAL(10,2)) AS d, true AS e",
+            "SELECT CAST(1 AS BIGINT) AS a, 'ação' AS b, CAST(NULL AS BIGINT) AS c, CAST(12.50 AS DECIMAL(10,2)) AS d, true AS e",
             &[],
         )
         .await;
@@ -525,7 +525,7 @@ async fn statements_report_like_trino() {
     assert!(schema.last.get("data").is_none(), "{}", schema.last);
     let ctas = h
         .run(
-            "CREATE TABLE datafusion.st.t AS SELECT * FROM (VALUES (1, 'x'), (2, 'y'), (3, 'z')) v(a, b)",
+            "CREATE TABLE datafusion.st.t AS SELECT * FROM (VALUES (CAST(1 AS BIGINT), 'x'), (2, 'y'), (3, 'z')) v(a, b)",
             &[],
         )
         .await;
