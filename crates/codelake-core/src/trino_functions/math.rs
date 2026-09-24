@@ -984,7 +984,19 @@ fn extreme(call: &Call<'_>, greatest: bool) -> Result<ArrayRef> {
     } else {
         let mut result = first;
         for next in call.args.iter().skip(1) {
-            let take = if greatest {
+            let take = if result.data_type().is_nested() {
+                // Arrays and rows compare element by element (Arrow's
+                // comparison kernels reject nested types).
+                let order = datafusion::arrow::array::make_comparator(
+                    next.as_ref(),
+                    result.as_ref(),
+                    datafusion::arrow::compute::SortOptions::default(),
+                )?;
+                datafusion::arrow::array::BooleanArray::from_iter((0..call.rows).map(|i| {
+                    let o = order(i, i);
+                    Some(if greatest { o.is_gt() } else { o.is_lt() })
+                }))
+            } else if greatest {
                 gt(next, &result)?
             } else {
                 lt(next, &result)?

@@ -255,7 +255,7 @@ pub(crate) fn contains() -> ScalarUDF {
                     if needle.is_null() {
                         return Ok(None);
                     }
-                    if values.iter().any(|v| !v.is_null() && same(v, needle)) {
+                    if values.iter().any(|v| !v.is_null() && equal(v, needle)) {
                         return Ok(Some(true));
                     }
                     Ok(if values.iter().any(ScalarValue::is_null) {
@@ -288,7 +288,7 @@ pub(crate) fn array_position() -> ScalarUDF {
                     if needle.is_null() {
                         return Ok(None);
                     }
-                    let found = values.iter().position(|v| !v.is_null() && same(v, needle));
+                    let found = values.iter().position(|v| !v.is_null() && equal(v, needle));
                     Ok(Some(
                         found.map_or(0, |p| i64::try_from(p).unwrap_or(i64::MAX) + 1),
                     ))
@@ -313,9 +313,27 @@ fn map_lists(
     build_lists(rows, element)
 }
 
+/// First occurrence of each value (`-0.0` is `0.0`, NaN is NaN, as in Trino).
 fn distinct(values: Vec<ScalarValue>) -> Vec<ScalarValue> {
     let mut seen = HashSet::new();
-    values.into_iter().filter(|v| seen.insert(v.clone())).collect()
+    values
+        .into_iter()
+        .filter(|v| seen.insert(super::aggregate::canonical_float(v.clone())))
+        .collect()
+}
+
+/// Trino's `=` for array elements: IEEE for floats (NaN equals nothing,
+/// `-0.0 = 0.0`), the engine's comparison otherwise.
+fn equal(a: &ScalarValue, b: &ScalarValue) -> bool {
+    match (a, b) {
+        (ScalarValue::Float64(Some(x)), ScalarValue::Float64(Some(y))) => {
+            x.partial_cmp(y) == Some(std::cmp::Ordering::Equal)
+        }
+        (ScalarValue::Float32(Some(x)), ScalarValue::Float32(Some(y))) => {
+            x.partial_cmp(y) == Some(std::cmp::Ordering::Equal)
+        }
+        _ => same(a, b),
+    }
 }
 
 fn coerce_list1(name: &str, types: &[DataType]) -> Result<Vec<DataType>> {
@@ -364,6 +382,13 @@ fn extreme(call: &Call<'_>, max: bool) -> Result<ArrayRef> {
             if values.is_empty() || values.iter().any(ScalarValue::is_null) {
                 return Ok(null);
             }
+            // Trino skips NaN unless every element is NaN.
+            let numbers: Vec<ScalarValue> = values
+                .iter()
+                .filter(|v| !super::aggregate::is_nan(v))
+                .cloned()
+                .collect();
+            let values = if numbers.is_empty() { values } else { numbers };
             Ok(values
                 .into_iter()
                 .reduce(|a, b| {
@@ -411,7 +436,7 @@ pub(crate) fn array_remove() -> ScalarUDF {
                 Ok(Some(
                     values
                         .into_iter()
-                        .filter(|v| v.is_null() || !same(v, needle))
+                        .filter(|v| v.is_null() || !equal(v, needle))
                         .collect(),
                 ))
             })

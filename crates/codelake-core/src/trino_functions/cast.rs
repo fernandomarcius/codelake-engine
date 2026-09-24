@@ -470,8 +470,14 @@ fn floats_to_int(array: &ArrayRef, rows: usize, target: &DataType, is_try: bool)
         let rounded = v.round();
         match rounded.to_i128() {
             Some(n) if (min..=max).contains(&n) => Ok(n.to_i64()),
-            _ => Err(invalid_cast(format!(
+            // Trino: `bigint` reports a failed cast, the narrower types a
+            // value out of their range.
+            _ if *target == DataType::Int64 => Err(invalid_cast(format!(
                 "Unable to cast {} to {name}",
+                format_double(v)
+            ))),
+            _ => Err(out_of_range(format!(
+                "Out of range for {name}: {}",
                 format_double(v)
             ))),
         }
@@ -545,11 +551,26 @@ fn text_to_date(text: &str) -> Result<i32> {
         .ok_or_else(bad)
 }
 
+/// Trino's casts from text read a blank between the date and the time; the
+/// ISO `T` separator is rejected (`from_iso8601_timestamp` reads it).
+fn iso_separator(text: &str) -> bool {
+    TIMESTAMP_TEXT
+        .as_ref()
+        .and_then(|r| r.captures(text))
+        .and_then(|c| c.get(3))
+        .is_some_and(|day| text[day.end()..].starts_with('T'))
+}
+
+/// `CAST(varchar AS timestamp)`: a zone after the time is checked and
+/// dropped (the wall clock is kept), as in Trino.
 fn text_to_timestamp(text: &str, unit: TimeUnit) -> Result<i64> {
     let bad = || invalid_cast(format!("Value cannot be cast to timestamp: {text}"));
     let parsed = parse_timestamp_text(text)
-        .filter(|p| p.zone.is_none())
+        .filter(|_| !iso_separator(text))
         .ok_or_else(bad)?;
+    if let Some(zone) = &parsed.zone {
+        Zone::parse(zone.trim()).ok_or_else(bad)?;
+    }
     round_to_unit(parsed.local, unit).ok_or_else(out_of_range_timestamp)
 }
 
@@ -683,6 +704,7 @@ fn text_to_zoned(call: &Call<'_>, is_try: bool, unit: TimeUnit, zone: &Arc<str>)
     let out = collect(call.rows, is_try, |i| {
         let Some(s) = text.at(i) else { return Ok(None) };
         let parsed = parse_timestamp_text(s)
+            .filter(|_| !iso_separator(s))
             .ok_or_else(|| invalid_cast(format!("Value cannot be cast to timestamp with time zone: {s}")))?;
         let row_zone: Zone = match &parsed.zone {
             Some(id) => Zone::parse(id.trim()).ok_or_else(|| {

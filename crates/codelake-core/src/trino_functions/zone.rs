@@ -39,6 +39,36 @@ const UTC_ALIASES: &[&str] = &[
     "Etc/UT",
 ];
 
+/// Java's (JDK `TimeZoneNames`) standard and daylight short names of the
+/// regions whose IANA abbreviations are numeric.
+const JAVA_SHORT_NAMES: &[(&str, &str, &str)] = &[
+    ("America/Sao_Paulo", "BRT", "BRST"),
+    ("America/Bahia", "BRT", "BRST"),
+    ("America/Fortaleza", "BRT", "BRST"),
+    ("America/Recife", "BRT", "BRST"),
+    ("America/Maceio", "BRT", "BRST"),
+    ("America/Belem", "BRT", "BRST"),
+    ("America/Araguaina", "BRT", "BRST"),
+    ("America/Santarem", "BRT", "BRST"),
+    ("America/Manaus", "AMT", "AMST"),
+    ("America/Cuiaba", "AMT", "AMST"),
+    ("America/Campo_Grande", "AMT", "AMST"),
+    ("America/Porto_Velho", "AMT", "AMST"),
+    ("America/Boa_Vista", "AMT", "AMST"),
+    ("America/Rio_Branco", "ACT", "ACST"),
+    ("America/Eirunepe", "ACT", "ACST"),
+    ("America/Noronha", "FNT", "FNST"),
+    ("America/Argentina/Buenos_Aires", "ART", "ARST"),
+    ("America/Buenos_Aires", "ART", "ARST"),
+    ("America/Montevideo", "UYT", "UYST"),
+    ("America/Asuncion", "PYT", "PYST"),
+    ("America/Santiago", "CLT", "CLST"),
+    ("America/Bogota", "COT", "COST"),
+    ("America/Lima", "PET", "PEST"),
+    ("America/Caracas", "VET", "VEST"),
+    ("America/La_Paz", "BOT", "BOST"),
+];
+
 /// Maximum offset Trino accepts (±14:00).
 const MAX_OFFSET_SECONDS: i32 = 14 * 3600;
 
@@ -112,6 +142,31 @@ impl Zone {
                 format!("{sign}{:02}:{:02}", abs / 3600, (abs % 3600) / 60)
             }
             Zone::Named(tz) => tz.name().to_owned(),
+        }
+    }
+
+    /// Joda's short zone name at a UTC instant (pattern letter `z`): the
+    /// Java name of the zone (`BRT`, `EST`, `CEST`), the id of an offset.
+    /// `None` when the Java name is not known here: IANA data dropped the
+    /// letter abbreviations of some regions (`-03` for São Paulo), and a
+    /// number in their place would be a different answer.
+    pub(crate) fn short_name(self, utc: NaiveDateTime) -> Option<String> {
+        use chrono_tz::{OffsetComponents, OffsetName};
+        match self {
+            Zone::Fixed(_) => Some(self.name()),
+            Zone::Named(tz) => {
+                let offset = tz.offset_from_utc_datetime(&utc);
+                let daylight = !offset.dst_offset().is_zero();
+                if let Some(abbreviation) = offset.abbreviation()
+                    && abbreviation.starts_with(|c: char| c.is_ascii_alphabetic())
+                {
+                    return Some(abbreviation.to_owned());
+                }
+                JAVA_SHORT_NAMES
+                    .iter()
+                    .find(|(id, _, _)| *id == tz.name())
+                    .map(|(_, standard, summer)| (if daylight { *summer } else { *standard }).to_owned())
+            }
         }
     }
 

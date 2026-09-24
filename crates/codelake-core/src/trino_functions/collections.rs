@@ -602,8 +602,107 @@ pub(crate) fn map_constructor() -> ScalarUDF {
     .udf()
 }
 
+/// `UNNEST(x) AS t(a, b, …)` with one argument and several columns: Trino
+/// expands a map into key and value columns and an array of rows into the
+/// row's fields. The AST rewrite (see `syntax`) unnests
+/// `codelake_unnest_part(x, 0)`, `codelake_unnest_part(x, 1)`, … instead,
+/// each an array the engine's `UNNEST` zips with the others.
+pub(crate) const UNNEST_PART: &str = "codelake_unnest_part";
+
+fn unnest_part_index(r: &super::support::Ret<'_>) -> Result<usize> {
+    match r.scalars.get(1).copied().flatten() {
+        Some(ScalarValue::Int64(Some(i))) => {
+            usize::try_from(*i).map_err(|_| invalid_argument("negative part"))
+        }
+        _ => Err(DataFusionError::Plan(format!(
+            "{UNNEST_PART} needs a constant part"
+        ))),
+    }
+}
+
+fn unnest_part_type(input: &DataType, index: usize) -> Option<DataType> {
+    if let Some((key, value)) = map_parts(input) {
+        return match index {
+            0 => Some(list_of(key.clone())),
+            1 => Some(list_of(value.clone())),
+            _ => None,
+        };
+    }
+    match element_type(input)? {
+        DataType::Struct(fields) => fields.get(index).map(|f| list_of(f.data_type().clone())),
+        element if index == 0 => Some(list_of(element.clone())),
+        _ => None,
+    }
+}
+
+pub(crate) fn unnest_part() -> ScalarUDF {
+    Func::new(
+        UNNEST_PART,
+        |name, types| match types {
+            [t @ DataType::Map(..), i] if super::support::is_integer(i) => {
+                Ok(vec![t.clone(), DataType::Int64])
+            }
+            [t, i] if super::support::is_integer(i) => Ok(vec![
+                as_list(t).ok_or_else(|| not_found(name, types))?,
+                DataType::Int64,
+            ]),
+            _ => Err(not_found(name, types)),
+        },
+        |r| {
+            let index = unnest_part_index(r)?;
+            let input = r
+                .types
+                .first()
+                .ok_or_else(|| DataFusionError::Internal("unnest argument".into()))?;
+            unnest_part_type(input, index).ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "NOT_SUPPORTED: UNNEST of {} has no column {}",
+                    super::support::trino_type_name(input),
+                    index + 1
+                ))
+            })
+        },
+        |call| {
+            let input = call.arg(0)?;
+            let index = ints(call.arg(1)?)?
+                .iter()
+                .flatten()
+                .next()
+                .and_then(|i| usize::try_from(i).ok())
+                .unwrap_or(0);
+            let DataType::List(field) = call.return_type else {
+                return Err(DataFusionError::Internal("unnest part type".into()));
+            };
+            let (offsets, values, nulls): (OffsetBuffer<i32>, ArrayRef, Option<NullBuffer>) =
+                if let Some(maps) = input.as_any().downcast_ref::<MapArray>() {
+                    let entries = maps.entries();
+                    (
+                        maps.offsets().clone(),
+                        Arc::clone(entries.column(index)),
+                        maps.nulls().cloned(),
+                    )
+                } else {
+                    let list = lists(input)?;
+                    let values = match list.values().as_any().downcast_ref::<StructArray>() {
+                        Some(rows) => Arc::clone(rows.column(index)),
+                        None => Arc::clone(list.values()),
+                    };
+                    (list.offsets().clone(), values, list.nulls().cloned())
+                };
+            Ok(Arc::new(datafusion::arrow::array::ListArray::try_new(
+                Arc::clone(field),
+                offsets,
+                values,
+                nulls,
+            )?))
+        },
+    )
+    .udf()
+}
+
 pub(crate) fn udfs() -> Vec<ScalarUDF> {
     vec![
+        unnest_part(),
         subscript(),
         map_constructor(),
         map_from_entries(),

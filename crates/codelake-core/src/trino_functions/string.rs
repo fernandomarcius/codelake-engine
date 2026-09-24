@@ -312,69 +312,138 @@ pub(crate) fn trims() -> Vec<ScalarUDF> {
 }
 
 /// `concat(varchar…)` / `concat(varbinary…)`: NULL if any argument is NULL.
+fn coerce_concat(name: &str, types: &[DataType]) -> Result<Vec<DataType>> {
+    if types.is_empty() {
+        return Err(not_found(name, types));
+    }
+    if types.iter().all(|t| is_binary(t) || t.is_null()) && types.iter().any(is_binary) {
+        return Ok(vec![DataType::Binary; types.len()]);
+    }
+    if types
+        .iter()
+        .all(|t| matches!(t, DataType::List(_)) || t.is_null())
+        && types.iter().any(|t| matches!(t, DataType::List(_)))
+    {
+        let elements: Vec<DataType> = types
+            .iter()
+            .filter_map(|t| super::array::element_type(t).cloned())
+            .collect();
+        let common = datafusion::logical_expr::type_coercion::binary::type_union_resolution(&elements)
+            .ok_or_else(|| not_found(name, types))?;
+        let list = DataType::List(Arc::new(Field::new_list_field(common, true)));
+        return Ok(vec![list; types.len()]);
+    }
+    types
+        .iter()
+        .map(|t| as_str(t).ok_or_else(|| not_found(name, types)))
+        .collect()
+}
+
+fn invoke_concat(call: &Call<'_>) -> Result<ArrayRef> {
+    if let Some(DataType::List(_)) = call.args.first().map(|a| a.data_type().clone()) {
+        return super::array::concat_lists(call);
+    }
+    if let Some(DataType::Binary) = call.args.first().map(|a| a.data_type().clone()) {
+        let columns = call.args.iter().map(binaries).collect::<Result<Vec<_>>>()?;
+        let out: Vec<Option<Vec<u8>>> = (0..call.rows)
+            .map(|i| {
+                let mut value = Vec::new();
+                for c in &columns {
+                    value.extend_from_slice(c.at(i)?);
+                }
+                Some(value)
+            })
+            .collect();
+        return Ok(binary_array(&out));
+    }
+    let columns = call.args.iter().map(strings).collect::<Result<Vec<_>>>()?;
+    Ok(string_array(
+        (0..call.rows)
+            .map(|i| {
+                let mut value = String::new();
+                for c in &columns {
+                    value.push_str(c.at(i)?);
+                }
+                Some(value)
+            })
+            .collect(),
+    ))
+}
+
+fn concat_return(r: &super::support::Ret<'_>) -> Result<DataType> {
+    match r.types {
+        [t @ DataType::List(_), ..] | [_, t @ DataType::List(_)] => Ok(t.clone()),
+        _ => SAME_AS_FIRST(r),
+    }
+}
+
 pub(crate) fn concat() -> ScalarUDF {
+    Func::new("concat", coerce_concat, concat_return, invoke_concat).udf()
+}
+
+/// The `||` operator (the SQL text rewrite calls it for every `a || b`):
+/// Trino's `concat` of two strings, two `varbinary` or two arrays, and an
+/// array with an element on either side (appended or prepended). The
+/// engine's `||` only joins strings (and casts other operands to text).
+pub(crate) const CONCAT_OPERATOR: &str = "codelake_trino_concat_operator";
+
+/// `(array(T), T)` or `(T, array(T))`: the element's side and common type.
+fn element_side(types: &[DataType]) -> Option<(usize, DataType)> {
+    let (list, element, side) = match types {
+        [l @ DataType::List(_), e] if !matches!(e, DataType::List(_)) && !e.is_null() => (l, e, 1),
+        [e, l @ DataType::List(_)] if !matches!(e, DataType::List(_)) && !e.is_null() => (l, e, 0),
+        _ => return None,
+    };
+    let inner = super::array::element_type(list)?.clone();
+    let common =
+        datafusion::logical_expr::type_coercion::binary::type_union_resolution(&[inner, element.clone()])?;
+    Some((side, common))
+}
+
+pub(crate) fn concat_operator() -> ScalarUDF {
     Func::new(
-        "concat",
+        CONCAT_OPERATOR,
         |name, types| {
-            if types.is_empty() {
+            if types.len() != 2 {
                 return Err(not_found(name, types));
             }
-            if types.iter().all(|t| is_binary(t) || t.is_null()) && types.iter().any(is_binary) {
-                return Ok(vec![DataType::Binary; types.len()]);
+            if let Some((side, common)) = element_side(types) {
+                let list = DataType::List(Arc::new(Field::new_list_field(common.clone(), true)));
+                return Ok(if side == 1 {
+                    vec![list, common]
+                } else {
+                    vec![common, list]
+                });
             }
-            if types
-                .iter()
-                .all(|t| matches!(t, DataType::List(_)) || t.is_null())
-                && types.iter().any(|t| matches!(t, DataType::List(_)))
-            {
-                let elements: Vec<DataType> = types
-                    .iter()
-                    .filter_map(|t| super::array::element_type(t).cloned())
-                    .collect();
-                let common =
-                    datafusion::logical_expr::type_coercion::binary::type_union_resolution(&elements)
-                        .ok_or_else(|| not_found(name, types))?;
-                let list = DataType::List(Arc::new(Field::new_list_field(common, true)));
-                return Ok(vec![list; types.len()]);
-            }
-            types
-                .iter()
-                .map(|t| as_str(t).ok_or_else(|| not_found(name, types)))
-                .collect()
+            coerce_concat(name, types)
         },
-        |r| match r.types.first() {
-            Some(t @ DataType::List(_)) => Ok(t.clone()),
-            _ => SAME_AS_FIRST(r),
-        },
+        concat_return,
         |call| {
-            if let Some(DataType::List(_)) = call.args.first().map(|a| a.data_type().clone()) {
-                return super::array::concat_lists(call);
-            }
-            if let Some(DataType::Binary) = call.args.first().map(|a| a.data_type().clone()) {
-                let columns = call.args.iter().map(binaries).collect::<Result<Vec<_>>>()?;
-                let out: Vec<Option<Vec<u8>>> = (0..call.rows)
-                    .map(|i| {
-                        let mut value = Vec::new();
-                        for c in &columns {
-                            value.extend_from_slice(c.at(i)?);
-                        }
-                        Some(value)
-                    })
-                    .collect();
-                return Ok(binary_array(&out));
-            }
-            let columns = call.args.iter().map(strings).collect::<Result<Vec<_>>>()?;
-            Ok(string_array(
-                (0..call.rows)
-                    .map(|i| {
-                        let mut value = String::new();
-                        for c in &columns {
-                            value.push_str(c.at(i)?);
-                        }
-                        Some(value)
-                    })
-                    .collect(),
-            ))
+            let types: Vec<DataType> = call.args.iter().map(|a| a.data_type().clone()).collect();
+            let Some((side, _)) = element_side(&types) else {
+                return invoke_concat(call);
+            };
+            let DataType::List(field) = call.return_type else {
+                return Err(DataFusionError::Internal("concat of an array".into()));
+            };
+            // The element as a one-element array.
+            let element = Arc::clone(call.arg(side)?);
+            let single: ArrayRef = Arc::new(ListArray::try_new(
+                Arc::clone(field),
+                datafusion::arrow::buffer::OffsetBuffer::from_lengths(std::iter::repeat_n(1, element.len())),
+                element,
+                None,
+            )?);
+            let mut args = call.args.clone();
+            args[side] = single;
+            let lists = Call {
+                args,
+                fields: call.fields.clone(),
+                rows: call.rows,
+                return_type: call.return_type,
+                zone: Arc::clone(&call.zone),
+            };
+            super::array::concat_lists(&lists)
         },
     )
     .udf()
@@ -922,12 +991,66 @@ pub(crate) fn from_utf8() -> ScalarUDF {
     .udf()
 }
 
+/// One code point of `bytes` (Airlift's `SliceUtf8.tryGetCodePointAt`, used
+/// by Trino): `Ok((char, length))`, or `Err(skip)`, the bytes one
+/// replacement covers. The lead byte fixes the sequence length (up to six
+/// bytes); a missing continuation byte ends the bad sequence before it, and a
+/// complete sequence that is not a scalar value (overlong form, surrogate,
+/// beyond U+10FFFF) is replaced as a whole.
+fn code_point_at(bytes: &[u8]) -> std::result::Result<(char, usize), usize> {
+    let Some(&lead) = bytes.first() else {
+        return Err(1);
+    };
+    let (length, initial) = match lead {
+        0x00..=0x7F => return Ok((char::from(lead), 1)),
+        0xC0..=0xDF => (2, u32::from(lead & 0x1F)),
+        0xE0..=0xEF => (3, u32::from(lead & 0x0F)),
+        0xF0..=0xF7 => (4, u32::from(lead & 0x07)),
+        0xF8..=0xFB => (5, 0),
+        0xFC..=0xFD => (6, 0),
+        _ => return Err(1),
+    };
+    let mut code = initial;
+    for i in 1..length {
+        match bytes.get(i) {
+            Some(b) if b & 0xC0 == 0x80 => code = (code << 6) | u32::from(b & 0x3F),
+            _ => return Err(i),
+        }
+    }
+    let minimum = match length {
+        2 => 0x80,
+        3 => 0x800,
+        _ => 0x1_0000,
+    };
+    match char::from_u32(code) {
+        Some(c) if length <= 4 && code >= minimum => Ok((c, length)),
+        _ => Err(length),
+    }
+}
+
 fn decode_utf8_with(bytes: &[u8], replacement: &str) -> String {
-    let mut out = String::new();
-    for chunk in bytes.utf8_chunks() {
-        out.push_str(chunk.valid());
-        if !chunk.invalid().is_empty() {
-            out.push_str(replacement);
+    let mut out = String::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        // Valid runs in one step; the byte-wise decoder only at bad bytes.
+        let valid = match std::str::from_utf8(rest) {
+            Ok(text) => {
+                out.push_str(text);
+                break;
+            }
+            Err(error) => error.valid_up_to(),
+        };
+        out.push_str(std::str::from_utf8(&rest[..valid]).unwrap_or_default());
+        rest = &rest[valid..];
+        match code_point_at(rest) {
+            Ok((c, length)) => {
+                out.push(c);
+                rest = &rest[length..];
+            }
+            Err(skip) => {
+                out.push_str(replacement);
+                rest = &rest[skip.min(rest.len())..];
+            }
         }
     }
     out
@@ -1162,6 +1285,7 @@ pub(crate) fn udfs() -> Vec<ScalarUDF> {
         translate(),
         to_utf8(),
         from_utf8(),
+        concat_operator(),
         soundex(),
         luhn_check(),
         split_to_map(),

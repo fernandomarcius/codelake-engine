@@ -57,10 +57,14 @@ enum Kind {
     TwoDigitWeekyear,
     WeekOfWeekyear,
     DayOfWeek,
-    DayOfWeekText { full: bool },
+    DayOfWeekText {
+        full: bool,
+    },
     DayOfYear,
     Month,
-    MonthText { full: bool },
+    MonthText {
+        full: bool,
+    },
     DayOfMonth,
     Halfday,
     HourOfHalfday,
@@ -69,9 +73,16 @@ enum Kind {
     ClockhourOfDay,
     Minute,
     Second,
-    Fraction { min: usize, max: usize },
-    Offset { colon: bool },
+    Fraction {
+        min: usize,
+        max: usize,
+    },
+    Offset {
+        colon: bool,
+    },
     ZoneId,
+    /// Short zone name (`z`), print only.
+    ZoneName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,11 +105,12 @@ impl Kind {
                 | Kind::Halfday
                 | Kind::Offset { .. }
                 | Kind::ZoneId
+                | Kind::ZoneName
         )
     }
 
     fn is_zone(self) -> bool {
-        matches!(self, Kind::Offset { .. } | Kind::ZoneId)
+        matches!(self, Kind::Offset { .. } | Kind::ZoneId | Kind::ZoneName)
     }
 }
 
@@ -218,9 +230,10 @@ fn joda_field(letter: char, count: usize) -> Result<Token> {
         'Z' if count == 1 => field(Kind::Offset { colon: false }, 0, 0),
         'Z' if count == 2 => field(Kind::Offset { colon: true }, 0, 0),
         'Z' => field(Kind::ZoneId, 0, 0),
+        'z' if count < 4 => field(Kind::ZoneName, 0, 0),
         'z' => {
             return Err(invalid_argument(
-                "Time zone names ('z') are not supported; use 'ZZZ' for the zone id",
+                "Long time zone names ('zzzz') are not supported; use 'ZZZ' for the zone id",
             ));
         }
         other => return Err(invalid_argument(format!("Illegal pattern component: {other}"))),
@@ -366,6 +379,17 @@ fn print(tokens: &[Token], local: NaiveDateTime, zone: Option<(Zone, i32)>) -> R
             Kind::ZoneId => {
                 let (zone, _) = zone.ok_or_else(|| invalid_argument("no time zone"))?;
                 out.push_str(&zone.name());
+            }
+            Kind::ZoneName => {
+                let (zone, offset) = zone.ok_or_else(|| invalid_argument("no time zone"))?;
+                let utc = local - Duration::seconds(i64::from(offset));
+                let name = zone.short_name(utc).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "NOT_SUPPORTED: the short name of time zone {} is not known; use 'ZZZ' for the zone id",
+                        zone.name()
+                    ))
+                })?;
+                out.push_str(&name);
             }
         }
     }

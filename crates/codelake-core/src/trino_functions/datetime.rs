@@ -1296,8 +1296,44 @@ pub(crate) fn to_iso8601() -> ScalarUDF {
     .udf()
 }
 
+/// Joda's ISO date element (Trino's `from_iso8601_date`): `yyyy`,
+/// `yyyy-MM`, `yyyy-MM-dd`, the ordinal `yyyy-DDD` and the week date
+/// `xxxx-Www[-e]`.
 fn parse_iso8601_date(text: &str) -> Option<NaiveDate> {
-    NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()
+    let (year, rest) = match text.split_once('-') {
+        Some((year, rest)) => (year, Some(rest)),
+        None => (text, None),
+    };
+    if year.len() < 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let year: i32 = year.parse().ok()?;
+    let digits = |s: &str, min: usize, max: usize| {
+        (min..=max).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
+    };
+    let Some(rest) = rest else {
+        return NaiveDate::from_ymd_opt(year, 1, 1);
+    };
+    if let Some(week) = rest.strip_prefix('W') {
+        let (week, day) = match week.split_once('-') {
+            Some((week, day)) if digits(day, 1, 1) => (week, day.parse::<u8>().ok()?),
+            Some(_) => return None,
+            None => (week, 1_u8),
+        };
+        if !digits(week, 2, 2) {
+            return None;
+        }
+        let weekday = chrono::Weekday::try_from(day.checked_sub(1)?).ok()?;
+        return NaiveDate::from_isoywd_opt(year, week.parse().ok()?, weekday);
+    }
+    match rest.split_once('-') {
+        Some((month, day)) if digits(month, 1, 2) && digits(day, 1, 2) => {
+            NaiveDate::from_ymd_opt(year, month.parse().ok()?, day.parse().ok()?)
+        }
+        None if digits(rest, 3, 3) => NaiveDate::from_yo_opt(year, rest.parse().ok()?),
+        None if digits(rest, 1, 2) => NaiveDate::from_ymd_opt(year, rest.parse().ok()?, 1),
+        _ => None,
+    }
 }
 
 pub(crate) fn from_iso8601_date() -> ScalarUDF {

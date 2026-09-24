@@ -40,6 +40,15 @@ fn text_of(value: &ScalarValue) -> Result<String> {
     Ok(text.value(0).to_owned())
 }
 
+/// Java's text of NaN and the infinities.
+fn non_finite(nan: bool, positive: bool) -> String {
+    match (nan, positive) {
+        (true, _) => "NaN".to_owned(),
+        (false, true) => "Infinity".to_owned(),
+        (false, false) => "-Infinity".to_owned(),
+    }
+}
+
 fn write_json(value: &ScalarValue, out: &mut String) -> Result<()> {
     if value.is_null() {
         out.push_str("null");
@@ -59,6 +68,13 @@ fn write_json(value: &ScalarValue, out: &mut String) -> Result<()> {
         | ScalarValue::UInt32(_)
         | ScalarValue::UInt64(_) => out.push_str(&value.to_string()),
         ScalarValue::Decimal128(..) => out.push_str(&text_of(value)?),
+        // Jackson quotes the numbers JSON cannot spell.
+        ScalarValue::Float64(Some(f)) if !f.is_finite() => {
+            write_string(&non_finite(f.is_nan(), *f > 0.0), out);
+        }
+        ScalarValue::Float32(Some(f)) if !f.is_finite() => {
+            write_string(&non_finite(f.is_nan(), *f > 0.0), out);
+        }
         ScalarValue::Float64(Some(f)) => out.push_str(&java_double(*f)),
         // Jackson writes a float with Java's `Float.toString`.
         ScalarValue::Float32(Some(f)) => {
