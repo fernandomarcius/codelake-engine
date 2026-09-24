@@ -26,15 +26,17 @@ pub(crate) enum ServeError {
     PgListener(String),
 }
 
-pub(crate) fn run(validated: ValidatedConfig) -> Result<(), ServeError> {
+/// `session_sampling`: share of PostgreSQL sessions traced (see
+/// [`hooks::TracingHook`]); `None` when traces are not exported.
+pub(crate) fn run(validated: ValidatedConfig, session_sampling: Option<f64>) -> Result<(), ServeError> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("codelake")
         .build()?
-        .block_on(serve(validated))
+        .block_on(serve(validated, session_sampling))
 }
 
-async fn serve(validated: ValidatedConfig) -> Result<(), ServeError> {
+async fn serve(validated: ValidatedConfig, session_sampling: Option<f64>) -> Result<(), ServeError> {
     let ValidatedConfig { config, secrets } = validated;
     let prometheus = PrometheusBuilder::new().install_recorder()?;
 
@@ -69,7 +71,7 @@ async fn serve(validated: ValidatedConfig) -> Result<(), ServeError> {
     let session = Arc::new(engine.context().clone());
 
     tokio::select! {
-        result = datafusion_postgres::serve_with_hooks(session, &options, hooks::all()) => {
+        result = datafusion_postgres::serve_with_hooks(session, &options, hooks::all(session_sampling)) => {
             shutdown.cancel();
             let reason = result.err().map_or_else(|| "exited".to_owned(), |e| e.to_string());
             return Err(ServeError::PgListener(reason));

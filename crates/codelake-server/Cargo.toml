@@ -32,6 +32,10 @@ serde_json.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+tracing-opentelemetry.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 thiserror.workspace = true
@@ -42,6 +46,11 @@ reqwest = { version = "0.12", default-features = false }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile.workspace = true
+testcontainers.workspace = true
+testcontainers-modules.workspace = true
+secrecy.workspace = true
+tiberius.workspace = true
+tokio-util = { workspace = true, features = ["compat"] }
 
 [lints]
 workspace = true
