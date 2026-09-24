@@ -1,0 +1,1727 @@
+{
+  "category": "array",
+  "cases": [
+    {
+      "name": "cardinality_fn",
+      "sql": "SELECT cardinality(ARRAY[1, 2, NULL]), cardinality(CAST(ARRAY[] AS array(bigint))), cardinality(CAST(NULL AS array(bigint))), cardinality(MAP(ARRAY['a'], ARRAY[1]))",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            3,
+            0,
+            null,
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "element_at_fn",
+      "sql": "SELECT element_at(ARRAY[1, 2, 3], 2), element_at(ARRAY[1, 2, 3], -1), element_at(ARRAY[1, 2, 3], 5), element_at(MAP(ARRAY['a', 'b'], ARRAY[1, 2]), 'b'), element_at(MAP(ARRAY['a'], ARRAY[1]), 'z')",
+      "trino": {
+        "types": [
+          "integer",
+          "integer",
+          "integer",
+          "integer",
+          "integer"
+        ],
+        "rows": [
+          [
+            2,
+            3,
+            null,
+            2,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "element_at_zero",
+      "sql": "SELECT element_at(ARRAY[1, 2, 3], 0)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "SQL array indices start at 1"
+      }
+    },
+    {
+      "name": "contains_fn",
+      "sql": "SELECT contains(ARRAY[1, 2], 2), contains(ARRAY[1, 2], 3), contains(ARRAY[1, NULL], 3), contains(ARRAY['a', 'b'], 'b'), contains(ARRAY[1], NULL)",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            false,
+            null,
+            true,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_position_fn",
+      "sql": "SELECT array_position(ARRAY[5, 6, 5], 5), array_position(ARRAY[5, 6], 7), array_position(ARRAY['a', 'b'], 'b')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            1,
+            0,
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_distinct_sort",
+      "sql": "SELECT array_distinct(ARRAY[3, 1, 3, NULL, 1, NULL]), array_sort(ARRAY[3, NULL, 1, 2]), array_sort(ARRAY['b', 'a'])",
+      "trino": {
+        "types": [
+          "array(integer)",
+          "array(integer)",
+          "array(varchar(1))"
+        ],
+        "rows": [
+          [
+            [
+              3,
+              1,
+              null
+            ],
+            [
+              1,
+              2,
+              3,
+              null
+            ],
+            [
+              "a",
+              "b"
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_max_min",
+      "sql": "SELECT array_max(ARRAY[1, 5, 3]), array_min(ARRAY[1, 5, 3]), array_max(ARRAY[1, NULL]), array_max(CAST(ARRAY[] AS array(bigint))), array_max(ARRAY['a', 'c', 'b'])",
+      "trino": {
+        "types": [
+          "integer",
+          "integer",
+          "integer",
+          "bigint",
+          "varchar(1)"
+        ],
+        "rows": [
+          [
+            5,
+            1,
+            null,
+            null,
+            "c"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_remove_fn",
+      "sql": "SELECT array_remove(ARRAY[1, 2, 1, NULL], 1), array_remove(ARRAY['a'], 'b')",
+      "trino": {
+        "types": [
+          "array(integer)",
+          "array(varchar(1))"
+        ],
+        "rows": [
+          [
+            [
+              2,
+              null
+            ],
+            [
+              "a"
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "slice_fn",
+      "sql": "SELECT slice(ARRAY[1, 2, 3, 4], 2, 2), slice(ARRAY[1, 2, 3, 4], -2, 5), slice(ARRAY[1, 2], 5, 1)",
+      "trino": {
+        "types": [
+          "array(integer)",
+          "array(integer)",
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            [
+              2,
+              3
+            ],
+            [
+              3,
+              4
+            ],
+            []
+          ]
+        ]
+      }
+    },
+    {
+      "name": "slice_zero",
+      "sql": "SELECT slice(ARRAY[1, 2], 0, 1)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "SQL array indices start at 1"
+      }
+    },
+    {
+      "name": "trim_array_fn",
+      "sql": "SELECT trim_array(ARRAY[1, 2, 3], 2), trim_array(ARRAY[1], 0)",
+      "trino": {
+        "types": [
+          "array(integer)",
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            [
+              1
+            ],
+            [
+              1
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "repeat_fn",
+      "sql": "SELECT repeat('x', 3), repeat(1, 0), repeat(CAST(NULL AS bigint), 2)",
+      "trino": {
+        "types": [
+          "array(varchar(1))",
+          "array(integer)",
+          "array(bigint)"
+        ],
+        "rows": [
+          [
+            [
+              "x",
+              "x",
+              "x"
+            ],
+            [],
+            [
+              null,
+              null
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "repeat_negative",
+      "sql": "SELECT repeat(1, -1)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "count argument of repeat function must be greater than or equal to 0"
+      }
+    },
+    {
+      "name": "sequence_fn",
+      "sql": "SELECT sequence(1, 5), sequence(5, 1), sequence(1, 10, 3), sequence(DATE '2024-02-27', DATE '2024-03-01')",
+      "trino": {
+        "types": [
+          "array(bigint)",
+          "array(bigint)",
+          "array(bigint)",
+          "array(date)"
+        ],
+        "rows": [
+          [
+            [
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            [
+              5,
+              4,
+              3,
+              2,
+              1
+            ],
+            [
+              1,
+              4,
+              7,
+              10
+            ],
+            [
+              "2024-02-27",
+              "2024-02-28",
+              "2024-02-29",
+              "2024-03-01"
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "sequence_bad_step",
+      "sql": "SELECT sequence(1, 5, -1)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "sequence stop value should be greater than or equal to start value if step is greater than zero otherwise stop should be less than or equal to start"
+      }
+    },
+    {
+      "name": "set_fns",
+      "sql": "SELECT array_union(ARRAY[1, 2, 2], ARRAY[3, 1]), array_intersect(ARRAY[3, 1, 2, 1], ARRAY[1, 3]), array_except(ARRAY[1, 2, 2, 3], ARRAY[2])",
+      "trino": {
+        "types": [
+          "array(integer)",
+          "array(integer)",
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            [
+              1,
+              2,
+              3
+            ],
+            [
+              3,
+              1
+            ],
+            [
+              1,
+              3
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "arrays_overlap_fn",
+      "sql": "SELECT arrays_overlap(ARRAY[1, 2], ARRAY[2, 3]), arrays_overlap(ARRAY[1, 2], ARRAY[3]), arrays_overlap(ARRAY[1, NULL], ARRAY[3])",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            false,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_join_fn",
+      "sql": "SELECT array_join(ARRAY['a', NULL, 'c'], ','), array_join(ARRAY['a', NULL, 'c'], ',', '-'), array_join(ARRAY[1.5E0, 2E0], ';'), array_join(ARRAY[1, 2], '')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "a,c",
+            "a,-,c",
+            "1.5E0;2.0E0",
+            "12"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "concat_arrays",
+      "sql": "SELECT concat(ARRAY[1, 2], ARRAY[3]), ARRAY[1] || ARRAY[2, 3], concat(ARRAY[1], CAST(NULL AS array(integer)))",
+      "trino": {
+        "types": [
+          "array(integer)",
+          "array(integer)",
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            [
+              1,
+              2,
+              3
+            ],
+            [
+              1,
+              2,
+              3
+            ],
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "reverse_array",
+      "sql": "SELECT reverse(ARRAY[1, 2, 3]), reverse(ARRAY['a', NULL])",
+      "trino": {
+        "types": [
+          "array(integer)",
+          "array(varchar(1))"
+        ],
+        "rows": [
+          [
+            [
+              3,
+              2,
+              1
+            ],
+            [
+              null,
+              "a"
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "flatten_fn",
+      "sql": "SELECT flatten(ARRAY[ARRAY[1, 2], ARRAY[3]])",
+      "trino": {
+        "types": [
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            [
+              1,
+              2,
+              3
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "map_fns",
+      "sql": "SELECT map_keys(MAP(ARRAY['a', 'b'], ARRAY[1, 2])), map_values(MAP(ARRAY['a', 'b'], ARRAY[1, 2]))",
+      "trino": {
+        "types": [
+          "array(varchar(1))",
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            [
+              "a",
+              "b"
+            ],
+            [
+              1,
+              2
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "subscript",
+      "sql": "SELECT ARRAY[10, 20, 30][2]",
+      "trino": {
+        "types": [
+          "integer"
+        ],
+        "rows": [
+          [
+            20
+          ]
+        ]
+      }
+    },
+    {
+      "name": "cardinality_nested",
+      "sql": "SELECT cardinality(ARRAY[ARRAY[1], ARRAY[2, 3]]), cardinality(ARRAY[NULL]), cardinality(split('a,b', ','))",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            2,
+            1,
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "contains_null_edge",
+      "sql": "SELECT contains(CAST(NULL AS array(bigint)), 1), contains(ARRAY[NULL, 1], 1), contains(ARRAY[1.5E0], 1.5E0), contains(CAST(ARRAY[] AS array(bigint)), 1)",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            null,
+            true,
+            true,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_position_null_edge",
+      "sql": "SELECT array_position(ARRAY[1, NULL], NULL), array_position(CAST(NULL AS array(bigint)), 1), array_position(ARRAY[5, 6, 5], 6), array_position(CAST(ARRAY[] AS array(bigint)), 1)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            2,
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_distinct_edge",
+      "sql": "SELECT array_distinct(CAST(ARRAY[] AS array(bigint))), array_distinct(CAST(NULL AS array(bigint))), array_distinct(ARRAY['b', 'a', 'b'])",
+      "trino": {
+        "types": [
+          "array(bigint)",
+          "array(bigint)",
+          "array(varchar(1))"
+        ],
+        "rows": [
+          [
+            [],
+            null,
+            [
+              "b",
+              "a"
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_sort_edge",
+      "sql": "SELECT array_sort(CAST(NULL AS array(bigint))), array_sort(ARRAY[NULL, NULL]), array_sort(ARRAY[2.5E0, -1E0, 0E0]), array_sort(ARRAY[DATE '2024-01-02', DATE '2024-01-01'])",
+      "trino": {
+        "types": [
+          "array(bigint)",
+          "array(unknown)",
+          "array(double)",
+          "array(date)"
+        ],
+        "rows": [
+          [
+            null,
+            [
+              null,
+              null
+            ],
+            [
+              -1.0,
+              0.0,
+              2.5
+            ],
+            [
+              "2024-01-01",
+              "2024-01-02"
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_max_min_null_edge",
+      "sql": "SELECT array_min(ARRAY[NULL, 1]), array_min(CAST(NULL AS array(bigint))), array_min(ARRAY[DATE '2024-01-01', DATE '2023-01-01']), array_max(ARRAY[CAST(NULL AS bigint)])",
+      "trino": {
+        "types": [
+          "integer",
+          "bigint",
+          "date",
+          "bigint"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            "2023-01-01",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_remove_null_edge",
+      "sql": "SELECT array_remove(CAST(NULL AS array(bigint)), 1), array_remove(ARRAY[1, 2], CAST(NULL AS bigint)), array_remove(ARRAY[1, 1], 1)",
+      "trino": {
+        "types": [
+          "array(bigint)",
+          "array(bigint)",
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            []
+          ]
+        ]
+      }
+    },
+    {
+      "name": "slice_null_edge",
+      "sql": "SELECT slice(CAST(NULL AS array(bigint)), 1, 1), slice(ARRAY[1, 2, 3], 1, 0), slice(ARRAY[1, 2, 3], -5, 2), slice(ARRAY[1, 2, 3], 3, 10)",
+      "trino": {
+        "types": [
+          "array(bigint)",
+          "array(integer)",
+          "array(integer)",
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            null,
+            [],
+            [],
+            [
+              3
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "slice_negative_length",
+      "sql": "SELECT slice(ARRAY[1], 1, -1)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "length must be greater than or equal to 0"
+      }
+    },
+    {
+      "name": "trim_array_edge",
+      "sql": "SELECT trim_array(CAST(NULL AS array(bigint)), 1), trim_array(ARRAY[1, 2], 2)",
+      "trino": {
+        "types": [
+          "array(bigint)",
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            null,
+            []
+          ]
+        ]
+      }
+    },
+    {
+      "name": "trim_array_too_many",
+      "sql": "SELECT trim_array(ARRAY[1], 2)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "size must not exceed array cardinality 1: 2"
+      }
+    },
+    {
+      "name": "sequence_edge",
+      "sql": "SELECT sequence(1, 1), sequence(-2, 2, 2), sequence(DATE '2024-01-31', DATE '2024-03-31', INTERVAL '1' MONTH), sequence(TIMESTAMP '2024-01-01 00:00:00', TIMESTAMP '2024-01-01 02:00:00', INTERVAL '1' HOUR)",
+      "trino": {
+        "types": [
+          "array(bigint)",
+          "array(bigint)",
+          "array(date)",
+          "array(timestamp(0))"
+        ],
+        "rows": [
+          [
+            [
+              1
+            ],
+            [
+              -2,
+              0,
+              2
+            ],
+            [
+              "2024-01-31",
+              "2024-02-29",
+              "2024-03-31"
+            ],
+            [
+              "2024-01-01 00:00:00",
+              "2024-01-01 01:00:00",
+              "2024-01-01 02:00:00"
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "sequence_null",
+      "sql": "SELECT sequence(CAST(NULL AS bigint), 5), sequence(1, 5, CAST(NULL AS bigint))",
+      "trino": {
+        "types": [
+          "array(bigint)",
+          "array(bigint)"
+        ],
+        "rows": [
+          [
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "set_fns_null_edge",
+      "sql": "SELECT array_union(ARRAY[1, NULL], ARRAY[NULL]), array_intersect(ARRAY[1, NULL], ARRAY[NULL]), array_except(ARRAY[1, NULL], ARRAY[1]), array_union(CAST(NULL AS array(bigint)), ARRAY[1])",
+      "trino": {
+        "types": [
+          "array(integer)",
+          "array(integer)",
+          "array(integer)",
+          "array(bigint)"
+        ],
+        "rows": [
+          [
+            [
+              1,
+              null
+            ],
+            [
+              null
+            ],
+            [
+              null
+            ],
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "set_fns_empty",
+      "sql": "SELECT array_intersect(ARRAY[1], ARRAY[2]), array_except(ARRAY[1], ARRAY[1]), array_union(CAST(ARRAY[] AS array(bigint)), CAST(ARRAY[] AS array(bigint)))",
+      "trino": {
+        "types": [
+          "array(integer)",
+          "array(integer)",
+          "array(bigint)"
+        ],
+        "rows": [
+          [
+            [],
+            [],
+            []
+          ]
+        ]
+      }
+    },
+    {
+      "name": "arrays_overlap_edge",
+      "sql": "SELECT arrays_overlap(CAST(NULL AS array(bigint)), ARRAY[1]), arrays_overlap(ARRAY[NULL], ARRAY[NULL]), arrays_overlap(CAST(ARRAY[] AS array(bigint)), ARRAY[1])",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_join_null_edge",
+      "sql": "SELECT array_join(CAST(NULL AS array(varchar)), ','), array_join(ARRAY['a'], CAST(NULL AS varchar)), array_join(CAST(ARRAY[] AS array(varchar)), ','), array_join(ARRAY[NULL, NULL], ','), array_join(ARRAY[DATE '2024-01-01'], ',')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            "",
+            "",
+            "2024-01-01"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "flatten_null_edge",
+      "sql": "SELECT flatten(ARRAY[ARRAY[1], NULL, ARRAY[NULL, 2]]), flatten(CAST(NULL AS array(array(bigint)))), flatten(CAST(ARRAY[] AS array(array(bigint))))",
+      "trino": {
+        "types": [
+          "array(integer)",
+          "array(bigint)",
+          "array(bigint)"
+        ],
+        "rows": [
+          [
+            [
+              1,
+              null,
+              2
+            ],
+            null,
+            []
+          ]
+        ]
+      }
+    },
+    {
+      "name": "reverse_array_null",
+      "sql": "SELECT reverse(CAST(NULL AS array(bigint))), reverse(CAST(ARRAY[] AS array(bigint)))",
+      "trino": {
+        "types": [
+          "array(bigint)",
+          "array(bigint)"
+        ],
+        "rows": [
+          [
+            null,
+            []
+          ]
+        ]
+      }
+    },
+    {
+      "name": "element_at_null_edge",
+      "sql": "SELECT element_at(CAST(NULL AS array(bigint)), 1), element_at(ARRAY[1, 2], CAST(NULL AS bigint)), element_at(ARRAY[1, 2], -3), element_at(MAP(ARRAY['a'], ARRAY[CAST(NULL AS bigint)]), 'a')",
+      "trino": {
+        "types": [
+          "bigint",
+          "integer",
+          "integer",
+          "bigint"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "subscript_null_edge",
+      "sql": "SELECT ARRAY[1, NULL][2], CAST(NULL AS array(bigint))[1], ARRAY['a', 'b'][1], MAP(ARRAY['a'], ARRAY[1])['a']",
+      "trino": {
+        "types": [
+          "integer",
+          "bigint",
+          "varchar(1)",
+          "integer"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            "a",
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "subscript_out_of_bounds",
+      "sql": "SELECT ARRAY[1, 2][3]",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Array subscript must be less than or equal to array length: 3 > 2"
+      }
+    },
+    {
+      "name": "subscript_zero",
+      "sql": "SELECT ARRAY[1, 2][0]",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "SQL array indices start at 1"
+      }
+    },
+    {
+      "name": "map_subscript_missing",
+      "sql": "SELECT MAP(ARRAY['a'], ARRAY[1])['z']",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Key not present in map: z"
+      }
+    },
+    {
+      "name": "concat_arrays_edge",
+      "sql": "SELECT concat(CAST(ARRAY[] AS array(bigint)), ARRAY[1]), ARRAY[1] || 2, 0 || ARRAY[1], ARRAY[CAST(NULL AS integer)] || ARRAY[1]",
+      "trino": {
+        "types": [
+          "array(bigint)",
+          "array(integer)",
+          "array(integer)",
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            [
+              1
+            ],
+            [
+              1,
+              2
+            ],
+            [
+              0,
+              1
+            ],
+            [
+              null,
+              1
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "map_null_edge",
+      "sql": "SELECT map_keys(CAST(NULL AS map(varchar, bigint))), map_values(MAP(ARRAY['a'], ARRAY[CAST(NULL AS bigint)])), map_keys(MAP(CAST(ARRAY[] AS array(varchar)), CAST(ARRAY[] AS array(bigint))))",
+      "trino": {
+        "types": [
+          "array(varchar)",
+          "array(bigint)",
+          "array(varchar)"
+        ],
+        "rows": [
+          [
+            null,
+            [
+              null
+            ],
+            []
+          ]
+        ]
+      }
+    },
+    {
+      "name": "map_constructor",
+      "sql": "SELECT MAP(ARRAY['a', 'b'], ARRAY[1, 2]), MAP(ARRAY[1], ARRAY[CAST(NULL AS varchar)]), cardinality(MAP(ARRAY['x'], ARRAY[1]))",
+      "trino": {
+        "types": [
+          "map(varchar(1), integer)",
+          "map(integer, varchar)",
+          "bigint"
+        ],
+        "rows": [
+          [
+            {
+              "a": 1,
+              "b": 2
+            },
+            {
+              "1": null
+            },
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "map_constructor_duplicate",
+      "sql": "SELECT MAP(ARRAY['a', 'a'], ARRAY[1, 2])",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Duplicate map keys (a) are not allowed"
+      }
+    },
+    {
+      "name": "map_constructor_mismatch",
+      "sql": "SELECT MAP(ARRAY['a'], ARRAY[1, 2])",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Key and value arrays must be the same length"
+      }
+    },
+    {
+      "name": "map_constructor_null_key",
+      "sql": "SELECT MAP(ARRAY[CAST(NULL AS varchar)], ARRAY[1])",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "map key cannot be null"
+      }
+    },
+    {
+      "name": "map_entries_fn",
+      "sql": "SELECT map_entries(MAP(ARRAY['a', 'b'], ARRAY[1, 2])), map_entries(CAST(NULL AS map(varchar, bigint)))",
+      "trino": {
+        "types": [
+          "array(row(varchar(1), integer))",
+          "array(row(varchar, bigint))"
+        ],
+        "rows": [
+          [
+            [
+              [
+                "a",
+                1
+              ],
+              [
+                "b",
+                2
+              ]
+            ],
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "map_from_entries_fn",
+      "sql": "SELECT map_from_entries(ARRAY[ROW('a', 1), ROW('b', 2)]), map_from_entries(CAST(NULL AS array(row(varchar, bigint))))",
+      "trino": {
+        "types": [
+          "map(varchar(1), integer)",
+          "map(varchar, bigint)"
+        ],
+        "rows": [
+          [
+            {
+              "a": 1,
+              "b": 2
+            },
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "map_from_entries_duplicate",
+      "sql": "SELECT map_from_entries(ARRAY[ROW('a', 1), ROW('a', 2)])",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Duplicate map keys (a) are not allowed"
+      }
+    },
+    {
+      "name": "map_concat_fn",
+      "sql": "SELECT map_concat(MAP(ARRAY['a', 'b'], ARRAY[1, 2]), MAP(ARRAY['b', 'c'], ARRAY[3, 4])), map_concat(MAP(ARRAY['a'], ARRAY[1]), CAST(NULL AS map(varchar, integer)))",
+      "trino": {
+        "types": [
+          "map(varchar(1), integer)",
+          "map(varchar, integer)"
+        ],
+        "rows": [
+          [
+            {
+              "a": 1,
+              "b": 3,
+              "c": 4
+            },
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "contains_sequence_fn",
+      "sql": "SELECT contains_sequence(ARRAY[1, 2, 3], ARRAY[2, 3]), contains_sequence(ARRAY[1, 2, 3], ARRAY[3, 2]), contains_sequence(ARRAY[1, NULL, 3], ARRAY[NULL, 3]), contains_sequence(ARRAY[1], CAST(ARRAY[] AS array(integer)))",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            false,
+            true,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "ngrams_fn",
+      "sql": "SELECT ngrams(ARRAY['a', 'b', 'c'], 2), ngrams(ARRAY[1, 2], 5), ngrams(CAST(NULL AS array(bigint)), 2)",
+      "trino": {
+        "types": [
+          "array(array(varchar(1)))",
+          "array(array(integer))",
+          "array(array(bigint))"
+        ],
+        "rows": [
+          [
+            [
+              [
+                "a",
+                "b"
+              ],
+              [
+                "b",
+                "c"
+              ]
+            ],
+            [
+              [
+                1,
+                2
+              ]
+            ],
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "ngrams_bad",
+      "sql": "SELECT ngrams(ARRAY[1], 0)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "N must be positive"
+      }
+    },
+    {
+      "name": "combinations_fn",
+      "sql": "SELECT combinations(ARRAY['a', 'b', 'c'], 2), combinations(ARRAY[1, 2], 0), combinations(ARRAY[1, 2], 3)",
+      "trino": {
+        "types": [
+          "array(array(varchar(1)))",
+          "array(array(integer))",
+          "array(array(integer))"
+        ],
+        "rows": [
+          [
+            [
+              [
+                "a",
+                "b"
+              ],
+              [
+                "a",
+                "c"
+              ],
+              [
+                "b",
+                "c"
+              ]
+            ],
+            [
+              []
+            ],
+            []
+          ]
+        ]
+      }
+    },
+    {
+      "name": "zip_fn",
+      "sql": "SELECT zip(ARRAY[1, 2], ARRAY['a', 'b', 'c']), zip(ARRAY[1], CAST(NULL AS array(varchar)))",
+      "trino": {
+        "types": [
+          "array(row(integer, varchar(1)))",
+          "array(row(integer, varchar))"
+        ],
+        "rows": [
+          [
+            [
+              [
+                1,
+                "a"
+              ],
+              [
+                2,
+                "b"
+              ],
+              [
+                null,
+                "c"
+              ]
+            ],
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "unnest_table",
+      "sql": "SELECT x FROM UNNEST(ARRAY[3, 1, 2]) AS t(x) ORDER BY x",
+      "trino": {
+        "types": [
+          "integer"
+        ],
+        "rows": [
+          [
+            1
+          ],
+          [
+            2
+          ],
+          [
+            3
+          ]
+        ]
+      }
+    },
+    {
+      "name": "unnest_ordinality",
+      "sql": "SELECT x, n FROM UNNEST(ARRAY['a', 'b']) WITH ORDINALITY AS t(x, n) ORDER BY n",
+      "trino": {
+        "types": [
+          "varchar(1)",
+          "bigint"
+        ],
+        "rows": [
+          [
+            "a",
+            1
+          ],
+          [
+            "b",
+            2
+          ]
+        ]
+      },
+      "unsupported": "UNNEST … WITH ORDINALITY: not implemented by DataFusion 53's planner"
+    },
+    {
+      "name": "array_constructor_types",
+      "sql": "SELECT ARRAY[1, 2.5E0], ARRAY[CAST(NULL AS varchar)], typeof(ARRAY[1, CAST(2 AS bigint)])",
+      "trino": {
+        "types": [
+          "array(double)",
+          "array(varchar)",
+          "varchar"
+        ],
+        "rows": [
+          [
+            [
+              1.0,
+              2.5
+            ],
+            [
+              null
+            ],
+            "array(bigint)"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "contains_more",
+      "sql": "SELECT contains(ARRAY[DATE '2024-01-01'], DATE '2024-01-01'), contains(ARRAY[ARRAY[1]], ARRAY[1]), contains(ARRAY['a'], CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            true,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_position_more",
+      "sql": "SELECT array_position(ARRAY[1.5E0, 2E0], 2E0), array_position(ARRAY['b', 'a', 'a'], 'a'), array_position(ARRAY[CAST(NULL AS bigint)], 1)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            2,
+            2,
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_distinct_more",
+      "sql": "SELECT array_distinct(ARRAY[1.0E0, 1E0, nan(), nan()]), array_distinct(ARRAY[ARRAY[1], ARRAY[1], ARRAY[2]]), array_distinct(ARRAY[NULL, NULL])",
+      "trino": {
+        "types": [
+          "array(double)",
+          "array(array(integer))",
+          "array(unknown)"
+        ],
+        "rows": [
+          [
+            [
+              1.0,
+              "NaN"
+            ],
+            [
+              [
+                1
+              ],
+              [
+                2
+              ]
+            ],
+            [
+              null
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_max_min_more",
+      "sql": "SELECT array_max(ARRAY['b', 'ab']), array_min(ARRAY[CAST(NULL AS varchar), 'a']), array_max(ARRAY[TIMESTAMP '2024-01-01 00:00:00', TIMESTAMP '2023-01-01 00:00:00'])",
+      "trino": {
+        "types": [
+          "varchar(2)",
+          "varchar",
+          "timestamp(0)"
+        ],
+        "rows": [
+          [
+            "b",
+            null,
+            "2024-01-01 00:00:00"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_remove_more",
+      "sql": "SELECT array_remove(ARRAY['a', 'b', 'a'], 'a'), array_remove(CAST(ARRAY[] AS array(varchar)), 'a'), array_remove(ARRAY[1.5E0, 2E0], 1.5E0)",
+      "trino": {
+        "types": [
+          "array(varchar(1))",
+          "array(varchar)",
+          "array(double)"
+        ],
+        "rows": [
+          [
+            [
+              "b"
+            ],
+            [],
+            [
+              2.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "arrays_overlap_more",
+      "sql": "SELECT arrays_overlap(ARRAY['a', 'b'], ARRAY['b']), arrays_overlap(ARRAY[1, NULL], ARRAY[NULL, 1]), arrays_overlap(ARRAY[1], ARRAY[2, NULL])",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            true,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "flatten_more",
+      "sql": "SELECT flatten(ARRAY[ARRAY['a'], ARRAY['b', 'c']]), flatten(ARRAY[CAST(NULL AS array(bigint))]), cardinality(flatten(ARRAY[ARRAY[1, 2], ARRAY[3]]))",
+      "trino": {
+        "types": [
+          "array(varchar(1))",
+          "array(bigint)",
+          "bigint"
+        ],
+        "rows": [
+          [
+            [
+              "a",
+              "b",
+              "c"
+            ],
+            [],
+            3
+          ]
+        ]
+      }
+    },
+    {
+      "name": "repeat_more",
+      "sql": "SELECT repeat(CAST(NULL AS varchar), 0), repeat('ab', 2), repeat(ARRAY[1], 2)",
+      "trino": {
+        "types": [
+          "array(varchar)",
+          "array(varchar(2))",
+          "array(array(integer))"
+        ],
+        "rows": [
+          [
+            [],
+            [
+              "ab",
+              "ab"
+            ],
+            [
+              [
+                1
+              ],
+              [
+                1
+              ]
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "map_keys_values_more",
+      "sql": "SELECT map_keys(MAP(ARRAY[2, 1], ARRAY['b', 'a'])), map_values(MAP(ARRAY[2, 1], ARRAY['b', 'a'])), map_values(CAST(NULL AS map(varchar, bigint)))",
+      "trino": {
+        "types": [
+          "array(integer)",
+          "array(varchar(1))",
+          "array(bigint)"
+        ],
+        "rows": [
+          [
+            [
+              2,
+              1
+            ],
+            [
+              "b",
+              "a"
+            ],
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "map_entries_more",
+      "sql": "SELECT map_entries(MAP(CAST(ARRAY[] AS array(varchar)), CAST(ARRAY[] AS array(bigint)))), cardinality(map_entries(MAP(ARRAY[1, 2], ARRAY[3, 4])))",
+      "trino": {
+        "types": [
+          "array(row(varchar, bigint))",
+          "bigint"
+        ],
+        "rows": [
+          [
+            [],
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "map_entries_null_values",
+      "sql": "SELECT map_entries(MAP(ARRAY['k'], ARRAY[CAST(NULL AS bigint)]))",
+      "trino": {
+        "types": [
+          "array(row(varchar(1), bigint))"
+        ],
+        "rows": [
+          [
+            [
+              [
+                "k",
+                null
+              ]
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "map_from_entries_more",
+      "sql": "SELECT map_from_entries(CAST(ARRAY[] AS array(row(varchar, bigint)))), map_from_entries(ARRAY[ROW(1, CAST(NULL AS varchar))])",
+      "trino": {
+        "types": [
+          "map(varchar, bigint)",
+          "map(integer, varchar)"
+        ],
+        "rows": [
+          [
+            {},
+            {
+              "1": null
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "name": "map_concat_more",
+      "sql": "SELECT map_concat(MAP(ARRAY['a'], ARRAY[1]), MAP(CAST(ARRAY[] AS array(varchar)), CAST(ARRAY[] AS array(integer)))), map_concat(MAP(ARRAY['a'], ARRAY[1]), MAP(ARRAY['a'], ARRAY[2]), MAP(ARRAY['a'], ARRAY[3]))",
+      "trino": {
+        "types": [
+          "map(varchar, integer)",
+          "map(varchar(1), integer)"
+        ],
+        "rows": [
+          [
+            {
+              "a": 1
+            },
+            {
+              "a": 3
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "name": "map_concat_null_value",
+      "sql": "SELECT map_concat(MAP(ARRAY['a'], ARRAY[1]), MAP(ARRAY['a'], ARRAY[CAST(NULL AS integer)]))",
+      "trino": {
+        "types": [
+          "map(varchar(1), integer)"
+        ],
+        "rows": [
+          [
+            {
+              "a": null
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "name": "contains_sequence_more",
+      "sql": "SELECT contains_sequence(CAST(NULL AS array(bigint)), ARRAY[1]), contains_sequence(ARRAY[1, 2, 1, 2], ARRAY[1, 2, 1]), contains_sequence(ARRAY['a'], ARRAY['a', 'b'])",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            null,
+            true,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "name": "contains_sequence_nulls",
+      "sql": "SELECT contains_sequence(ARRAY[1, 2], ARRAY[CAST(NULL AS integer)]), contains_sequence(ARRAY[CAST(NULL AS integer)], ARRAY[CAST(NULL AS integer)])",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            false,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "ngrams_more",
+      "sql": "SELECT ngrams(ARRAY['a'], 1), ngrams(CAST(ARRAY[] AS array(varchar)), 2), ngrams(ARRAY[1, NULL, 3], 2)",
+      "trino": {
+        "types": [
+          "array(array(varchar(1)))",
+          "array(array(varchar))",
+          "array(array(integer))"
+        ],
+        "rows": [
+          [
+            [
+              [
+                "a"
+              ]
+            ],
+            [
+              []
+            ],
+            [
+              [
+                1,
+                null
+              ],
+              [
+                null,
+                3
+              ]
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "combinations_more",
+      "sql": "SELECT combinations(CAST(NULL AS array(bigint)), 2), combinations(ARRAY[1, 2, 3, 4], 3), combinations(ARRAY['a', 'a'], 2)",
+      "trino": {
+        "types": [
+          "array(array(bigint))",
+          "array(array(integer))",
+          "array(array(varchar(1)))"
+        ],
+        "rows": [
+          [
+            null,
+            [
+              [
+                1,
+                2,
+                3
+              ],
+              [
+                1,
+                2,
+                4
+              ],
+              [
+                1,
+                3,
+                4
+              ],
+              [
+                2,
+                3,
+                4
+              ]
+            ],
+            [
+              [
+                "a",
+                "a"
+              ]
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "combinations_bad",
+      "sql": "SELECT combinations(ARRAY[1], 6)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "combination size must not exceed 5: 6"
+      }
+    },
+    {
+      "name": "zip_more",
+      "sql": "SELECT zip(ARRAY[1, 2], ARRAY[3, 4], ARRAY['a', 'b']), zip(CAST(ARRAY[] AS array(bigint)), ARRAY[1])",
+      "trino": {
+        "types": [
+          "array(row(integer, integer, varchar(1)))",
+          "array(row(bigint, integer))"
+        ],
+        "rows": [
+          [
+            [
+              [
+                1,
+                3,
+                "a"
+              ],
+              [
+                2,
+                4,
+                "b"
+              ]
+            ],
+            [
+              [
+                null,
+                1
+              ]
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "zip_nulls",
+      "sql": "SELECT zip(ARRAY[NULL, 1], ARRAY['x'])",
+      "trino": {
+        "types": [
+          "array(row(integer, varchar(1)))"
+        ],
+        "rows": [
+          [
+            [
+              [
+                null,
+                "x"
+              ],
+              [
+                1,
+                null
+              ]
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}

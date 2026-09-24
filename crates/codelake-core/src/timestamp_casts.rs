@@ -410,34 +410,6 @@ fn spelled_cast(expr: &Expr, schema: &DFSchema) -> Result<Option<(Expr, DataType
     })
 }
 
-/// `x AT TIME ZONE '<zone>'`, which `DataFusion` plans as a cast to a
-/// nanosecond timestamp in that zone: Trino keeps the precision of `x`, and
-/// reads an `x` without time zone in the session zone first.
-pub(crate) fn at_time_zone(expr: Expr, schema: &DFSchema, session_zone: &str) -> Result<Transformed<Expr>> {
-    let Expr::Cast(Cast {
-        expr: arg,
-        data_type: DataType::Timestamp(TimeUnit::Nanosecond, Some(zone)),
-    }) = &expr
-    else {
-        return Ok(Transformed::no(expr));
-    };
-    let DataType::Timestamp(unit, source_zone) = arg.get_type(schema)? else {
-        return Ok(Transformed::no(expr));
-    };
-    if source_zone.is_some() && unit == TimeUnit::Nanosecond {
-        return Ok(Transformed::no(expr));
-    }
-    let arg = match source_zone {
-        Some(_) => arg.as_ref().clone(),
-        None => Expr::Cast(Cast::new(
-            arg.clone(),
-            DataType::Timestamp(unit, Some(session_zone.into())),
-        )),
-    };
-    let target = DataType::Timestamp(unit, Some(Arc::clone(zone)));
-    Ok(Transformed::yes(Expr::Cast(Cast::new(Box::new(arg), target))))
-}
-
 /// A timestamp cast → [`TimestampCast`] (see the module documentation).
 pub(crate) fn check_cast(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
     let Some((arg, target, safe)) = spelled_cast(&expr, schema)? else {

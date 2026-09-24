@@ -127,13 +127,17 @@ fn result_type(declared: Option<Declared>, input: &DataType) -> Result<DataType>
 
 fn too_long(mode: Mode, text: &str, declared: Declared) -> ArrowError {
     let target = declared.name(&DataType::Utf8);
-    ArrowError::CastError(match mode {
-        Mode::Insert => format!(
-            "Cannot truncate non-space characters when casting from varchar({}) to {target} on INSERT",
+    match mode {
+        // Named like the function library's errors (`<errorName>: …`), so
+        // every layer reports it the same way, whichever catalog the table
+        // is in.
+        Mode::Insert => ArrowError::InvalidArgumentError(format!(
+            "INVALID_CAST_ARGUMENT: Cannot truncate non-space characters when casting from varchar({}) to \
+             {target} on INSERT",
             text.chars().count()
-        ),
-        _ => format!("Value {text} cannot be represented as {target}"),
-    })
+        )),
+        _ => ArrowError::CastError(format!("Value {text} cannot be represented as {target}")),
+    }
 }
 
 /// A text as a `varchar(n)` / `char(n)` value (`char` without its padding).

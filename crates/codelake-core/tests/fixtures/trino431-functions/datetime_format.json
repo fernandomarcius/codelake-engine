@@ -1,0 +1,387 @@
+{
+  "category": "datetime_format",
+  "cases": [
+    {
+      "name": "date_format_csf",
+      "sql": "SELECT date_format(TIMESTAMP '2024-02-09 14:05:06.789', '%Y-%m-%d %H:%i:%s'), date_format(TIMESTAMP '2024-02-09 14:05:06.789', '%Y%m%d'), CONCAT_WS('_', CAST(7 AS varchar), date_format(DATE '2024-02-09', '%Y%m%d'))",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "2024-02-09 14:05:06",
+            "20240209",
+            "7_20240209"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_format_all",
+      "sql": "SELECT date_format(TIMESTAMP '2024-02-09 14:05:06.789', '%a %b %c %d %e %f %H %h %I %i %j %k %l %M %m %p %r %S %s %T %v %W %x %Y %y %% %q')",
+      "trino": {
+        "types": [
+          "varchar"
+        ],
+        "rows": [
+          [
+            "Fri Feb 2 09 9 789000 14 02 02 05 040 14 2 February 02 PM 02:05:06 PM 06 06 14:05:06 06 Friday 2024 2024 24 % q"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_format_midnight",
+      "sql": "SELECT date_format(TIMESTAMP '2024-01-01 00:00:00.000', '%h %I %l %p %k %H'), date_format(TIMESTAMP '2024-01-01 12:00:00.000', '%h %p')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "12 12 12 AM 0 00",
+            "12 PM"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_format_tz",
+      "sql": "SELECT date_format(TIMESTAMP '2024-02-09 01:00:00.000 America/Sao_Paulo', '%Y-%m-%d %H:%i'), date_format(TIMESTAMP '2024-02-09 01:00:00.000 UTC', '%Y-%m-%d %H:%i')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "2024-02-09 01:00",
+            "2024-02-09 01:00"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_format_micros",
+      "sql": "SELECT date_format(TIMESTAMP '2024-02-09 14:05:06.123456', '%f'), date_format(CAST(NULL AS timestamp(3)), '%Y')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "123000",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_format_unsupported",
+      "sql": "SELECT date_format(TIMESTAMP '2024-02-09 14:05:06.789', '%D')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "%D not supported in date format string"
+      }
+    },
+    {
+      "name": "date_format_year_week",
+      "sql": "SELECT date_format(TIMESTAMP '2021-01-01 00:00:00.000', '%x-%v'), date_format(TIMESTAMP '0099-01-01 00:00:00.000', '%Y %y')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "2020-53",
+            "0099 99"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "format_datetime_csf",
+      "sql": "SELECT COALESCE(format_datetime(TIMESTAMP '2024-02-09 14:05:06.789', 'yyyy/MM/dd'), ''), format_datetime(CAST(NULL AS timestamp(3)), 'yyyy')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "2024/02/09",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "format_datetime_all",
+      "sql": "SELECT format_datetime(TIMESTAMP '2024-02-09 14:05:06.789', 'yyyy/MM/dd HH:mm:ss.SSS EEE EEEE MMM MMMM a hh K k D w xxxx e G C y yy yyy YYYY')",
+      "trino": {
+        "types": [
+          "varchar"
+        ],
+        "rows": [
+          [
+            "2024/02/09 14:05:06.789 Fri Friday Feb February PM 02 2 14 40 6 2024 5 AD 20 2024 24 2024 2024"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "format_datetime_literals",
+      "sql": "SELECT format_datetime(TIMESTAMP '2024-02-09 14:05:06.789', '''at'' HH '''' mm')",
+      "trino": {
+        "types": [
+          "varchar"
+        ],
+        "rows": [
+          [
+            "at 14 ' 05"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "format_datetime_zone",
+      "sql": "SELECT format_datetime(TIMESTAMP '2024-02-09 14:05:06.789 America/Sao_Paulo', 'yyyy-MM-dd HH:mm Z ZZ ZZZ'), format_datetime(TIMESTAMP '2024-02-09 14:05:06.789 UTC', 'HH:mm ZZ ZZZ'), format_datetime(TIMESTAMP '2024-02-09 14:05:06.789 +05:30', 'HH:mm Z ZZZ')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "2024-02-09 14:05 -0300 -03:00 America/Sao_Paulo",
+            "14:05 +00:00 UTC",
+            "14:05 +0530 +05:30"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "format_datetime_zone_on_timestamp",
+      "sql": "SELECT format_datetime(TIMESTAMP '2024-02-09 14:05:06.789', 'HH:mm Z')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "format_datetime for TIMESTAMP type, cannot use 'Z' nor 'z' in format, as this type does not contain TZ information"
+      }
+    },
+    {
+      "name": "format_datetime_bad_letter",
+      "sql": "SELECT format_datetime(TIMESTAMP '2024-02-09 14:05:06.789', 'yyyy q')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Illegal pattern component: q"
+      }
+    },
+    {
+      "name": "format_datetime_fraction",
+      "sql": "SELECT format_datetime(TIMESTAMP '2024-02-09 14:05:06.789', 'S SS SSSS SSSSSS'), format_datetime(TIMESTAMP '2024-02-09 14:05:06.123456', 'SSSSSS')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "7 78 7890 789000",
+            "123000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_parse_basic",
+      "sql": "SELECT date_parse('2024-02-29 23:59:58', '%Y-%m-%d %H:%i:%s'), date_parse('20240229', '%Y%m%d'), date_parse('29/02/24', '%d/%m/%y'), date_parse('2024-02-29 01:02:03.4567', '%Y-%m-%d %H:%i:%s.%f')",
+      "trino": {
+        "types": [
+          "timestamp(3)",
+          "timestamp(3)",
+          "timestamp(3)",
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2024-02-29 23:59:58.000",
+            "2024-02-29 00:00:00.000",
+            "2024-02-29 00:00:00.000",
+            "2024-02-29 01:02:03.456"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_parse_text",
+      "sql": "SELECT date_parse('Feb 29 2024 01:30 PM', '%b %d %Y %h:%i %p'), date_parse('February 5 2024', '%M %e %Y'), date_parse('12:30 AM', '%h:%i %p')",
+      "trino": {
+        "types": [
+          "timestamp(3)",
+          "timestamp(3)",
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2024-02-29 13:30:00.000",
+            "2024-02-05 00:00:00.000",
+            "1970-01-01 00:30:00.000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_parse_invalid_date",
+      "sql": "SELECT date_parse('2024-02-30', '%Y-%m-%d')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Invalid date 'FEBRUARY 30'"
+      }
+    },
+    {
+      "name": "date_parse_trailing",
+      "sql": "SELECT date_parse('2024-02-29 xx', '%Y-%m-%d')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Invalid format: \"2024-02-29 xx\" is malformed at \" xx\""
+      }
+    },
+    {
+      "name": "date_parse_null",
+      "sql": "SELECT date_parse(CAST(NULL AS varchar), '%Y'), date_parse('2024', CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "timestamp(3)",
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "parse_datetime_basic",
+      "sql": "SELECT parse_datetime('2024/02/29 10:11:12', 'yyyy/MM/dd HH:mm:ss'), parse_datetime('20240229', 'yyyyMMdd')",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-02-29 10:11:12.000 UTC",
+            "2024-02-29 00:00:00.000 UTC"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "parse_datetime_edge",
+      "sql": "SELECT parse_datetime('2024-02-29 10:11:12.345 America/Sao_Paulo', 'yyyy-MM-dd HH:mm:ss.SSS ZZZ'), parse_datetime(CAST(NULL AS varchar), 'yyyy'), parse_datetime('2024-2-9', 'yyyy-M-d')",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-02-29 10:11:12.345 America/Sao_Paulo",
+            null,
+            "2024-02-09 00:00:00.000 UTC"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "parse_datetime_invalid",
+      "sql": "SELECT parse_datetime('2024-13-01', 'yyyy-MM-dd')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Cannot parse \"2024-13-01\": Value 13 for monthOfYear must be in the range [1,12]"
+      }
+    },
+    {
+      "name": "date_format_null_edge",
+      "sql": "SELECT date_format(TIMESTAMP '2024-02-09 14:05:06.789', CAST(NULL AS varchar)), date_format(TIMESTAMP '2024-02-09 14:05:06.789', 'literal %% text'), date_format(TIMESTAMP '1969-12-31 23:59:59.999', '%Y-%m-%d %T.%f')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            null,
+            "literal % text",
+            "1969-12-31 23:59:59.999000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "format_datetime_null_edge",
+      "sql": "SELECT format_datetime(TIMESTAMP '1969-12-31 23:59:59.999', 'yyyy-MM-dd HH:mm:ss.SSS'), format_datetime(TIMESTAMP '2024-12-30 00:00:00.000', 'xxxx-ww e'), format_datetime(CAST(NULL AS timestamp(3)), 'yyyy')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "1969-12-31 23:59:59.999",
+            "2025-01 1",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_parse_edge",
+      "sql": "SELECT date_parse('2024-02-29 13', '%Y-%m-%d %H'), date_parse('1 2 2024', '%e %c %Y'), date_parse('00:00:00', '%T'), date_parse('2024-366', '%Y-%j')",
+      "trino": {
+        "types": [
+          "timestamp(3)",
+          "timestamp(3)",
+          "timestamp(3)",
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2024-02-29 13:00:00.000",
+            "2024-02-01 00:00:00.000",
+            "1970-01-01 00:00:00.000",
+            "2024-12-31 00:00:00.000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_format_empty",
+      "sql": "SELECT date_format(TIMESTAMP '2024-02-09 14:05:06.789', '')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Both printing and parsing not supported"
+      }
+    },
+    {
+      "name": "format_datetime_empty",
+      "sql": "SELECT format_datetime(TIMESTAMP '2024-02-09 14:05:06.789', '')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Invalid pattern specification"
+      }
+    }
+  ]
+}

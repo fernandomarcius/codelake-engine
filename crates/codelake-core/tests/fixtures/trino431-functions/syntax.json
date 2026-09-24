@@ -1,0 +1,566 @@
+{
+  "category": "syntax",
+  "cases": [
+    {
+      "name": "varbinary_literal_max_csf",
+      "sql": "SELECT COALESCE(MAX(x), X'00') FROM (VALUES X'0001', X'00FF', X'0100') t(x)",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "AQA="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "varbinary_literal_empty_max",
+      "sql": "SELECT COALESCE(MAX(x), X'00') FROM (VALUES X'01') t(x) WHERE false",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "AA=="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "varbinary_compare",
+      "sql": "SELECT X'0001' < X'0002', X'00' < X'0000', X'FF' > X'00FF'",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            true,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "interval_arithmetic",
+      "sql": "SELECT TIMESTAMP '2024-01-31 10:00:00.000' + INTERVAL '1' DAY, DATE '2024-01-31' + INTERVAL '2' DAY, TIMESTAMP '2024-01-01 00:00:00.000' - INTERVAL '90' MINUTE",
+      "trino": {
+        "types": [
+          "timestamp(3)",
+          "date",
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2024-02-01 10:00:00.000",
+            "2024-02-02",
+            "2023-12-31 22:30:00.000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "at_time_zone_expression",
+      "sql": "SELECT CAST(ts AT TIME ZONE 'UTC' AS timestamp(3)) FROM (VALUES with_timezone(TIMESTAMP '2024-06-01 09:00:00.000', 'America/Sao_Paulo')) t(ts)",
+      "trino": {
+        "types": [
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2024-06-01 12:00:00.000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "try_cast_syntax",
+      "sql": "SELECT TRY_CAST('2024-01-01' AS date), TRY_CAST('nope' AS date), TRY_CAST('1.5' AS double)",
+      "trino": {
+        "types": [
+          "date",
+          "date",
+          "double"
+        ],
+        "rows": [
+          [
+            "2024-01-01",
+            null,
+            1.5
+          ]
+        ]
+      }
+    },
+    {
+      "name": "localtimestamp_minus_interval",
+      "sql": "SELECT typeof(date_add('minute', -30, localtimestamp)), date_add('day', -14, localtimestamp) < localtimestamp",
+      "trino": {
+        "types": [
+          "varchar",
+          "boolean"
+        ],
+        "rows": [
+          [
+            "timestamp(3)",
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "decimal_literal_arith",
+      "sql": "SELECT DECIMAL '1.50' + DECIMAL '2.25', DECIMAL '10.00' * 2",
+      "trino": {
+        "types": [
+          "decimal(4, 2)",
+          "decimal(14, 2)"
+        ],
+        "rows": [
+          [
+            "3.75",
+            "20.00"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "case_when_between",
+      "sql": "SELECT CASE WHEN x BETWEEN 1 AND 2 THEN 'low' ELSE 'high' END FROM (VALUES 1, 3) t(x) ORDER BY x",
+      "trino": {
+        "types": [
+          "varchar(4)"
+        ],
+        "rows": [
+          [
+            "low"
+          ],
+          [
+            "high"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "row_number_window_csf",
+      "sql": "SELECT k, v FROM (SELECT k, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v DESC) AS rn FROM (VALUES (1, 10), (1, 20), (2, 5)) t(k, v)) WHERE rn = 1 ORDER BY k",
+      "trino": {
+        "types": [
+          "integer",
+          "integer"
+        ],
+        "rows": [
+          [
+            1,
+            20
+          ],
+          [
+            2,
+            5
+          ]
+        ]
+      }
+    },
+    {
+      "name": "values_table",
+      "sql": "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name) ORDER BY id",
+      "trino": {
+        "types": [
+          "integer",
+          "varchar(1)"
+        ],
+        "rows": [
+          [
+            1,
+            "a"
+          ],
+          [
+            2,
+            "b"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "full_outer_join",
+      "sql": "SELECT COALESCE(a.k, b.k), a.v, b.v FROM (VALUES (1, 'x'), (2, 'y')) a(k, v) FULL OUTER JOIN (VALUES (2, 'z'), (3, 'w')) b(k, v) ON a.k = b.k ORDER BY 1",
+      "trino": {
+        "types": [
+          "integer",
+          "varchar(1)",
+          "varchar(1)"
+        ],
+        "rows": [
+          [
+            1,
+            "x",
+            null
+          ],
+          [
+            2,
+            "y",
+            "z"
+          ],
+          [
+            3,
+            null,
+            "w"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "lambda_transform",
+      "sql": "SELECT transform(ARRAY[1, 2], v -> v * 10)",
+      "trino": {
+        "types": [
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            [
+              10,
+              20
+            ]
+          ]
+        ]
+      },
+      "unsupported": "lambda expressions: DataFusion 53 has no lambda in its logical plan (see docs/trino-functions.md)"
+    },
+    {
+      "name": "lambda_filter",
+      "sql": "SELECT filter(ARRAY[1, 2, 3], v -> v > 1)",
+      "trino": {
+        "types": [
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            [
+              2,
+              3
+            ]
+          ]
+        ]
+      },
+      "unsupported": "lambda expressions: DataFusion 53 has no lambda in its logical plan (see docs/trino-functions.md)"
+    },
+    {
+      "name": "lambda_reduce",
+      "sql": "SELECT reduce(ARRAY[1, 2, 3], 0, (s, v) -> s + v, s -> s)",
+      "trino": {
+        "types": [
+          "integer"
+        ],
+        "rows": [
+          [
+            6
+          ]
+        ]
+      },
+      "unsupported": "lambda expressions: DataFusion 53 has no lambda in its logical plan (see docs/trino-functions.md)"
+    },
+    {
+      "name": "lambda_matches",
+      "sql": "SELECT any_match(ARRAY[1, 2], v -> v > 1), all_match(ARRAY[1, 2], v -> v > 1), none_match(ARRAY[1, 2], v -> v > 5)",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            false,
+            true
+          ]
+        ]
+      },
+      "unsupported": "lambda expressions: DataFusion 53 has no lambda in its logical plan (see docs/trino-functions.md)"
+    },
+    {
+      "name": "lambda_array_sort_comparator",
+      "sql": "SELECT array_sort(ARRAY[3, 1, 2], (p, q) -> IF(p < q, 1, IF(p = q, 0, -1)))",
+      "trino": {
+        "types": [
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            [
+              3,
+              2,
+              1
+            ]
+          ]
+        ]
+      },
+      "unsupported": "lambda expressions: DataFusion 53 has no lambda in its logical plan (see docs/trino-functions.md)"
+    },
+    {
+      "name": "lambda_map_filter",
+      "sql": "SELECT map_filter(MAP(ARRAY['a', 'b'], ARRAY[1, 2]), (k, v) -> v > 1), transform_values(MAP(ARRAY['a'], ARRAY[1]), (k, v) -> v + 1), transform_keys(MAP(ARRAY['a'], ARRAY[1]), (k, v) -> upper(k))",
+      "trino": {
+        "types": [
+          "map(varchar(1), integer)",
+          "map(varchar(1), integer)",
+          "map(varchar(1), integer)"
+        ],
+        "rows": [
+          [
+            {
+              "b": 2
+            },
+            {
+              "a": 2
+            },
+            {
+              "A": 1
+            }
+          ]
+        ]
+      },
+      "unsupported": "lambda expressions: DataFusion 53 has no lambda in its logical plan (see docs/trino-functions.md)"
+    },
+    {
+      "name": "lambda_zip_with",
+      "sql": "SELECT zip_with(ARRAY[1, 2], ARRAY[10, 20], (p, q) -> p + q)",
+      "trino": {
+        "types": [
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            [
+              11,
+              22
+            ]
+          ]
+        ]
+      },
+      "unsupported": "lambda expressions: DataFusion 53 has no lambda in its logical plan (see docs/trino-functions.md)"
+    },
+    {
+      "name": "interval_year_month_literal",
+      "sql": "SELECT DATE '2024-01-31' + INTERVAL '1-1' YEAR TO MONTH, TIMESTAMP '2024-01-01 00:00:00.000' + INTERVAL '1 02:03:04' DAY TO SECOND",
+      "trino": {
+        "types": [
+          "date",
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2025-02-28",
+            "2024-01-02 02:03:04.000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "interval_negative",
+      "sql": "SELECT DATE '2024-03-01' + INTERVAL '-1' DAY, TIMESTAMP '2024-03-01 00:00:00.000' - INTERVAL '1' SECOND",
+      "trino": {
+        "types": [
+          "date",
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2024-02-29",
+            "2024-02-29 23:59:59.000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "double_quoted_identifiers",
+      "sql": "SELECT \"A\", \"b c\" FROM (VALUES (1, 2)) t(\"A\", \"b c\")",
+      "trino": {
+        "types": [
+          "integer",
+          "integer"
+        ],
+        "rows": [
+          [
+            1,
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "is_distinct_from",
+      "sql": "SELECT 1 IS DISTINCT FROM NULL, NULL IS NOT DISTINCT FROM NULL, CAST(NULL AS integer) IS DISTINCT FROM 1",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            true,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "row_constructor_field",
+      "sql": "SELECT CAST(ROW(1, 'a') AS row(x integer, y varchar)).y",
+      "trino": {
+        "types": [
+          "varchar"
+        ],
+        "rows": [
+          [
+            "a"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "current_date_arith",
+      "sql": "SELECT current_date - INTERVAL '1' DAY < current_date",
+      "trino": {
+        "types": [
+          "boolean"
+        ],
+        "rows": [
+          [
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "cast_timestamp_with_time_zone_literal",
+      "sql": "SELECT TIMESTAMP '2024-01-01 10:00:00.000 UTC' = TIMESTAMP '2024-01-01 07:00:00.000 America/Sao_Paulo'",
+      "trino": {
+        "types": [
+          "boolean"
+        ],
+        "rows": [
+          [
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "like_escape",
+      "sql": "SELECT 'a_b' LIKE 'a\\_b' ESCAPE '\\', 'axb' LIKE 'a\\_b' ESCAPE '\\', 'ação' LIKE 'a_ão'",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            false,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "between_null",
+      "sql": "SELECT 2 BETWEEN 1 AND NULL, 5 BETWEEN 1 AND NULL, NULL BETWEEN 1 AND 2",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "in_list_null",
+      "sql": "SELECT 1 IN (1, NULL), 2 IN (1, NULL), 2 NOT IN (1, NULL)",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "integer_division",
+      "sql": "SELECT 7 / 2, -7 / 2, 7 % -2, typeof(7 / 2), 7.0 / 2, typeof(CAST(7 AS bigint) / 2)",
+      "trino": {
+        "types": [
+          "integer",
+          "integer",
+          "integer",
+          "varchar",
+          "decimal(2, 1)",
+          "varchar"
+        ],
+        "rows": [
+          [
+            3,
+            -3,
+            1,
+            "integer",
+            "3.5",
+            "bigint"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "integer_overflow_arith",
+      "sql": "SELECT CAST(9223372036854775807 AS bigint) + 1",
+      "trino": {
+        "error": "NUMERIC_VALUE_OUT_OF_RANGE",
+        "message": "bigint addition overflow: 9223372036854775807 + 1"
+      }
+    },
+    {
+      "name": "decimal_arith_types",
+      "sql": "SELECT DECIMAL '1.10' * DECIMAL '2.5', typeof(DECIMAL '1.10' * DECIMAL '2.5'), DECIMAL '1' / DECIMAL '3', typeof(DECIMAL '1' / DECIMAL '3'), typeof(DECIMAL '1.5' + 1)",
+      "trino": {
+        "types": [
+          "decimal(5, 3)",
+          "varchar",
+          "decimal(1, 0)",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "2.750",
+            "decimal(5,3)",
+            "0",
+            "decimal(1,0)",
+            "decimal(12,1)"
+          ]
+        ]
+      }
+    }
+  ]
+}

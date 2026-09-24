@@ -553,7 +553,7 @@ mod tests {
         // Batches of up to 2 MiB (`computed_batches`); the merge's exchange
         // slice is 2 MiB.
         let frame = engine
-            .sql("SELECT value, repeat('x', 4000) AS pad FROM generate_series(1, 10000) WHERE value > 0")
+            .sql("SELECT value, lpad('', 4000, 'x') AS pad FROM generate_series(1, 10000) WHERE value > 0")
             .await
             .unwrap();
         let plan = frame.clone().create_physical_plan().await.unwrap();
@@ -670,7 +670,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = engine(dir.path(), ByteSize::mib(1), 1);
         let error = engine
-            .sql("SELECT repeat('x', 1024) AS s FROM generate_series(1, 8192)")
+            .sql("SELECT lpad('', 1024, 'x') AS s FROM generate_series(1, 8192)")
             .await
             .unwrap()
             .collect()

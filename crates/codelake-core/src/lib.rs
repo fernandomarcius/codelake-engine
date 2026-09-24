@@ -25,23 +25,32 @@ pub mod runtime;
 #[cfg(test)]
 mod semantics_tests;
 pub mod session_properties;
+pub mod statement_policy;
 pub mod subquery;
+pub mod table_procedure;
 #[cfg(test)]
 mod testing;
 mod timestamp_casts;
 mod timestamps;
-mod trino_datetime;
-mod trino_functions;
+pub mod trace;
+pub mod trino_functions;
 mod trino_sql;
 mod trino_sql_checks;
 pub mod trino_types;
 
 pub use bytes::ByteSize;
 pub use config::{Config, SourceConfig, SourceKind, TrinoProtocolConfig, ValidatedConfig};
-pub use connector::{BoxError, Connector, ConnectorError, ViewDefinition, ViewSecurity, WritableCatalog};
+pub use connector::{
+    BoxError, COLUMN_COMMENT, Connector, ConnectorError, DECLARED_TYPE, ViewDefinition, ViewSecurity,
+    WritableCatalog,
+};
 pub use ddl::{RelationKind, update_type as ddl_update_type};
 pub use declared::trino_type_syntax;
-pub use engine::{Attach, Engine, EngineError, QueryOptions, SourceStatus};
+pub use engine::{Attach, Engine, EngineError, Query, QueryOptions, SourceStatus};
 pub use runtime::MemoryStats;
-pub use session_properties::{Effect, PropertyRegistry, PropertyType, SessionProperties, SessionProperty};
+pub use session_properties::{
+    CatalogSession, Effect, PropertyRegistry, PropertyType, SessionProperties, SessionProperty,
+};
+pub use table_procedure::{ProcedureArgument, ProcedureCall, TableProcedure};
 pub use timestamps::trino_time_zone;
+pub use trace::{QueryTrace, TraceParent};

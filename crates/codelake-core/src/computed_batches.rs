@@ -2,7 +2,7 @@
 //!
 //! `DataFusion` sizes a batch in rows (`execution.batch_size`), so a projection
 //! that computes wide values produces batches of `batch_size` × their width:
-//! `repeat('x', 4096)` over 8192 rows is a 32 MiB batch, allocated whole before
+//! `lpad('', 4096, 'x')` over 8192 rows is a 32 MiB batch, allocated whole before
 //! any consumer can reserve it. One such batch per running worker is outside
 //! the pool; 12 Trino clients of that query grew a server with
 //! `memory.limit = 128 MiB` by 187-213 MiB (DEFECT-MEM8, MEM9).
@@ -490,7 +490,7 @@ mod tests {
     async fn wide_computed_values_come_in_batches_of_about_the_target() {
         let dir = tempfile::tempdir().unwrap();
         let engine = engine(dir.path(), 1);
-        let sql = "SELECT value, repeat('x', 4096) AS s FROM generate_series(1, 20000)";
+        let sql = "SELECT value, lpad('', 4096, 'x') AS s FROM generate_series(1, 20000)";
         let text = plan(&engine, sql).await;
         assert!(text.contains("SizedBatchesExec"), "{text}");
         assert!(text.contains("SliceExec"), "{text}");
@@ -619,7 +619,7 @@ mod tests {
     async fn partitioned_wide_projection_keeps_every_row() {
         let dir = tempfile::tempdir().unwrap();
         let engine = engine(dir.path(), 4);
-        let sql = "SELECT value, repeat('y', 3000) || CAST(value AS VARCHAR) AS s \
+        let sql = "SELECT value, lpad('', 3000, 'y') || CAST(value AS VARCHAR) AS s \
                    FROM generate_series(1, 50000)";
         let text = plan(&engine, sql).await;
         assert!(text.contains("SizedBatchesExec"), "{text}");

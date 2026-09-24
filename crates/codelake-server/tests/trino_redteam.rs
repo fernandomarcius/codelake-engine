@@ -177,7 +177,7 @@ async fn rt_pass_canceled_hive_write_leaves_no_files() {
     let created = c.run("CREATE TABLE hive.rt.small AS SELECT 1 AS a").await;
     assert_eq!(created["stats"]["state"], "FINISHED", "{created}");
 
-    let big = "SELECT value, repeat('x', 100) AS pad FROM generate_series(1, 400000000)";
+    let big = "SELECT value, lpad('', 100, 'x') AS pad FROM generate_series(1, 400000000)";
     for statement in [
         format!("CREATE TABLE hive.rt.big AS {big}"),
         format!("INSERT INTO hive.rt.small SELECT value FROM ({big})"),

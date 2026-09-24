@@ -1,0 +1,611 @@
+{
+  "category": "binary",
+  "cases": [
+    {
+      "name": "to_hex_upper",
+      "sql": "SELECT to_hex(X'00ab0F'), to_hex(X''), to_hex(CAST(NULL AS varbinary))",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "00AB0F",
+            "",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "from_hex_cases",
+      "sql": "SELECT from_hex('00AB0f'), from_hex(''), from_hex(CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "varbinary",
+          "varbinary",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "AKsP",
+            "",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "from_hex_odd",
+      "sql": "SELECT from_hex('abc')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "invalid input length 3"
+      }
+    },
+    {
+      "name": "from_hex_bad_char",
+      "sql": "SELECT from_hex('zz')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "not a hexadecimal digit: \"z\" = 122"
+      }
+    },
+    {
+      "name": "big_endian_64",
+      "sql": "SELECT from_big_endian_64(X'0000000000000102'), from_big_endian_64(X'FFFFFFFFFFFFFFFF'), to_big_endian_64(258), to_big_endian_64(-1), from_big_endian_64(CAST(NULL AS varbinary))",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "varbinary",
+          "varbinary",
+          "bigint"
+        ],
+        "rows": [
+          [
+            258,
+            -1,
+            "AAAAAAAAAQI=",
+            "//////////8=",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "big_endian_64_length",
+      "sql": "SELECT from_big_endian_64(X'01')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "expected 8-byte input, but got instead: 1"
+      }
+    },
+    {
+      "name": "big_endian_32",
+      "sql": "SELECT from_big_endian_32(X'00000102'), to_big_endian_32(CAST(258 AS integer)), from_big_endian_32(X'80000000')",
+      "trino": {
+        "types": [
+          "integer",
+          "varbinary",
+          "integer"
+        ],
+        "rows": [
+          [
+            258,
+            "AAABAg==",
+            -2147483648
+          ]
+        ]
+      }
+    },
+    {
+      "name": "big_endian_32_length",
+      "sql": "SELECT from_big_endian_32(X'0102')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "expected 4-byte input, but got instead: 2"
+      }
+    },
+    {
+      "name": "ieee754",
+      "sql": "SELECT to_ieee754_64(1.5E0), from_ieee754_64(X'3FF8000000000000'), to_ieee754_32(REAL '1.5'), from_ieee754_32(X'3FC00000')",
+      "trino": {
+        "types": [
+          "varbinary",
+          "double",
+          "varbinary",
+          "real"
+        ],
+        "rows": [
+          [
+            "P/gAAAAAAAA=",
+            1.5,
+            "P8AAAA==",
+            1.5
+          ]
+        ]
+      }
+    },
+    {
+      "name": "ieee754_length",
+      "sql": "SELECT from_ieee754_64(X'00')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Input floating-point value must be exactly 8 bytes long"
+      }
+    },
+    {
+      "name": "hashes",
+      "sql": "SELECT md5(X'616263'), sha1(X'616263'), sha256(X'616263'), sha512(X''), md5(CAST(NULL AS varbinary))",
+      "trino": {
+        "types": [
+          "varbinary",
+          "varbinary",
+          "varbinary",
+          "varbinary",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "kAFQmDzST7DWlj99KOF/cg==",
+            "qZk+NkcGgWq6PiVxeFDCbJzQ2J0=",
+            "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=",
+            "z4PhNX7vuL3xVChQ1m2AB9Yg5AULVxXcg/SpIdNs6c5H0NE8XYXysP+DGNKHfuwvY7kxvUdBeoGlODJ6+SfaPg==",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "xxhash64_crc32",
+      "sql": "SELECT xxhash64(X'616263'), xxhash64(X''), crc32(X'616263'), crc32(to_utf8('ação')), crc32(CAST(NULL AS varbinary))",
+      "trino": {
+        "types": [
+          "varbinary",
+          "varbinary",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            "RLws9a13CZk=",
+            "70bbN1HY6Zk=",
+            891568578,
+            3350033681,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "hmac",
+      "sql": "SELECT hmac_sha256(X'616263', X'6b6579'), hmac_md5(X'616263', X'6b6579'), hmac_sha1(X'', X'01'), hmac_sha512(X'61', X'62')",
+      "trino": {
+        "types": [
+          "varbinary",
+          "varbinary",
+          "varbinary",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "nBluMtwBdfhvSxy4konWYZ3mvuaZ5MN45oMJ7Zehpqs=",
+            "0v6YBj+HawMZOvtJtJeVkQ==",
+            "WV0ITDaMS+jwxL/bCyUxO6xgk/A=",
+            "aMFof6fLUXD/gAWAoM7CncDMtRWq+VWHvf5ckjcwp4UuK+7+/WvjHZeqYSrYuFabumHtLDOc2bKECXUbC56WoA=="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "base64_cases",
+      "sql": "SELECT to_base64(X'616263ff'), from_base64('YWJj/w=='), to_base64url(X'616263ff'), from_base64url('YWJj_w=='), to_base64(X''), from_base64(CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "varchar",
+          "varbinary",
+          "varchar",
+          "varbinary",
+          "varchar",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "YWJj/w==",
+            "YWJj/w==",
+            "YWJj_w==",
+            "YWJj/w==",
+            "",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "from_base64_invalid",
+      "sql": "SELECT from_base64('***')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Illegal base64 character 2a"
+      }
+    },
+    {
+      "name": "varbinary_length_concat",
+      "sql": "SELECT length(X'010203'), concat(X'01', X'02') = X'0102'",
+      "trino": {
+        "types": [
+          "bigint",
+          "boolean"
+        ],
+        "rows": [
+          [
+            3,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "to_hex_edge",
+      "sql": "SELECT to_hex(X'FF'), to_hex(to_utf8('ç')), to_hex(from_hex('00')), to_hex(to_big_endian_64(1))",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "FF",
+            "C3A7",
+            "00",
+            "0000000000000001"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "big_endian_64_edge",
+      "sql": "SELECT to_big_endian_64(CAST(NULL AS bigint)), from_big_endian_64(X'8000000000000000'), to_big_endian_64(9223372036854775807), from_big_endian_64(X'0000000000000000')",
+      "trino": {
+        "types": [
+          "varbinary",
+          "bigint",
+          "varbinary",
+          "bigint"
+        ],
+        "rows": [
+          [
+            null,
+            -9223372036854775808,
+            "f/////////8=",
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "big_endian_32_null_edge",
+      "sql": "SELECT to_big_endian_32(CAST(NULL AS integer)), from_big_endian_32(CAST(NULL AS varbinary)), to_big_endian_32(-1), from_big_endian_32(X'FFFFFFFF')",
+      "trino": {
+        "types": [
+          "varbinary",
+          "integer",
+          "varbinary",
+          "integer"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            "/////w==",
+            -1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "ieee754_edge",
+      "sql": "SELECT to_ieee754_64(nan()), to_ieee754_64(-0E0), from_ieee754_64(X'7FF0000000000000'), to_ieee754_64(CAST(NULL AS double)), from_ieee754_32(CAST(NULL AS varbinary)), to_ieee754_32(REAL '-0.0')",
+      "trino": {
+        "types": [
+          "varbinary",
+          "varbinary",
+          "double",
+          "varbinary",
+          "real",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "f/gAAAAAAAA=",
+            "gAAAAAAAAAA=",
+            "Infinity",
+            null,
+            null,
+            "gAAAAA=="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "ieee754_32_length",
+      "sql": "SELECT from_ieee754_32(X'0102')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Input floating-point value must be exactly 4 bytes long"
+      }
+    },
+    {
+      "name": "hashes_empty_null",
+      "sql": "SELECT md5(X''), sha1(X''), sha256(X''), sha512(CAST(NULL AS varbinary)), sha1(CAST(NULL AS varbinary)), sha256(CAST(NULL AS varbinary))",
+      "trino": {
+        "types": [
+          "varbinary",
+          "varbinary",
+          "varbinary",
+          "varbinary",
+          "varbinary",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "1B2M2Y8AsgTpgAmY7PhCfg==",
+            "2jmj7l5rSw0yVb/vlWAYkK/YBwk=",
+            "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+            null,
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "hashes_utf8",
+      "sql": "SELECT md5(to_utf8('ação')), sha1(to_utf8('ação')), sha256(to_utf8('😀')), sha512(X'00')",
+      "trino": {
+        "types": [
+          "varbinary",
+          "varbinary",
+          "varbinary",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "znYqLIBz4LatXZvJkoOvZw==",
+            "ZEWSzwePwkuKQ5qdWdKGUYtKrcs=",
+            "8EQ6NCxe9UeDoRG1G6Vsk45HTDIyTZDDpgycjjo34tk=",
+            "uCRNAomB1pOve0Vq+O+kytY9KC4Z/xSULCRuUNk1HSJwSoAqccNYC2Nw3kzrKTwySoQjNCVX1OXDhDjw42kQ7g=="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "xxhash64_crc32_edge",
+      "sql": "SELECT xxhash64(CAST(NULL AS varbinary)), crc32(X''), xxhash64(to_utf8('ação')), crc32(X'FF')",
+      "trino": {
+        "types": [
+          "varbinary",
+          "bigint",
+          "varbinary",
+          "bigint"
+        ],
+        "rows": [
+          [
+            null,
+            0,
+            "OzG4Mcddp1o=",
+            4278190080
+          ]
+        ]
+      }
+    },
+    {
+      "name": "xxhash64_crc32_long",
+      "sql": "SELECT xxhash64(to_utf8('The quick brown fox jumps over the lazy dog')), crc32(to_utf8('The quick brown fox jumps over the lazy dog'))",
+      "trino": {
+        "types": [
+          "varbinary",
+          "bigint"
+        ],
+        "rows": [
+          [
+            "CyQtNh/acbw=",
+            1095738169
+          ]
+        ]
+      }
+    },
+    {
+      "name": "hmac_null_edge",
+      "sql": "SELECT hmac_sha256(CAST(NULL AS varbinary), X'01'), hmac_md5(X'01', CAST(NULL AS varbinary)), hmac_sha512(X'', X'01'), hmac_sha1(X'', X'02')",
+      "trino": {
+        "types": [
+          "varbinary",
+          "varbinary",
+          "varbinary",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            "+m5mGSitly7V9T2tf1rxqzQx7qNEU0nxloXgxY6HtMFPZ/s098KZhzkZZm9g1LrjoV2GmozbZRum6IaQE19xwg==",
+            "JhQ1zH1QH5NcCCfvi4FQjTuQ/VA="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "hmac_long_key",
+      "sql": "SELECT hmac_sha256(X'61', from_hex(lpad('', 200, 'ab'))), hmac_sha512(X'61', from_hex(lpad('', 400, 'cd'))), hmac_md5(X'61', from_hex(lpad('', 200, 'ef'))), hmac_sha1(X'61', from_hex(lpad('', 200, '01')))",
+      "trino": {
+        "types": [
+          "varbinary",
+          "varbinary",
+          "varbinary",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "S8YzNDZRlJ5Zm4qmTk5wYIqRwKUfCOL/QvGVktBAS0Q=",
+            "2EMhLmzIcwUjoRuDaJxm3NSjuw4aZOxuGdiKatY6UE6d9Y47Qsd6pmllYSMY6a28ubRe9F3bgJI5fflV9gZ3Rg==",
+            "2nP0oID4seQkhg8HQelYpw==",
+            "3Owm9TpcMFoat4o8pLthocbHQoE="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "base64_null_edge",
+      "sql": "SELECT to_base64(CAST(NULL AS varbinary)), from_base64(''), to_base64url(X'fbff'), from_base64url(CAST(NULL AS varchar)), to_base64(X'00'), to_base64url(CAST(NULL AS varbinary))",
+      "trino": {
+        "types": [
+          "varchar",
+          "varbinary",
+          "varchar",
+          "varbinary",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            null,
+            "",
+            "-_8=",
+            null,
+            "AA==",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "from_base64_no_padding",
+      "sql": "SELECT from_base64('YWJj'), from_base64('YQ'), from_base64url('YQ')",
+      "trino": {
+        "types": [
+          "varbinary",
+          "varbinary",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "YWJj",
+            "YQ==",
+            "YQ=="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "varbinary_length_null",
+      "sql": "SELECT length(CAST(NULL AS varbinary)), length(X''), concat(X'', X'')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            null,
+            0,
+            ""
+          ]
+        ]
+      }
+    },
+    {
+      "name": "hmac_empty_key",
+      "sql": "SELECT hmac_sha1(X'61', X'')",
+      "trino": {
+        "error": "GENERIC_INTERNAL_ERROR",
+        "message": "Empty key"
+      }
+    },
+    {
+      "name": "to_hex_null_long",
+      "sql": "SELECT to_hex(CAST(NULL AS varbinary)), to_hex(to_utf8('The quick brown fox')), length(to_hex(sha512(X'')))",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "bigint"
+        ],
+        "rows": [
+          [
+            null,
+            "54686520717569636B2062726F776E20666F78",
+            128
+          ]
+        ]
+      }
+    },
+    {
+      "name": "big_endian_32_edge",
+      "sql": "SELECT to_big_endian_32(2147483647), to_big_endian_32(-2147483648), from_big_endian_32(X'7FFFFFFF')",
+      "trino": {
+        "types": [
+          "varbinary",
+          "varbinary",
+          "integer"
+        ],
+        "rows": [
+          [
+            "f////w==",
+            "gAAAAA==",
+            2147483647
+          ]
+        ]
+      }
+    },
+    {
+      "name": "ieee754_more",
+      "sql": "SELECT to_ieee754_32(REAL '1.5'), to_ieee754_32(CAST(NULL AS real)), to_ieee754_32(CAST(nan() AS real)), to_ieee754_64(infinity()), to_ieee754_64(-1.5E0)",
+      "trino": {
+        "types": [
+          "varbinary",
+          "varbinary",
+          "varbinary",
+          "varbinary",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "P8AAAA==",
+            null,
+            "f8AAAA==",
+            "f/AAAAAAAAA=",
+            "v/gAAAAAAAA="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "base64_more",
+      "sql": "SELECT to_base64(to_utf8('ação')), to_base64url(X'FFEE'), to_base64url(X''), from_base64url('_-4')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "YcOnw6Nv",
+            "_-4=",
+            "",
+            "/+4="
+          ]
+        ]
+      }
+    }
+  ]
+}

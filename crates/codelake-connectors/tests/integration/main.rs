@@ -12,7 +12,17 @@
 mod common;
 
 #[cfg(feature = "hive")]
+mod f4_acceptance;
+#[cfg(feature = "hive")]
+mod f9_acceptance;
+#[cfg(feature = "hive")]
 mod hive_acceptance;
+#[cfg(feature = "hive")]
+mod hive_optimize;
+#[cfg(feature = "hive")]
+mod hive_redteam;
+#[cfg(feature = "hive")]
+mod hive_redteam_w1;
 #[cfg(feature = "hive")]
 mod hive_smoke;
 

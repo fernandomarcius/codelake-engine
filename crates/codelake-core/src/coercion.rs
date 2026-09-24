@@ -1264,20 +1264,13 @@ fn rewrite_expressions(plan: LogicalPlan, session_zone: &str) -> Result<Transfor
     plan.map_expressions(|expr| {
         let name = names.save(&expr);
         expr.transform_up(|e| {
-            let zoned = crate::timestamp_casts::at_time_zone(e, &schema, session_zone)?;
-            let function = crate::trino_functions::trino_function(zoned.data, &schema, session_zone)?;
-            let narrowed = narrow_literal(function.data);
+            let narrowed = narrow_literal(e);
             let interval = zoned_day_interval(narrowed.data, &schema)?;
             let unified = common_types(interval.data, &schema, session_zone)?;
             let outer = refresh_outer_references(unified.data, &schema)?;
             Ok(Transformed::new_transformed(
                 outer.data,
-                zoned.transformed
-                    || function.transformed
-                    || narrowed.transformed
-                    || interval.transformed
-                    || unified.transformed
-                    || outer.transformed,
+                narrowed.transformed || interval.transformed || unified.transformed || outer.transformed,
             ))
         })
         .map(|t| {
@@ -1295,6 +1288,9 @@ fn common_types_node(plan: LogicalPlan, session_zone: &str) -> Result<Transforme
     let plan = match plan {
         LogicalPlan::Values(values) => {
             let narrowed = LogicalPlan::Values(values).map_expressions(|cell| {
+                // A rewrite that preserves expression names (the function
+                // library's) may alias a cell; names mean nothing in `VALUES`.
+                let cell = cell.unalias();
                 // Only the values as written, inside their marks.
                 if is_values_cell(&cell)
                     || matches!(&cell, Expr::Cast(Cast { expr, .. }) if is_values_cell(expr))

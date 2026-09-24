@@ -1,0 +1,395 @@
+{
+  "category": "regexp",
+  "cases": [
+    {
+      "name": "regexp_like_fn",
+      "sql": "SELECT regexp_like('abc123', '\\d+'), regexp_like('abc', '^b'), regexp_like(CAST(NULL AS varchar), 'a')",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            false,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "regexp_replace_all",
+      "sql": "SELECT regexp_replace('pilot.tabela', '^pilot\\.', ''), regexp_replace('a1b22c', '\\d+', '#'), regexp_replace('a1b22c', '\\d'), regexp_replace('abc', '', 'x')",
+      "trino": {
+        "types": [
+          "varchar(12)",
+          "varchar(27)",
+          "varchar(6)",
+          "varchar(7)"
+        ],
+        "rows": [
+          [
+            "tabela",
+            "a#b#c",
+            "abc",
+            "xaxbxcx"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "regexp_replace_groups",
+      "sql": "SELECT regexp_replace('John Smith', '(\\w+) (\\w+)', '$2, $1'), regexp_replace('ab', '(a)(b)?', '[$1$2]'), regexp_replace('x', 'x', '\\$1'), regexp_replace('abc', '(?<n>b)', '<${n}>')",
+      "trino": {
+        "types": [
+          "varchar(340)",
+          "varchar(20)",
+          "varchar(7)",
+          "varchar(39)"
+        ],
+        "rows": [
+          [
+            "Smith, John",
+            "[ab]",
+            "$1",
+            "a<b>c"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "regexp_replace_bad_group",
+      "sql": "SELECT regexp_replace('ab', '(a)', '$2')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Illegal replacement sequence: unknown group 2"
+      }
+    },
+    {
+      "name": "regexp_extract_fn",
+      "sql": "SELECT regexp_extract('1a 2b 14m', '\\d+'), regexp_extract('1a 2b 14m', '(\\d+)([a-z]+)', 2), regexp_extract('abc', '\\d'), regexp_extract_all('1a 2b 14m', '\\d+'), regexp_extract_all('1a 2b 14m', '(\\d+)([a-z]+)', 2)",
+      "trino": {
+        "types": [
+          "varchar(9)",
+          "varchar(9)",
+          "varchar(3)",
+          "array(varchar(9))",
+          "array(varchar(9))"
+        ],
+        "rows": [
+          [
+            "1",
+            "a",
+            null,
+            [
+              "1",
+              "2",
+              "14"
+            ],
+            [
+              "a",
+              "b",
+              "m"
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "regexp_extract_bad_group",
+      "sql": "SELECT regexp_extract('abc', '(a)', 2)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Pattern has 1 groups. Cannot access group 2"
+      }
+    },
+    {
+      "name": "regexp_count_position",
+      "sql": "SELECT regexp_count('a1b2c3', '\\d'), regexp_position('ação b', 'b'), regexp_position('abab', 'b', 3), regexp_position('abab', 'b', 1, 2), regexp_position('abc', 'x')",
+      "trino": {
+        "types": [
+          "bigint",
+          "integer",
+          "integer",
+          "integer",
+          "integer"
+        ],
+        "rows": [
+          [
+            3,
+            6,
+            4,
+            4,
+            -1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "regexp_split_fn",
+      "sql": "SELECT regexp_split('a1b22c', '\\d+'), regexp_split('abc', 'x')",
+      "trino": {
+        "types": [
+          "array(varchar(6))",
+          "array(varchar(3))"
+        ],
+        "rows": [
+          [
+            [
+              "a",
+              "b",
+              "c"
+            ],
+            [
+              "abc"
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "regexp_invalid",
+      "sql": "SELECT regexp_like('a', '(')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "end pattern with unmatched parenthesis"
+      }
+    },
+    {
+      "name": "regexp_like_edge",
+      "sql": "SELECT regexp_like('', ''), regexp_like('ação', '^a.ã'), regexp_like('abc', CAST(NULL AS varchar)), regexp_like('ABC', '(?i)abc')",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            true,
+            null,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "regexp_replace_null",
+      "sql": "SELECT regexp_replace(CAST(NULL AS varchar), 'a', 'b'), regexp_replace('abc', CAST(NULL AS varchar), 'b'), regexp_replace('abc', 'b', CAST(NULL AS varchar)), regexp_replace('ação', '[çã]', '_')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar(7)",
+          "varchar",
+          "varchar(14)"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            null,
+            "a__o"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "regexp_extract_null_edge",
+      "sql": "SELECT regexp_extract(CAST(NULL AS varchar), 'a'), regexp_extract('abc', '(x)?b', 1), regexp_extract_all('abc', 'x'), regexp_extract_all(CAST(NULL AS varchar), 'a'), regexp_extract_all('aaa', 'a*')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar(3)",
+          "array(varchar(3))",
+          "array(varchar)",
+          "array(varchar(3))"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            [],
+            null,
+            [
+              "aaa",
+              ""
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "regexp_count_edge",
+      "sql": "SELECT regexp_count('', 'x'), regexp_count('aaa', 'a*'), regexp_count(CAST(NULL AS varchar), 'a'), regexp_count('ação', 'ç')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            0,
+            2,
+            null,
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "regexp_position_edge",
+      "sql": "SELECT regexp_position(CAST(NULL AS varchar), 'a'), regexp_position('abc', 'c', 10), regexp_position('aaa', 'a', 1, 5), regexp_position('ação', 'ç', 2)",
+      "trino": {
+        "types": [
+          "integer",
+          "integer",
+          "integer",
+          "integer"
+        ],
+        "rows": [
+          [
+            null,
+            -1,
+            -1,
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "regexp_position_start_zero",
+      "sql": "SELECT regexp_position('abc', 'a', 0)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "start position cannot be smaller than 1"
+      }
+    },
+    {
+      "name": "regexp_split_edge",
+      "sql": "SELECT regexp_split('', ','), regexp_split(',a,', ','), regexp_split(CAST(NULL AS varchar), ','), regexp_split('abc', '')",
+      "trino": {
+        "types": [
+          "array(varchar(0))",
+          "array(varchar(3))",
+          "array(varchar)",
+          "array(varchar(3))"
+        ],
+        "rows": [
+          [
+            [
+              ""
+            ],
+            [
+              "",
+              "a",
+              ""
+            ],
+            null,
+            [
+              "",
+              "a",
+              "b",
+              "c",
+              ""
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "regexp_classes",
+      "sql": "SELECT regexp_like('ç', '\\w'), regexp_like('٣', '\\d'), regexp_replace('a  b', '\\s+', ' '), regexp_extract('x=ação', '=(\\p{L}+)', 1)",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "varchar(14)",
+          "varchar(6)"
+        ],
+        "rows": [
+          [
+            false,
+            false,
+            "a b",
+            "ação"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "regexp_count_more",
+      "sql": "SELECT regexp_count('a1b2', '[a-z]'), regexp_count('abc', CAST(NULL AS varchar)), regexp_count('😀😀', '😀')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            2,
+            null,
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "regexp_extract_all_more",
+      "sql": "SELECT regexp_extract_all('a1b22', '\\d+', 0), regexp_extract_all('ab', '(x)?b', 1), regexp_extract_all('😀1😀2', '\\d')",
+      "trino": {
+        "types": [
+          "array(varchar(5))",
+          "array(varchar(2))",
+          "array(varchar(4))"
+        ],
+        "rows": [
+          [
+            [
+              "1",
+              "22"
+            ],
+            [
+              null
+            ],
+            [
+              "1",
+              "2"
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "regexp_split_more",
+      "sql": "SELECT regexp_split('a1b2', '\\d'), regexp_split('ação', 'ç'), regexp_split('abc', CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "array(varchar(4))",
+          "array(varchar(4))",
+          "array(varchar(3))"
+        ],
+        "rows": [
+          [
+            [
+              "a",
+              "b",
+              ""
+            ],
+            [
+              "a",
+              "ão"
+            ],
+            null
+          ]
+        ]
+      }
+    }
+  ]
+}

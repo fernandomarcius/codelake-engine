@@ -220,7 +220,7 @@ async fn large_results_are_paged_and_complete() {
     let h = harness();
     let out = h
         .run(
-            "SELECT value, repeat('x', 40) AS pad FROM generate_series(1, 200000) ORDER BY value",
+            "SELECT value, lpad('', 40, 'x') AS pad FROM generate_series(1, 200000) ORDER BY value",
             &[],
         )
         .await;

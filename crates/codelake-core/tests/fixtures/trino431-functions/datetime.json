@@ -1,0 +1,2081 @@
+{
+  "category": "datetime",
+  "cases": [
+    {
+      "name": "date_add_day",
+      "sql": "SELECT date_add('day', 1, TIMESTAMP '2024-02-28 10:00:00.000')",
+      "trino": {
+        "types": [
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2024-02-29 10:00:00.000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_month_clamps",
+      "sql": "SELECT date_add('month', 1, TIMESTAMP '2024-01-31 10:00:00.000')",
+      "trino": {
+        "types": [
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2024-02-29 10:00:00.000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_month_negative",
+      "sql": "SELECT date_add('month', -1, TIMESTAMP '2024-03-31 23:59:59.999')",
+      "trino": {
+        "types": [
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2024-02-29 23:59:59.999"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_year_leap",
+      "sql": "SELECT date_add('year', 1, DATE '2024-02-29')",
+      "trino": {
+        "types": [
+          "date"
+        ],
+        "rows": [
+          [
+            "2025-02-28"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_quarter",
+      "sql": "SELECT date_add('quarter', 1, DATE '2024-11-30')",
+      "trino": {
+        "types": [
+          "date"
+        ],
+        "rows": [
+          [
+            "2025-02-28"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_week",
+      "sql": "SELECT date_add('week', -2, DATE '2024-01-10')",
+      "trino": {
+        "types": [
+          "date"
+        ],
+        "rows": [
+          [
+            "2023-12-27"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_ms",
+      "sql": "SELECT date_add('millisecond', 5, TIMESTAMP '2024-01-31 10:00:00.998')",
+      "trino": {
+        "types": [
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2024-01-31 10:00:01.003"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_ms_csf",
+      "sql": "SELECT date_add('millisecond', (CAST(3 AS bigint) - 1) * 5, TIMESTAMP '2024-01-31 10:00:00.000')",
+      "trino": {
+        "types": [
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2024-01-31 10:00:00.010"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_minute_neg",
+      "sql": "SELECT date_add('minute', -30, TIMESTAMP '2024-01-01 00:10:00.000')",
+      "trino": {
+        "types": [
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2023-12-31 23:40:00.000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_hour_integer_arg",
+      "sql": "SELECT date_add('hour', CAST(-4 AS integer), TIMESTAMP '2024-01-01 02:00:00.000')",
+      "trino": {
+        "types": [
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2023-12-31 22:00:00.000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_micros_kept",
+      "sql": "SELECT date_add('day', 1, TIMESTAMP '2024-01-31 10:00:00.123456')",
+      "trino": {
+        "types": [
+          "timestamp(6)"
+        ],
+        "rows": [
+          [
+            "2024-02-01 10:00:00.123456"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_seconds_ts0",
+      "sql": "SELECT date_add('second', 90, TIMESTAMP '2024-01-31 23:59:00')",
+      "trino": {
+        "types": [
+          "timestamp(0)"
+        ],
+        "rows": [
+          [
+            "2024-02-01 00:00:30"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_unit_case",
+      "sql": "SELECT date_add('DAY', 1, DATE '2024-12-31')",
+      "trino": {
+        "types": [
+          "date"
+        ],
+        "rows": [
+          [
+            "2025-01-01"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_null_value",
+      "sql": "SELECT date_add('day', CAST(NULL AS bigint), TIMESTAMP '2024-01-01 00:00:00.000')",
+      "trino": {
+        "types": [
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_null_ts",
+      "sql": "SELECT date_add('day', 1, CAST(NULL AS timestamp(3)))",
+      "trino": {
+        "types": [
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_null_unit",
+      "sql": "SELECT date_add(CAST(NULL AS varchar), 1, DATE '2024-01-01')",
+      "trino": {
+        "types": [
+          "date"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_tz_day_dst",
+      "sql": "SELECT date_add('day', 1, TIMESTAMP '2024-03-09 12:00:00.000 America/New_York')",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-03-10 12:00:00.000 America/New_York"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_tz_hour_dst",
+      "sql": "SELECT date_add('hour', 24, TIMESTAMP '2024-03-09 12:00:00.000 America/New_York')",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-03-10 13:00:00.000 America/New_York"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_tz_sao_paulo",
+      "sql": "SELECT date_add('month', 1, TIMESTAMP '2024-01-31 22:00:00.000 America/Sao_Paulo')",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-02-29 22:00:00.000 America/Sao_Paulo"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_date_hour_error",
+      "sql": "SELECT date_add('hour', 1, DATE '2024-02-29')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "'hour' is not a valid DATE field"
+      }
+    },
+    {
+      "name": "date_add_bad_unit",
+      "sql": "SELECT date_add('fortnight', 1, TIMESTAMP '2024-02-29 00:00:00.000')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "'fortnight' is not a valid TIMESTAMP field"
+      }
+    },
+    {
+      "name": "date_add_column",
+      "sql": "SELECT date_add('day', n, TIMESTAMP '2024-12-30 00:00:00.000') FROM (VALUES CAST(1 AS bigint), 2, NULL) t(n) ORDER BY n NULLS LAST",
+      "trino": {
+        "types": [
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2024-12-31 00:00:00.000"
+          ],
+          [
+            "2025-01-01 00:00:00.000"
+          ],
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_diff_month_end",
+      "sql": "SELECT date_diff('month', TIMESTAMP '2024-01-31 00:00:00', TIMESTAMP '2024-02-29 00:00:00')",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_diff_month_short",
+      "sql": "SELECT date_diff('month', TIMESTAMP '2024-01-31 00:00:00', TIMESTAMP '2024-02-28 00:00:00')",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_diff_month_negative",
+      "sql": "SELECT date_diff('month', TIMESTAMP '2024-02-29 00:00:00', TIMESTAMP '2024-01-31 00:00:00')",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            -1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_diff_year_leap",
+      "sql": "SELECT date_diff('year', DATE '2024-02-29', DATE '2025-02-28')",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_diff_year_leap_before",
+      "sql": "SELECT date_diff('year', DATE '2023-03-01', DATE '2024-02-29')",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_diff_day_partial",
+      "sql": "SELECT date_diff('day', TIMESTAMP '2024-01-01 12:00:00', TIMESTAMP '2024-01-02 11:59:59')",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_diff_second_negative",
+      "sql": "SELECT date_diff('second', TIMESTAMP '2024-01-01 00:00:01', TIMESTAMP '2024-01-01 00:00:00.5')",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_diff_ms_micros",
+      "sql": "SELECT date_diff('millisecond', TIMESTAMP '2024-01-01 00:00:00.000999', TIMESTAMP '2024-01-01 00:00:00.002001')",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_diff_week",
+      "sql": "SELECT date_diff('week', DATE '2024-01-01', DATE '2024-01-14')",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_diff_quarter",
+      "sql": "SELECT date_diff('quarter', DATE '2024-01-31', DATE '2024-10-30')",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_diff_hours_csf",
+      "sql": "SELECT date_diff('second', TIMESTAMP '2024-01-01 00:00:00.000', TIMESTAMP '2024-01-01 01:30:00.000') / 3600.0",
+      "trino": {
+        "types": [
+          "decimal(21, 1)"
+        ],
+        "rows": [
+          [
+            "1.5"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_diff_minute_null",
+      "sql": "SELECT date_diff('minute', CAST(NULL AS timestamp(3)), TIMESTAMP '2024-01-01 00:00:00.000')",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_diff_tz_day_dst",
+      "sql": "SELECT date_diff('day', TIMESTAMP '2024-03-09 12:00:00 America/New_York', TIMESTAMP '2024-03-10 12:00:00 America/New_York')",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_diff_tz_hour_dst",
+      "sql": "SELECT date_diff('hour', TIMESTAMP '2024-03-09 12:00:00 America/New_York', TIMESTAMP '2024-03-10 12:00:00 America/New_York')",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            23
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_diff_mixed_date_ts",
+      "sql": "SELECT date_diff('day', DATE '2024-01-01', TIMESTAMP '2024-01-03 10:00:00.000')",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_diff_date_minute_error",
+      "sql": "SELECT date_diff('minute', DATE '2024-01-01', DATE '2024-01-02')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "'minute' is not a valid DATE field"
+      }
+    },
+    {
+      "name": "date_trunc_month_date",
+      "sql": "SELECT date_trunc('month', DATE '2024-02-29')",
+      "trino": {
+        "types": [
+          "date"
+        ],
+        "rows": [
+          [
+            "2024-02-01"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_trunc_week",
+      "sql": "SELECT date_trunc('week', TIMESTAMP '2024-02-29 10:11:12.345')",
+      "trino": {
+        "types": [
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2024-02-26 00:00:00.000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_trunc_quarter",
+      "sql": "SELECT date_trunc('quarter', TIMESTAMP '2024-05-29 10:11:12.345')",
+      "trino": {
+        "types": [
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2024-04-01 00:00:00.000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_trunc_day",
+      "sql": "SELECT date_trunc('day', TIMESTAMP '1969-12-31 23:59:59.999')",
+      "trino": {
+        "types": [
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "1969-12-31 00:00:00.000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_trunc_second_micros",
+      "sql": "SELECT date_trunc('second', TIMESTAMP '2024-05-29 10:11:12.345678')",
+      "trino": {
+        "types": [
+          "timestamp(6)"
+        ],
+        "rows": [
+          [
+            "2024-05-29 10:11:12.000000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_trunc_hour_tz",
+      "sql": "SELECT date_trunc('hour', TIMESTAMP '2024-05-29 10:41:12.345 Asia/Kolkata')",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-05-29 10:00:00.000 Asia/Kolkata"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_trunc_day_tz",
+      "sql": "SELECT date_trunc('day', TIMESTAMP '2024-05-29 01:41:12.345 America/Sao_Paulo')",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-05-29 00:00:00.000 America/Sao_Paulo"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_trunc_null",
+      "sql": "SELECT date_trunc('day', CAST(NULL AS date))",
+      "trino": {
+        "types": [
+          "date"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_trunc_date_hour_error",
+      "sql": "SELECT date_trunc('hour', DATE '2024-02-29')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "'hour' is not a valid DATE field"
+      }
+    },
+    {
+      "name": "extract_parts",
+      "sql": "SELECT year(TIMESTAMP '2024-12-30 10:11:12.345'), quarter(DATE '2024-12-30'), month(DATE '2024-12-30'), week(DATE '2024-12-30'), day(DATE '2024-12-30'), day_of_week(DATE '2024-12-29'), day_of_year(DATE '2024-12-30'), year_of_week(DATE '2024-12-30')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            2024,
+            4,
+            12,
+            1,
+            30,
+            7,
+            365,
+            2025
+          ]
+        ]
+      }
+    },
+    {
+      "name": "extract_time_parts",
+      "sql": "SELECT hour(TIMESTAMP '2024-12-30 10:11:12.345'), minute(TIMESTAMP '2024-12-30 10:11:12.345'), second(TIMESTAMP '2024-12-30 10:11:12.345'), millisecond(TIMESTAMP '2024-12-30 10:11:12.345')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            10,
+            11,
+            12,
+            345
+          ]
+        ]
+      }
+    },
+    {
+      "name": "extract_aliases",
+      "sql": "SELECT dow(DATE '2024-01-07'), doy(DATE '2024-02-01'), yow(DATE '2021-01-01'), week_of_year(DATE '2021-01-03'), day_of_month(DATE '2024-02-29')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            7,
+            32,
+            2020,
+            53,
+            29
+          ]
+        ]
+      }
+    },
+    {
+      "name": "extract_syntax",
+      "sql": "SELECT EXTRACT(YEAR FROM DATE '2024-02-29'), EXTRACT(DOW FROM DATE '2024-01-07'), EXTRACT(HOUR FROM TIMESTAMP '2024-01-07 13:00:00.000'), EXTRACT(DAY_OF_YEAR FROM DATE '2024-03-01')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            2024,
+            7,
+            13,
+            61
+          ]
+        ]
+      }
+    },
+    {
+      "name": "extract_tz_fields",
+      "sql": "SELECT hour(TIMESTAMP '2024-01-07 13:00:00.000 America/Sao_Paulo'), timezone_hour(TIMESTAMP '2024-01-07 13:00:00.000 America/Sao_Paulo'), timezone_minute(TIMESTAMP '2024-01-07 13:00:00.000 Asia/Kolkata')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            13,
+            -3,
+            30
+          ]
+        ]
+      }
+    },
+    {
+      "name": "extract_null",
+      "sql": "SELECT year(CAST(NULL AS date)), hour(CAST(NULL AS timestamp(3)))",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "last_day",
+      "sql": "SELECT last_day_of_month(DATE '2024-02-10'), last_day_of_month(TIMESTAMP '2023-02-10 10:00:00.000'), last_day_of_month(CAST(NULL AS date))",
+      "trino": {
+        "types": [
+          "date",
+          "date",
+          "date"
+        ],
+        "rows": [
+          [
+            "2024-02-29",
+            "2023-02-28",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "with_timezone_basic",
+      "sql": "SELECT with_timezone(TIMESTAMP '2024-03-01 10:00:00.123', 'America/Sao_Paulo')",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-03-01 10:00:00.123 America/Sao_Paulo"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "with_timezone_csf",
+      "sql": "SELECT CAST(with_timezone(CAST(TIMESTAMP '2024-03-01 10:00:00.123' AS timestamp(3)), 'America/Sao_Paulo') AT TIME ZONE 'UTC' AS timestamp(3))",
+      "trino": {
+        "types": [
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2024-03-01 13:00:00.123"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "with_timezone_offset",
+      "sql": "SELECT with_timezone(TIMESTAMP '2024-01-01 00:00:00', '+05:30'), with_timezone(TIMESTAMP '2024-01-01 00:00:00', 'GMT-03:00'), with_timezone(TIMESTAMP '2024-01-01 00:00:00', 'Etc/UTC')",
+      "trino": {
+        "types": [
+          "timestamp(0) with time zone",
+          "timestamp(0) with time zone",
+          "timestamp(0) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-01-01 00:00:00 +05:30",
+            "2024-01-01 00:00:00 -03:00",
+            "2024-01-01 00:00:00 UTC"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "with_timezone_gap",
+      "sql": "SELECT with_timezone(TIMESTAMP '2024-03-10 02:30:00', 'America/New_York')",
+      "trino": {
+        "types": [
+          "timestamp(0) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-03-10 03:30:00 America/New_York"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "with_timezone_null",
+      "sql": "SELECT with_timezone(CAST(NULL AS timestamp(3)), 'UTC')",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "with_timezone_bad_zone",
+      "sql": "SELECT with_timezone(TIMESTAMP '2024-01-01 00:00:00', 'utc')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "'utc' is not a valid time zone"
+      }
+    },
+    {
+      "name": "at_time_zone_naive",
+      "sql": "SELECT TIMESTAMP '2024-01-01 10:00:00' AT TIME ZONE 'America/Sao_Paulo'",
+      "trino": {
+        "types": [
+          "timestamp(0) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-01-01 07:00:00 America/Sao_Paulo"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "at_time_zone_tz",
+      "sql": "SELECT TIMESTAMP '2024-01-01 10:00:00.000 UTC' AT TIME ZONE 'Europe/Berlin'",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-01-01 11:00:00.000 Europe/Berlin"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "at_time_zone_cast_local",
+      "sql": "SELECT CAST(TIMESTAMP '2024-03-01 10:00:00.123' AT TIME ZONE 'America/Sao_Paulo' AS timestamp(3))",
+      "trino": {
+        "types": [
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2024-03-01 07:00:00.123"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "at_time_zone_null",
+      "sql": "SELECT CAST(NULL AS timestamp(3)) AT TIME ZONE 'UTC'",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "timestamp_literal_zone",
+      "sql": "SELECT TIMESTAMP '2024-01-01 10:00:00 America/Sao_Paulo', TIMESTAMP '2024-01-01 10:00:00.500 +02:00'",
+      "trino": {
+        "types": [
+          "timestamp(0) with time zone",
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-01-01 10:00:00 America/Sao_Paulo",
+            "2024-01-01 10:00:00.500 +02:00"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "timestamp_literal_precisions",
+      "sql": "SELECT TIMESTAMP '2024-01-01 10:00:00', TIMESTAMP '2024-01-01 10:00:00.123', TIMESTAMP '2024-01-01 10:00:00.123456', TIMESTAMP '2024-01-01 10:00:00.123456789'",
+      "trino": {
+        "types": [
+          "timestamp(0)",
+          "timestamp(3)",
+          "timestamp(6)",
+          "timestamp(9)"
+        ],
+        "rows": [
+          [
+            "2024-01-01 10:00:00",
+            "2024-01-01 10:00:00.123",
+            "2024-01-01 10:00:00.123456",
+            "2024-01-01 10:00:00.123456789"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "localtimestamp_type",
+      "sql": "SELECT typeof(localtimestamp) = 'timestamp(3)', localtimestamp IS NOT NULL",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "current_timestamp_type",
+      "sql": "SELECT current_timestamp IS NOT NULL, typeof(now()) = 'timestamp(3) with time zone', current_timezone()",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "varchar"
+        ],
+        "rows": [
+          [
+            true,
+            true,
+            "UTC"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "current_date_consistent",
+      "sql": "SELECT current_date = CAST(localtimestamp AS date)",
+      "trino": {
+        "types": [
+          "boolean"
+        ],
+        "rows": [
+          [
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "now_brt_macro",
+      "sql": "SELECT date_diff('hour', CAST(current_timestamp AT TIME ZONE 'America/Sao_Paulo' AS timestamp(3)), localtimestamp)",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            3
+          ]
+        ]
+      }
+    },
+    {
+      "name": "from_unixtime_basic",
+      "sql": "SELECT from_unixtime(1700000000.5), from_unixtime(CAST(-1 AS bigint)), from_unixtime(CAST(NULL AS double))",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            "2023-11-14 22:13:20.500 UTC",
+            "1969-12-31 23:59:59.000 UTC",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "from_unixtime_nanos",
+      "sql": "SELECT from_unixtime_nanos(1700000000123456789)",
+      "trino": {
+        "types": [
+          "timestamp(9) with time zone"
+        ],
+        "rows": [
+          [
+            "2023-11-14 22:13:20.123456789 UTC"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "to_unixtime_basic",
+      "sql": "SELECT to_unixtime(TIMESTAMP '2024-01-01 00:00:00.500 UTC'), to_unixtime(TIMESTAMP '1969-12-31 23:59:59.999 UTC'), to_unixtime(CAST(NULL AS timestamp(3) with time zone))",
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            1704067200.5,
+            -0.001,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "to_iso8601_basic",
+      "sql": "SELECT to_iso8601(DATE '2024-01-02'), to_iso8601(TIMESTAMP '2024-01-02 03:04:05.678'), to_iso8601(TIMESTAMP '2024-01-02 03:04:05.678 America/Sao_Paulo'), to_iso8601(TIMESTAMP '2024-01-02 03:04:05.678 UTC')",
+      "trino": {
+        "types": [
+          "varchar(16)",
+          "varchar(26)",
+          "varchar(32)",
+          "varchar(32)"
+        ],
+        "rows": [
+          [
+            "2024-01-02",
+            "2024-01-02T03:04:05.678",
+            "2024-01-02T03:04:05.678-03:00",
+            "2024-01-02T03:04:05.678Z"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "from_iso8601",
+      "sql": "SELECT from_iso8601_date('2024-02-29'), from_iso8601_timestamp('2024-02-29T10:11:12.345Z'), from_iso8601_timestamp('2024-02-29T10:11:12.345-03:00')",
+      "trino": {
+        "types": [
+          "date",
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-02-29",
+            "2024-02-29 10:11:12.345 UTC",
+            "2024-02-29 10:11:12.345 -03:00"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "from_iso8601_error",
+      "sql": "SELECT from_iso8601_date('2024-02-30')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Cannot parse \"2024-02-30\": Value 30 for dayOfMonth must be in the range [1,29]"
+      }
+    },
+    {
+      "name": "date_function",
+      "sql": "SELECT date('2024-02-29'), date(TIMESTAMP '2024-02-29 23:59:59.999'), date(CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "date",
+          "date",
+          "date"
+        ],
+        "rows": [
+          [
+            "2024-02-29",
+            "2024-02-29",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "human_readable",
+      "sql": "SELECT human_readable_seconds(96), human_readable_seconds(3762), human_readable_seconds(56363463), human_readable_seconds(0.4)",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "1 minute, 36 seconds",
+            "1 hour, 2 minutes, 42 seconds",
+            "93 weeks, 1 day, 8 hours, 31 minutes, 3 seconds",
+            "0 seconds"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "at_timezone_fn",
+      "sql": "SELECT at_timezone(TIMESTAMP '2024-01-01 10:00:00.000 UTC', 'America/Sao_Paulo'), at_timezone(CAST(NULL AS timestamp(3) with time zone), 'UTC'), at_timezone(TIMESTAMP '2024-07-01 12:00:00.000 UTC', '+05:30')",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-01-01 07:00:00.000 America/Sao_Paulo",
+            null,
+            "2024-07-01 17:30:00.000 +05:30"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "extract_parts_null",
+      "sql": "SELECT day(CAST(NULL AS date)), day_of_week(CAST(NULL AS timestamp(3))), quarter(CAST(NULL AS date)), week(CAST(NULL AS date)), month(CAST(NULL AS timestamp(3))), minute(CAST(NULL AS timestamp(3))), second(CAST(NULL AS timestamp(3))), millisecond(CAST(NULL AS timestamp(3))), year_of_week(CAST(NULL AS date)), day_of_year(CAST(NULL AS date))",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "extract_parts_edge",
+      "sql": "SELECT week(DATE '2021-01-03'), year_of_week(DATE '2024-12-30'), day_of_year(DATE '2024-12-31'), day_of_week(DATE '1970-01-01'), quarter(DATE '2024-03-31'), millisecond(TIMESTAMP '1969-12-31 23:59:59.999'), second(TIMESTAMP '1969-12-31 23:59:59.999'), day(DATE '1900-02-28'), month(TIMESTAMP '2024-12-31 23:59:59.999 Asia/Tokyo')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            53,
+            2025,
+            366,
+            4,
+            1,
+            999,
+            59,
+            28,
+            12
+          ]
+        ]
+      }
+    },
+    {
+      "name": "extract_ts_tz_parts",
+      "sql": "SELECT year(TIMESTAMP '2024-12-31 23:00:00.000 America/Sao_Paulo'), day_of_week(TIMESTAMP '2024-01-07 23:00:00 America/Sao_Paulo'), minute(TIMESTAMP '2024-01-07 13:45:00.000 Asia/Kolkata'), week_of_year(TIMESTAMP '2024-12-30 00:00:00'), dow(TIMESTAMP '2024-01-07 00:00:00'), doy(TIMESTAMP '2024-12-31 00:00:00'), yow(TIMESTAMP '2021-01-01 00:00:00'), day_of_month(TIMESTAMP '2024-02-29 23:59:59')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            2024,
+            7,
+            45,
+            1,
+            7,
+            366,
+            2020,
+            29
+          ]
+        ]
+      }
+    },
+    {
+      "name": "extract_syntax_more",
+      "sql": "SELECT EXTRACT(MONTH FROM TIMESTAMP '2024-02-29 10:00:00'), EXTRACT(QUARTER FROM DATE '2024-11-01'), EXTRACT(MINUTE FROM TIMESTAMP '2024-02-29 10:45:00'), EXTRACT(SECOND FROM TIMESTAMP '2024-02-29 10:45:59.999'), EXTRACT(WEEK FROM DATE '2024-12-30'), EXTRACT(YEAR FROM CAST(NULL AS date))",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            2,
+            4,
+            45,
+            59,
+            1,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "timezone_parts_edge",
+      "sql": "SELECT timezone_hour(TIMESTAMP '2024-07-01 00:00:00.000 America/New_York'), timezone_minute(TIMESTAMP '2024-01-01 00:00:00.000 -03:30'), timezone_hour(TIMESTAMP '2024-01-01 00:00:00.000 -03:30'), timezone_hour(CAST(NULL AS timestamp(3) with time zone))",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            -4,
+            -30,
+            -3,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "localtime_type",
+      "sql": "SELECT typeof(localtime), localtime IS NOT NULL",
+      "trino": {
+        "types": [
+          "varchar",
+          "boolean"
+        ],
+        "rows": [
+          [
+            "time(3)",
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "current_date_type",
+      "sql": "SELECT typeof(current_date), current_date > DATE '2020-01-01', current_timezone() = 'UTC'",
+      "trino": {
+        "types": [
+          "varchar",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            "date",
+            true,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_edge",
+      "sql": "SELECT date(TIMESTAMP '2024-01-01 01:00:00.000 Asia/Tokyo'), date('1900-01-01'), date(TIMESTAMP '1969-12-31 23:59:59.999')",
+      "trino": {
+        "types": [
+          "date",
+          "date",
+          "date"
+        ],
+        "rows": [
+          [
+            "2024-01-01",
+            "1900-01-01",
+            "1969-12-31"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_invalid",
+      "sql": "SELECT date('2024-13-01')",
+      "trino": {
+        "error": "INVALID_CAST_ARGUMENT",
+        "message": "Value cannot be cast to date: 2024-13-01"
+      }
+    },
+    {
+      "name": "from_unixtime_edge",
+      "sql": "SELECT from_unixtime(0), from_unixtime(1.5E0, 'America/Sao_Paulo'), from_unixtime(0, 2, 30), from_unixtime(-0.0005E0)",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            "1970-01-01 00:00:00.000 UTC",
+            "1969-12-31 21:00:01.500 America/Sao_Paulo",
+            "1970-01-01 02:30:00.000 +02:30",
+            "1970-01-01 00:00:00.000 UTC"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "from_unixtime_nanos_edge",
+      "sql": "SELECT from_unixtime_nanos(0), from_unixtime_nanos(-1), from_unixtime_nanos(CAST(NULL AS bigint))",
+      "trino": {
+        "types": [
+          "timestamp(9) with time zone",
+          "timestamp(9) with time zone",
+          "timestamp(9) with time zone"
+        ],
+        "rows": [
+          [
+            "1970-01-01 00:00:00.000000000 UTC",
+            "1969-12-31 23:59:59.999999999 UTC",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "to_unixtime_edge",
+      "sql": "SELECT to_unixtime(TIMESTAMP '2024-01-01 00:00:00.000'), to_unixtime(TIMESTAMP '2024-01-01 00:00:00.000 America/Sao_Paulo'), to_unixtime(TIMESTAMP '1970-01-01 00:00:00.123456 UTC')",
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            1704067200.0,
+            1704078000.0,
+            0.123456
+          ]
+        ]
+      }
+    },
+    {
+      "name": "to_iso8601_null_edge",
+      "sql": "SELECT to_iso8601(CAST(NULL AS date)), to_iso8601(TIMESTAMP '2024-01-02 03:04:05'), to_iso8601(TIMESTAMP '1969-12-31 23:59:59.999999'), to_iso8601(TIMESTAMP '2024-01-02 03:04:05 +05:30')",
+      "trino": {
+        "types": [
+          "varchar(16)",
+          "varchar(22)",
+          "varchar(29)",
+          "varchar(28)"
+        ],
+        "rows": [
+          [
+            null,
+            "2024-01-02T03:04:05",
+            "1969-12-31T23:59:59.999999",
+            "2024-01-02T03:04:05+05:30"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "from_iso8601_ts_edge",
+      "sql": "SELECT from_iso8601_timestamp('2024-02-29'), from_iso8601_timestamp('2024-02-29T10:11'), from_iso8601_timestamp(CAST(NULL AS varchar)), from_iso8601_date(CAST(NULL AS varchar)), from_iso8601_timestamp('2024-02-29T10:11:12+05:30')",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone",
+          "date",
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-02-29 00:00:00.000 UTC",
+            "2024-02-29 10:11:00.000 UTC",
+            null,
+            null,
+            "2024-02-29 10:11:12.000 +05:30"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "from_iso8601_ts_invalid",
+      "sql": "SELECT from_iso8601_timestamp('2024-02-29T25:00')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Cannot parse \"2024-02-29T25:00\": Value 25 for hourOfDay must be in the range [0,23]"
+      }
+    },
+    {
+      "name": "human_readable_edge",
+      "sql": "SELECT human_readable_seconds(0), human_readable_seconds(1), human_readable_seconds(CAST(NULL AS double)), human_readable_seconds(604800), human_readable_seconds(61.5)",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "0 seconds",
+            "1 second",
+            null,
+            "1 week",
+            "1 minute, 2 seconds"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "last_day_edge",
+      "sql": "SELECT last_day_of_month(DATE '2023-12-31'), last_day_of_month(DATE '2100-02-01'), last_day_of_month(TIMESTAMP '2024-02-29 23:59:59.999 America/Sao_Paulo')",
+      "trino": {
+        "types": [
+          "date",
+          "date",
+          "date"
+        ],
+        "rows": [
+          [
+            "2023-12-31",
+            "2100-02-28",
+            "2024-02-29"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_trunc_units",
+      "sql": "SELECT date_trunc('year', TIMESTAMP '2024-05-29 10:11:12.345'), date_trunc('minute', TIMESTAMP '2024-05-29 10:11:12.345'), date_trunc('millisecond', TIMESTAMP '2024-05-29 10:11:12.345678'), date_trunc('week', DATE '2024-01-01'), date_trunc('QUARTER', DATE '2024-12-31')",
+      "trino": {
+        "types": [
+          "timestamp(3)",
+          "timestamp(3)",
+          "timestamp(6)",
+          "date",
+          "date"
+        ],
+        "rows": [
+          [
+            "2024-01-01 00:00:00.000",
+            "2024-05-29 10:11:00.000",
+            "2024-05-29 10:11:12.345000",
+            "2024-01-01",
+            "2024-10-01"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_trunc_bad_unit",
+      "sql": "SELECT date_trunc('fortnight', DATE '2024-01-01')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "'fortnight' is not a valid DATE field"
+      }
+    },
+    {
+      "name": "date_diff_null_unit_units",
+      "sql": "SELECT date_diff(CAST(NULL AS varchar), DATE '2024-01-01', DATE '2024-01-02'), date_diff('millisecond', TIMESTAMP '2024-01-01 00:00:00.000 UTC', TIMESTAMP '2024-01-01 00:00:00.000 America/Sao_Paulo'), date_diff('year', TIMESTAMP '2000-02-29 00:00:00', TIMESTAMP '2100-02-28 23:59:59.999')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            null,
+            10800000,
+            100
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_overflow_month",
+      "sql": "SELECT date_add('month', 13, DATE '2024-01-31'), date_add('year', -1, TIMESTAMP '2024-02-29 12:00:00.000 America/Sao_Paulo'), date_add('day', -1, DATE '2024-03-01')",
+      "trino": {
+        "types": [
+          "date",
+          "timestamp(3) with time zone",
+          "date"
+        ],
+        "rows": [
+          [
+            "2025-02-28",
+            "2023-02-28 12:00:00.000 America/Sao_Paulo",
+            "2024-02-29"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "interval_literals",
+      "sql": "SELECT TIMESTAMP '2024-01-31 10:00:00.000' + INTERVAL '1' MONTH, DATE '2024-02-29' - INTERVAL '1' YEAR, TIMESTAMP '2024-03-10 01:00:00.000 America/New_York' + INTERVAL '1' HOUR, TIMESTAMP '2024-03-09 12:00:00.000 America/New_York' + INTERVAL '1' DAY",
+      "trino": {
+        "types": [
+          "timestamp(3)",
+          "date",
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-02-29 10:00:00.000",
+            "2023-02-28",
+            "2024-03-10 03:00:00.000 America/New_York",
+            "2024-03-10 13:00:00.000 America/New_York"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "interval_null",
+      "sql": "SELECT CAST(NULL AS timestamp(3)) + INTERVAL '1' DAY, CAST(NULL AS date) + INTERVAL '1' DAY",
+      "trino": {
+        "types": [
+          "timestamp(3)",
+          "date"
+        ],
+        "rows": [
+          [
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "timestamp_subtract",
+      "sql": "SELECT date_diff('second', TIMESTAMP '2024-01-01 00:00:00', TIMESTAMP '2024-01-02 00:00:00'), TIMESTAMP '2024-01-02 00:00:00.000' > TIMESTAMP '2024-01-01 23:59:59.999'",
+      "trino": {
+        "types": [
+          "bigint",
+          "boolean"
+        ],
+        "rows": [
+          [
+            86400,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "parse_duration_fn",
+      "sql": "SELECT to_milliseconds(parse_duration('1.5h')), to_milliseconds(parse_duration('42.8ms')), to_milliseconds(parse_duration('3.81 d')), to_milliseconds(parse_duration('0s'))",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            5400000,
+            43,
+            329184000,
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "parse_duration_invalid",
+      "sql": "SELECT parse_duration('1x')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Unknown time unit: x"
+      }
+    },
+    {
+      "name": "to_milliseconds_fn",
+      "sql": "SELECT to_milliseconds(INTERVAL '1' DAY), to_milliseconds(INTERVAL '90' MINUTE), to_milliseconds(CAST(NULL AS interval day to second))",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            86400000,
+            5400000,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "from_iso8601_timestamp_nanos_fn",
+      "sql": "SELECT from_iso8601_timestamp_nanos('2024-02-29T10:11:12.123456789Z'), from_iso8601_timestamp_nanos('2024-02-29T10:11:12-03:00'), from_iso8601_timestamp_nanos(CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "timestamp(9) with time zone",
+          "timestamp(9) with time zone",
+          "timestamp(9) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-02-29 10:11:12.123456789 UTC",
+            "2024-02-29 10:11:12.000000000 -03:00",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_diff_month_last_day_time",
+      "sql": "SELECT date_diff('month', TIMESTAMP '2024-02-29 11:00:00', TIMESTAMP '2024-03-31 10:00:00'), date_diff('month', TIMESTAMP '2024-01-31 11:00:00', TIMESTAMP '2024-02-29 10:00:00'), date_diff('month', TIMESTAMP '2024-03-31 10:00:00', TIMESTAMP '2024-02-29 11:00:00')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            1,
+            0,
+            -1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_add_second_to_date",
+      "sql": "SELECT date_add('second', -1, DATE '2024-01-01')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "'second' is not a valid DATE field"
+      }
+    },
+    {
+      "name": "date_plus_hours_error",
+      "sql": "SELECT DATE '2024-01-01' + INTERVAL '36' HOUR",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Cannot add hour, minutes or seconds to a date"
+      }
+    },
+    {
+      "name": "at_timezone_null_zone_dst",
+      "sql": "SELECT at_timezone(TIMESTAMP '2024-03-10 06:59:59.999 UTC', 'America/New_York'), at_timezone(TIMESTAMP '2024-03-10 07:00:00.000 UTC', 'America/New_York'), at_timezone(TIMESTAMP '2024-11-03 05:30:00.000 UTC', 'America/New_York')",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-03-10 01:59:59.999 America/New_York",
+            "2024-03-10 03:00:00.000 America/New_York",
+            "2024-11-03 01:30:00.000 America/New_York"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "localtime_now_consistency",
+      "sql": "SELECT localtime IS NOT NULL, now() >= current_timestamp - INTERVAL '1' MINUTE, typeof(now())",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "varchar"
+        ],
+        "rows": [
+          [
+            true,
+            true,
+            "timestamp(3) with time zone"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "localtime_now_types",
+      "sql": "SELECT typeof(localtime), typeof(current_timestamp), current_timezone()",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "time(3)",
+            "timestamp(3) with time zone",
+            "UTC"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "from_iso8601_timestamp_nanos_edge",
+      "sql": "SELECT from_iso8601_timestamp_nanos('2024-02-29T10:11:12Z'), from_iso8601_timestamp_nanos('1969-12-31T23:59:59.999999999Z')",
+      "trino": {
+        "types": [
+          "timestamp(9) with time zone",
+          "timestamp(9) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-02-29 10:11:12.000000000 UTC",
+            "1969-12-31 23:59:59.999999999 UTC"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "from_iso8601_timestamp_nanos_invalid",
+      "sql": "SELECT from_iso8601_timestamp_nanos('2024-02-30T00:00:00Z')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Text '2024-02-30T00:00:00Z' could not be parsed: Invalid date 'FEBRUARY 30'"
+      }
+    },
+    {
+      "name": "extract_aliases_null",
+      "sql": "SELECT day_of_month(CAST(NULL AS date)), dow(CAST(NULL AS date)), doy(CAST(NULL AS date)), yow(CAST(NULL AS date)), week_of_year(CAST(NULL AS date))",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            null,
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "extract_aliases_edge",
+      "sql": "SELECT day_of_month(DATE '2023-02-28'), dow(DATE '2024-01-01'), doy(DATE '2023-12-31'), yow(DATE '2024-12-30'), week_of_year(DATE '2024-12-30')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            28,
+            1,
+            365,
+            2025,
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "timezone_parts_null_offset",
+      "sql": "SELECT timezone_hour(TIMESTAMP '2024-01-01 00:00:00.000 +05:45'), timezone_minute(TIMESTAMP '2024-01-01 00:00:00.000 +05:45'), timezone_minute(CAST(NULL AS timestamp(3) with time zone))",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            5,
+            45,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "current_timezone_is_session",
+      "sql": "SELECT current_timezone(), length(current_timezone())",
+      "trino": {
+        "types": [
+          "varchar",
+          "bigint"
+        ],
+        "rows": [
+          [
+            "UTC",
+            3
+          ]
+        ]
+      }
+    },
+    {
+      "name": "current_timestamp_ordering",
+      "sql": "SELECT current_timestamp <= current_timestamp, date(current_timestamp) = current_date",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "from_unixtime_null_edge",
+      "sql": "SELECT from_unixtime(CAST(NULL AS bigint)), from_unixtime(253402300799), from_unixtime(-62135596800)",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            null,
+            "9999-12-31 23:59:59.000 UTC",
+            "0001-01-01 00:00:00.000 UTC"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "from_unixtime_nanos_edge_big",
+      "sql": "SELECT from_unixtime_nanos(1700000000999999999), from_unixtime_nanos(-1700000000000000001)",
+      "trino": {
+        "types": [
+          "timestamp(9) with time zone",
+          "timestamp(9) with time zone"
+        ],
+        "rows": [
+          [
+            "2023-11-14 22:13:20.999999999 UTC",
+            "1916-02-18 01:46:39.999999999 UTC"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "to_unixtime_null_negative",
+      "sql": "SELECT to_unixtime(CAST(NULL AS timestamp(3))), to_unixtime(TIMESTAMP '1969-12-31 23:59:59.5 UTC'), to_unixtime(TIMESTAMP '2038-01-19 03:14:08.000 UTC')",
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            null,
+            -0.5,
+            2147483648.0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "to_iso8601_edge_zones",
+      "sql": "SELECT to_iso8601(TIMESTAMP '2024-01-02 03:04:05.000 UTC'), to_iso8601(TIMESTAMP '2024-07-01 00:00:00.000 America/Sao_Paulo'), to_iso8601(DATE '0001-01-01')",
+      "trino": {
+        "types": [
+          "varchar(32)",
+          "varchar(32)",
+          "varchar(16)"
+        ],
+        "rows": [
+          [
+            "2024-01-02T03:04:05.000Z",
+            "2024-07-01T00:00:00.000-03:00",
+            "0001-01-01"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "human_readable_seconds_edge",
+      "sql": "SELECT human_readable_seconds(59.9), human_readable_seconds(3600), human_readable_seconds(86401)",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "1 minute",
+            "1 hour",
+            "1 day, 1 second"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "last_day_null_leap",
+      "sql": "SELECT last_day_of_month(DATE '2000-02-15'), last_day_of_month(DATE '1900-02-15'), last_day_of_month(CAST(NULL AS timestamp(3)))",
+      "trino": {
+        "types": [
+          "date",
+          "date",
+          "date"
+        ],
+        "rows": [
+          [
+            "2000-02-29",
+            "1900-02-28",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "parse_duration_null_units",
+      "sql": "SELECT to_milliseconds(parse_duration(CAST(NULL AS varchar))), to_milliseconds(parse_duration('1500ns')), to_milliseconds(parse_duration('2.5us')), to_milliseconds(parse_duration('10m'))",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            null,
+            0,
+            0,
+            600000
+          ]
+        ]
+      }
+    },
+    {
+      "name": "to_milliseconds_edge",
+      "sql": "SELECT to_milliseconds(INTERVAL '0' SECOND), to_milliseconds(INTERVAL '-2' DAY), to_milliseconds(INTERVAL '1 00:00:00.001' DAY TO SECOND)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            0,
+            -172800000,
+            86400001
+          ]
+        ]
+      }
+    },
+    {
+      "name": "at_timezone_offsets",
+      "sql": "SELECT at_timezone(TIMESTAMP '2024-01-01 00:00:00.000 +05:30', 'UTC'), at_timezone(TIMESTAMP '2024-01-01 00:00:00.123456 UTC', 'Asia/Kolkata')",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone",
+          "timestamp(6) with time zone"
+        ],
+        "rows": [
+          [
+            "2023-12-31 18:30:00.000 UTC",
+            "2024-01-01 05:30:00.123456 Asia/Kolkata"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "now_consistency",
+      "sql": "SELECT now() IS NOT NULL, date(now()) = current_date, typeof(now())",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "varchar"
+        ],
+        "rows": [
+          [
+            true,
+            true,
+            "timestamp(3) with time zone"
+          ]
+        ]
+      }
+    }
+  ]
+}

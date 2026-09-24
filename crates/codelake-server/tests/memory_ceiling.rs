@@ -245,7 +245,7 @@ impl Trino {
 }
 
 /// ~1.2 GiB of 4 KiB rows: 32 MiB per 8192-row batch.
-const WIDE: &str = "SELECT value, repeat('x', 4096) AS s FROM generate_series(1, 300000)";
+const WIDE: &str = "SELECT value, lpad('', 4096, 'x') AS s FROM generate_series(1, 300000)";
 const WIDE_ROWS: i64 = 300_000;
 const WIDE_BYTES: usize = 4096;
 
@@ -563,7 +563,7 @@ async fn heavy_sort_spills_under_the_ceiling() {
         "sort",
         "SELECT r, length(s) AS l, substr(s, 201) AS v FROM (\
            SELECT row_number() OVER (ORDER BY s DESC) AS r, s FROM (\
-             SELECT repeat('x', 200) || CAST(value AS VARCHAR) AS s \
+             SELECT lpad('', 200, 'x') || CAST(value AS VARCHAR) AS s \
              FROM generate_series(1, 1500000))) \
          WHERE r IN (1, 1500000) ORDER BY r",
         &[json!([1, 206, "999999"]), json!([1_500_000, 201, "1"])],
@@ -582,7 +582,7 @@ async fn heavy_aggregation_spills_under_the_ceiling() {
         "aggregation",
         "SELECT count(*) AS groups, sum(c) AS n, min(c) AS lo, max(c) AS hi FROM (\
            SELECT p, count(*) AS c FROM (\
-             SELECT repeat('x', 200) || CAST(value % 1000000 AS VARCHAR) AS p \
+             SELECT lpad('', 200, 'x') || CAST(value % 1000000 AS VARCHAR) AS p \
              FROM generate_series(1, 2000000)) GROUP BY p)",
         &[json!([1_000_000, 2_000_000, 2, 2])],
         true,
@@ -601,9 +601,9 @@ async fn heavy_hash_join_fails_cleanly_under_the_ceiling() {
     let (report, wrong) = heavy(
         "hash join",
         "SELECT count(*) AS n, sum(a.v) AS total, sum(length(a.p) + length(b.p)) AS bytes FROM (\
-           SELECT value AS v, repeat('x', 200) || CAST(value AS VARCHAR) AS p \
+           SELECT value AS v, lpad('', 200, 'x') || CAST(value AS VARCHAR) AS p \
            FROM generate_series(1, 1000000)) a JOIN (\
-           SELECT value AS v, repeat('y', 200) || CAST(value AS VARCHAR) AS p \
+           SELECT value AS v, lpad('', 200, 'y') || CAST(value AS VARCHAR) AS p \
            FROM generate_series(1, 1000000)) b ON a.v = b.v",
         &[json!([
             1_000_000,

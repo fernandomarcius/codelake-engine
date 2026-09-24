@@ -36,7 +36,7 @@
 //! `GENERIC_INTERNAL_ERROR` ([`is_trino_internal_error`]).
 
 mod arith;
-mod avg;
+pub(crate) mod avg;
 pub(crate) mod decimal;
 mod real;
 mod sum;
@@ -397,18 +397,6 @@ fn uncheck_node(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
         other => other.data,
     };
     let expr = match crate::casts::uncheck_cast(expr) {
-        done @ Transformed {
-            transformed: true, ..
-        } => return Ok(done),
-        other => other.data,
-    };
-    let expr = match crate::trino_functions::uncheck_round(expr, schema)? {
-        done @ Transformed {
-            transformed: true, ..
-        } => return Ok(done),
-        other => other.data,
-    };
-    let expr = match crate::trino_functions::uncheck_integral(expr, schema)? {
         done @ Transformed {
             transformed: true, ..
         } => return Ok(done),

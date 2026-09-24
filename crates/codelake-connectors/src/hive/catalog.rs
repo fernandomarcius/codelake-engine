@@ -1,9 +1,16 @@
 //! Catalog and schema providers over a Trino file metastore, and the DDL the
 //! engine routes here (`WritableCatalog`).
 //!
-//! Listing (`schema_names`, `table_names`) comes from a cache refreshed after
-//! every DDL and at startup; `table()` always reads the metastore, so tables
-//! created by another writer (Trino during a canary) resolve immediately.
+//! Listing (`schema_names`, `table_names`) reads a local warehouse's
+//! directories each time, so a schema or table another writer created (Trino
+//! during a canary, another `CodeLake` node) is listed at once; an object
+//! store warehouse lists from a cache refreshed after every DDL and at
+//! startup. `table()` always reads the metastore.
+//!
+//! A table the catalog cannot read (another storage format, partitions,
+//! unreadable metadata) fails only when it is read; columns of a type
+//! `CodeLake` does not read yet fail only when the query reads them (see
+//! `types.rs`). Listings (`information_schema`) stay whole.
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,22 +19,34 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use codelake_core::{ViewDefinition, ViewSecurity, WritableCatalog};
+use codelake_core::statement_policy::{ObjectKind, check_object_name, parse_view_query};
+use codelake_core::trino_types::Declared;
+use codelake_core::{
+    COLUMN_COMMENT, CatalogSession, ProcedureCall, TableProcedure, ViewDefinition, ViewSecurity,
+    WritableCatalog,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::{CatalogProvider, SchemaProvider, Session, TableProvider};
+use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{Expr, LogicalPlanBuilder, cast, col};
+use datafusion::functions::expr_fn;
+use datafusion::logical_expr::{Expr, LogicalPlanBuilder, TableProviderFilterPushDown, cast};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::sql::sqlparser::dialect::dialect_from_str;
+use object_store::ObjectStoreExt;
 use serde::{Deserialize, Serialize};
 
-use super::metastore::{ColumnMetadata, FileMetastore, MetastoreError, TableMetadata};
-use super::table::{HiveSink, HiveTable};
-use super::types::{arrow_type, declared_text, hive_field, hive_field_type, hive_type};
+use codelake_core::config::HiveTimestampPrecision;
+
+use super::metastore::{ColumnMetadata, FileMetastore, MetastoreError, Staging, TableMetadata};
+use super::optimize::{self, OPTIMIZE, Settings};
+use super::table::{HiveSink, HiveTable, refuse_char_comparisons};
+use super::types::{UNSUPPORTED, arrow_type, char_column, hive_type, stored_type, unsupported};
 
 const VIEW_PREFIX: &str = "/* Presto View: ";
 const VIEW_SUFFIX: &str = " */";
@@ -36,6 +55,7 @@ fn metastore_error(err: MetastoreError) -> DataFusionError {
     match err {
         MetastoreError::AlreadyExists(what) => DataFusionError::Plan(format!("{what} already exists")),
         MetastoreError::NotFound(what) => DataFusionError::Plan(format!("{what} does not exist")),
+        MetastoreError::Conflict(what) => DataFusionError::Plan(what),
         other => DataFusionError::External(Box::new(other)),
     }
 }
@@ -89,19 +109,37 @@ impl TrinoView {
     }
 }
 
+/// Arrow unit of a Trino timestamp precision.
+fn precision_unit(precision: &str) -> TimeUnit {
+    // The smallest unit that holds the precision; 1 and 2 (like 4, 5, 7 and
+    // 8) also declare it in the field (see `view_declared`).
+    match precision.trim().parse::<u8>().unwrap_or(3) {
+        0 => TimeUnit::Second,
+        1..=3 => TimeUnit::Millisecond,
+        4..=6 => TimeUnit::Microsecond,
+        _ => TimeUnit::Nanosecond,
+    }
+}
+
+/// Zone of the Arrow type of Trino's `timestamp(p) with time zone`: values
+/// keep their instant; each value's own zone is not kept (Arrow has one zone
+/// per column), so they read in UTC.
+const VIEW_ZONE: &str = "UTC";
+
 /// Trino type name (view columns) → Arrow.
 pub(crate) fn trino_to_arrow(trino: &str) -> Result<DataType> {
     let lower = trino.trim().to_ascii_lowercase();
-    if let Some(precision) = lower.strip_prefix("timestamp(").and_then(|r| r.strip_suffix(')')) {
-        // The smallest unit that holds the precision; 1 and 2 (like 4, 5, 7
-        // and 8) also declare it in the field (see `view_declared`).
-        let unit = match precision.parse::<u8>().unwrap_or(3) {
-            0 => TimeUnit::Second,
-            1..=3 => TimeUnit::Millisecond,
-            4..=6 => TimeUnit::Microsecond,
-            _ => TimeUnit::Nanosecond,
+    if let Some(rest) = lower.strip_prefix("timestamp") {
+        let (precision, zoned) = match rest.trim().strip_suffix("with time zone") {
+            Some(before) => (before.trim(), true),
+            None => (rest.trim(), false),
         };
-        return Ok(DataType::Timestamp(unit, None));
+        let precision = precision
+            .strip_prefix('(')
+            .and_then(|p| p.strip_suffix(')'))
+            .unwrap_or("3");
+        let zone = zoned.then(|| VIEW_ZONE.into());
+        return Ok(DataType::Timestamp(precision_unit(precision), zone));
     }
     match lower.split('(').next().unwrap_or_default() {
         "integer" => Ok(DataType::Int32),
@@ -111,17 +149,54 @@ pub(crate) fn trino_to_arrow(trino: &str) -> Result<DataType> {
     }
 }
 
-/// The type a view column declares beyond its Arrow type: `varchar(n)`,
-/// `char(n)`, and a timestamp precision no Arrow unit has (`timestamp(1)`).
-fn view_declared(trino: &str) -> Option<codelake_core::trino_types::Declared> {
-    use codelake_core::trino_types::Declared;
-    declared_text(trino).or_else(|| {
-        Declared::parse(trino).filter(|d| matches!(d, Declared::Timestamp(p) if ![0, 3, 6, 9].contains(p)))
+/// The field of a view column: a type `CodeLake` does not read yet fails
+/// only when a query reads the column (see `types.rs`).
+fn view_field(name: &str, trino: &str) -> Field {
+    let lower = trino.trim().to_ascii_lowercase();
+    let refuse = |data_type: DataType, reason: String| {
+        Field::new(name, data_type, true).with_metadata(std::collections::HashMap::from([(
+            UNSUPPORTED.to_owned(),
+            reason,
+        )]))
+    };
+    if lower == "char" || lower.starts_with("char(") {
+        // Padded like a table's char column (see `types.rs`).
+        return super::types::column_field(name, &lower, HiveTimestampPrecision::default());
+    }
+    match trino_to_arrow(&lower) {
+        Ok(data_type) => {
+            let field = Field::new(name, data_type, true);
+            match view_declared(&lower) {
+                Some(declared) => field.with_metadata(declared.metadata()),
+                None => field,
+            }
+        }
+        Err(_) => refuse(
+            DataType::Null,
+            format!("view column {name}: type `{trino}` is not supported"),
+        ),
+    }
+}
+
+/// The type a view column declares beyond its Arrow type: `varchar(n)`, and
+/// a timestamp precision no Arrow unit has (`timestamp(1)`); `char(n)` is a
+/// table's char column (see `view_field`).
+fn view_declared(trino: &str) -> Option<Declared> {
+    Declared::parse(trino).filter(|d| match d {
+        Declared::Varchar(_) => true,
+        Declared::Timestamp(p) => ![0, 3, 6, 9].contains(p),
+        Declared::Char(_) => false,
     })
 }
 
 /// Arrow → Trino type name (view columns).
 pub(crate) fn arrow_to_trino(data_type: &DataType) -> Result<String> {
+    let digits = |unit: &TimeUnit| match unit {
+        TimeUnit::Second => 0,
+        TimeUnit::Millisecond => 3,
+        TimeUnit::Microsecond => 6,
+        TimeUnit::Nanosecond => 9,
+    };
     Ok(match data_type {
         DataType::Int32 => "integer".into(),
         DataType::Float32 => "real".into(),
@@ -131,6 +206,7 @@ pub(crate) fn arrow_to_trino(data_type: &DataType) -> Result<String> {
         DataType::Timestamp(TimeUnit::Millisecond, None) => "timestamp(3)".into(),
         DataType::Timestamp(TimeUnit::Microsecond, None) => "timestamp(6)".into(),
         DataType::Timestamp(TimeUnit::Nanosecond, None) => "timestamp(9)".into(),
+        DataType::Timestamp(unit, Some(_)) => format!("timestamp({}) with time zone", digits(unit)),
         other => hive_type(other)?,
     })
 }
@@ -138,11 +214,24 @@ pub(crate) fn arrow_to_trino(data_type: &DataType) -> Result<String> {
 /// A view stored in the metastore. Planned from its SQL at scan time, in the
 /// catalog and schema stored with it (Trino resolves a view's unqualified
 /// names that way, not in the reader's session), then cast to the declared
-/// column types.
+/// column types. The stored SQL must be a query: whoever wrote the metadata,
+/// reading a view never runs anything else.
 #[derive(Debug)]
 struct HiveView {
+    name: String,
     definition: TrinoView,
     schema: SchemaRef,
+}
+
+/// Refuses reading columns `CodeLake` cannot return (see `types.rs`).
+pub(crate) fn refuse_unsupported(schema: &Schema, projection: Option<&Vec<usize>>) -> Result<()> {
+    let indices: Vec<usize> = projection.map_or_else(|| (0..schema.fields().len()).collect(), Clone::clone);
+    for index in &indices {
+        if let Some(reason) = schema.fields().get(*index).and_then(|f| unsupported(f)) {
+            return Err(DataFusionError::NotImplemented(reason.to_owned()));
+        }
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -163,6 +252,11 @@ impl TableProvider for HiveView {
         Some(&self.definition.original_sql)
     }
 
+    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Result<Vec<TableProviderFilterPushDown>> {
+        // Seen by `scan` (to refuse char comparisons), applied again above.
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
@@ -174,6 +268,8 @@ impl TableProvider for HiveView {
             .as_any()
             .downcast_ref::<SessionState>()
             .ok_or_else(|| DataFusionError::Internal("hive views need a SessionState".into()))?;
+        refuse_unsupported(&self.schema, projection)?;
+        refuse_char_comparisons(&self.schema, filters)?;
         // The view's plan becomes part of the outer one, which merges and
         // reserves the output of the whole query (`codelake_core::output`).
         let rules = state
@@ -192,13 +288,21 @@ impl TableProvider for HiveView {
         if let Some(schema) = &self.definition.schema {
             defaults.default_schema.clone_from(schema);
         }
-        // The same statement rewrites as any query the engine plans.
-        let dialect = view_state.config().options().sql_parser.dialect;
-        let sql = codelake_core::engine::trino_text(&self.definition.original_sql);
-        let mut statement = view_state.sql_to_statement(&sql, &dialect)?;
+        let dialect_name = view_state.config().options().sql_parser.dialect;
         let zone = view_state.config().options().execution.time_zone.clone();
-        codelake_core::engine::trino_statement(&mut statement, zone.as_deref().unwrap_or("UTC"));
-        let plan = view_state.statement_to_plan(statement).await?;
+        let query = {
+            // `Box<dyn Dialect>` is not `Send`: gone before any `.await`.
+            let dialect = dialect_from_str(dialect_name)
+                .ok_or_else(|| DataFusionError::Plan(format!("unsupported SQL dialect {dialect_name}")))?;
+            // The same statement rewrites as any query the engine plans.
+            parse_view_query(
+                &self.definition.original_sql,
+                dialect.as_ref(),
+                zone.as_deref().unwrap_or("UTC"),
+            )
+            .map_err(|err| DataFusionError::Plan(format!("view {}: {err}", self.name)))?
+        };
+        let plan = view_state.statement_to_plan(query).await?;
         let output = plan.schema().clone();
         if output.fields().len() != self.schema.fields().len() {
             return Err(DataFusionError::Plan(format!(
@@ -207,20 +311,51 @@ impl TableProvider for HiveView {
                 self.schema.fields().len()
             )));
         }
-        let casts: Vec<Expr> = output
-            .columns()
-            .into_iter()
-            .zip(self.schema.fields())
-            .map(|(column, field)| cast(col(column), field.data_type().clone()).alias(field.name()))
+        // Only the columns read: one of a type `CodeLake` does not read yet
+        // must not fail a query that does not read it.
+        let fields = self.schema.fields();
+        let indices: Vec<usize> = projection.cloned().unwrap_or_else(|| (0..fields.len()).collect());
+        let columns = output.columns();
+        let mut read: Vec<usize> = indices.clone();
+        for filter in filters {
+            for column in filter.column_refs() {
+                if let Some(index) = fields.iter().position(|f| f.name() == &column.name)
+                    && !read.contains(&index)
+                {
+                    read.push(index);
+                }
+            }
+        }
+        refuse_unsupported(&self.schema, Some(&read))?;
+        let casts: Vec<Expr> = read
+            .iter()
+            .map(|index| {
+                let field = &fields[*index];
+                let value = cast(Expr::Column(columns[*index].clone()), field.data_type().clone());
+                // A char(n) column shows its values padded, as Trino.
+                let value = match char_column(field) {
+                    Some(length) => expr_fn::rpad(vec![
+                        expr_fn::rtrim(vec![value]),
+                        Expr::Literal(ScalarValue::Int64(i64::try_from(length).ok()), None),
+                    ]),
+                    None => value,
+                };
+                value.alias(field.name())
+            })
             .collect();
-        let mut builder = LogicalPlanBuilder::from(plan).project(casts)?;
+        let mut builder = LogicalPlanBuilder::from(plan);
+        if !casts.is_empty() {
+            builder = builder.project(casts)?;
+        }
         if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
             builder = builder.filter(filter)?;
         }
-        if let Some(indices) = projection {
-            let fields = self.schema.fields();
-            builder = builder.project(indices.iter().map(|i| col(fields[*i].name())).collect::<Vec<_>>())?;
-        }
+        builder = builder.project(
+            indices
+                .iter()
+                .map(|i| Expr::Column(Column::from_name(fields[*i].name())))
+                .collect::<Vec<_>>(),
+        )?;
         if let Some(limit) = limit {
             builder = builder.limit(0, Some(limit))?;
         }
@@ -296,18 +431,13 @@ impl HiveCatalog {
                 .as_deref()
                 .ok_or_else(|| DataFusionError::Plan(format!("view {schema}.{table} has no definition")))?;
             let definition = TrinoView::decode(text)?;
-            let fields = definition
+            let fields: Vec<Field> = definition
                 .columns
                 .iter()
-                .map(|c| {
-                    let field = Field::new(&c.name, trino_to_arrow(&c.trino_type)?, true);
-                    Ok(match view_declared(&c.trino_type) {
-                        Some(declared) => field.with_metadata(declared.metadata()),
-                        None => field,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
+                .map(|c| view_field(&c.name, &c.trino_type))
+                .collect();
             return Ok(Some(Arc::new(HiveView {
+                name: format!("{schema}.{table}"),
                 definition,
                 schema: Arc::new(Schema::new(fields)),
             })));
@@ -315,29 +445,75 @@ impl HiveCatalog {
         Ok(Some(Arc::new(self.table_provider(schema, table, &metadata)?)))
     }
 
-    fn table_provider(&self, schema: &str, table: &str, metadata: &TableMetadata) -> Result<HiveTable> {
-        if metadata.storage_format.as_deref().is_some_and(|f| f != "PARQUET") {
-            return Err(DataFusionError::NotImplemented(format!(
-                "{schema}.{table}: only PARQUET hive tables are supported"
-            )));
+    pub(crate) fn table_provider(
+        &self,
+        schema: &str,
+        table: &str,
+        metadata: &TableMetadata,
+    ) -> Result<HiveTable> {
+        HiveTable::from_metadata(
+            self.metastore.clone(),
+            self.store_url.clone(),
+            schema,
+            table,
+            metadata,
+        )
+    }
+
+    /// Finishes or undoes `OPTIMIZE` runs interrupted by a crash, in every
+    /// table. Called when the catalog is opened, before any query can list a
+    /// table whose files were half swapped. A table whose swap cannot be
+    /// settled (unreadable or inconsistent marker) is logged and left as it
+    /// is: the other tables stay available, and that table refuses scans and
+    /// `OPTIMIZE` until someone inspects it (its marker stays in place).
+    pub(crate) async fn recover_interrupted_optimize(&self) -> Result<usize> {
+        let tables: Vec<(String, String)> = self
+            .listing
+            .read()
+            .map(|l| {
+                l.tables
+                    .iter()
+                    .flat_map(|(schema, tables)| tables.iter().map(move |t| (schema.clone(), t.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut recovered = 0;
+        for (schema, table) in tables {
+            match self.recover_table(&schema, &table).await {
+                Ok(true) => recovered += 1,
+                Ok(false) => {}
+                Err(err) => tracing::error!(
+                    catalog = %self.name,
+                    %schema,
+                    %table,
+                    error = %err,
+                    "an interrupted OPTIMIZE could not be settled; the table refuses scans until it is inspected"
+                ),
+            }
         }
-        if !metadata.partition_columns.is_empty() {
-            return Err(DataFusionError::NotImplemented(format!(
-                "{schema}.{table}: partitioned hive tables are not supported yet"
-            )));
+        Ok(recovered)
+    }
+
+    /// [`optimize::recover`] for one table; `false` when it has no marker.
+    async fn recover_table(&self, schema: &str, table: &str) -> Result<bool> {
+        let marker = self.metastore.table_dir(schema, table).join(optimize::MARKER);
+        match self.metastore.store().head(&marker).await {
+            Ok(_) => {}
+            Err(object_store::Error::NotFound { .. }) => return Ok(false),
+            Err(err) => return Err(DataFusionError::External(Box::new(err))),
         }
-        let fields = metadata
-            .data_columns
-            .iter()
-            .map(|c| hive_field(&c.name, &c.hive_type))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(HiveTable {
-            metastore: self.metastore.clone(),
-            store_url: self.store_url.clone(),
-            schema_name: schema.to_owned(),
-            table: table.to_owned(),
-            schema: Arc::new(Schema::new(fields)),
-        })
+        let Some(metadata) = self
+            .metastore
+            .table(schema, table)
+            .await
+            .map_err(metastore_error)?
+        else {
+            return Ok(false);
+        };
+        let hive = self.table_provider(schema, table, &metadata)?;
+        let locks = self.metastore.table_locks(schema, table);
+        let _one_at_a_time = locks.optimize.lock().await;
+        optimize::recover(&hive).await
     }
 
     async fn require_schema(&self, schema: &str) -> Result<()> {
@@ -367,6 +543,9 @@ impl CatalogProvider for HiveCatalogProvider {
     }
 
     fn schema_names(&self) -> Vec<String> {
+        if let Some(schemas) = self.0.metastore.local_schemas() {
+            return schemas;
+        }
         self.0
             .listing
             .read()
@@ -394,6 +573,9 @@ impl SchemaProvider for HiveSchema {
     }
 
     fn table_names(&self) -> Vec<String> {
+        if let Some(tables) = self.catalog.metastore.local_tables(&self.schema) {
+            return tables;
+        }
         self.catalog
             .listing
             .read()
@@ -407,11 +589,14 @@ impl SchemaProvider for HiveSchema {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.catalog.listing.read().is_ok_and(|l| {
-            l.tables
-                .get(&self.schema)
-                .is_some_and(|t| t.contains(&hive_name(name)))
-        })
+        let name = hive_name(name);
+        if let Some(tables) = self.catalog.metastore.local_tables(&self.schema) {
+            return tables.contains(&name);
+        }
+        self.catalog
+            .listing
+            .read()
+            .is_ok_and(|l| l.tables.get(&self.schema).is_some_and(|t| t.contains(&name)))
     }
 }
 
@@ -423,15 +608,11 @@ pub(crate) fn hive_name(name: &str) -> String {
     name.to_lowercase()
 }
 
+#[cfg(test)]
 fn column(name: &str, data_type: &DataType) -> Result<ColumnMetadata> {
-    column_of(&Field::new(name, data_type.clone(), true))
-}
-
-/// The metastore column of a field (its declared `varchar(n)` included).
-fn column_of(field: &Field) -> Result<ColumnMetadata> {
     Ok(ColumnMetadata {
-        name: hive_name(field.name()),
-        hive_type: hive_field_type(field)?,
+        name: hive_name(name),
+        hive_type: hive_type(data_type)?,
         comment: None,
         properties: BTreeMap::new(),
         extra: BTreeMap::new(),
@@ -477,10 +658,151 @@ async fn rename_relation(
     catalog.refresh().await
 }
 
+/// How a new column is stored (see [`stored_type`]), with its comment.
+fn new_column(
+    field: &Field,
+    precision: HiveTimestampPrecision,
+    check_precision: bool,
+) -> Result<ColumnMetadata> {
+    check_object_name(ObjectKind::Column, field.name())?;
+    Ok(ColumnMetadata {
+        name: hive_name(field.name()),
+        hive_type: stored_type(field, precision, check_precision)?,
+        comment: field.metadata().get(COLUMN_COMMENT).cloned(),
+        properties: BTreeMap::new(),
+        extra: BTreeMap::new(),
+    })
+}
+
+/// Checks a schema and table name before they become paths.
+fn check_names(schema: &str, table: &str, kind: ObjectKind) -> Result<()> {
+    check_object_name(ObjectKind::Schema, schema)?;
+    check_object_name(kind, table)
+}
+
+/// What a `CREATE TABLE` does with an existing table of the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Existing {
+    Fail,
+    Keep,
+}
+
+impl HiveCatalog {
+    /// Makes the table staged in `staging` visible, under the table's locks.
+    /// `false` when `IF NOT EXISTS` found a table another statement created
+    /// meanwhile.
+    async fn publish(
+        &self,
+        staging: &Staging,
+        schema: &str,
+        table: &str,
+        existing: Existing,
+    ) -> Result<bool> {
+        let _metadata = self
+            .metastore
+            .lock_metadata(schema, table)
+            .await
+            .map_err(metastore_error)?;
+        match self.metastore.publish_table(staging, schema, table).await {
+            Ok(()) => Ok(true),
+            // Another statement created it meanwhile: `IF NOT EXISTS` is
+            // satisfied, anything else fails as if that one came first.
+            Err(MetastoreError::AlreadyExists(_)) if existing == Existing::Keep => Ok(false),
+            Err(MetastoreError::AlreadyExists(_)) => Err(DataFusionError::Plan(format!(
+                "table {}.{schema}.{table} already exists",
+                self.name
+            ))),
+            Err(err) => Err(metastore_error(err)),
+        }
+    }
+
+    /// `CREATE TABLE [AS]`: rows and metadata are written into a private
+    /// staging directory, then published
+    /// under the table's metadata lock (see `metastore.rs`). A failure at any
+    /// point removes only the staging directory: an existing table, or one
+    /// another statement created meanwhile, is never touched.
+    async fn write_table_as(
+        &self,
+        (schema, table): (&str, &str),
+        existing: Existing,
+        owner: &str,
+        rows: SendableRecordBatchStream,
+        context: Arc<TaskContext>,
+    ) -> Result<u64> {
+        let if_not_exists = existing == Existing::Keep;
+        let (schema, table) = (&hive_name(schema), &hive_name(table));
+        check_names(schema, table, ObjectKind::Table)?;
+        self.require_schema(schema).await?;
+        let found = self
+            .metastore
+            .table(schema, table)
+            .await
+            .map_err(metastore_error)?;
+        match found {
+            Some(_) if if_not_exists => return Ok(0),
+            Some(_) => {
+                return Err(DataFusionError::Plan(format!(
+                    "table {}.{schema}.{table} already exists",
+                    self.name
+                )));
+            }
+            None => {}
+        }
+        let precision = self.metastore.timestamp_precision();
+        let columns = rows
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| new_column(f, precision, true))
+            .collect::<Result<Vec<_>>>()?;
+        let mut names = BTreeSet::new();
+        if let Some(twice) = columns.iter().find(|c| !names.insert(c.name.as_str())) {
+            return Err(DataFusionError::Plan(format!(
+                "duplicate column name `{}` in {schema}.{table} (hive column names are case-insensitive)",
+                twice.name
+            )));
+        }
+        // Trino refuses a target directory that exists without a table (left
+        // by another writer); taking it over could mix foreign files in.
+        if self
+            .metastore
+            .table_location_exists(schema, table)
+            .await
+            .map_err(metastore_error)?
+        {
+            return Err(DataFusionError::Plan(format!(
+                "target directory for table {}.{schema}.{table} already exists",
+                self.name
+            )));
+        }
+        let metadata = TableMetadata::managed_parquet(owner, columns);
+        let hive = self.table_provider(schema, table, &metadata)?;
+        let staging = self.metastore.staging();
+        let committed = async {
+            let written = HiveSink::new(hive)
+                .write_into(rows, &context, &staging.dir)
+                .await?;
+            self.metastore
+                .stage_table(&staging, &metadata, owner)
+                .await
+                .map_err(metastore_error)?;
+            let published = self.publish(&staging, schema, table, existing).await?;
+            Ok::<_, DataFusionError>(if published { written } else { 0 })
+        }
+        .await;
+        // Published or not, nothing of this statement stays in staging.
+        self.metastore.discard(&staging).await;
+        let written = committed?;
+        self.refresh().await?;
+        Ok(written)
+    }
+}
+
 #[async_trait]
 impl WritableCatalog for HiveCatalog {
     async fn create_schema(&self, schema: &str, if_not_exists: bool, owner: &str) -> Result<()> {
         let schema = &hive_name(schema);
+        check_object_name(ObjectKind::Schema, schema)?;
         match self.metastore.create_schema(schema, owner).await {
             Ok(()) => {}
             Err(MetastoreError::AlreadyExists(_)) if if_not_exists => return Ok(()),
@@ -498,81 +820,33 @@ impl WritableCatalog for HiveCatalog {
         rows: SendableRecordBatchStream,
         context: Arc<TaskContext>,
     ) -> Result<u64> {
-        let (schema, table) = (&hive_name(schema), &hive_name(table));
-        self.require_schema(schema).await?;
-        if self
-            .metastore
-            .table(schema, table)
-            .await
-            .map_err(metastore_error)?
-            .is_some()
-        {
-            if if_not_exists {
-                return Ok(0);
-            }
-            return Err(DataFusionError::Plan(format!(
-                "table {}.{schema}.{table} already exists",
-                self.name
-            )));
-        }
-        let columns = rows
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| column_of(f))
-            .collect::<Result<Vec<_>>>()?;
-        let mut names = BTreeSet::new();
-        if let Some(twice) = columns.iter().find(|c| !names.insert(c.name.as_str())) {
-            return Err(DataFusionError::Plan(format!(
-                "duplicate column name `{}` in {schema}.{table} (hive column names are case-insensitive)",
-                twice.name
-            )));
-        }
-        let metadata = TableMetadata::managed_parquet(owner, columns);
-        let hive = self.table_provider(schema, table, &metadata)?;
-        // Trino refuses a target directory that exists without a table (left
-        // by another writer); taking it over could mix foreign files in.
-        if self
-            .metastore
-            .table_location_exists(schema, table)
-            .await
-            .map_err(metastore_error)?
-        {
-            return Err(DataFusionError::Plan(format!(
-                "target directory for table {}.{schema}.{table} already exists",
-                self.name
-            )));
-        }
-        // Data first, metadata last: a failure leaves no visible table, and
-        // the directory this statement created is removed, as Trino does.
-        let created = async {
-            let written = HiveSink { table: hive }.write_data(rows, &context).await?;
-            self.metastore
-                .write_table(schema, table, &metadata)
-                .await
-                .map_err(metastore_error)?;
-            self.metastore
-                .write_owner_permissions(schema, table, owner)
-                .await
-                .map_err(metastore_error)?;
-            Ok::<_, DataFusionError>(written)
-        }
-        .await;
-        let written = match created {
-            Ok(written) => written,
-            Err(err) => {
-                if let Err(cleanup) = self.metastore.remove_table_location(schema, table).await {
-                    tracing::warn!(%schema, %table, error = %cleanup, "failed CTAS left files behind");
-                }
-                return Err(err);
-            }
+        let existing = if if_not_exists {
+            Existing::Keep
+        } else {
+            Existing::Fail
         };
-        self.refresh().await?;
-        Ok(written)
+        self.write_table_as((schema, table), existing, owner, rows, context)
+            .await
     }
 
     async fn drop_table(&self, schema: &str, table: &str, if_exists: bool) -> Result<()> {
         let (schema, table) = (&hive_name(schema), &hive_name(table));
+        check_names(schema, table, ObjectKind::Table)?;
+        // Never in the middle of an OPTIMIZE swap of this table, nor of a
+        // commit of its files.
+        let locks = self.metastore.table_locks(schema, table);
+        let _swap = locks.commit.write().await;
+        // Scans of other processes list files under this lock, shared.
+        let _other_processes = self
+            .metastore
+            .table_file_lock(schema, table, true)
+            .await
+            .map_err(metastore_error)?;
+        let _metadata = self
+            .metastore
+            .lock_metadata(schema, table)
+            .await
+            .map_err(metastore_error)?;
         match self
             .metastore
             .table(schema, table)
@@ -609,9 +883,55 @@ impl WritableCatalog for HiveCatalog {
         definition: ViewDefinition,
     ) -> Result<()> {
         let (schema, view) = (&hive_name(schema), &hive_name(view));
+        check_names(schema, view, ObjectKind::View)?;
         // Trino stores no owner for SECURITY INVOKER views (`runAsInvoker`).
         let invoker = definition.security == ViewSecurity::Invoker;
         self.require_schema(schema).await?;
+        {
+            let dialect = dialect_from_str("generic")
+                .ok_or_else(|| DataFusionError::Internal("generic SQL dialect".into()))?;
+            parse_view_query(&definition.sql, dialect.as_ref(), "UTC")?;
+        }
+        let trino_view = TrinoView {
+            original_sql: definition.sql,
+            // The session the SQL was planned in, not the view's own schema:
+            // unqualified names must keep resolving to the same tables.
+            catalog: Some(definition.catalog),
+            schema: Some(definition.schema),
+            columns: definition
+                .output
+                .fields()
+                .iter()
+                .map(|f| {
+                    // Trino folds view column names, as every other name.
+                    check_object_name(ObjectKind::Column, f.name())?;
+                    Ok(TrinoViewColumn {
+                        name: hive_name(f.name()),
+                        trino_type: match codelake_core::trino_types::declared(f) {
+                            Some(
+                                declared
+                                @ (Declared::Varchar(_) | Declared::Char(_) | Declared::Timestamp(_)),
+                            ) if !matches!(f.data_type(), DataType::Timestamp(_, Some(_))) => {
+                                declared.name(f.data_type())
+                            }
+                            _ => arrow_to_trino(f.data_type())?,
+                        },
+                        extra: BTreeMap::new(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            // Trino stores no owner for SECURITY INVOKER views (`runAsInvoker`).
+            owner: (!invoker).then(|| owner.to_owned()),
+            run_as_invoker: invoker,
+            path: Vec::new(),
+            extra: BTreeMap::new(),
+        };
+        let metadata = TableMetadata::trino_view(owner, trino_view.encode()?);
+        let _metadata = self
+            .metastore
+            .lock_metadata(schema, view)
+            .await
+            .map_err(metastore_error)?;
         if let Some(existing) = self
             .metastore
             .table(schema, view)
@@ -628,39 +948,6 @@ impl WritableCatalog for HiveCatalog {
                 )));
             }
         }
-        let trino_view = TrinoView {
-            original_sql: definition.sql,
-            // The session the SQL was planned in, not the view's own schema:
-            // unqualified names must keep resolving to the same tables.
-            catalog: Some(definition.catalog),
-            schema: Some(definition.schema),
-            columns: definition
-                .output
-                .fields()
-                .iter()
-                .map(|f| {
-                    Ok(TrinoViewColumn {
-                        name: f.name().clone(),
-                        trino_type: match codelake_core::trino_types::declared(f) {
-                            Some(
-                                declared @ (codelake_core::trino_types::Declared::Varchar(_)
-                                | codelake_core::trino_types::Declared::Char(_)
-                                | codelake_core::trino_types::Declared::Timestamp(_)),
-                            ) if !matches!(f.data_type(), DataType::Timestamp(_, Some(_))) => {
-                                declared.name(f.data_type())
-                            }
-                            _ => arrow_to_trino(f.data_type())?,
-                        },
-                        extra: BTreeMap::new(),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?,
-            owner: (!invoker).then(|| owner.to_owned()),
-            run_as_invoker: invoker,
-            path: Vec::new(),
-            extra: BTreeMap::new(),
-        };
-        let metadata = TableMetadata::trino_view(owner, trino_view.encode()?);
         self.metastore
             .write_table(schema, view, &metadata)
             .await
@@ -674,6 +961,12 @@ impl WritableCatalog for HiveCatalog {
 
     async fn drop_view(&self, schema: &str, view: &str, if_exists: bool) -> Result<()> {
         let (schema, view) = (&hive_name(schema), &hive_name(view));
+        check_names(schema, view, ObjectKind::View)?;
+        let _metadata = self
+            .metastore
+            .lock_metadata(schema, view)
+            .await
+            .map_err(metastore_error)?;
         match self
             .metastore
             .table(schema, view)
@@ -713,29 +1006,69 @@ impl WritableCatalog for HiveCatalog {
         rename_relation(self, true, (schema, view), (new_schema, new_view)).await
     }
 
-    async fn add_column(&self, schema: &str, table: &str, name: &str, data_type: &DataType) -> Result<()> {
-        let (schema, table, name) = (&hive_name(schema), &hive_name(table), &hive_name(name));
-        let mut metadata = self
+    async fn add_column(&self, schema: &str, table: &str, column: &Field) -> Result<()> {
+        let (schema, table) = (&hive_name(schema), &hive_name(table));
+        check_names(schema, table, ObjectKind::Table)?;
+        // Trino records any timestamp precision as `timestamp` here.
+        let column = new_column(column, self.metastore.timestamp_precision(), false)?;
+        match self.metastore.add_column(schema, table, column).await {
+            Ok(()) => Ok(()),
+            Err(MetastoreError::NotFound(_)) => Err(DataFusionError::Plan(format!(
+                "table {}.{schema}.{table} does not exist",
+                self.name
+            ))),
+            Err(err) => Err(metastore_error(err)),
+        }
+    }
+
+    fn table_procedures(&self) -> Vec<TableProcedure> {
+        optimize::procedures()
+    }
+
+    fn check_table_procedure(&self, call: &ProcedureCall, session: &CatalogSession) -> Result<()> {
+        Settings::new(call, session).map(|_| ())
+    }
+
+    async fn execute_table_procedure(
+        &self,
+        schema: &str,
+        table: &str,
+        call: &ProcedureCall,
+        session: &CatalogSession,
+        context: Arc<TaskContext>,
+    ) -> Result<()> {
+        if !call.procedure.eq_ignore_ascii_case(OPTIMIZE) {
+            return Err(DataFusionError::Plan(
+                codelake_core::table_procedure::not_registered(&call.procedure),
+            ));
+        }
+        let settings = Settings::new(call, session)?;
+        let (schema, table) = (&hive_name(schema), &hive_name(table));
+        let metadata = self
             .metastore
             .table(schema, table)
             .await
             .map_err(metastore_error)?
             .ok_or_else(|| {
-                DataFusionError::Plan(format!("table {}.{schema}.{table} does not exist", self.name))
+                DataFusionError::Plan(format!("Table '{}.{schema}.{table}' does not exist", self.name))
             })?;
         if metadata.is_view() {
-            return Err(DataFusionError::Plan(format!("{schema}.{table} is a view")));
+            return Err(DataFusionError::Plan(
+                "ALTER TABLE EXECUTE is not supported for views".into(),
+            ));
         }
-        if metadata.data_columns.iter().any(|c| hive_name(&c.name) == *name) {
-            return Err(DataFusionError::Plan(format!(
-                "column {name} already exists in {schema}.{table}"
-            )));
-        }
-        metadata.data_columns.push(column(name, data_type)?);
-        self.metastore
-            .write_table(schema, table, &metadata)
-            .await
-            .map_err(metastore_error)
+        let hive = self.table_provider(schema, table, &metadata)?;
+        let outcome = optimize::optimize(&hive, settings, &context).await?;
+        tracing::info!(
+            catalog = %self.name,
+            schema,
+            table,
+            files_removed = outcome.files_removed,
+            files_written = outcome.files_written,
+            rows = outcome.rows,
+            "OPTIMIZE finished"
+        );
+        Ok(())
     }
 }
 

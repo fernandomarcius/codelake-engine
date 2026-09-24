@@ -16,6 +16,11 @@
 //!
 //! Remove only when an upstream fix is released **and** the integration test
 //! `mysql::joins_across_mysql_and_postgres` passes without this rule.
+//!
+//! Because the barrier sits on every remote node, it is also where a remote
+//! node is traced: one `codelake.remote` span per federated scan, for every
+//! SQL source, with the executor name, rows returned, duration and errors.
+//! Connectors add their own child spans below it (e.g. the SQL they sent).
 
 use std::any::Any;
 use std::fmt;
@@ -27,6 +32,9 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use tracing::field::Empty;
+
+use crate::trace::{self, TARGET, TracedStream};
 
 /// Detects the remote-SQL leaf of `datafusion-federation` by type, not by name:
 /// a renamed string upstream would silently disable the guard, a changed type
@@ -81,13 +89,38 @@ impl PhysicalOptimizerRule for FederationFilterGuard {
 pub struct FederationFilterBarrier {
     input: Arc<dyn ExecutionPlan>,
     properties: Arc<PlanProperties>,
+    /// `SQLExecutor::name()` of the wrapped remote node, for its span.
+    executor: String,
 }
 
 impl FederationFilterBarrier {
     pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
         let properties = Arc::clone(input.properties());
-        Self { input, properties }
+        let executor = executor_name(input.as_ref());
+        Self {
+            input,
+            properties,
+            executor,
+        }
     }
+}
+
+/// Name of the SQL executor below `plan`, looking through single-child
+/// wrappers later optimizer rules add (e.g. `CooperativeExec`).
+fn executor_name(plan: &dyn ExecutionPlan) -> String {
+    fn find(node: &dyn ExecutionPlan) -> Option<String> {
+        if let Some(remote) = node
+            .as_any()
+            .downcast_ref::<datafusion_federation::sql::VirtualExecutionPlan>()
+        {
+            return Some(remote.executor().name().to_owned());
+        }
+        match node.children().as_slice() {
+            [child] => find(child.as_ref()),
+            _ => None,
+        }
+    }
+    find(plan).unwrap_or_else(|| plan.name().to_owned())
 }
 
 impl DisplayAs for FederationFilterBarrier {
@@ -135,7 +168,26 @@ impl ExecutionPlan for FederationFilterBarrier {
     }
 
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
-        self.input.execute(partition, context)
+        let span = tracing::info_span!(
+            target: TARGET,
+            "codelake.remote",
+            otel.kind = "client",
+            otel.status_code = Empty,
+            otel.status_description = Empty,
+            codelake.remote.executor = self.executor.as_str(),
+            codelake.remote.partition = partition,
+            db.response.returned_rows = Empty,
+            codelake.cancelled = Empty,
+        );
+        // Connectors start their remote work inside `execute`: their spans
+        // become children of this one.
+        match span.in_scope(|| self.input.execute(partition, context)) {
+            Ok(stream) => Ok(Box::pin(TracedStream::new(stream, span))),
+            Err(err) => {
+                trace::record_error(&span, &err);
+                Err(err)
+            }
+        }
     }
 }
 

@@ -328,7 +328,13 @@ impl Connector for SqlServerConnector {
         for tables in listing.values_mut() {
             tables.sort();
         }
-        let executor = SqlServerExecutor::new(self.params.compute_context(), pool.clone(), BATCH_SIZE);
+        let target = executor::Target {
+            host: self.params.host.clone(),
+            port: self.params.port,
+            database: self.params.database.clone(),
+        };
+        let executor =
+            SqlServerExecutor::new(self.params.compute_context(), pool.clone(), BATCH_SIZE, target);
         let resolver = SqlServerResolver {
             source: self.name.clone(),
             pool,

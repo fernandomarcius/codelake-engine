@@ -1,8 +1,5 @@
 //! Trino 431's reading of SQL text where the parser reads it differently.
 //!
-//! - `VALUES 1, 2` is two rows in Trino (a row needs parentheses only when
-//!   it has more than one column); the parser only reads `VALUES (1), (2)`.
-//!   [`values_rows`] adds the parentheses to the text before parsing.
 //! - An integer literal that does not fit `bigint` is a syntax error in Trino
 //!   (`Invalid numeric literal: 9223372036854775808`; the smallest `bigint`,
 //!   `-9223372036854775808`, is valid); `DataFusion` reads it as a decimal.
@@ -16,7 +13,6 @@
 //!   itself defines that exact name (a column alias, a table or CTE alias, a
 //!   derived column list), which then stays reachable as written.
 
-use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 
@@ -26,148 +22,10 @@ use datafusion::sql::sqlparser::ast::{
     DataType, Expr, Ident, Query, SelectItem, SetExpr, Statement as SqlStatement, TableFactor, TimezoneInfo,
     UnaryOperator, Value, ValueWithSpan, Visit, VisitMut, Visitor, VisitorMut, visit_expressions,
 };
-use datafusion::sql::sqlparser::dialect::GenericDialect;
-use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::ParserError;
-use datafusion::sql::sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
 
 /// Largest timestamp precision Trino has (picoseconds).
 const MAX_TIMESTAMP_PRECISION: u64 = 12;
-
-/// Keywords that end a `VALUES` list at its own nesting level.
-fn ends_values(keyword: Keyword) -> bool {
-    matches!(
-        keyword,
-        Keyword::ORDER
-            | Keyword::LIMIT
-            | Keyword::OFFSET
-            | Keyword::FETCH
-            | Keyword::UNION
-            | Keyword::INTERSECT
-            | Keyword::EXCEPT
-            | Keyword::ON
-            | Keyword::RETURNING
-    )
-}
-
-/// Whether a `VALUES` word after `previous` starts a `VALUES` list (and is
-/// not a column named `values`): at the start, in parentheses, after a set
-/// operator, or after the table (or column list) of an `INSERT`.
-fn starts_values(previous: Option<&Token>, insert: bool) -> bool {
-    match previous {
-        None | Some(Token::LParen) => true,
-        Some(Token::Word(w)) if w.quote_style.is_none() => {
-            matches!(
-                w.keyword,
-                Keyword::UNION | Keyword::INTERSECT | Keyword::EXCEPT | Keyword::ALL | Keyword::DISTINCT
-            ) || (insert && w.keyword == Keyword::NoKeyword)
-        }
-        Some(Token::Word(_) | Token::RParen) => insert,
-        _ => false,
-    }
-}
-
-/// Character index of `location` in a text whose lines start at `lines`.
-fn char_index(lines: &[usize], location: Location) -> Option<usize> {
-    let line = usize::try_from(location.line).ok()?.checked_sub(1)?;
-    let column = usize::try_from(location.column).ok()?.checked_sub(1)?;
-    Some(lines.get(line)? + column)
-}
-
-/// `VALUES 1, 2` → `VALUES (1), (2)`: every row of a `VALUES` list written
-/// without parentheses gets them (see the module documentation). Text the
-/// tokenizer cannot read, or without such a list, is returned as is.
-pub(crate) fn values_rows(sql: &str) -> Cow<'_, str> {
-    let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize_with_location() else {
-        return Cow::Borrowed(sql);
-    };
-    let tokens: Vec<&TokenWithSpan> = tokens
-        .iter()
-        .filter(|t| !matches!(t.token, Token::Whitespace(_)))
-        .collect();
-    // (character index, text) to insert.
-    let mut inserts: Vec<(Location, &'static str)> = Vec::new();
-    let insert =
-        matches!(tokens.first().map(|t| &t.token), Some(Token::Word(w)) if w.keyword == Keyword::INSERT);
-    let mut k = 0;
-    while k < tokens.len() {
-        let is_values = matches!(&tokens[k].token, Token::Word(w) if w.keyword == Keyword::VALUES)
-            && starts_values(k.checked_sub(1).map(|p| &tokens[p].token), insert);
-        k += 1;
-        if !is_values || tokens.get(k).is_none_or(|t| t.token == Token::LParen) {
-            continue;
-        }
-        // Rows at depth 0 until the list ends.
-        let mut depth = 0_usize;
-        let mut row_start: Option<Location> = None;
-        let mut row_end: Option<Location> = None;
-        while let Some(token) = tokens.get(k) {
-            let ends = match &token.token {
-                Token::LParen => {
-                    depth += 1;
-                    false
-                }
-                Token::RParen if depth == 0 => true,
-                Token::RParen => {
-                    depth -= 1;
-                    false
-                }
-                Token::SemiColon | Token::EOF => depth == 0,
-                Token::Comma if depth == 0 => {
-                    if let (Some(start), Some(end)) = (row_start.take(), row_end.take()) {
-                        inserts.push((start, "("));
-                        inserts.push((end, ")"));
-                    }
-                    k += 1;
-                    continue;
-                }
-                Token::Word(w) => depth == 0 && ends_values(w.keyword),
-                _ => false,
-            };
-            if ends {
-                break;
-            }
-            row_start.get_or_insert(token.span.start);
-            row_end = Some(token.span.end);
-            k += 1;
-        }
-        if let (Some(start), Some(end)) = (row_start, row_end) {
-            inserts.push((start, "("));
-            inserts.push((end, ")"));
-        }
-    }
-    if inserts.is_empty() {
-        return Cow::Borrowed(sql);
-    }
-    let chars: Vec<char> = sql.chars().collect();
-    let mut lines = vec![0_usize];
-    for (i, c) in chars.iter().enumerate() {
-        if *c == '\n' {
-            lines.push(i + 1);
-        }
-    }
-    let mut at: Vec<(usize, &str)> = Vec::with_capacity(inserts.len());
-    for (location, text) in inserts {
-        let Some(index) = char_index(&lines, location) else {
-            return Cow::Borrowed(sql);
-        };
-        at.push((index, text));
-    }
-    // A row's `)` goes before the next row's `(` at the same index.
-    at.sort_by_key(|(index, text)| (*index, *text == "("));
-    let mut out = String::with_capacity(sql.len() + at.len());
-    let mut next = at.iter().peekable();
-    for (i, c) in chars.iter().enumerate() {
-        while let Some((_, text)) = next.next_if(|(index, _)| *index == i) {
-            out.push_str(text);
-        }
-        out.push(*c);
-    }
-    for (_, text) in next {
-        out.push_str(text);
-    }
-    Cow::Owned(out)
-}
 
 fn invalid_literal(text: &str) -> DataFusionError {
     DataFusionError::SQL(
@@ -423,46 +281,6 @@ impl VisitorMut for NameFoldedItems<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn values_rows_get_parentheses() {
-        assert_eq!(
-            values_rows("SELECT x FROM (VALUES 1, 2) t(x) ORDER BY x"),
-            "SELECT x FROM (VALUES (1), (2)) t(x) ORDER BY x"
-        );
-        assert_eq!(
-            values_rows("SELECT x FROM (VALUES CAST(NULL AS DECIMAL(5,2)), 1.5, -2.25) t(x)"),
-            "SELECT x FROM (VALUES (CAST(NULL AS DECIMAL(5,2))), (1.5), (-2.25)) t(x)"
-        );
-        assert_eq!(
-            values_rows("VALUES 'a,b', 2 ORDER BY 1"),
-            "VALUES ('a,b'), (2) ORDER BY 1"
-        );
-        assert_eq!(
-            values_rows("SELECT 'VALUES 1, 2' FROM (VALUES\n  1 + 1,\n  2) t(x)"),
-            "SELECT 'VALUES 1, 2' FROM (VALUES\n  (1 + 1),\n  (2)) t(x)"
-        );
-        assert_eq!(
-            values_rows("VALUES 1 UNION ALL VALUES 2"),
-            "VALUES (1) UNION ALL VALUES (2)"
-        );
-        assert_eq!(values_rows("INSERT INTO t VALUES 7"), "INSERT INTO t VALUES (7)");
-        assert_eq!(
-            values_rows("SELECT 'é', x FROM (VALUES 1) t(x)"),
-            "SELECT 'é', x FROM (VALUES (1)) t(x)"
-        );
-        // Already in parentheses, or no list: unchanged.
-        for sql in [
-            "VALUES (1), (2)",
-            "INSERT INTO t VALUES (1, 'a')",
-            "SELECT 1",
-            "SELECT values FROM t",
-            "SELECT a, values, b FROM t",
-            "SELECT \"values\" FROM t",
-        ] {
-            assert!(matches!(values_rows(sql), Cow::Borrowed(_)), "{sql}");
-        }
-    }
 
     fn checked(sql: &str) -> Result<(), DataFusionError> {
         let statement = datafusion::sql::parser::DFParser::parse_sql(sql)

@@ -1,0 +1,1673 @@
+{
+  "category": "math",
+  "cases": [
+    {
+      "name": "round_double",
+      "sql": "SELECT round(2.5E0), round(-2.5E0), round(1.005E0, 2), round(123.456E0, -1), round(CAST(NULL AS double))",
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            3.0,
+            -3.0,
+            1.0,
+            120.0,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "round_integer",
+      "sql": "SELECT round(CAST(15 AS integer)), round(CAST(1250 AS bigint), -2), round(CAST(-1250 AS bigint), -2), typeof(round(CAST(15 AS integer)))",
+      "trino": {
+        "types": [
+          "integer",
+          "bigint",
+          "bigint",
+          "varchar"
+        ],
+        "rows": [
+          [
+            15,
+            1300,
+            -1300,
+            "integer"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "round_decimal",
+      "sql": "SELECT round(DECIMAL '2.5'), round(DECIMAL '-2.5'), round(CAST(1.555 AS decimal(18,6)), 2), round(CAST(-1.555 AS decimal(18,6)), 2), round(DECIMAL '1234.5', -2)",
+      "trino": {
+        "types": [
+          "decimal(2, 0)",
+          "decimal(2, 0)",
+          "decimal(19, 6)",
+          "decimal(19, 6)",
+          "decimal(6, 1)"
+        ],
+        "rows": [
+          [
+            "3",
+            "-3",
+            "1.560000",
+            "-1.560000",
+            "1200.0"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "round_decimal_csf",
+      "sql": "SELECT ROUND(CAST(10.125 AS decimal(18,6)),2) <> ROUND(CAST(10.1249 AS decimal(18,6)),2), ROUND(SUM(x), 2) FROM (VALUES CAST(1.005 AS decimal(18,6)), CAST(2.0 AS decimal(18,6))) t(x)",
+      "trino": {
+        "types": [
+          "boolean",
+          "decimal(38, 6)"
+        ],
+        "rows": [
+          [
+            true,
+            "3.010000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "round_real",
+      "sql": "SELECT round(REAL '2.5'), round(REAL '1.25', 1)",
+      "trino": {
+        "types": [
+          "real",
+          "real"
+        ],
+        "rows": [
+          [
+            3.0,
+            1.3
+          ]
+        ]
+      }
+    },
+    {
+      "name": "round_huge",
+      "sql": "SELECT round(1E20), round(1E300, 2)",
+      "trino": {
+        "types": [
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            1e+20,
+            1e+300
+          ]
+        ]
+      }
+    },
+    {
+      "name": "ceil_floor",
+      "sql": "SELECT ceil(1.2E0), ceiling(-1.2E0), floor(-1.2E0), floor(DECIMAL '-1.25'), ceil(DECIMAL '1.25'), ceil(CAST(7 AS bigint)), floor(CAST(NULL AS double))",
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "decimal(2, 0)",
+          "decimal(2, 0)",
+          "bigint",
+          "double"
+        ],
+        "rows": [
+          [
+            2.0,
+            -1.0,
+            -2.0,
+            "-2",
+            "2",
+            7,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "truncate_fn",
+      "sql": "SELECT truncate(-1.9E0), truncate(DECIMAL '-1.99'), truncate(DECIMAL '12.345', 2), truncate(1.99E0)",
+      "trino": {
+        "types": [
+          "double",
+          "decimal(1, 0)",
+          "decimal(5, 3)",
+          "double"
+        ],
+        "rows": [
+          [
+            -1.0,
+            "-1",
+            "12.340",
+            1.0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "abs_fn",
+      "sql": "SELECT abs(CAST(-5 AS bigint)), abs(-5.5E0), abs(DECIMAL '-1.50'), abs(CAST(-3 AS integer)), abs(CAST(NULL AS bigint))",
+      "trino": {
+        "types": [
+          "bigint",
+          "double",
+          "decimal(3, 2)",
+          "integer",
+          "bigint"
+        ],
+        "rows": [
+          [
+            5,
+            5.5,
+            "1.50",
+            3,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "abs_overflow",
+      "sql": "SELECT abs(CAST(-9223372036854775808 AS bigint))",
+      "trino": {
+        "error": "NUMERIC_VALUE_OUT_OF_RANGE",
+        "message": "Value -9223372036854775808 is out of range for abs(bigint)"
+      }
+    },
+    {
+      "name": "sign_fn",
+      "sql": "SELECT sign(CAST(-5 AS bigint)), sign(0E0), sign(-2.5E0), sign(DECIMAL '-1.50'), sign(nan())",
+      "trino": {
+        "types": [
+          "bigint",
+          "double",
+          "double",
+          "decimal(1, 0)",
+          "double"
+        ],
+        "rows": [
+          [
+            -1,
+            0.0,
+            -1.0,
+            "-1",
+            "NaN"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "power_sqrt",
+      "sql": "SELECT power(2, 10), pow(2.0E0, -1), sqrt(16), sqrt(-1E0), cbrt(27E0), exp(0), ln(1E0), ln(0E0), log2(8), log10(1000), log(2, 8)",
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            1024.0,
+            0.5,
+            4.0,
+            "NaN",
+            3.0,
+            1.0,
+            0.0,
+            "-Infinity",
+            3.0,
+            3.0,
+            3.0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "trig",
+      "sql": "SELECT sin(0E0), cos(0E0), tan(0E0), asin(1E0), acos(1E0), atan(1E0), atan2(1E0, 1E0), degrees(pi()), radians(180E0), e(), pi()",
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            0.0,
+            1.0,
+            0.0,
+            1.5707963267948966,
+            0.0,
+            0.7853981633974483,
+            0.7853981633974483,
+            180.0,
+            3.141592653589793,
+            2.718281828459045,
+            3.141592653589793
+          ]
+        ]
+      }
+    },
+    {
+      "name": "nan_infinity",
+      "sql": "SELECT is_nan(nan()), is_nan(1E0), is_finite(infinity()), is_infinite(-infinity()), is_finite(1E0), nan() = nan(), infinity() > 1E308",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            false,
+            false,
+            true,
+            true,
+            false,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "mod_fn",
+      "sql": "SELECT mod(7, 3), mod(-7, 3), mod(7, -3), mod(7.5E0, 2E0), mod(CAST(NULL AS bigint), 2)",
+      "trino": {
+        "types": [
+          "integer",
+          "integer",
+          "integer",
+          "double",
+          "bigint"
+        ],
+        "rows": [
+          [
+            1,
+            -1,
+            1,
+            1.5,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "width_bucket_fn",
+      "sql": "SELECT width_bucket(5.35, 0.024, 10.06, 5), width_bucket(-1, 0, 10, 5), width_bucket(10, 0, 10, 5), width_bucket(5, 10, 0, 5)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            3,
+            0,
+            6,
+            3
+          ]
+        ]
+      }
+    },
+    {
+      "name": "to_from_base",
+      "sql": "SELECT to_base(255, 16), to_base(-10, 2), from_base('ff', 16), from_base('-1010', 2), to_base(CAST(NULL AS bigint), 10)",
+      "trino": {
+        "types": [
+          "varchar(64)",
+          "varchar(64)",
+          "bigint",
+          "bigint",
+          "varchar(64)"
+        ],
+        "rows": [
+          [
+            "ff",
+            "-1010",
+            255,
+            -10,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "from_base_invalid",
+      "sql": "SELECT from_base('zz', 10)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Not a valid base-10 number: zz"
+      }
+    },
+    {
+      "name": "bitwise_fns",
+      "sql": "SELECT bitwise_and(12, 10), bitwise_or(12, 10), bitwise_xor(12, 10), bitwise_not(0), bit_count(9, 64), bit_count(-1, 8), bitwise_left_shift(1, 3), bitwise_right_shift(-8, 1), bitwise_right_shift_arithmetic(-8, 1)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "integer",
+          "integer",
+          "integer"
+        ],
+        "rows": [
+          [
+            8,
+            14,
+            6,
+            -1,
+            2,
+            8,
+            8,
+            2147483644,
+            -4
+          ]
+        ]
+      }
+    },
+    {
+      "name": "greatest_least",
+      "sql": "SELECT greatest(1, 3, 2), least(1, 3, 2), greatest('a', 'b'), least(DATE '2024-01-01', DATE '2023-01-01'), greatest(1, CAST(NULL AS integer)), least(CAST(NULL AS varchar), 'a')",
+      "trino": {
+        "types": [
+          "integer",
+          "integer",
+          "varchar(1)",
+          "date",
+          "integer",
+          "varchar"
+        ],
+        "rows": [
+          [
+            3,
+            1,
+            "b",
+            "2023-01-01",
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "greatest_mixed_nan",
+      "sql": "SELECT greatest(1.0E0, nan()), greatest(nan(), 1.0E0), least(1.0E0, nan()), greatest(1, 2.5E0), greatest(CAST(1 AS bigint), DECIMAL '1.5')",
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double",
+          "decimal(20, 1)"
+        ],
+        "rows": [
+          [
+            1.0,
+            1.0,
+            1.0,
+            2.5,
+            "1.5"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "greatest_csf",
+      "sql": "SELECT CAST(GREATEST(COALESCE(CAST(NULL AS bigint), 0) - COALESCE(CAST(5 AS bigint), 0), 0) AS bigint), GREATEST(0, date_diff('second', TIMESTAMP '2024-01-01 00:00:10.000', TIMESTAMP '2024-01-01 00:00:00.000'))",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            0,
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "random_fn",
+      "sql": "SELECT random() >= 0 AND random() < 1, random(10) BETWEEN 0 AND 9, typeof(random(CAST(10 AS integer)))",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "varchar"
+        ],
+        "rows": [
+          [
+            true,
+            true,
+            "integer"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "nullif_coalesce",
+      "sql": "SELECT NULLIF(CAST(5 AS bigint), 5), NULLIF(1, 2), CAST(10 AS DOUBLE) / NULLIF(CAST(0 AS bigint), 0), COALESCE(CAST(NULL AS bigint), 7)",
+      "trino": {
+        "types": [
+          "bigint",
+          "integer",
+          "double",
+          "bigint"
+        ],
+        "rows": [
+          [
+            null,
+            1,
+            null,
+            7
+          ]
+        ]
+      }
+    },
+    {
+      "name": "round_null_edge",
+      "sql": "SELECT round(CAST(NULL AS bigint)), round(DECIMAL '0.5'), round(-0.5E0), round(CAST(NULL AS decimal(10,2)), 1), round(0.5E0, CAST(NULL AS integer))",
+      "trino": {
+        "types": [
+          "bigint",
+          "decimal(1, 0)",
+          "double",
+          "decimal(11, 2)",
+          "double"
+        ],
+        "rows": [
+          [
+            null,
+            "1",
+            -1.0,
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "round_decimal_carry",
+      "sql": "SELECT round(DECIMAL '9.99', 1), round(DECIMAL '99.5'), round(CAST(-99.95 AS decimal(4,2)), 1), round(DECIMAL '0.005', 2)",
+      "trino": {
+        "types": [
+          "decimal(4, 2)",
+          "decimal(3, 0)",
+          "decimal(5, 2)",
+          "decimal(4, 3)"
+        ],
+        "rows": [
+          [
+            "10.00",
+            "100",
+            "-100.00",
+            "0.010"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "round_integer_overflow",
+      "sql": "SELECT round(CAST(9223372036854775807 AS bigint), -1)",
+      "trino": {
+        "error": "NUMERIC_VALUE_OUT_OF_RANGE",
+        "message": "numerical overflow: 9223372036854775807"
+      }
+    },
+    {
+      "name": "ceil_floor_edge",
+      "sql": "SELECT ceil(-0.5E0), floor(0.5E0), ceil(DECIMAL '-0.5'), floor(DECIMAL '9.9'), ceil(CAST(NULL AS decimal(5,2))), floor(REAL '1.5'), ceil(nan())",
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "decimal(1, 0)",
+          "decimal(2, 0)",
+          "decimal(4, 0)",
+          "real",
+          "double"
+        ],
+        "rows": [
+          [
+            -0.0,
+            0.0,
+            "0",
+            "9",
+            null,
+            1.0,
+            "NaN"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "truncate_null_edge",
+      "sql": "SELECT truncate(CAST(NULL AS double)), truncate(DECIMAL '12.345', -1), truncate(-0.5E0), truncate(DECIMAL '-12.345', 1), truncate(REAL '1.9')",
+      "trino": {
+        "types": [
+          "double",
+          "decimal(5, 3)",
+          "double",
+          "decimal(5, 3)",
+          "real"
+        ],
+        "rows": [
+          [
+            null,
+            "10.000",
+            -0.0,
+            "-12.300",
+            1.0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "abs_edge",
+      "sql": "SELECT abs(-0E0), abs(-infinity()), abs(nan()), abs(REAL '-1.5'), abs(CAST(-127 AS tinyint))",
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "real",
+          "tinyint"
+        ],
+        "rows": [
+          [
+            0.0,
+            "Infinity",
+            "NaN",
+            1.5,
+            127
+          ]
+        ]
+      }
+    },
+    {
+      "name": "abs_tinyint_overflow",
+      "sql": "SELECT abs(CAST(-128 AS tinyint))",
+      "trino": {
+        "error": "NUMERIC_VALUE_OUT_OF_RANGE",
+        "message": "Value -128 is out of range for abs(tinyint)"
+      }
+    },
+    {
+      "name": "sign_null_edge",
+      "sql": "SELECT sign(CAST(NULL AS bigint)), sign(-0E0), sign(infinity()), sign(DECIMAL '0.00'), sign(CAST(5 AS integer))",
+      "trino": {
+        "types": [
+          "bigint",
+          "double",
+          "double",
+          "decimal(1, 0)",
+          "integer"
+        ],
+        "rows": [
+          [
+            null,
+            -0.0,
+            1.0,
+            "0",
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "power_edge",
+      "sql": "SELECT power(0, 0), power(-8, 1E0/3), power(2, 1024), power(CAST(NULL AS double), 2), pow(10, -2)",
+      "ulps": 2,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            1.0,
+            "NaN",
+            "Infinity",
+            null,
+            0.01
+          ]
+        ]
+      }
+    },
+    {
+      "name": "sqrt_exp_edge",
+      "sql": "SELECT sqrt(0), sqrt(CAST(NULL AS double)), sqrt(2), exp(1), exp(-infinity()), exp(710), cbrt(-27), cbrt(CAST(NULL AS double))",
+      "ulps": 2,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            0.0,
+            null,
+            1.4142135623730951,
+            2.7182818284590455,
+            0.0,
+            "Infinity",
+            -3.0,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "log_edge",
+      "sql": "SELECT ln(-1E0), ln(CAST(NULL AS double)), log2(0), log2(1), log10(0.001), log10(CAST(NULL AS double)), log(10, 100), log(1, 10), log(CAST(NULL AS double), 1)",
+      "ulps": 2,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            "NaN",
+            null,
+            "-Infinity",
+            0.0,
+            -3.0,
+            null,
+            2.0,
+            "Infinity",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "log_single_arg",
+      "sql": "SELECT log(100)",
+      "trino": {
+        "error": "FUNCTION_NOT_FOUND",
+        "message": "line 1:8: Unexpected parameters (integer) for function log. Expected: log(double, double)"
+      }
+    },
+    {
+      "name": "trig_null_edge",
+      "sql": "SELECT sin(CAST(NULL AS double)), cos(pi()), tan(pi()/4), asin(2), acos(-1), atan(infinity()), atan2(0, -1), atan2(CAST(NULL AS double), 1)",
+      "ulps": 2,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            null,
+            -1.0,
+            0.9999999999999999,
+            "NaN",
+            3.141592653589793,
+            1.5707963267948966,
+            3.141592653589793,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "hyperbolic",
+      "sql": "SELECT cosh(0), tanh(1), cosh(1), tanh(CAST(NULL AS double)), tanh(infinity())",
+      "ulps": 2,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            1.0,
+            0.7615941559557649,
+            1.543080634815244,
+            null,
+            1.0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "degrees_radians_edge",
+      "sql": "SELECT degrees(CAST(NULL AS double)), radians(-90), degrees(1), radians(CAST(NULL AS double))",
+      "ulps": 1,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            null,
+            -1.5707963267948966,
+            57.29577951308232,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "constants",
+      "sql": "SELECT abs(e() - exp(1)) < 1E-15, pi() * 2, typeof(pi()), typeof(e())",
+      "trino": {
+        "types": [
+          "boolean",
+          "double",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            true,
+            6.283185307179586,
+            "double",
+            "double"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "nan_null_edge",
+      "sql": "SELECT is_nan(CAST(NULL AS double)), is_finite(CAST(NULL AS double)), is_infinite(nan()), is_finite(nan()), is_nan(CAST(nan() AS real)), is_infinite(CAST(NULL AS double))",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            false,
+            false,
+            true,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "nan_comparisons",
+      "sql": "SELECT infinity() = infinity(), -infinity() < -1E308, nan() <> nan(), nan() > 1E0, nan() < 1E0",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            true,
+            true,
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "name": "mod_edge",
+      "sql": "SELECT mod(0, 5), mod(-7.5E0, 2E0), mod(DECIMAL '7.5', 2), mod(5, CAST(NULL AS integer)), mod(-7, -3)",
+      "trino": {
+        "types": [
+          "integer",
+          "double",
+          "decimal(2, 1)",
+          "integer",
+          "integer"
+        ],
+        "rows": [
+          [
+            0,
+            -1.5,
+            "1.5",
+            null,
+            -1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "division_by_zero",
+      "sql": "SELECT 5 / 0",
+      "trino": {
+        "error": "DIVISION_BY_ZERO",
+        "message": "Division by zero"
+      }
+    },
+    {
+      "name": "width_bucket_edge",
+      "sql": "SELECT width_bucket(CAST(NULL AS double), 0, 10, 5), width_bucket(0, 0, 10, 5), width_bucket(9.999, 0, 10, 5), width_bucket(10, 10, 0, 5)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            null,
+            1,
+            5,
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "width_bucket_bad",
+      "sql": "SELECT width_bucket(5, 0, 10, 0)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "bucketCount must be greater than 0"
+      }
+    },
+    {
+      "name": "to_base_edge",
+      "sql": "SELECT to_base(0, 2), to_base(35, 36), from_base('Z', 36), from_base(CAST(NULL AS varchar), 10), to_base(9223372036854775807, 36)",
+      "trino": {
+        "types": [
+          "varchar(64)",
+          "varchar(64)",
+          "bigint",
+          "bigint",
+          "varchar(64)"
+        ],
+        "rows": [
+          [
+            "0",
+            "z",
+            35,
+            null,
+            "1y2p0ij32e8e7"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "to_base_bad_radix",
+      "sql": "SELECT to_base(1, 1)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Radix must be between 2 and 36"
+      }
+    },
+    {
+      "name": "bitwise_null_edge",
+      "sql": "SELECT bitwise_and(CAST(NULL AS bigint), 1), bitwise_not(-1), bitwise_xor(-1, 0), bit_count(0, 64), bit_count(-1, 64), bitwise_left_shift(1, 63), bitwise_left_shift(1, 64), bitwise_right_shift(-1, 60), bitwise_right_shift_arithmetic(-1, 60)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "integer",
+          "integer",
+          "integer",
+          "integer"
+        ],
+        "rows": [
+          [
+            null,
+            0,
+            -1,
+            0,
+            64,
+            0,
+            0,
+            0,
+            -1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "bit_count_bad",
+      "sql": "SELECT bit_count(256, 8)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Number must be representable with the bits specified. 256 cannot be represented with 8 bits"
+      }
+    },
+    {
+      "name": "greatest_least_edge",
+      "sql": "SELECT greatest(1E0, -infinity()), least(TIMESTAMP '2024-01-01 00:00:00', TIMESTAMP '2023-01-01 00:00:00'), greatest('ab', 'b', 'a'), least(CAST(1 AS tinyint), 2), greatest(true, false)",
+      "trino": {
+        "types": [
+          "double",
+          "timestamp(0)",
+          "varchar(2)",
+          "integer",
+          "boolean"
+        ],
+        "rows": [
+          [
+            1.0,
+            "2023-01-01 00:00:00",
+            "b",
+            1,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "random_range",
+      "sql": "SELECT count_if(random(3) BETWEEN 0 AND 2), count(*), count_if(rand() < 1) FROM UNNEST(sequence(1, 100)) t(x)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            100,
+            100,
+            100
+          ]
+        ]
+      }
+    },
+    {
+      "name": "rand_type",
+      "sql": "SELECT typeof(rand()), typeof(random(CAST(5 AS bigint))), typeof(random(CAST(5 AS smallint)))",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "double",
+            "bigint",
+            "smallint"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "random_bad_bound",
+      "sql": "SELECT random(0)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "bound must be positive"
+      }
+    },
+    {
+      "name": "normal_cdf_fn",
+      "sql": "SELECT normal_cdf(0, 1, 0), normal_cdf(10, 9, 10), normal_cdf(0, 1, 1.96), normal_cdf(0, 1, CAST(NULL AS double))",
+      "ulps": 4,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            0.5,
+            0.5,
+            0.9750021048517796,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "inverse_normal_cdf_fn",
+      "sql": "SELECT inverse_normal_cdf(0, 1, 0.5), inverse_normal_cdf(0, 1, 0.975), inverse_normal_cdf(10, 2, 0.1), inverse_normal_cdf(0, 1, CAST(NULL AS double))",
+      "ulps": 8,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            0.0,
+            1.959963984540054,
+            7.436896868910798,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "normal_cdf_bad_sd",
+      "sql": "SELECT normal_cdf(0, 0, 1)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "standardDeviation must be > 0"
+      }
+    },
+    {
+      "name": "inverse_normal_cdf_bad_p",
+      "sql": "SELECT inverse_normal_cdf(0, 1, 1)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "p must be 0 > p > 1"
+      }
+    },
+    {
+      "name": "wilson_interval",
+      "sql": "SELECT wilson_interval_lower(1, 5, 1.96), wilson_interval_upper(1, 5, 1.96), wilson_interval_lower(0, 10, 2.576), wilson_interval_upper(10, 10, 1.0)",
+      "ulps": 4,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            0.036223160969787456,
+            0.6244717358814612,
+            3.336853732056613e-17,
+            1.0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "wilson_interval_bad",
+      "sql": "SELECT wilson_interval_lower(6, 5, 1.96)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "number of successes must not be larger than number of trials"
+      }
+    },
+    {
+      "name": "cosine_similarity_fn",
+      "sql": "SELECT cosine_similarity(MAP(ARRAY['a', 'b'], ARRAY[1.0E0, 2.0E0]), MAP(ARRAY['a', 'c'], ARRAY[1.0E0, 3.0E0])), cosine_similarity(MAP(ARRAY['a'], ARRAY[1.0E0]), MAP(ARRAY['a'], ARRAY[2.0E0])), cosine_similarity(MAP(ARRAY['a'], ARRAY[0E0]), MAP(ARRAY['a'], ARRAY[1E0]))",
+      "ulps": 2,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            0.14142135623730948,
+            1.0,
+            "NaN"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "ceil_floor_more",
+      "sql": "SELECT ceiling(REAL '-1.5'), ceiling(CAST(NULL AS bigint)), ceil(-infinity()), floor(CAST(-7 AS integer)), floor(DECIMAL '-0.001')",
+      "trino": {
+        "types": [
+          "real",
+          "bigint",
+          "double",
+          "integer",
+          "decimal(1, 0)"
+        ],
+        "rows": [
+          [
+            -1.0,
+            null,
+            "-Infinity",
+            -7,
+            "-1"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "sign_more",
+      "sql": "SELECT sign(nan()), sign(-infinity()), sign(REAL '-0.5'), sign(CAST(-3 AS tinyint))",
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "real",
+          "tinyint"
+        ],
+        "rows": [
+          [
+            "NaN",
+            -1.0,
+            -1.0,
+            -1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "power_more",
+      "sql": "SELECT pow(2, 0.5), power(-2, 3), power(CAST(NULL AS double), CAST(NULL AS double)), pow(0, -1)",
+      "ulps": 2,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            1.4142135623730951,
+            -8.0,
+            null,
+            "Infinity"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "sqrt_cbrt_more",
+      "sql": "SELECT sqrt(1E-300), sqrt(infinity()), cbrt(0), cbrt(1E300), sqrt(nan())",
+      "ulps": 2,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            1e-150,
+            "Infinity",
+            0.0,
+            1e+100,
+            "NaN"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "log_more",
+      "sql": "SELECT ln(exp(2)), log2(1024), log10(1E300), ln(infinity()), log2(CAST(NULL AS double)), log10(-1)",
+      "ulps": 2,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            2.0,
+            10.0,
+            300.0,
+            "Infinity",
+            null,
+            "NaN"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "trig_more",
+      "sql": "SELECT sin(pi()), cos(0), tan(0), asin(-1), acos(0), atan(-1), atan2(-1, -1), sin(CAST(NULL AS double))",
+      "ulps": 2,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            1.2246467991473532e-16,
+            1.0,
+            0.0,
+            -1.5707963267948966,
+            1.5707963267948966,
+            -0.7853981633974483,
+            -2.356194490192345,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "trig_edge",
+      "sql": "SELECT asin(CAST(NULL AS double)), acos(2), atan(CAST(NULL AS double)), cos(infinity()), tan(CAST(NULL AS double)), atan2(1, CAST(NULL AS double))",
+      "ulps": 2,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            null,
+            "NaN",
+            null,
+            "NaN",
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "hyperbolic_more",
+      "sql": "SELECT cosh(-1), tanh(-infinity()), cosh(CAST(NULL AS double)), tanh(0)",
+      "ulps": 2,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            1.543080634815244,
+            -1.0,
+            null,
+            0.0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "degrees_radians_more",
+      "sql": "SELECT degrees(0), radians(0), degrees(-pi()), radians(360)",
+      "ulps": 1,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            0.0,
+            0.0,
+            -180.0,
+            6.283185307179586
+          ]
+        ]
+      }
+    },
+    {
+      "name": "nan_predicates_more",
+      "sql": "SELECT is_nan(1E0/0E0), is_finite(1E308 * 10), is_infinite(1E308 * 10), is_nan(0E0/0E0)",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            false,
+            false,
+            true,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "mod_more",
+      "sql": "SELECT mod(CAST(-7 AS bigint), CAST(2 AS bigint)), mod(7.5E0, -2E0), mod(DECIMAL '-7.5', DECIMAL '2.0')",
+      "trino": {
+        "types": [
+          "bigint",
+          "double",
+          "decimal(2, 1)"
+        ],
+        "rows": [
+          [
+            -1,
+            1.5,
+            "-1.5"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "rand_more",
+      "sql": "SELECT rand() >= 0, random(1) = 0, typeof(random(CAST(10 AS bigint)))",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "varchar"
+        ],
+        "rows": [
+          [
+            true,
+            true,
+            "bigint"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "truncate_more",
+      "sql": "SELECT truncate(DECIMAL '9.99', 1), truncate(-1.5E0), truncate(CAST(NULL AS decimal(5,2)), 1)",
+      "trino": {
+        "types": [
+          "decimal(3, 2)",
+          "double",
+          "decimal(5, 2)"
+        ],
+        "rows": [
+          [
+            "9.90",
+            -1.0,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "bitwise_more",
+      "sql": "SELECT bitwise_and(-1, 12), bitwise_and(CAST(NULL AS bigint), CAST(NULL AS bigint)), bitwise_left_shift(CAST(1 AS tinyint), 7), bitwise_right_shift(CAST(-1 AS smallint), 1), bitwise_right_shift_arithmetic(CAST(-128 AS tinyint), 1)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "tinyint",
+          "smallint",
+          "tinyint"
+        ],
+        "rows": [
+          [
+            12,
+            null,
+            -128,
+            32767,
+            -64
+          ]
+        ]
+      }
+    },
+    {
+      "name": "normal_cdf_more",
+      "sql": "SELECT normal_cdf(0, 1, -infinity()), normal_cdf(0, 1, infinity()), normal_cdf(5, 2, 3)",
+      "ulps": 4,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            0.0,
+            1.0,
+            0.15865525393145702
+          ]
+        ]
+      }
+    },
+    {
+      "name": "inverse_normal_cdf_more",
+      "sql": "SELECT inverse_normal_cdf(0, 1, 0.001), inverse_normal_cdf(0, 1, 0.999), inverse_normal_cdf(100, 15, 0.5)",
+      "ulps": 8,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            -3.0902323061678136,
+            3.0902323061678136,
+            100.0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "wilson_interval_more",
+      "sql": "SELECT wilson_interval_lower(50, 100, 1.96), wilson_interval_upper(50, 100, 1.96), wilson_interval_upper(0, 10, 1.96), wilson_interval_upper(CAST(NULL AS bigint), 10, 1.0)",
+      "ulps": 4,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            0.40382982859014716,
+            0.5961701714098528,
+            0.2775401687666165,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "cosine_similarity_null_edge",
+      "sql": "SELECT cosine_similarity(MAP(ARRAY['a'], ARRAY[1E0]), MAP(ARRAY['b'], ARRAY[1E0])), cosine_similarity(CAST(NULL AS map(varchar, double)), MAP(ARRAY['a'], ARRAY[1E0])), cosine_similarity(MAP(ARRAY['a', 'b'], ARRAY[3E0, 4E0]), MAP(ARRAY['a', 'b'], ARRAY[3E0, 4E0]))",
+      "ulps": 2,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            0.0,
+            null,
+            1.0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "ceiling_more",
+      "sql": "SELECT ceiling(DECIMAL '1.01'), ceiling(-0.1E0), ceiling(CAST(3 AS integer))",
+      "trino": {
+        "types": [
+          "decimal(2, 0)",
+          "double",
+          "integer"
+        ],
+        "rows": [
+          [
+            "2",
+            -0.0,
+            3
+          ]
+        ]
+      }
+    },
+    {
+      "name": "hyperbolic_edge",
+      "sql": "SELECT cosh(infinity()), tanh(-1), cosh(10), tanh(nan())",
+      "ulps": 2,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            "Infinity",
+            -0.7615941559557649,
+            11013.232920103324,
+            "NaN"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "cosine_similarity_more",
+      "sql": "SELECT cosine_similarity(MAP(ARRAY['a', 'b'], ARRAY[1E0, 0E0]), MAP(ARRAY['a', 'b'], ARRAY[0E0, 1E0])), cosine_similarity(MAP(ARRAY['a'], ARRAY[-1E0]), MAP(ARRAY['a'], ARRAY[1E0]))",
+      "ulps": 2,
+      "trino": {
+        "types": [
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            0.0,
+            -1.0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "wilson_interval_upper_more",
+      "sql": "SELECT wilson_interval_upper(3, 7, 0.5), wilson_interval_upper(7, 7, 1.96), wilson_interval_lower(7, 7, 1.96)",
+      "ulps": 4,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            0.5229628453523227,
+            1.0,
+            0.6456611570247934
+          ]
+        ]
+      }
+    },
+    {
+      "name": "nan_self_comparison",
+      "sql": "SELECT x = x, x <> x, x >= x FROM (VALUES nan(), 2E0, CAST(NULL AS double)) t(x) ORDER BY 1 NULLS LAST, 2",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            false,
+            true,
+            false
+          ],
+          [
+            true,
+            false,
+            true
+          ],
+          [
+            null,
+            null,
+            null
+          ]
+        ]
+      }
+    }
+  ]
+}

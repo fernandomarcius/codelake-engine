@@ -86,6 +86,77 @@ Server 2022, and each is the behavior of Trino 431 itself.
   Trino configured with another zone needs the same setting in `CodeLake`
   (not implemented): check the production Trino before the M2 canary.
 
+## Red-team corrections
+
+An independent red-team (probes in `tests/integration/hive_redteam.rs`) found
+data loss, concurrency, type and security defects. Each rule below is either
+Trino 431's behavior (checked on `trinodb/trino:431`) or what data safety
+requires where Trino has no equivalent.
+
+- **Client statements reach files only through catalogs.** `COPY … TO`,
+  `CREATE EXTERNAL TABLE` and `SET/RESET datafusion.runtime.*` are refused with
+  `NOT_SUPPORTED` in the core (`statement_policy`), on the statement and again
+  on the plan, for every protocol (Trino, and the PostgreSQL wire through a
+  hook that runs before any other). Trino has none of them.
+- **Names.** `""` is a syntax error anywhere, as Trino's lexer ("Zero-length
+  delimited identifier not allowed"). Schema, table and view names that would
+  not be a directory of their own (`.`, `..`, `/`, `\`, control characters)
+  are refused before any writable catalog turns them into a path.
+- **Writers are serialized per table.** Each change of a table's metadata and
+  each commit of new files holds the table's metadata lock (in-process mutex
+  plus `flock` across processes on a local warehouse). New tables and `INSERT`
+  files are written under `.codelake/staging/<id>/` and published by one
+  rename under that lock after re-checking the target: two CTAS of one name
+  never mix rows (the loser fails), an `ADD COLUMN` is never lost to a
+  concurrent `INSERT` or `ADD COLUMN`, an `INSERT` whose metadata update fails
+  leaves no file visible, and a failed CTAS removes only its own staging.
+- **`CREATE OR REPLACE TABLE … AS`** (not in Trino's Hive connector, which
+  answers "This connector does not support replacing tables") writes the new
+  table in staging and swaps directories only after every row is written, so
+  it may read the table it replaces and a failure keeps the old table. A
+  journal in `.codelake/replace/` puts the old table back if the process dies
+  between the two renames. Local warehouses only; object stores refuse it.
+- **Stored views are queries.** The SQL of a view is parsed and must be one
+  `SELECT`/`WITH`/`VALUES`, when it is created and every time it is read.
+- **Timestamps.** The catalog has Trino's `hive.timestamp-precision`
+  (`timestamp_precision`, default `MILLISECONDS`). Values are rounded half up
+  to it on write and on read (a file of another writer may hold
+  nanoseconds), never cut. `CREATE TABLE` and CTAS refuse a timestamp column
+  of another precision with Trino's message ("Incorrect timestamp precision
+  for timestamp(6); the configured precision is MILLISECONDS; column name:
+  ts"); `ADD COLUMN` accepts any and records `timestamp`, as Trino does.
+  `OPTIMIZE` keeps what files hold (microseconds, or nanoseconds for a
+  `NANOSECONDS` catalog).
+- **`varchar(n)`** is stored as declared; an `INSERT` of a longer value fails
+  as in Trino (`INVALID_CAST_ARGUMENT`, only trailing spaces are cut) and reads
+  cut values to `n` characters, as Trino's reader. **`char(n)`** is stored as
+  declared, written without trailing spaces (as Trino stores it; a longer
+  value fails like Trino's `INSERT`) and read padded to `n` (`'ab   '`,
+  length 5, as Trino shows it). Trino also compares char values padded
+  (`ch = 'ab'` is true); the engine has no char type, so a filter on a char
+  column (other than `IS [NOT] NULL`) is refused instead of answered as a
+  varchar comparison. Comparisons outside a filter on the table or view (a
+  join with a varchar, a `CASE`) still compare the padded text: pending an
+  engine char type.
+- **Checksums are verified.** A metadata file whose `.crc` does not match is
+  an error ("Checksum error"), as in Trino, never a table read with other
+  columns. A mismatch is re-read briefly first: writers replace the checksum
+  just before the file.
+- **Listing never goes stale nor breaks.** On a local warehouse schema and
+  table names are read from the directories at every listing, so tables of
+  another writer appear at once. A table the catalog cannot read (another
+  format, partitions, unreadable metadata) is listed and fails only when read;
+  a column of a type the engine cannot read (`array`, `map`, `struct`) fails
+  only when a query reads it.
+- **Column options** the catalog cannot keep (`NOT NULL`, `DEFAULT`, …) are
+  refused with Trino's messages; `COMMENT` is stored.
+- **Views** pad their `char(n)` columns and fold their column names (a quoted `"MixedCol"` is `mixedcol`), and
+  `timestamp(p) with time zone` columns keep their instant (read in UTC: Arrow
+  has one zone per column, so each value's own zone is not kept).
+- **Pending, F5.** Owner-based security (R11): Trino with
+  `hive.security=sql-standard` refuses `DROP`/`INSERT` on another user's
+  table; `CodeLake` writes `.trinoPermissions` but does not check them yet.
+
 ## Acceptance (F2 DoD)
 
 - Round trip with a real Trino 431 container sharing the warehouse volume:

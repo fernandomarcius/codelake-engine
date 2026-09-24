@@ -458,6 +458,14 @@ mod tests {
         assert_eq!(t(Modulo, (5, 2), (7, 3)), D(6, 3));
         assert_eq!(t(Plus, (12, 2), (10, 0)), D(13, 2));
         assert_eq!(t(Minus, (12, 2), (10, 0)), D(13, 2));
+        // The cases of the function library's former decimal operators.
+        assert_eq!(t(Plus, (3, 2), (3, 2)), D(4, 2));
+        assert_eq!(t(Plus, (2, 1), (10, 0)), D(12, 1));
+        assert_eq!(t(Multiply, (3, 2), (2, 1)), D(5, 3));
+        assert_eq!(t(Multiply, (4, 2), (10, 0)), D(14, 2));
+        assert_eq!(t(Divide, (1, 0), (1, 0)), D(1, 0));
+        assert_eq!(t(Divide, (19, 0), (5, 1)), D(21, 1));
+        assert_eq!(t(Modulo, (2, 1), (10, 0)), D(2, 1));
         assert_eq!(t(Multiply, (12, 2), (5, 0)), D(17, 2));
         assert_eq!(t(Multiply, (12, 2), (3, 0)), D(15, 2));
         assert_eq!(t(Multiply, (20, 10), (20, 10)), D(38, 20));

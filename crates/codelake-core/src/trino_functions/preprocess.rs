@@ -1,0 +1,381 @@
+//! Trino syntax the SQL parser rejects, rewritten on the text before parsing.
+//!
+//! Only the matched spans are edited (from token positions), so string
+//! literals, comments and everything else stay byte for byte:
+//!
+//! - `VALUES 1, 2` (rows without parentheses) becomes `VALUES (1), (2)`;
+//! - `TRIM(TRAILING FROM s)` (a side without characters) becomes `rtrim(s)`
+//!   (`LEADING`: `ltrim`, `BOTH`: `trim`);
+//! - `CAST(x AS array(T))`, `map(K, V)` and `row(…)` targets, which the parser
+//!   only knows with angle brackets, become
+//!   `codelake_trino_cast_type(x, 'array(T)')` (`TRY_CAST`: the `try` form),
+//!   planned by `cast_type` with Trino's type grammar.
+//!
+//! A text the tokenizer rejects is returned unchanged: the parser reports the
+//! error as it would have.
+
+use std::borrow::Cow;
+
+use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::keywords::Keyword;
+use datafusion::sql::sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
+
+use super::cast_type::{CAST_TYPE, TRY_CAST_TYPE};
+
+/// Guards against pathological inputs: each pass rewrites one construct.
+const MAX_PASSES: usize = 10_000;
+
+/// Byte offset of every line start, to turn token locations into offsets.
+struct Offsets<'a> {
+    text: &'a str,
+    lines: Vec<usize>,
+}
+
+impl<'a> Offsets<'a> {
+    fn new(text: &'a str) -> Self {
+        let mut lines = vec![0];
+        lines.extend(text.match_indices('\n').map(|(i, _)| i + 1));
+        Self { text, lines }
+    }
+
+    /// Byte offset of a 1-based (line, column-in-characters) location.
+    fn of(&self, location: Location) -> Option<usize> {
+        let line = usize::try_from(location.line).ok()?.checked_sub(1)?;
+        let column = usize::try_from(location.column).ok()?.checked_sub(1)?;
+        let start = *self.lines.get(line)?;
+        let rest = self.text.get(start..)?;
+        Some(start + rest.char_indices().nth(column).map_or(rest.len(), |(i, _)| i))
+    }
+}
+
+/// Tokens without whitespace, with byte spans.
+fn tokens(text: &str) -> Option<Vec<(Token, usize, usize)>> {
+    let dialect = GenericDialect {};
+    let raw: Vec<TokenWithSpan> = Tokenizer::new(&dialect, text).tokenize_with_location().ok()?;
+    let offsets = Offsets::new(text);
+    raw.into_iter()
+        .filter(|t| !matches!(t.token, Token::Whitespace(_) | Token::EOF))
+        .map(|t| Some((t.token, offsets.of(t.span.start)?, offsets.of(t.span.end)?)))
+        .collect()
+}
+
+fn is_keyword(token: &Token, keyword: Keyword) -> bool {
+    matches!(token, Token::Word(w) if w.keyword == keyword && w.quote_style.is_none())
+}
+
+fn is_word(token: &Token, name: &str) -> bool {
+    matches!(token, Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(name))
+}
+
+/// Index of the token closing the parenthesis opened at `open`.
+fn closing(tokens: &[(Token, usize, usize)], open: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    for (i, (token, _, _)) in tokens.iter().enumerate().skip(open) {
+        match token {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether a `VALUES` word after `previous` starts a `VALUES` list (and is
+/// not a column named `values`): at the start, in parentheses, after a set
+/// operator, or after the table (or column list) of an `INSERT`.
+fn starts_values(previous: Option<&Token>, insert: bool) -> bool {
+    match previous {
+        None | Some(Token::LParen) => true,
+        Some(Token::Word(w)) if w.quote_style.is_none() => {
+            matches!(
+                w.keyword,
+                Keyword::UNION | Keyword::INTERSECT | Keyword::EXCEPT | Keyword::ALL | Keyword::DISTINCT
+            ) || (insert && w.keyword == Keyword::NoKeyword)
+        }
+        Some(Token::Word(_) | Token::RParen) => insert,
+        _ => false,
+    }
+}
+
+/// `VALUES a, b` → `VALUES (a), (b)` for the first such list; `None` if none.
+fn values_rows(text: &str, tokens: &[(Token, usize, usize)]) -> Option<String> {
+    let insert = tokens
+        .first()
+        .is_some_and(|(t, _, _)| is_keyword(t, Keyword::INSERT));
+    let start = tokens.iter().enumerate().position(|(i, (t, _, _))| {
+        is_keyword(t, Keyword::VALUES)
+            && starts_values(i.checked_sub(1).map(|p| &tokens[p].0), insert)
+            && tokens
+                .get(i + 1)
+                .is_some_and(|(next, _, _)| !matches!(next, Token::LParen | Token::SemiColon))
+    })? + 1;
+    let ends_list = |t: &Token| {
+        matches!(t, Token::SemiColon)
+            || [
+                Keyword::ORDER,
+                Keyword::LIMIT,
+                Keyword::OFFSET,
+                Keyword::FETCH,
+                Keyword::UNION,
+                Keyword::EXCEPT,
+                Keyword::INTERSECT,
+                Keyword::ON,
+                Keyword::RETURNING,
+            ]
+            .iter()
+            .any(|k| is_keyword(t, *k))
+    };
+    // Byte ranges of each row expression.
+    let mut rows: Vec<(usize, usize)> = Vec::new();
+    let mut depth = 0_usize;
+    let mut row_start: Option<usize> = None;
+    let mut last_end = 0;
+    for (token, from, to) in tokens.iter().skip(start) {
+        if depth == 0 && (matches!(token, Token::RParen) || ends_list(token)) {
+            break;
+        }
+        match token {
+            Token::Comma if depth == 0 => {
+                rows.push((row_start?, last_end));
+                row_start = None;
+                continue;
+            }
+            // Commas inside `ARRAY[…]`, `f(…)` or `x[i]` do not end a row.
+            Token::LParen | Token::LBracket => depth += 1,
+            Token::RParen | Token::RBracket => depth -= 1,
+            _ => {}
+        }
+        row_start.get_or_insert(*from);
+        last_end = *to;
+    }
+    rows.push((row_start?, last_end));
+    let mut out = String::with_capacity(text.len() + 2 * rows.len());
+    let mut copied = 0;
+    for (from, to) in rows {
+        out.push_str(text.get(copied..from)?);
+        out.push('(');
+        out.push_str(text.get(from..to)?);
+        out.push(')');
+        copied = to;
+    }
+    out.push_str(text.get(copied..)?);
+    Some(out)
+}
+
+/// The last `CAST(x AS array|map|row(…))` rewritten; `None` if there is none.
+/// The last one to start contains no other, so rewriting from the end
+/// handles nesting.
+fn container_cast(text: &str, tokens: &[(Token, usize, usize)]) -> Option<String> {
+    for i in (0..tokens.len()).rev() {
+        let (token, cast_start, _) = &tokens[i];
+        let function = if is_keyword(token, Keyword::CAST) {
+            CAST_TYPE
+        } else if is_keyword(token, Keyword::TRY_CAST) {
+            TRY_CAST_TYPE
+        } else {
+            continue;
+        };
+        if !matches!(tokens.get(i + 1), Some((Token::LParen, _, _))) {
+            continue;
+        }
+        let Some(close) = closing(tokens, i + 1) else {
+            continue;
+        };
+        // `AS` at the cast's own depth.
+        let mut depth = 0_usize;
+        let mut as_index = None;
+        for (j, (t, _, _)) in tokens.iter().enumerate().take(close).skip(i + 2) {
+            match t {
+                Token::LParen => depth += 1,
+                Token::RParen => depth = depth.saturating_sub(1),
+                _ if depth == 0 && is_keyword(t, Keyword::AS) => as_index = Some(j),
+                _ => {}
+            }
+        }
+        let Some(as_index) = as_index else { continue };
+        let (Some((type_word, type_start, _)), Some((Token::LParen, _, _))) =
+            (tokens.get(as_index + 1), tokens.get(as_index + 2))
+        else {
+            continue;
+        };
+        if !["array", "map", "row"]
+            .iter()
+            .any(|name| is_word(type_word, name))
+        {
+            continue;
+        }
+        let (_, expr_start, _) = tokens.get(i + 2)?;
+        let (_, as_start, _) = tokens.get(as_index)?;
+        let (_, close_start, close_end) = tokens.get(close)?;
+        let expression = text.get(*expr_start..*as_start)?.trim_end();
+        let type_text = text.get(*type_start..*close_start)?.trim().replace('\'', "''");
+        let mut out = String::with_capacity(text.len() + 32);
+        out.push_str(text.get(..*cast_start)?);
+        out.push_str(function);
+        out.push('(');
+        out.push_str(expression);
+        out.push_str(", '");
+        out.push_str(&type_text);
+        out.push_str("')");
+        out.push_str(text.get(*close_end..)?);
+        return Some(out);
+    }
+    None
+}
+
+/// `TRIM(LEADING | TRAILING | BOTH FROM s)` (no characters: blanks) becomes
+/// `ltrim(s)`, `rtrim(s)` or `trim(s)`; the parser needs the characters.
+fn trim_side(text: &str, tokens: &[(Token, usize, usize)]) -> Option<String> {
+    for window in tokens.windows(4) {
+        let [
+            (trim, start, _),
+            (Token::LParen, _, _),
+            (side, _, _),
+            (from, _, from_end),
+        ] = window
+        else {
+            continue;
+        };
+        if !is_keyword(trim, Keyword::TRIM) || !is_keyword(from, Keyword::FROM) {
+            continue;
+        }
+        let function = if is_keyword(side, Keyword::LEADING) {
+            "ltrim("
+        } else if is_keyword(side, Keyword::TRAILING) {
+            "rtrim("
+        } else if is_keyword(side, Keyword::BOTH) {
+            "trim("
+        } else {
+            continue;
+        };
+        let mut out = String::with_capacity(text.len());
+        out.push_str(text.get(..*start)?);
+        out.push_str(function);
+        out.push_str(text.get(*from_end..)?);
+        return Some(out);
+    }
+    None
+}
+
+/// Rewrites the constructs listed in the module docs.
+pub(crate) fn preprocess(sql: &str) -> Cow<'_, str> {
+    let mut text = Cow::Borrowed(sql);
+    for _ in 0..MAX_PASSES {
+        let Some(tokens) = tokens(&text) else { return text };
+        let next = container_cast(&text, &tokens)
+            .or_else(|| values_rows(&text, &tokens))
+            .or_else(|| trim_side(&text, &tokens));
+        match next {
+            Some(rewritten) => text = Cow::Owned(rewritten),
+            None => return text,
+        }
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn values_rows_get_parentheses() {
+        assert_eq!(
+            preprocess("SELECT x FROM (VALUES 1, 2, NULL) t(x)"),
+            "SELECT x FROM (VALUES (1), (2), (NULL)) t(x)"
+        );
+        assert_eq!(
+            preprocess("SELECT * FROM (VALUES CAST(1 AS bigint), f(2, 3)) t(x) ORDER BY 1"),
+            "SELECT * FROM (VALUES (CAST(1 AS bigint)), (f(2, 3))) t(x) ORDER BY 1"
+        );
+        assert_eq!(preprocess("VALUES 'a''b', 'ç'"), "VALUES ('a''b'), ('ç')");
+        let untouched = "INSERT INTO t VALUES (1, 'a'), (2, 'b')";
+        assert_eq!(preprocess(untouched), untouched);
+        assert_eq!(
+            preprocess("VALUES 1 UNION ALL VALUES 2"),
+            "VALUES (1) UNION ALL VALUES (2)"
+        );
+        assert_eq!(
+            preprocess("SELECT * FROM (VALUES ARRAY[1, 2], ARRAY[3]) t(a)"),
+            "SELECT * FROM (VALUES (ARRAY[1, 2]), (ARRAY[3])) t(a)"
+        );
+    }
+
+    /// The cases of the engine's former `VALUES` rewrite (front/semantics),
+    /// kept against the one rewrite that remains.
+    #[test]
+    fn values_rows_keep_text_and_positions() {
+        assert_eq!(
+            preprocess("SELECT x FROM (VALUES 1, 2) t(x) ORDER BY x"),
+            "SELECT x FROM (VALUES (1), (2)) t(x) ORDER BY x"
+        );
+        assert_eq!(
+            preprocess("SELECT x FROM (VALUES CAST(NULL AS DECIMAL(5,2)), 1.5, -2.25) t(x)"),
+            "SELECT x FROM (VALUES (CAST(NULL AS DECIMAL(5,2))), (1.5), (-2.25)) t(x)"
+        );
+        assert_eq!(
+            preprocess("VALUES 'a,b', 2 ORDER BY 1"),
+            "VALUES ('a,b'), (2) ORDER BY 1"
+        );
+        assert_eq!(
+            preprocess("SELECT 'VALUES 1, 2' FROM (VALUES\n  1 + 1,\n  2) t(x)"),
+            "SELECT 'VALUES 1, 2' FROM (VALUES\n  (1 + 1),\n  (2)) t(x)"
+        );
+        assert_eq!(preprocess("INSERT INTO t VALUES 7"), "INSERT INTO t VALUES (7)");
+        assert_eq!(
+            preprocess("SELECT 'é', x FROM (VALUES 1) t(x)"),
+            "SELECT 'é', x FROM (VALUES (1)) t(x)"
+        );
+        // Already in parentheses, or no list: unchanged.
+        for sql in [
+            "VALUES (1), (2)",
+            "INSERT INTO t VALUES (1, 'a')",
+            "SELECT 1",
+            "SELECT values FROM t",
+            "SELECT a, values, b FROM t",
+            "SELECT \"values\" FROM t",
+        ] {
+            assert!(matches!(preprocess(sql), Cow::Borrowed(_)), "{sql}");
+        }
+    }
+
+    #[test]
+    fn trim_sides_without_characters() {
+        assert_eq!(
+            preprocess(
+                "SELECT trim(TRAILING FROM s), TRIM(leading FROM 'a'), trim(BOTH FROM x), trim(BOTH 'x' FROM y)"
+            ),
+            "SELECT rtrim( s), ltrim( 'a'), trim( x), trim(BOTH 'x' FROM y)"
+        );
+    }
+
+    #[test]
+    fn container_casts_carry_trino_type_text() {
+        assert_eq!(
+            preprocess(
+                "SELECT CAST(NULL AS array(bigint)), TRY_CAST(j AS map(varchar, array(integer))) FROM t"
+            ),
+            format!(
+                "SELECT {CAST_TYPE}(NULL, 'array(bigint)'), {TRY_CAST_TYPE}(j, 'map(varchar, array(integer))') FROM t"
+            )
+        );
+        assert_eq!(
+            preprocess("SELECT CAST(CAST(x AS row(a integer)) AS array(row(a integer)))"),
+            format!("SELECT {CAST_TYPE}({CAST_TYPE}(x, 'row(a integer)'), 'array(row(a integer))')")
+        );
+        let untouched = "SELECT CAST(x AS varchar), 'CAST(y AS array(bigint))', ARRAY[1]";
+        assert_eq!(preprocess(untouched), untouched);
+    }
+
+    #[test]
+    fn multi_line_text_keeps_offsets() {
+        assert_eq!(
+            preprocess("SELECT\n  'ação',\n  CAST(x AS array(varchar))\nFROM t"),
+            format!("SELECT\n  'ação',\n  {CAST_TYPE}(x, 'array(varchar)')\nFROM t")
+        );
+    }
+}

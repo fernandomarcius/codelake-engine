@@ -21,12 +21,27 @@ toml.workspace = true
 thiserror.workspace = true
 secrecy.workspace = true
 tracing.workspace = true
+chrono-tz.workspace = true
+regex.workspace = true
+fancy-regex.workspace = true
+num-traits.workspace = true
+twox-hash.workspace = true
+md5.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+crc32fast.workspace = true
+base64.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+libm.workspace = true
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 criterion.workspace = true
+tracing-subscriber.workspace = true
 
 [[bench]]
 name = "query_memory"

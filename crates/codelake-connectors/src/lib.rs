@@ -119,21 +119,25 @@ pub fn build(source: &SourceConfig, secrets: &Secrets) -> Result<Arc<dyn Connect
             access_key_id_env,
             secret_access_key_env,
             s3_path_style,
+            timestamp_precision,
         } => {
             let credentials = match (access_key_id_env, secret_access_key_env) {
                 (Some(key), Some(secret_key)) => Some((secret(key)?, secret(secret_key)?)),
                 _ => None,
             };
-            Ok(Arc::new(hive::HiveConnector::new(
-                name.clone(),
-                hive::HiveParams {
-                    warehouse: warehouse.clone(),
-                    s3_endpoint: s3_endpoint.clone(),
-                    s3_region: s3_region.clone(),
-                    credentials,
-                    path_style: *s3_path_style,
-                },
-            )))
+            Ok(Arc::new(
+                hive::HiveConnector::new(
+                    name.clone(),
+                    hive::HiveParams {
+                        warehouse: warehouse.clone(),
+                        s3_endpoint: s3_endpoint.clone(),
+                        s3_region: s3_region.clone(),
+                        credentials,
+                        path_style: *s3_path_style,
+                    },
+                )
+                .with_timestamp_precision(*timestamp_precision),
+            ))
         }
         #[cfg(feature = "iceberg")]
         SourceKind::Iceberg {

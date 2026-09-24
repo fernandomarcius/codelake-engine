@@ -359,7 +359,10 @@ async fn mem3_history_does_not_keep_page_bodies_outside_the_pool() {
     for _ in 0..8 {
         // Two 8 MiB rows per batch: every page carries one whole row.
         let first = h
-            .submit("SELECT repeat('x', 8388608) AS s FROM generate_series(1, 4)", &[])
+            .submit(
+                "SELECT lpad('', 8388608, 'x') AS s FROM generate_series(1, 4)",
+                &[],
+            )
             .await;
         let id = first.body["id"].as_str().unwrap().to_owned();
         let one = path_of(first.body["nextUri"].as_str().unwrap());

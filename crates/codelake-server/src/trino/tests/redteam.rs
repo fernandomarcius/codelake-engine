@@ -591,3 +591,52 @@ async fn post_with_host(router: &axum::Router, host: &str) -> Value {
     let raw = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&raw).unwrap_or(Value::Null)
 }
+
+/// F2 red-team: a Trino client reaches server files through `DataFusion`
+/// statements Trino does not have (`CREATE EXTERNAL TABLE`, `COPY … TO`).
+/// Trino 431 rejects both as syntax errors.
+#[tokio::test]
+async fn f2rt_client_statements_cannot_touch_server_files() {
+    let h = harness();
+    let target = std::env::temp_dir().join(format!("f2rt-{}.csv", std::process::id()));
+    let mut reached = Vec::new();
+    let external = h
+        .run(
+            "CREATE EXTERNAL TABLE leak (line VARCHAR) STORED AS CSV LOCATION '/etc/hostname' \
+             OPTIONS ('format.has_header' 'false')",
+            &[("x-trino-user", "mallory")],
+        )
+        .await;
+    let leak = h
+        .run("SELECT line FROM leak", &[("x-trino-user", "mallory")])
+        .await;
+    eprintln!(
+        "[F2RT] external: {} / leak: {} {:?}",
+        external.state(),
+        leak.state(),
+        leak.rows
+    );
+    if leak.state() == "FINISHED" {
+        reached.push(format!("read /etc/hostname: {:?}", leak.rows));
+    }
+    let copy = h
+        .run(
+            &format!(
+                "COPY (SELECT 'owned' AS a) TO '{}' STORED AS CSV",
+                target.display()
+            ),
+            &[("x-trino-user", "mallory")],
+        )
+        .await;
+    eprintln!(
+        "[F2RT] copy: {} {:?} exists={}",
+        copy.state(),
+        copy.rows,
+        target.exists()
+    );
+    if target.exists() {
+        reached.push(format!("wrote {}", target.display()));
+        let _ = std::fs::remove_file(&target);
+    }
+    assert!(reached.is_empty(), "{reached:#?}");
+}

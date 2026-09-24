@@ -625,7 +625,7 @@ mod tests {
         let engine = engine(dir.path(), ByteSize::mib(128), 4);
         let sql = "SELECT count(*) AS groups, sum(c) AS n, min(c) AS lo, max(c) AS hi FROM (\
                      SELECT p, count(*) AS c FROM (\
-                       SELECT repeat('x', 200) || CAST(value % 1000000 AS VARCHAR) AS p \
+                       SELECT lpad('', 200, 'x') || CAST(value % 1000000 AS VARCHAR) AS p \
                        FROM generate_series(1, 2000000)) GROUP BY p)";
         let batches = engine.sql(sql).await.unwrap().collect().await.unwrap();
         let value = |c: usize| {
