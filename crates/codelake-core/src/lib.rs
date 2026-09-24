@@ -14,6 +14,7 @@ pub mod functions;
 pub mod runtime;
 pub mod session_properties;
 pub mod subquery;
+pub mod table_procedure;
 #[cfg(test)]
 mod testing;
 
@@ -22,4 +23,7 @@ pub use config::{Config, SourceConfig, SourceKind, ValidatedConfig};
 pub use connector::{BoxError, Connector, ConnectorError, WritableCatalog};
 pub use engine::{Attach, Engine, EngineError, QueryOptions, SourceStatus};
 pub use runtime::MemoryStats;
-pub use session_properties::{Effect, PropertyRegistry, PropertyType, SessionProperties, SessionProperty};
+pub use session_properties::{
+    CatalogSession, Effect, PropertyRegistry, PropertyType, SessionProperties, SessionProperty,
+};
+pub use table_procedure::{ProcedureArgument, ProcedureCall, TableProcedure};

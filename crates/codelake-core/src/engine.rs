@@ -2,10 +2,15 @@
 //! bounded by [`EngineRuntime`].
 
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
 
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::common::ScalarValue;
 use datafusion::dataframe::DataFrame;
+use datafusion::datasource::TableType;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::{DdlStatement, LogicalPlan};
@@ -13,6 +18,8 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::TableReference;
+use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, visit_expressions};
+use datafusion::sql::sqlparser::dialect::dialect_from_str;
 use datafusion_federation::FederatedQueryPlanner;
 use futures::future::join_all;
 use serde::Serialize;
@@ -20,10 +27,11 @@ use tracing::{info, warn};
 
 use crate::config::{ExecutionConfig, MemoryConfig};
 use crate::connector::{Connector, ConnectorError, WritableCatalog};
-use crate::ddl::{self, Prepared};
+use crate::ddl::{self, Prepared, TableExecute};
 use crate::federation_guard::FederationFilterGuard;
 use crate::runtime::{EngineRuntime, MemoryStats};
 use crate::session_properties::{PropertyRegistry, SessionProperties};
+use crate::table_procedure::{self, ArgumentValue, RawArgument};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -178,7 +186,7 @@ impl Engine {
     pub async fn sql_with(&self, options: &QueryOptions, sql: &str) -> Result<DataFrame, DataFusionError> {
         let ctx = self.session(options);
         // Planning futures are large; boxing keeps callers' futures small.
-        Box::pin(self.plan_and_run(&ctx, &options.user, sql)).await
+        Box::pin(self.plan_and_run(&ctx, options, sql)).await
     }
 
     fn session(&self, options: &QueryOptions) -> SessionContext {
@@ -196,11 +204,17 @@ impl Engine {
     async fn plan_and_run(
         &self,
         ctx: &SessionContext,
-        user: &str,
+        options: &QueryOptions,
         sql: &str,
     ) -> Result<DataFrame, DataFusionError> {
+        let user = options.user.as_str();
         let state = ctx.state();
         let dialect = state.config().options().sql_parser.dialect;
+        if let Some(parser_dialect) = dialect_from_str(dialect)
+            && let Some(execute) = ddl::parse_table_execute(sql, parser_dialect.as_ref())?
+        {
+            return self.table_execute(ctx, options, execute).await;
+        }
         let mut statement = state.sql_to_statement(sql, &dialect)?;
         let prepared = ddl::prepare(&mut statement)?;
         if let Some(Prepared::AddColumn {
@@ -243,8 +257,7 @@ impl Engine {
     }
 
     fn row_count(ctx: &SessionContext, rows: u64) -> Result<DataFrame, DataFusionError> {
-        use datafusion::arrow::array::{RecordBatch, UInt64Array};
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::array::UInt64Array;
         let schema = Arc::new(Schema::new(vec![Field::new("rows", DataType::UInt64, false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![rows]))])?;
         ctx.read_batch(batch)
@@ -266,6 +279,97 @@ impl Engine {
         let data_type = probe.schema().field(0).data_type().clone();
         writable.add_column(&schema, &name, column, &data_type).await?;
         Self::empty(ctx)
+    }
+
+    /// `ALTER TABLE … EXECUTE <procedure>`: checks run in Trino's order (table,
+    /// procedure, arguments, filter) with Trino's messages, then the catalog runs
+    /// the procedure. The answer is Trino's: an empty result with one `rows`
+    /// column.
+    async fn table_execute(
+        &self,
+        ctx: &SessionContext,
+        options: &QueryOptions,
+        execute: TableExecute,
+    ) -> Result<DataFrame, DataFusionError> {
+        let (catalog, schema, table) = Self::resolve(ctx, &execute.table);
+        let schema_provider = ctx.catalog(&catalog).and_then(|c| c.schema(&schema));
+        let provider = match schema_provider {
+            Some(provider) => provider.table(&table).await?,
+            None => None,
+        }
+        .ok_or_else(|| DataFusionError::Plan(format!("Table '{catalog}.{schema}.{table}' does not exist")))?;
+        if provider.table_type() == TableType::View {
+            return Err(DataFusionError::Plan(
+                "ALTER TABLE EXECUTE is not supported for views".into(),
+            ));
+        }
+        let writable = self.writable(&catalog);
+        let procedures = writable.map(|w| w.table_procedures()).unwrap_or_default();
+        let procedure =
+            table_procedure::find(&procedures, &execute.procedure).map_err(DataFusionError::Plan)?;
+        let mut arguments = Vec::with_capacity(execute.arguments.len());
+        for (name, expr) in &execute.arguments {
+            arguments.push(RawArgument {
+                name: name.clone(),
+                value: Self::constant(ctx, expr).await?,
+            });
+        }
+        let call = table_procedure::bind(&catalog, procedure, arguments).map_err(DataFusionError::Plan)?;
+        if execute.filter.is_some() {
+            return Err(DataFusionError::Plan(
+                "Unexpected FilterNode found in plan; probably connector was not able to handle provided WHERE expression".into(),
+            ));
+        }
+        let Some(writable) = writable else {
+            return Err(DataFusionError::Plan(table_procedure::not_registered(
+                &execute.procedure,
+            )));
+        };
+        let session = self.properties.catalog_session(&catalog, &options.properties);
+        writable
+            .execute_table_procedure(&schema, &table, &call, &session, ctx.task_ctx())
+            .await?;
+        let output = Arc::new(Schema::new(vec![Field::new("rows", DataType::Int64, true)]));
+        ctx.read_batch(RecordBatch::new_empty(output))
+    }
+
+    /// Evaluates a procedure argument, which must be a constant expression.
+    async fn constant(ctx: &SessionContext, expr: &SqlExpr) -> Result<ArgumentValue, DataFusionError> {
+        let subquery = visit_expressions(expr, |e| {
+            if matches!(
+                e,
+                SqlExpr::Subquery(_) | SqlExpr::Exists { .. } | SqlExpr::InSubquery { .. }
+            ) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        if subquery.is_break() {
+            return Err(DataFusionError::Plan(
+                "Constant expression cannot contain a subquery".into(),
+            ));
+        }
+        let batches = ctx.sql(&format!("SELECT {expr}")).await?.collect().await?;
+        let batch = batches
+            .iter()
+            .find(|b| b.num_rows() > 0)
+            .ok_or_else(|| DataFusionError::Internal(format!("constant {expr} produced no value")))?;
+        let value = ScalarValue::try_from_array(batch.column(0), 0)?;
+        if value.is_null() {
+            return Ok(ArgumentValue::Null);
+        }
+        Ok(match value {
+            ScalarValue::Boolean(Some(b)) => ArgumentValue::Boolean(b),
+            ScalarValue::Int8(Some(i)) => ArgumentValue::Integer(i.into()),
+            ScalarValue::Int16(Some(i)) => ArgumentValue::Integer(i.into()),
+            ScalarValue::Int32(Some(i)) => ArgumentValue::Integer(i.into()),
+            ScalarValue::Int64(Some(i)) => ArgumentValue::Integer(i),
+            ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) | ScalarValue::Utf8View(Some(s)) => {
+                ArgumentValue::Varchar(s)
+            }
+            other => ArgumentValue::Other(other.to_string()),
+        })
     }
 
     async fn route_ddl(
@@ -581,6 +685,265 @@ mod tests {
                 .contains("connection refused")
         );
         assert!(statuses[1].error.as_deref().unwrap().contains("no answer"));
+    }
+
+    /// `(schema, table, file_size_threshold, session "enabled")`.
+    type Call = (String, String, Option<String>, Option<String>);
+
+    /// A writable catalog that registers one procedure and records its calls.
+    #[derive(Debug, Default)]
+    struct Procedures {
+        calls: std::sync::Mutex<Vec<Call>>,
+    }
+
+    #[async_trait]
+    impl WritableCatalog for Procedures {
+        async fn create_schema(&self, _: &str, _: bool, _: &str) -> datafusion::error::Result<()> {
+            Ok(())
+        }
+        async fn create_table_as(
+            &self,
+            _: &str,
+            _: &str,
+            _: bool,
+            _: &str,
+            _: datafusion::physical_plan::SendableRecordBatchStream,
+            _: Arc<datafusion::execution::TaskContext>,
+        ) -> datafusion::error::Result<u64> {
+            Ok(0)
+        }
+        async fn drop_table(&self, _: &str, _: &str, _: bool) -> datafusion::error::Result<()> {
+            Ok(())
+        }
+        async fn create_view(
+            &self,
+            _: &str,
+            _: &str,
+            _: bool,
+            _: &str,
+            _: &str,
+            _: datafusion::arrow::datatypes::SchemaRef,
+        ) -> datafusion::error::Result<()> {
+            Ok(())
+        }
+        async fn drop_view(&self, _: &str, _: &str, _: bool) -> datafusion::error::Result<()> {
+            Ok(())
+        }
+        async fn add_column(&self, _: &str, _: &str, _: &str, _: &DataType) -> datafusion::error::Result<()> {
+            Ok(())
+        }
+        fn table_procedures(&self) -> Vec<crate::TableProcedure> {
+            vec![crate::TableProcedure::new(
+                "optimize",
+                vec![crate::ProcedureArgument::new(
+                    "file_size_threshold",
+                    crate::PropertyType::DataSize,
+                    "100MB",
+                    "threshold",
+                )],
+            )]
+        }
+        async fn execute_table_procedure(
+            &self,
+            schema: &str,
+            table: &str,
+            call: &crate::ProcedureCall,
+            session: &crate::CatalogSession,
+            _: Arc<datafusion::execution::TaskContext>,
+        ) -> datafusion::error::Result<()> {
+            self.calls.lock().unwrap().push((
+                schema.to_owned(),
+                table.to_owned(),
+                call.get("file_size_threshold").map(str::to_owned),
+                session.get("enabled").map(str::to_owned),
+            ));
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct ProcedureSource {
+        writable: Option<Arc<Procedures>>,
+    }
+
+    #[async_trait]
+    impl Connector for ProcedureSource {
+        fn name(&self) -> &str {
+            if self.writable.is_some() { "lake" } else { "plain" }
+        }
+        fn kind(&self) -> &'static str {
+            "fake"
+        }
+        async fn catalog(&self) -> Result<Arc<dyn CatalogProvider>, ConnectorError> {
+            let schema = MemorySchemaProvider::new();
+            let fields = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+            let table = MemTable::try_new(fields, vec![vec![]]).unwrap();
+            datafusion::catalog::SchemaProvider::register_table(&schema, "t".into(), Arc::new(table))
+                .unwrap();
+            let ctx = SessionContext::new();
+            let plan = ctx
+                .sql("SELECT 1 AS id")
+                .await
+                .unwrap()
+                .into_optimized_plan()
+                .unwrap();
+            let view = datafusion::datasource::ViewTable::new(plan, Some("SELECT 1 AS id".into()));
+            datafusion::catalog::SchemaProvider::register_table(&schema, "v".into(), Arc::new(view)).unwrap();
+            let catalog = MemoryCatalogProvider::new();
+            catalog.register_schema("public", Arc::new(schema)).unwrap();
+            Ok(Arc::new(catalog))
+        }
+        async fn ping(&self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+        fn writable(&self) -> Option<Arc<dyn WritableCatalog>> {
+            self.writable.clone().map(|w| w as Arc<dyn WritableCatalog>)
+        }
+        fn session_properties(&self) -> Vec<crate::SessionProperty> {
+            vec![crate::SessionProperty::new(
+                "enabled",
+                crate::PropertyType::Boolean,
+                "false",
+                crate::Effect::Enforced,
+                "gate",
+            )]
+        }
+    }
+
+    async fn procedure_engine(dir: &std::path::Path) -> (Engine, Arc<Procedures>) {
+        let mut engine = engine(dir, ByteSize::mib(64), ByteSize::mib(64));
+        let procedures = Arc::new(Procedures::default());
+        for writable in [Some(Arc::clone(&procedures)), None] {
+            engine
+                .attach(Arc::new(ProcedureSource { writable }), true, FAST)
+                .await
+                .unwrap();
+        }
+        (engine, procedures)
+    }
+
+    async fn execute_error(engine: &Engine, sql: &str) -> String {
+        engine.sql(sql).await.unwrap_err().to_string()
+    }
+
+    #[tokio::test]
+    async fn table_execute_is_routed_with_bound_arguments_and_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, procedures) = procedure_engine(dir.path()).await;
+
+        let result = engine
+            .sql("ALTER TABLE lake.public.t EXECUTE optimize")
+            .await
+            .unwrap();
+        assert_eq!(result.schema().field(0).name(), "rows");
+        assert_eq!(result.schema().field(0).data_type(), &DataType::Int64);
+        assert_eq!(
+            result
+                .collect()
+                .await
+                .unwrap()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            0
+        );
+
+        let mut options = QueryOptions::for_user("dbt");
+        options.catalog = Some("lake".into());
+        options.schema = Some("public".into());
+        options.properties = engine
+            .session_properties()
+            .session(std::collections::BTreeMap::from([(
+                "lake.enabled".to_owned(),
+                "true".to_owned(),
+            )]))
+            .unwrap();
+        engine
+            .sql_with(
+                &options,
+                "alter table T execute \"OPTIMIZE\"(file_size_threshold => '1' || 'MB');",
+            )
+            .await
+            .unwrap();
+        engine
+            .sql_with(&options, "ALTER TABLE t EXECUTE Optimize('2kB')")
+            .await
+            .unwrap();
+
+        let calls = procedures.calls.lock().unwrap().clone();
+        let expected = |threshold: &str, enabled: &str| {
+            (
+                "public".to_owned(),
+                "t".to_owned(),
+                Some(threshold.to_owned()),
+                Some(enabled.to_owned()),
+            )
+        };
+        assert_eq!(
+            calls,
+            vec![
+                expected("100MB", "false"),
+                expected("1MB", "true"),
+                expected("2kB", "true")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn table_execute_errors_follow_trino() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, procedures) = procedure_engine(dir.path()).await;
+        for (sql, message) in [
+            (
+                "ALTER TABLE lake.public.nope EXECUTE optimize",
+                "Table 'lake.public.nope' does not exist",
+            ),
+            (
+                "ALTER TABLE nocat.s.t EXECUTE optimize",
+                "Table 'nocat.s.t' does not exist",
+            ),
+            (
+                "ALTER TABLE lake.public.v EXECUTE optimize",
+                "ALTER TABLE EXECUTE is not supported for views",
+            ),
+            (
+                "ALTER TABLE lake.public.t EXECUTE foo",
+                "Table procedure not registered: FOO",
+            ),
+            (
+                "ALTER TABLE plain.public.t EXECUTE optimize",
+                "Table procedure not registered: OPTIMIZE",
+            ),
+            (
+                "ALTER TABLE lake.public.t EXECUTE optimize(foo => '1MB')",
+                "Catalog 'lake' table procedure 'OPTIMIZE' property 'foo' does not exist",
+            ),
+            (
+                "ALTER TABLE lake.public.t EXECUTE optimize(file_size_threshold => 10)",
+                "Cannot convert [10] to varchar",
+            ),
+            (
+                "ALTER TABLE lake.public.t EXECUTE optimize(file_size_threshold => NULL)",
+                "Invalid null value for catalog 'lake' table procedure 'OPTIMIZE' property 'file_size_threshold' from [null]",
+            ),
+            (
+                "ALTER TABLE lake.public.t EXECUTE optimize(file_size_threshold => 'abc')",
+                "size is not a valid data size string: abc",
+            ),
+            (
+                "ALTER TABLE lake.public.t EXECUTE optimize(file_size_threshold => (SELECT '1MB'))",
+                "Constant expression cannot contain a subquery",
+            ),
+            (
+                "ALTER TABLE lake.public.t EXECUTE optimize WHERE id = 1",
+                "Unexpected FilterNode found in plan",
+            ),
+            ("ALTER TABLE lake.public.t EXECUTE optimize(", "Expected"),
+        ] {
+            let error = execute_error(&engine, sql).await;
+            assert!(error.contains(message), "{sql}: {error}");
+        }
+        assert!(procedures.calls.lock().unwrap().is_empty());
     }
 
     /// ~40 MiB of rows, sorted under a 16 MiB ceiling.
