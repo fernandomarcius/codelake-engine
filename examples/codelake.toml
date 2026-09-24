@@ -19,6 +19,15 @@ spill_limit = "40GiB"
 batch_size = 8192
 source_startup_timeout_secs = 60
 
+# Distributed tracing (docs/adr/0010-observability-otlp.md). Off unless
+# otlp_endpoint is set. OTLP/HTTP protobuf to a collector agent on the node or
+# in the pod (plain http://; the agent handles TLS upstream).
+# [telemetry]
+# otlp_endpoint = "http://otel-collector:4318"
+# service_name = "codelake"
+# sampling_ratio = 0.1        # new traces; a caller's traceparent decides for its own
+# export_timeout_secs = 10
+
 [[source]]
 name = "erp"
 kind = "postgres"

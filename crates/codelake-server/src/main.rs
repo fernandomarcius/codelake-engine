@@ -5,15 +5,16 @@
 //! codelake serve --config codelake.toml          # run the server
 //! ```
 
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use codelake_server::telemetry;
 
 mod hooks;
 mod ops;
 mod serve;
-mod telemetry;
 mod trino;
 
 #[derive(Debug, Parser)]
@@ -46,26 +47,42 @@ const EXIT_CONFIG: u8 = 2;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    telemetry::init();
     let (Command::CheckConfig { config } | Command::Serve { config }) = &cli.command;
-    let validated = match codelake_core::Config::load(config) {
+    // Load first: the exporter is configured by the file. Errors are logged
+    // once the subscriber exists.
+    let loaded = codelake_core::Config::load(config);
+    let exporter = match (&cli.command, &loaded) {
+        (Command::Serve { .. }, Ok(validated)) => Some(&validated.config.telemetry),
+        _ => None,
+    };
+    let telemetry = match telemetry::init(exporter) {
+        Ok(telemetry) => telemetry,
+        Err(err) => {
+            // No subscriber could be installed: stderr is all there is.
+            let _ = writeln!(std::io::stderr(), "cannot start telemetry: {err}");
+            return ExitCode::from(EXIT_CONFIG);
+        }
+    };
+    let validated = match loaded {
         Ok(validated) => validated,
         Err(err) => {
             tracing::error!(config = %config.display(), "{err}");
             return ExitCode::from(EXIT_CONFIG);
         }
     };
-    match cli.command {
+    let code = match cli.command {
         Command::CheckConfig { .. } => {
             tracing::info!(sources = validated.config.sources.len(), "configuration is valid");
             ExitCode::SUCCESS
         }
-        Command::Serve { .. } => match serve::run(validated) {
+        Command::Serve { .. } => match serve::run(validated, telemetry.sampling_ratio()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 tracing::error!("{err}");
                 ExitCode::FAILURE
             }
         },
-    }
+    };
+    telemetry.shutdown();
+    code
 }

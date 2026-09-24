@@ -5,18 +5,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use datafusion::arrow::array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
-use datafusion::execution::SessionStateBuilder;
+use datafusion::execution::{SendableRecordBatchStream, SessionStateBuilder};
 use datafusion::logical_expr::{DdlStatement, LogicalPlan};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::TableReference;
 use datafusion_federation::FederatedQueryPlanner;
+use futures::TryStreamExt;
 use futures::future::join_all;
 use serde::Serialize;
-use tracing::{info, warn};
+use tracing::field::Empty;
+use tracing::{Instrument, Span, info, warn};
 
 use crate::config::{ExecutionConfig, MemoryConfig};
 use crate::connector::{Connector, ConnectorError, ViewDefinition, WritableCatalog};
@@ -25,6 +28,7 @@ use crate::federation_guard::FederationFilterGuard;
 use crate::information_schema::CatalogList;
 use crate::runtime::{EngineRuntime, MemoryStats};
 use crate::session_properties::{PropertyRegistry, SessionProperties};
+use crate::trace::{self, QueryTrace, TARGET, TracedStream};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -49,6 +53,9 @@ pub struct QueryOptions {
     pub schema: Option<String>,
     /// Validated session properties (see [`crate::PropertyRegistry`]).
     pub properties: SessionProperties,
+    /// Distributed-trace context: remote parent, query id, correlation id.
+    /// Default: a new trace (subject to sampling) and an engine query id.
+    pub trace: QueryTrace,
 }
 
 impl QueryOptions {
@@ -58,7 +65,89 @@ impl QueryOptions {
             catalog: None,
             schema: None,
             properties: SessionProperties::default(),
+            trace: QueryTrace::default(),
         }
+    }
+
+    /// Sets the trace context, e.g. from [`QueryTrace::from_headers`].
+    #[must_use]
+    pub fn with_trace(mut self, trace: QueryTrace) -> Self {
+        self.trace = trace;
+        self
+    }
+}
+
+/// A planned statement with its trace. The query span stays open until the
+/// results are fully fetched (or the stream is dropped), so a trace shows the
+/// whole life of the query: `parse`, `plan`, `execute`, `fetch`, and the
+/// source spans below them.
+#[derive(Debug)]
+pub struct Query {
+    dataframe: DataFrame,
+    span: Span,
+    id: String,
+}
+
+impl Query {
+    /// Engine- or protocol-assigned query id (Trino shape).
+    pub fn query_id(&self) -> &str {
+        &self.id
+    }
+
+    /// Trace id of this query, when it is being traced.
+    pub fn trace_id(&self) -> Option<String> {
+        trace::trace_id(&self.span)
+    }
+
+    /// The query span, for protocols that add their own children.
+    pub fn span(&self) -> &Span {
+        &self.span
+    }
+
+    pub fn dataframe(&self) -> &DataFrame {
+        &self.dataframe
+    }
+
+    /// Drops the trace: the query span ends here and execution is not traced.
+    pub fn into_dataframe(self) -> DataFrame {
+        self.dataframe
+    }
+
+    /// Plans physically and starts execution (`execute` span), then returns a
+    /// stream whose polling is the `fetch` span. Nothing is buffered.
+    pub async fn execute_stream(self) -> Result<SendableRecordBatchStream, DataFusionError> {
+        let execute = tracing::info_span!(
+            target: TARGET,
+            parent: &self.span,
+            "codelake.execute",
+            otel.status_code = Empty,
+            otel.status_description = Empty,
+        );
+        let started = self.dataframe.execute_stream().instrument(execute.clone()).await;
+        let stream = match started {
+            Ok(stream) => stream,
+            Err(err) => {
+                trace::record_error(&execute, &err);
+                trace::record_error(&self.span, &err);
+                return Err(err);
+            }
+        };
+        drop(execute);
+        let fetch = tracing::info_span!(
+            target: TARGET,
+            parent: &self.span,
+            "codelake.fetch",
+            otel.status_code = Empty,
+            otel.status_description = Empty,
+            db.response.returned_rows = Empty,
+            codelake.cancelled = Empty,
+        );
+        Ok(Box::pin(TracedStream::new(stream, fetch).keep_alive(self.span)))
+    }
+
+    /// [`Query::execute_stream`] collected into memory.
+    pub async fn collect(self) -> Result<Vec<RecordBatch>, DataFusionError> {
+        self.execute_stream().await?.try_collect().await
     }
 }
 
@@ -109,6 +198,86 @@ fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     rules
 }
 
+/// Phases of a query, one child span each.
+#[derive(Debug, Clone, Copy)]
+enum Phase {
+    Parse,
+    Plan,
+    Execute,
+}
+
+fn phase_span(phase: Phase) -> Span {
+    // `tracing` span names must be literals.
+    match phase {
+        Phase::Parse => tracing::info_span!(
+            target: TARGET,
+            "codelake.parse",
+            otel.status_code = Empty,
+            otel.status_description = Empty
+        ),
+        Phase::Plan => tracing::info_span!(
+            target: TARGET,
+            "codelake.plan",
+            otel.status_code = Empty,
+            otel.status_description = Empty
+        ),
+        Phase::Execute => tracing::info_span!(
+            target: TARGET,
+            "codelake.execute",
+            otel.status_code = Empty,
+            otel.status_description = Empty
+        ),
+    }
+}
+
+/// Runs `future` in a new span for `phase`, recording its error.
+async fn traced<T>(
+    phase: Phase,
+    future: impl Future<Output = Result<T, DataFusionError>>,
+) -> Result<T, DataFusionError> {
+    let span = phase_span(phase);
+    future
+        .instrument(span.clone())
+        .await
+        .inspect_err(|err| trace::record_error(&span, err))
+}
+
+/// Root span of one query. Its parent is the client's span when the client
+/// sent a `traceparent`.
+fn query_span(query_id: &str, options: &QueryOptions, sql: &str) -> Span {
+    let span = tracing::info_span!(
+        target: TARGET,
+        "codelake.query",
+        otel.kind = "server",
+        otel.status_code = Empty,
+        otel.status_description = Empty,
+        codelake.query_id = query_id,
+        codelake.trace_id = Empty,
+        codelake.correlation_id = options.trace.correlation_id.as_deref(),
+        enduser.id = options.user.as_str(),
+        codelake.catalog = options.catalog.as_deref(),
+        codelake.schema = options.schema.as_deref(),
+        db.query.text = Empty,
+        codelake.sql.hash = Empty,
+        db.response.returned_rows = Empty,
+        codelake.cancelled = Empty,
+    );
+    if let Some(parent) = &options.trace.parent {
+        trace::set_remote_parent(&span, parent, options.trace.tracestate.as_deref());
+    }
+    // Logs carry the trace id even when spans are not exported.
+    let trace_id = trace::trace_id(&span).or_else(|| options.trace.parent.map(|p| p.trace_id_hex()));
+    if let Some(trace_id) = trace_id {
+        span.record(trace::field::TRACE_ID, trace_id.as_str());
+    }
+    trace::record_sql(
+        &span,
+        sql,
+        &datafusion::sql::sqlparser::dialect::GenericDialect {},
+    );
+    span
+}
+
 /// Result of attaching one source at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Attach {
@@ -150,6 +319,7 @@ impl std::fmt::Debug for Engine {
 
 impl Engine {
     pub fn new(memory: &MemoryConfig, execution: &ExecutionConfig) -> Result<Self, EngineError> {
+        trace::install_task_propagation();
         let runtime = EngineRuntime::new(memory)?;
         // `information_schema` is provided per catalog by `CatalogList`.
         let mut session = SessionConfig::new()
@@ -195,10 +365,41 @@ impl Engine {
     /// [`Engine::sql_as`] with per-query defaults (catalog, schema), as set by
     /// client protocols. The query runs in a session derived from the engine's:
     /// same catalogs, runtime and memory pool, its own defaults.
+    ///
+    /// Only parsing and planning are traced; use [`Engine::query`] to trace
+    /// execution and fetching too.
     pub async fn sql_with(&self, options: &QueryOptions, sql: &str) -> Result<DataFrame, DataFusionError> {
+        self.query(options, sql).await.map(Query::into_dataframe)
+    }
+
+    /// Plans `sql` inside a new query span (see [`Query`]).
+    ///
+    /// The span is a child of `options.trace.parent` when the client sent a
+    /// W3C `traceparent`, and carries the query id, user, default catalog and
+    /// schema, correlation id and the SQL with its literals redacted.
+    pub async fn query(&self, options: &QueryOptions, sql: &str) -> Result<Query, DataFusionError> {
+        let query_id = options
+            .trace
+            .query_id
+            .clone()
+            .unwrap_or_else(trace::next_query_id);
+        let span = query_span(&query_id, options, sql);
         let ctx = self.session(options);
         // Planning futures are large; boxing keeps callers' futures small.
-        Box::pin(self.plan_and_run(&ctx, &options.user, sql)).await
+        let planned = Box::pin(self.plan_and_run(&ctx, &options.user, sql))
+            .instrument(span.clone())
+            .await;
+        match planned {
+            Ok(dataframe) => Ok(Query {
+                dataframe,
+                span,
+                id: query_id,
+            }),
+            Err(err) => {
+                trace::record_error(&span, &err);
+                Err(err)
+            }
+        }
     }
 
     fn session(&self, options: &QueryOptions) -> SessionContext {
@@ -220,27 +421,38 @@ impl Engine {
         sql: &str,
     ) -> Result<DataFrame, DataFusionError> {
         let state = ctx.state();
-        let dialect = state.config().options().sql_parser.dialect;
-        let mut statement = state.sql_to_statement(sql, &dialect)?;
-        let prepared = ddl::prepare(&mut statement)?;
-        // After `prepare`, which keeps a view's text as written.
-        crate::literals::rewrite_zoned_timestamps(&mut statement);
+        let parse = phase_span(Phase::Parse);
+        let (statement, prepared) = parse
+            .in_scope(|| {
+                let dialect = state.config().options().sql_parser.dialect;
+                let mut statement = state.sql_to_statement(sql, &dialect)?;
+                let prepared = ddl::prepare(&mut statement)?;
+                // After `prepare`, which keeps a view's text as written.
+                crate::literals::rewrite_zoned_timestamps(&mut statement);
+                Ok::<_, DataFusionError>((statement, prepared))
+            })
+            .inspect_err(|err| trace::record_error(&parse, err))?;
+        drop(parse);
         if let Some(Prepared::AddColumn {
             table,
             column,
             sql_type,
         }) = &prepared
         {
-            return self.add_column(ctx, table, column, sql_type).await;
+            return traced(Phase::Execute, self.add_column(ctx, table, column, sql_type)).await;
         }
-        let plan = state.statement_to_plan(statement).await?;
+        let plan = traced(Phase::Plan, state.statement_to_plan(statement)).await?;
         if ddl::is_routable(&plan)
-            && let Some(result) = self.route_ddl(ctx, user, &plan, prepared).await?
+            && let Some(result) = traced(Phase::Execute, self.route_ddl(ctx, user, &plan, prepared)).await?
         {
             return Ok(result);
         }
-        let plan = crate::subquery::pre_evaluate_scalar_subqueries(ctx, plan).await?;
-        ctx.execute_logical_plan(plan).await
+        traced(Phase::Plan, async {
+            // Uncorrelated scalar subqueries run here, against the sources.
+            let plan = crate::subquery::pre_evaluate_scalar_subqueries(ctx, plan).await?;
+            ctx.execute_logical_plan(plan).await
+        })
+        .await
     }
 
     fn resolve(ctx: &SessionContext, table: &TableReference) -> (String, String, String) {
@@ -822,6 +1034,378 @@ mod tests {
             .unwrap();
         assert_eq!(n.value(0), 40 * 65_536);
         assert!(engine.memory().reserved_bytes <= ByteSize::mib(16).as_u64());
+    }
+
+    /// Span structure, checked with an in-process capture layer (no exporter).
+    mod traces {
+        use super::*;
+        use crate::trace::{QueryTrace, TraceBackend, TraceParent};
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+        use tracing::Subscriber;
+        use tracing::field::{Field as TracingField, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+
+        #[derive(Debug, Clone, Default)]
+        struct Captured {
+            name: &'static str,
+            parent: Option<usize>,
+            fields: BTreeMap<String, String>,
+            closed: bool,
+        }
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<Captured>>>);
+
+        /// Position of a span in the capture (span ids are reused by the registry).
+        struct Index(usize);
+
+        struct Fields<'a>(&'a mut BTreeMap<String, String>);
+
+        impl Visit for Fields<'_> {
+            fn record_debug(&mut self, field: &TracingField, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_owned(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &TracingField, value: &str) {
+                self.0.insert(field.name().to_owned(), value.to_owned());
+            }
+        }
+
+        impl<S: Subscriber + for<'a> LookupSpan<'a>> tracing_subscriber::Layer<S> for Capture {
+            fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: LayerContext<'_, S>) {
+                if attrs.metadata().target() != TARGET {
+                    return;
+                }
+                let span = ctx.span(id).unwrap();
+                let parent = span
+                    .parent()
+                    .and_then(|p| p.extensions().get::<Index>().map(|i| i.0));
+                let mut record = Captured {
+                    name: attrs.metadata().name(),
+                    parent,
+                    ..Captured::default()
+                };
+                attrs.record(&mut Fields(&mut record.fields));
+                let mut spans = self.0.lock().unwrap();
+                span.extensions_mut().insert(Index(spans.len()));
+                spans.push(record);
+            }
+            fn on_record(&self, id: &Id, values: &Record<'_>, ctx: LayerContext<'_, S>) {
+                let span = ctx.span(id).unwrap();
+                if let Some(index) = span.extensions().get::<Index>() {
+                    values.record(&mut Fields(&mut self.0.lock().unwrap()[index.0].fields));
+                }
+            }
+            fn on_close(&self, id: Id, ctx: LayerContext<'_, S>) {
+                let span = ctx.span(&id).unwrap();
+                if let Some(index) = span.extensions().get::<Index>() {
+                    self.0.lock().unwrap()[index.0].closed = true;
+                }
+            }
+        }
+
+        impl Capture {
+            fn spans(&self) -> Vec<Captured> {
+                self.0.lock().unwrap().clone()
+            }
+        }
+
+        fn only<'a>(spans: &'a [Captured], name: &str) -> (usize, &'a Captured) {
+            let found: Vec<_> = spans.iter().enumerate().filter(|(_, s)| s.name == name).collect();
+            assert_eq!(found.len(), 1, "{name}: {spans:#?}");
+            found[0]
+        }
+
+        fn has_ancestor(spans: &[Captured], mut index: usize, ancestor: usize) -> bool {
+            while let Some(parent) = spans[index].parent {
+                if parent == ancestor {
+                    return true;
+                }
+                index = parent;
+            }
+            false
+        }
+
+        fn traced_engine(dir: &std::path::Path) -> Engine {
+            let engine = engine(dir, ByteSize::mib(64), ByteSize::mib(64));
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    crate::testing::int64(&[1, 42, 43]),
+                    crate::testing::strings(&["a", "secret", "b"]),
+                ],
+            )
+            .unwrap();
+            let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+            engine.context().register_table("t", Arc::new(table)).unwrap();
+            let remote = crate::testing::remote_table(
+                "erp",
+                "r",
+                vec![("id", crate::testing::int64(&[3, 1, 2]))],
+                None,
+            );
+            engine.context().register_table("r", remote).unwrap();
+            engine
+        }
+
+        fn capture() -> (Capture, tracing::subscriber::DefaultGuard) {
+            let capture = Capture::default();
+            let subscriber = tracing_subscriber::registry().with(capture.clone());
+            let guard = tracing::subscriber::set_default(subscriber);
+            (capture, guard)
+        }
+
+        fn ids(batches: &[RecordBatch]) -> Vec<i64> {
+            batches
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect()
+        }
+
+        // Current-thread runtime: the thread-local subscriber also sees
+        // the tasks DataFusion spawns.
+        #[tokio::test(flavor = "current_thread")]
+        async fn query_span_has_one_child_per_phase_and_no_literals() {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = traced_engine(dir.path());
+            let (capture, _guard) = capture();
+            let mut options = QueryOptions::for_user("alice").with_trace(
+                QueryTrace::from_headers(None, None, Some("dbt-run-7"))
+                    .with_query_id("20260923_000000_00001_test1"),
+            );
+            options.catalog = Some("datafusion".into());
+            options.schema = Some("public".into());
+            let query = engine
+                .query(&options, "SELECT id FROM t WHERE name <> 'secret' AND id > 41")
+                .await
+                .unwrap();
+            assert_eq!(query.query_id(), "20260923_000000_00001_test1");
+            assert_eq!(query.trace_id(), None, "no backend installed");
+            let rows = query.collect().await.unwrap();
+            assert_eq!(ids(&rows), vec![43]);
+
+            let spans = capture.spans();
+            let (root, query) = only(&spans, "codelake.query");
+            assert_eq!(query.parent, None);
+            let field = |name: &str| query.fields.get(name).map(String::as_str);
+            assert_eq!(field("codelake.query_id"), Some("20260923_000000_00001_test1"));
+            assert_eq!(field("enduser.id"), Some("alice"));
+            assert_eq!(field("codelake.catalog"), Some("datafusion"));
+            assert_eq!(field("codelake.schema"), Some("public"));
+            assert_eq!(field("codelake.correlation_id"), Some("dbt-run-7"));
+            assert_eq!(field("otel.kind"), Some("server"));
+            assert_eq!(field("db.response.returned_rows"), Some("1"));
+            assert_eq!(field("otel.status_code"), None);
+            let text = field("db.query.text").unwrap();
+            assert_eq!(text, "SELECT id FROM t WHERE name <> ? AND id > ?");
+            assert_eq!(field("codelake.sql.hash").unwrap(), crate::trace::sql_hash(text));
+
+            for phase in ["codelake.parse", "codelake.execute", "codelake.fetch"] {
+                let (_, span) = only(&spans, phase);
+                assert_eq!(span.parent, Some(root), "{phase}: {spans:#?}");
+            }
+            assert!(
+                spans
+                    .iter()
+                    .any(|s| s.name == "codelake.plan" && s.parent == Some(root)),
+                "{spans:#?}"
+            );
+            let (_, fetch) = only(&spans, "codelake.fetch");
+            assert_eq!(
+                fetch.fields.get("db.response.returned_rows").map(String::as_str),
+                Some("1")
+            );
+            assert!(
+                spans.iter().all(|s| s.closed),
+                "every span ends with the query: {spans:#?}"
+            );
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn remote_scans_are_spans_below_the_query() {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = traced_engine(dir.path());
+            let (capture, _guard) = capture();
+            let rows = engine
+                .query(&QueryOptions::for_user("bob"), "SELECT id FROM r")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            // The fake remote returns its rows as stored: [3, 1, 2].
+            assert_eq!(ids(&rows), vec![3, 1, 2]);
+
+            let spans = capture.spans();
+            let (root, _) = only(&spans, "codelake.query");
+            let (remote, span) = only(&spans, "codelake.remote");
+            assert!(has_ancestor(&spans, remote, root), "{spans:#?}");
+            let field = |name: &str| span.fields.get(name).map(String::as_str);
+            assert_eq!(field("codelake.remote.executor"), Some("ignores_filters"));
+            assert_eq!(field("otel.kind"), Some("client"));
+            assert_eq!(field("db.response.returned_rows"), Some("3"));
+            assert!(span.closed);
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn planning_errors_mark_the_query_and_phase_without_values() {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = traced_engine(dir.path());
+            let (capture, _guard) = capture();
+            let err = engine
+                .query(
+                    &QueryOptions::for_user("carol"),
+                    "SELECT secret_col FROM t WHERE name = 'top-secret'",
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("secret_col"), "{err}");
+
+            let spans = capture.spans();
+            let (_, query) = only(&spans, "codelake.query");
+            assert_eq!(
+                query.fields.get("otel.status_code").map(String::as_str),
+                Some("ERROR")
+            );
+            let description = &query.fields["otel.status_description"];
+            assert!(!description.contains("top-secret"), "{description}");
+            assert!(
+                spans
+                    .iter()
+                    .any(|s| s.name == "codelake.plan" && s.fields.contains_key("otel.status_code")),
+                "{spans:#?}"
+            );
+            assert!(!query.fields["db.query.text"].contains("top-secret"));
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn dropping_the_stream_early_closes_the_query_as_cancelled() {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = traced_engine(dir.path());
+            let (capture, _guard) = capture();
+            let stream = engine
+                .query(&QueryOptions::for_user("dave"), "SELECT id FROM t")
+                .await
+                .unwrap()
+                .execute_stream()
+                .await
+                .unwrap();
+            drop(stream);
+            let spans = capture.spans();
+            for name in ["codelake.query", "codelake.fetch"] {
+                let (_, span) = only(&spans, name);
+                assert_eq!(
+                    span.fields.get("codelake.cancelled").map(String::as_str),
+                    Some("true")
+                );
+                assert_eq!(
+                    span.fields.get("db.response.returned_rows").map(String::as_str),
+                    Some("0")
+                );
+                assert!(span.closed, "{name}");
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_query_failing_while_streaming_is_an_error_not_a_cancellation() {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = traced_engine(dir.path());
+            let (capture, _guard) = capture();
+            // Fails at id 42 while the results stream.
+            let err = engine
+                .query(
+                    &QueryOptions::for_user("frank"),
+                    "SELECT 10 / (id - 42) AS x FROM t",
+                )
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap_err();
+            assert!(err.to_string().to_lowercase().contains("divide by zero"), "{err}");
+
+            let spans = capture.spans();
+            for name in ["codelake.query", "codelake.fetch"] {
+                let (_, span) = only(&spans, name);
+                let field = |key: &str| span.fields.get(key).map(String::as_str);
+                assert_eq!(field("otel.status_code"), Some("ERROR"), "{name}: {span:#?}");
+                assert_eq!(field("codelake.cancelled"), None, "{name}: {span:#?}");
+                assert!(field("db.response.returned_rows").is_some(), "{name}: {span:#?}");
+                assert!(span.closed, "{name}");
+            }
+        }
+
+        #[derive(Debug, Default)]
+        struct RecordingBackend(Mutex<Vec<(TraceParent, Option<String>)>>);
+
+        impl TraceBackend for &'static RecordingBackend {
+            fn set_remote_parent(&self, span: &Span, parent: &TraceParent, tracestate: Option<&str>) {
+                if !span.is_none() {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push((*parent, tracestate.map(str::to_owned)));
+                }
+            }
+            fn trace_id(&self, _span: &Span) -> Option<String> {
+                None
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn incoming_traceparent_is_handed_to_the_backend() {
+            static BACKEND: std::sync::OnceLock<RecordingBackend> = std::sync::OnceLock::new();
+            let backend = BACKEND.get_or_init(RecordingBackend::default);
+            assert!(crate::trace::install_backend(Box::new(backend)));
+            assert!(
+                !crate::trace::install_backend(Box::new(backend)),
+                "first backend stays"
+            );
+
+            let dir = tempfile::tempdir().unwrap();
+            let engine = traced_engine(dir.path());
+            let (capture, _guard) = capture();
+            let header = "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01";
+            let options = QueryOptions::for_user("erin").with_trace(QueryTrace::from_headers(
+                Some(header),
+                Some("v=1"),
+                None,
+            ));
+            let rows = engine
+                .query(&options, "SELECT id FROM t ORDER BY id")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(ids(&rows), vec![1, 42, 43]);
+
+            let calls = backend.0.lock().unwrap().clone();
+            assert_eq!(
+                calls,
+                vec![(TraceParent::parse(header).unwrap(), Some("v=1".to_owned()))]
+            );
+            let spans = capture.spans();
+            let (_, query) = only(&spans, "codelake.query");
+            // Without an exporter the logs still carry the caller's trace id.
+            assert_eq!(
+                query.fields.get("codelake.trace_id").map(String::as_str),
+                Some("4bf92f3577b34da6a3ce929d0e0e4736")
+            );
+        }
     }
 
     #[tokio::test]

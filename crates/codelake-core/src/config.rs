@@ -24,6 +24,9 @@ pub struct Config {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub execution: ExecutionConfig,
+    /// Distributed tracing over OTLP. Off unless `otlp_endpoint` is set.
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
 }
@@ -140,6 +143,131 @@ impl Default for ExecutionConfig {
             target_partitions: None,
             source_startup_timeout_secs: default_startup_timeout_secs(),
         }
+    }
+}
+
+/// `[telemetry]`: OpenTelemetry traces exported over OTLP.
+///
+/// Disabled by default. When `otlp_endpoint` is absent no exporter, no
+/// background thread and no OpenTelemetry layer exist; the engine's spans only
+/// feed the JSON logs, as before.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// Base URL of an OTLP/HTTP receiver, e.g. `http://otel-collector:4318`.
+    /// Spans go to `<endpoint>/v1/traces`. Plain `http://` only: point it at a
+    /// collector agent on the node or in the pod, which handles TLS upstream.
+    pub otlp_endpoint: Option<String>,
+    /// OTLP transport. Only `http/protobuf` is supported; `grpc` is refused
+    /// instead of silently falling back.
+    #[serde(default = "default_otlp_protocol")]
+    pub protocol: String,
+    /// `service.name` resource attribute.
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+    /// Fraction of new traces recorded, `0.0`–`1.0`. A query that arrives with
+    /// a W3C `traceparent` follows the caller's sampling decision instead.
+    #[serde(default = "default_sampling_ratio")]
+    pub sampling_ratio: f64,
+    /// Seconds allowed for one export request before it is dropped.
+    #[serde(default = "default_export_timeout_secs")]
+    pub export_timeout_secs: u64,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            otlp_endpoint: None,
+            protocol: default_otlp_protocol(),
+            service_name: default_service_name(),
+            sampling_ratio: default_sampling_ratio(),
+            export_timeout_secs: default_export_timeout_secs(),
+        }
+    }
+}
+
+/// Why `endpoint` cannot be an OTLP/HTTP base URL, if it cannot: the
+/// exporter must be able to use every value validation accepts, and
+/// `/v1/traces` is appended to it, so a query or fragment would swallow that
+/// path. Accepted: `http://host[:port][/path]`, host a DNS name, an IPv4
+/// address or a bracketed IPv6 address, port 1–65535, no credentials.
+fn check_otlp_endpoint(endpoint: &str) -> Result<(), String> {
+    let Some(rest) = endpoint.strip_prefix("http://") else {
+        return Err(if endpoint.starts_with("https://") {
+            "uses https: TLS to the collector is not supported; export to a collector agent \
+             over http:// on the node or in the pod"
+                .to_owned()
+        } else {
+            "must be an http:// URL (OTLP/HTTP, port 4318 by default)".to_owned()
+        });
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    if authority.is_empty() || rest.contains(|c: char| c.is_whitespace() || c.is_control()) {
+        return Err("has no host".to_owned());
+    }
+    if rest.contains(['?', '#']) {
+        return Err("must not have a query or fragment: `/v1/traces` is appended to it".to_owned());
+    }
+    if authority.contains('@') {
+        return Err("must not carry credentials".to_owned());
+    }
+    if !path.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err("has an invalid path".to_owned());
+    }
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(bracketed) => {
+            let (host, after) = bracketed.split_once(']').ok_or("has an invalid IPv6 host")?;
+            if host.parse::<std::net::Ipv6Addr>().is_err() {
+                return Err("has an invalid IPv6 host".to_owned());
+            }
+            match after {
+                "" => (host, None),
+                port => (host, Some(port.strip_prefix(':').ok_or("has an invalid port")?)),
+            }
+        }
+        None => match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        },
+    };
+    if host.is_empty() {
+        return Err("has no host".to_owned());
+    }
+    if !authority.starts_with('[') {
+        let label_ok = |label: &str| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        };
+        // URL parsers read a host whose last label is numeric as IPv4.
+        let numeric = host
+            .rsplit('.')
+            .next()
+            .is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()));
+        if !host.split('.').all(label_ok) || (numeric && host.parse::<std::net::Ipv4Addr>().is_err()) {
+            return Err(format!("has an invalid host `{host}`"));
+        }
+    }
+    if let Some(port) = port
+        && !(port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok_and(|p| p > 0))
+    {
+        return Err(format!("has an invalid port `{port}` (1-65535)"));
+    }
+    Ok(())
+}
+
+impl TelemetryConfig {
+    /// `<endpoint>/v1/traces`, when tracing is enabled.
+    pub fn traces_url(&self) -> Option<String> {
+        self.otlp_endpoint.as_ref().map(|endpoint| {
+            let base = endpoint.trim_end_matches('/');
+            if base.ends_with("/v1/traces") {
+                base.to_owned()
+            } else {
+                format!("{base}/v1/traces")
+            }
+        })
     }
 }
 
@@ -324,6 +452,18 @@ fn default_mssql_encrypt() -> String {
 fn default_region() -> String {
     "us-east-1".to_owned()
 }
+fn default_otlp_protocol() -> String {
+    OTLP_PROTOCOLS[0].to_owned()
+}
+fn default_service_name() -> String {
+    "codelake".to_owned()
+}
+const fn default_sampling_ratio() -> f64 {
+    1.0
+}
+const fn default_export_timeout_secs() -> u64 {
+    10
+}
 
 /// Every validation problem found, reported together.
 #[derive(Debug, thiserror::Error)]
@@ -367,6 +507,9 @@ const PG_SSL_MODES: [&str; 5] = ["disable", "prefer", "require", "verify-ca", "v
 const MYSQL_SSL_MODES: [&str; 3] = ["disabled", "preferred", "required"];
 const MSSQL_ENCRYPT: [&str; 3] = ["required", "on", "off"];
 const MAX_POOL_SIZE: u32 = 256;
+const OTLP_PROTOCOLS: [&str; 1] = ["http/protobuf"];
+const MAX_EXPORT_TIMEOUT_SECS: u64 = 300;
+const MAX_SERVICE_NAME: usize = 255;
 
 fn is_identifier(name: &str) -> bool {
     let mut chars = name.chars();
@@ -418,6 +561,7 @@ impl Config {
         self.validate_server(file_exists, &mut errors);
         self.validate_memory(&mut errors);
         self.validate_execution(&mut errors);
+        self.validate_telemetry(&mut errors);
         let secrets = self.validate_sources(env, &mut errors);
         if errors.is_empty() {
             Ok(ValidatedConfig {
@@ -521,6 +665,44 @@ impl Config {
         }
         if exec.source_startup_timeout_secs == 0 {
             errors.push("execution.source_startup_timeout_secs must be > 0".into());
+        }
+    }
+
+    fn validate_telemetry(&self, errors: &mut Vec<String>) {
+        let telemetry = &self.telemetry;
+        if !OTLP_PROTOCOLS.contains(&telemetry.protocol.as_str()) {
+            errors.push(format!(
+                "telemetry.protocol `{}` is not supported; use one of {OTLP_PROTOCOLS:?}",
+                telemetry.protocol
+            ));
+        }
+        if !(0.0..=1.0).contains(&telemetry.sampling_ratio) {
+            errors.push(format!(
+                "telemetry.sampling_ratio {} must be between 0.0 and 1.0",
+                telemetry.sampling_ratio
+            ));
+        }
+        let name = telemetry.service_name.trim();
+        if name.is_empty() || name.len() > MAX_SERVICE_NAME {
+            errors.push(format!(
+                "telemetry.service_name must be 1 to {MAX_SERVICE_NAME} characters"
+            ));
+        }
+        if telemetry.export_timeout_secs == 0 || telemetry.export_timeout_secs > MAX_EXPORT_TIMEOUT_SECS {
+            errors.push(format!(
+                "telemetry.export_timeout_secs must be between 1 and {MAX_EXPORT_TIMEOUT_SECS}"
+            ));
+        }
+        if let Some(endpoint) = &telemetry.otlp_endpoint
+            && let Err(problem) = check_otlp_endpoint(endpoint)
+        {
+            // Never echo what may be a password in the user-info part.
+            let shown = if endpoint.contains('@') {
+                "<hidden>"
+            } else {
+                endpoint
+            };
+            errors.push(format!("telemetry.otlp_endpoint `{shown}` {problem}"));
         }
     }
 
@@ -931,6 +1113,107 @@ mod tests {
         );
         let cfg = parse(&doc);
         assert_eq!(cfg.sources.last().unwrap().kind.label(), "hive");
+    }
+
+    #[test]
+    fn telemetry_is_off_by_default() {
+        let validated = parse(VALID).validate(&full_env, &|_| true).unwrap();
+        let telemetry = &validated.config.telemetry;
+        assert_eq!(telemetry.otlp_endpoint, None);
+        assert_eq!(telemetry.traces_url(), None);
+        assert_eq!(telemetry.protocol, "http/protobuf");
+        assert_eq!(telemetry.service_name, "codelake");
+        assert!((telemetry.sampling_ratio - 1.0).abs() < f64::EPSILON);
+        assert_eq!(telemetry.export_timeout_secs, 10);
+    }
+
+    #[test]
+    fn telemetry_accepts_an_http_collector() {
+        for (endpoint, url) in [
+            (
+                "http://otel-collector:4318",
+                "http://otel-collector:4318/v1/traces",
+            ),
+            ("http://127.0.0.1:4318/", "http://127.0.0.1:4318/v1/traces"),
+            ("http://c:4318/v1/traces", "http://c:4318/v1/traces"),
+            ("http://otel_agent/otlp", "http://otel_agent/otlp/v1/traces"),
+            ("http://[::1]:4318", "http://[::1]:4318/v1/traces"),
+            ("http://[fe80::1]", "http://[fe80::1]/v1/traces"),
+            (
+                "http://collector.local:65535/",
+                "http://collector.local:65535/v1/traces",
+            ),
+        ] {
+            let doc = format!(
+                "{VALID}\n[telemetry]\notlp_endpoint = \"{endpoint}\"\nservice_name = \"lake\"\nsampling_ratio = 0.0\nexport_timeout_secs = 300\n"
+            );
+            let validated = parse(&doc).validate(&full_env, &|_| true).unwrap();
+            assert_eq!(validated.config.telemetry.traces_url().as_deref(), Some(url));
+        }
+    }
+
+    #[test]
+    fn telemetry_rejects_every_bad_setting_at_once() {
+        let doc = format!(
+            "{VALID}\n[telemetry]\notlp_endpoint = \"https://collector:4318\"\nprotocol = \"grpc\"\n\
+             service_name = \" \"\nsampling_ratio = 1.5\nexport_timeout_secs = 0\n"
+        );
+        let errors = errors_of(&doc, &full_env);
+        assert_eq!(errors.len(), 5, "{errors:#?}");
+        for expected in [
+            "telemetry.protocol `grpc` is not supported",
+            "telemetry.sampling_ratio 1.5 must be between",
+            "telemetry.service_name must be",
+            "telemetry.export_timeout_secs must be between 1 and 300",
+            "TLS to the collector is not supported",
+        ] {
+            assert!(
+                errors.iter().any(|e| e.contains(expected)),
+                "missing `{expected}` in {errors:#?}"
+            );
+        }
+        for (endpoint, expected) in [
+            ("otel:4318", "must be an http:// URL"),
+            ("http://", "has no host"),
+            ("http:///v1/traces", "has no host"),
+            ("http://a b", "has no host"),
+            ("http://:4318", "has no host"),
+            ("http://collector:99999", "has an invalid port"),
+            ("http://collector:0", "has an invalid port"),
+            ("http://collector:", "has an invalid port"),
+            ("http://collector:43a8", "has an invalid port"),
+            ("http://collector:+4318", "has an invalid port"),
+            (
+                "http://127.0.0.1:4318?token=abc",
+                "must not have a query or fragment",
+            ),
+            (
+                "http://127.0.0.1:4318/otlp#frag",
+                "must not have a query or fragment",
+            ),
+            ("http://user:secret@collector:4318", "must not carry credentials"),
+            ("http://coll ector:4318", "has no host"),
+            ("http://collector..local:4318", "has an invalid host"),
+            ("http://999.0.0.1:4318", "has an invalid host"),
+            ("http://a:b:4318", "has an invalid port"),
+            ("http://[::1", "has an invalid IPv6 host"),
+            ("http://[zz]:4318", "has an invalid IPv6 host"),
+            ("http://[::1]4318", "has an invalid port"),
+        ] {
+            let doc = format!("{VALID}\n[telemetry]\notlp_endpoint = \"{endpoint}\"\n");
+            let errors = errors_of(&doc, &full_env);
+            assert_eq!(errors.len(), 1, "{endpoint}: {errors:#?}");
+            assert!(errors[0].contains(expected), "{endpoint}: {errors:#?}");
+        }
+        let nan = format!("{VALID}\n[telemetry]\nsampling_ratio = nan\n");
+        assert_eq!(errors_of(&nan, &full_env).len(), 1);
+        let long = format!("{VALID}\n[telemetry]\nservice_name = \"{}\"\n", "s".repeat(256));
+        assert_eq!(errors_of(&long, &full_env).len(), 1);
+        let unknown = format!("{VALID}\n[telemetry]\nendpoint = \"http://x:4318\"\n");
+        assert!(
+            toml::from_str::<Config>(&unknown).is_err(),
+            "typos must not disable tracing silently"
+        );
     }
 
     #[test]
