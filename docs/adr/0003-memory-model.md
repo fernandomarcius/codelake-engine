@@ -86,7 +86,8 @@
   Kubernetes volume has its own `sizeLimit` above that value.
 - When memory and spill are exhausted, the query fails with a resources error;
   the process keeps serving other queries.
-- The server allocator is jemalloc, built to purge freed pages at once
+- The server allocator is jemalloc (`tikv-jemallocator`; dependency approved by the
+  owner on 2026-09-24), built to purge freed pages at once
   (`JEMALLOC_SYS_WITH_MALLOC_CONF` in `.cargo/config.toml`). With glibc's
   per-thread arenas the process stayed hundreds of MiB above what the pool
   held after a spill (aggregation of 1M groups: 636 MiB of growth with glibc,

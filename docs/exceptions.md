@@ -5,7 +5,7 @@ invalid. Expired entries fail review until renewed or removed.
 
 | ID | Rule | Scope | Justification | Owner | Approved by | Expires |
 |---|---|---|---|---|---|---|
-| — | — | — | No active exceptions. | — | — | — |
+| EX-001 | `clippy::unwrap_used`, `clippy::expect_used`, `clippy::panic` allowed (`#![allow(..., reason = "test crate")]`) | integration test crates under `crates/*/tests/` (e.g. `memory_ceiling.rs`, `e2e.rs`, `trino_clients.rs`) | A failed setup or assertion in an integration test must abort the test; propagating errors there adds noise without safety. Production code keeps the lints. | Fernando Farias | Fernando Farias, 2026-09-24 | 2027-03-24 |
 
 ## Known risks that are *not* exceptions
 
