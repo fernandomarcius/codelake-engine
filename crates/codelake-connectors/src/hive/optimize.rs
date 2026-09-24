@@ -32,6 +32,7 @@ use codelake_core::session_properties::parse_data_size;
 use codelake_core::{
     CatalogSession, Effect, ProcedureArgument, ProcedureCall, PropertyType, SessionProperty, TableProcedure,
 };
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
@@ -254,6 +255,8 @@ struct Open {
 /// Streams rows into hidden files, rolling over at the target size.
 struct Compactor<'a> {
     table: &'a HiveTable,
+    /// Columns of the files written ([`full_precision`] of the table's).
+    schema: SchemaRef,
     target: u64,
     reservation: MemoryReservation,
     open: Option<Open>,
@@ -266,7 +269,7 @@ impl Compactor<'_> {
         let temporary = format!(".{name}.inprogress");
         let writer = TrinoParquetWriter::try_new(
             ParquetObjectWriter::new(Arc::clone(store(self.table)), file(self.table, &temporary)),
-            Arc::clone(&self.table.schema),
+            Arc::clone(&self.schema),
             ROW_GROUP_ROWS,
         )?;
         Ok(Open {
@@ -288,7 +291,7 @@ impl Compactor<'_> {
             None => self.start()?,
         };
         let written = async {
-            open.writer.write(&conform(&self.table.schema, batch)?).await?;
+            open.writer.write(&conform(&self.schema, batch)?).await?;
             open.added.rows += batch.num_rows() as u64;
             // The encoder buffers the open row group: account for it.
             self.reservation.try_resize(open.writer.memory_size())?;
@@ -324,6 +327,22 @@ impl Compactor<'_> {
     }
 }
 
+/// The table's columns with timestamps in microseconds.
+fn full_precision(schema: &SchemaRef) -> SchemaRef {
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|field| match field.data_type() {
+            DataType::Timestamp(_, zone) => field
+                .as_ref()
+                .clone()
+                .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, zone.clone())),
+            _ => field.as_ref().clone(),
+        })
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
 /// Writes the rows of `candidates` into new hidden files. On failure every
 /// file it started is removed.
 pub(crate) async fn write_compacted(
@@ -338,9 +357,21 @@ pub(crate) async fn write_compacted(
         .cloned()
         .map(PartitionedFile::new_from_meta)
         .collect();
-    let plan = table.scan_files(context.runtime_env().as_ref(), vec![group], None, None)?;
+    // Timestamps are read and rewritten in microseconds, not at the
+    // millisecond precision of scans: compaction must not truncate what a
+    // Trino catalog at `hive.timestamp-precision=MICROSECONDS` wrote.
+    let schema = full_precision(&table.schema);
+    let plan = table.scan_files_as(
+        context.runtime_env().as_ref(),
+        Arc::clone(&schema),
+        "us",
+        vec![group],
+        None,
+        None,
+    )?;
     let mut compactor = Compactor {
         table,
+        schema,
         target,
         reservation: MemoryConsumer::new(format!("HiveOptimize[{}]", table.table))
             .register(context.memory_pool()),
