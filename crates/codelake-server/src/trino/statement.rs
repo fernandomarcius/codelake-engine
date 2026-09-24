@@ -85,6 +85,9 @@ impl Shape {
 fn shape(sql: &str) -> Shape {
     use datafusion::sql::parser::{DFParser, Statement as DfStatement};
     use datafusion::sql::sqlparser::ast::{AlterTableOperation, ObjectType, Statement};
+    if let Some(update_type) = codelake_core::ddl_update_type(sql) {
+        return Shape::Ack(update_type);
+    }
     let Ok(mut statements) = DFParser::parse_sql(sql) else {
         // The engine reports the parse error.
         return Shape::Rows;
@@ -600,7 +603,7 @@ impl TrinoState {
         })
     }
 
-    /// Catalog `system` with `runtime.queries`.
+    /// Catalog `system` with `runtime.queries`, `metadata.*` and `jdbc.*`.
     pub(crate) fn system_catalog(&self) -> datafusion::error::Result<Arc<dyn CatalogProvider>> {
         let runtime = MemorySchemaProvider::new();
         runtime.register_table(
@@ -609,6 +612,7 @@ impl TrinoState {
         )?;
         let catalog = MemoryCatalogProvider::new();
         catalog.register_schema("runtime", Arc::new(runtime))?;
+        super::system_tables::register(&catalog, self.engine.connectors())?;
         Ok(Arc::new(catalog))
     }
 
@@ -931,6 +935,7 @@ fn start(
         catalog: session.catalog,
         schema: session.schema,
         properties: session.properties,
+        functions: vec![super::system_tables::version_function(PROTOCOL_VERSION)],
         ..QueryOptions::for_user(&session.user)
     };
     tokio::spawn(execute(
@@ -1280,7 +1285,12 @@ mod tests {
         assert_eq!(shape("DROP TABLE t"), Shape::Ack("DROP TABLE"));
         assert_eq!(shape("DROP VIEW IF EXISTS v"), Shape::Ack("DROP VIEW"));
         assert_eq!(shape("ALTER TABLE t ADD COLUMN c INT"), Shape::Ack("ADD COLUMN"));
-        assert_eq!(shape("ALTER TABLE t RENAME TO t2"), Shape::Ack("RENAME TABLE"));
+        assert_eq!(shape("ALTER TABLE t RENAME TO u"), Shape::Ack("RENAME TABLE"));
+        assert_eq!(shape("ALTER VIEW v RENAME TO w"), Shape::Ack("RENAME VIEW"));
+        assert_eq!(
+            shape("CREATE OR REPLACE VIEW v SECURITY DEFINER AS SELECT 1"),
+            Shape::Ack("CREATE VIEW")
+        );
         assert_eq!(shape("SELECT 1 +"), Shape::Rows);
     }
 

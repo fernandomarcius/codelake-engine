@@ -14,6 +14,8 @@ use datafusion::error::Result as DfResult;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::SendableRecordBatchStream;
 
+pub use crate::ddl::ViewSecurity;
+
 /// Boxed error from a driver, kept opaque so connectors can wrap any client library.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -68,6 +70,8 @@ pub trait Connector: Send + Sync + Debug {
 pub struct ViewDefinition {
     /// Query text as written by the client.
     pub sql: String,
+    /// The `SECURITY` mode (`DEFINER` when the statement has none).
+    pub security: ViewSecurity,
     /// Output columns of the query.
     pub output: SchemaRef,
     /// Session catalog the query was planned in. With `schema`, it resolves
@@ -98,7 +102,7 @@ pub trait WritableCatalog: Send + Sync + Debug {
 
     async fn drop_table(&self, schema: &str, table: &str, if_exists: bool) -> DfResult<()>;
 
-    /// Stores a view.
+    /// Stores a view created by `owner`.
     async fn create_view(
         &self,
         schema: &str,
@@ -112,4 +116,28 @@ pub trait WritableCatalog: Send + Sync + Debug {
 
     async fn add_column(&self, schema: &str, table: &str, column: &str, data_type: &DataType)
     -> DfResult<()>;
+
+    /// `ALTER TABLE schema.table RENAME TO new_schema.new_table`. A reader
+    /// never sees a partial table under either name. The engine has checked
+    /// that the source is a table and that the target name is free.
+    async fn rename_table(
+        &self,
+        schema: &str,
+        table: &str,
+        new_schema: &str,
+        new_table: &str,
+    ) -> DfResult<()> {
+        let _ = (schema, table, new_schema, new_table);
+        Err(datafusion::error::DataFusionError::NotImplemented(
+            "This connector does not support renaming tables".into(),
+        ))
+    }
+
+    /// `ALTER VIEW … RENAME TO …`, with the same guarantees as [`Self::rename_table`].
+    async fn rename_view(&self, schema: &str, view: &str, new_schema: &str, new_view: &str) -> DfResult<()> {
+        let _ = (schema, view, new_schema, new_view);
+        Err(datafusion::error::DataFusionError::NotImplemented(
+            "This connector does not support renaming views".into(),
+        ))
+    }
 }

@@ -26,7 +26,7 @@ LABEL org.opencontainers.image.source="https://github.com/fernandomarcius/CodeLa
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.description="CodeLake federated SQL engine"
 COPY --from=build --chown=65532:65532 /out/codelake /usr/local/bin/codelake
-# zlib is linked dynamically by the MySQL driver (flate2) and is not part of
+# zlib is linked dynamically by the MySQL driver (its compression crate) and is not part of
 # distroless/cc. Same Debian release as the base, so the ABI matches.
 COPY --from=build /out/lib/libz.so.1 /usr/lib/libz.so.1
 # Fails the image build when any shared library is missing.

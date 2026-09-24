@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use codelake_core::{ViewDefinition, WritableCatalog};
+use codelake_core::{ViewDefinition, ViewSecurity, WritableCatalog};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::{CatalogProvider, SchemaProvider, Session, TableProvider};
 use datafusion::datasource::TableType;
@@ -399,6 +399,45 @@ fn column(name: &str, data_type: &DataType) -> Result<ColumnMetadata> {
     })
 }
 
+/// `ALTER TABLE|VIEW … RENAME TO` in the metastore, after checking that the
+/// source is of the kind the statement names.
+async fn rename_relation(
+    catalog: &HiveCatalog,
+    view: bool,
+    (schema, name): (&str, &str),
+    (new_schema, new_name): (&str, &str),
+) -> Result<()> {
+    let (noun, other) = if view {
+        ("View", "table")
+    } else {
+        ("Table", "view")
+    };
+    let metadata = catalog
+        .metastore
+        .table(schema, name)
+        .await
+        .map_err(metastore_error)?
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "{noun} '{}.{schema}.{name}' does not exist",
+                catalog.name
+            ))
+        })?;
+    if metadata.is_view() != view {
+        return Err(DataFusionError::Plan(format!(
+            "{noun} '{}.{schema}.{name}' does not exist, but a {other} with that name exists",
+            catalog.name
+        )));
+    }
+    catalog.require_schema(new_schema).await?;
+    catalog
+        .metastore
+        .rename_table(schema, name, new_schema, new_name)
+        .await
+        .map_err(metastore_error)?;
+    catalog.refresh().await
+}
+
 #[async_trait]
 impl WritableCatalog for HiveCatalog {
     async fn create_schema(&self, schema: &str, if_not_exists: bool, owner: &str) -> Result<()> {
@@ -531,6 +570,8 @@ impl WritableCatalog for HiveCatalog {
         definition: ViewDefinition,
     ) -> Result<()> {
         let (schema, view) = (&hive_name(schema), &hive_name(view));
+        // Trino stores no owner for SECURITY INVOKER views (`runAsInvoker`).
+        let invoker = definition.security == ViewSecurity::Invoker;
         self.require_schema(schema).await?;
         if let Some(existing) = self
             .metastore
@@ -566,8 +607,8 @@ impl WritableCatalog for HiveCatalog {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
-            owner: Some(owner.to_owned()),
-            run_as_invoker: false,
+            owner: (!invoker).then(|| owner.to_owned()),
+            run_as_invoker: invoker,
             path: Vec::new(),
             extra: BTreeMap::new(),
         };
@@ -610,6 +651,18 @@ impl WritableCatalog for HiveCatalog {
             .await
             .map_err(metastore_error)?;
         self.refresh().await
+    }
+
+    async fn rename_table(&self, schema: &str, table: &str, new_schema: &str, new_table: &str) -> Result<()> {
+        let (schema, table) = (&hive_name(schema), &hive_name(table));
+        let (new_schema, new_table) = (&hive_name(new_schema), &hive_name(new_table));
+        rename_relation(self, false, (schema, table), (new_schema, new_table)).await
+    }
+
+    async fn rename_view(&self, schema: &str, view: &str, new_schema: &str, new_view: &str) -> Result<()> {
+        let (schema, view) = (&hive_name(schema), &hive_name(view));
+        let (new_schema, new_view) = (&hive_name(new_schema), &hive_name(new_view));
+        rename_relation(self, true, (schema, view), (new_schema, new_view)).await
     }
 
     async fn add_column(&self, schema: &str, table: &str, name: &str, data_type: &DataType) -> Result<()> {

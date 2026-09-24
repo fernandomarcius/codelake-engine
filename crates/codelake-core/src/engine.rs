@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
-use datafusion::execution::SessionStateBuilder;
-use datafusion::logical_expr::{DdlStatement, LogicalPlan};
+use datafusion::execution::{FunctionRegistry, SessionStateBuilder};
+use datafusion::logical_expr::{DdlStatement, LogicalPlan, ScalarUDF};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use crate::config::{ExecutionConfig, MemoryConfig};
 use crate::connector::{Connector, ConnectorError, ViewDefinition, WritableCatalog};
-use crate::ddl::{self, Prepared};
+use crate::ddl::{self, Prepared, RelationKind, Rewrite, ViewSecurity};
 use crate::federation_guard::FederationFilterGuard;
 use crate::information_schema::CatalogList;
 use crate::runtime::{EngineRuntime, MemoryStats};
@@ -49,6 +49,9 @@ pub struct QueryOptions {
     pub schema: Option<String>,
     /// Validated session properties (see [`crate::PropertyRegistry`]).
     pub properties: SessionProperties,
+    /// Functions this protocol defines on top of the engine's (for instance
+    /// `version()`, which reports the emulated server's version).
+    pub functions: Vec<Arc<ScalarUDF>>,
 }
 
 impl QueryOptions {
@@ -58,6 +61,7 @@ impl QueryOptions {
             catalog: None,
             schema: None,
             properties: SessionProperties::default(),
+            functions: Vec::new(),
         }
     }
 }
@@ -196,12 +200,12 @@ impl Engine {
     /// client protocols. The query runs in a session derived from the engine's:
     /// same catalogs, runtime and memory pool, its own defaults.
     pub async fn sql_with(&self, options: &QueryOptions, sql: &str) -> Result<DataFrame, DataFusionError> {
-        let ctx = self.session(options);
+        let ctx = self.session(options)?;
         // Planning futures are large; boxing keeps callers' futures small.
         Box::pin(self.plan_and_run(&ctx, &options.user, sql)).await
     }
 
-    fn session(&self, options: &QueryOptions) -> SessionContext {
+    fn session(&self, options: &QueryOptions) -> Result<SessionContext, DataFusionError> {
         let mut state = self.ctx.state();
         let defaults = &mut state.config_mut().options_mut().catalog;
         if let Some(catalog) = &options.catalog {
@@ -210,7 +214,11 @@ impl Engine {
         if let Some(schema) = &options.schema {
             defaults.default_schema.clone_from(schema);
         }
-        SessionContext::new_with_state(state)
+        for function in &options.functions {
+            // Replacing a built-in is the point; the previous one is not needed.
+            state.register_udf(Arc::clone(function))?;
+        }
+        Ok(SessionContext::new_with_state(state))
     }
 
     async fn plan_and_run(
@@ -221,17 +229,30 @@ impl Engine {
     ) -> Result<DataFrame, DataFusionError> {
         let state = ctx.state();
         let dialect = state.config().options().sql_parser.dialect;
-        let mut statement = state.sql_to_statement(sql, &dialect)?;
-        let prepared = ddl::prepare(&mut statement)?;
+        let (sql, security) = match ddl::rewrite(sql)? {
+            Some(Rewrite::RenameView { from, to }) => {
+                return self.rename(ctx, RelationKind::View, &from, &to, false).await;
+            }
+            Some(Rewrite::ViewSecurity { sql, security }) => (std::borrow::Cow::Owned(sql), security),
+            None => (std::borrow::Cow::Borrowed(sql), ViewSecurity::default()),
+        };
+        let mut statement = state.sql_to_statement(&sql, &dialect)?;
+        let prepared = ddl::prepare(&mut statement, security)?;
         // After `prepare`, which keeps a view's text as written.
         crate::literals::rewrite_zoned_timestamps(&mut statement);
-        if let Some(Prepared::AddColumn {
-            table,
-            column,
-            sql_type,
-        }) = &prepared
-        {
-            return self.add_column(ctx, table, column, sql_type).await;
+        match &prepared {
+            Some(Prepared::AddColumn {
+                table,
+                column,
+                sql_type,
+            }) => return self.add_column(ctx, table, column, sql_type).await,
+            Some(Prepared::Rename {
+                kind,
+                from,
+                to,
+                if_exists,
+            }) => return self.rename(ctx, *kind, from, to, *if_exists).await,
+            Some(Prepared::View { .. }) | None => {}
         }
         let plan = state.statement_to_plan(statement).await?;
         if ddl::is_routable(&plan)
@@ -337,6 +358,111 @@ impl Engine {
         Self::empty(ctx)
     }
 
+    /// `ALTER TABLE … RENAME TO` and `ALTER VIEW … RENAME TO`. The target is
+    /// resolved against the session defaults, as in Trino, and must be in the
+    /// same catalog. A writable catalog renames in its own storage; any other
+    /// catalog is renamed through its schema providers (the in-memory catalog).
+    async fn rename(
+        &self,
+        ctx: &SessionContext,
+        kind: RelationKind,
+        from: &TableReference,
+        to: &TableReference,
+        if_exists: bool,
+    ) -> Result<DataFrame, DataFusionError> {
+        let (catalog, schema, name) = Self::resolve(ctx, from);
+        let (target_catalog, target_schema, target_name) = Self::resolve(ctx, to);
+        let noun = kind.noun();
+        let Some(provider) = ctx.catalog(&catalog) else {
+            return Err(DataFusionError::Plan(format!(
+                "Catalog '{catalog}' does not exist"
+            )));
+        };
+        let source = match provider.schema(&schema) {
+            Some(source) => source.table(&name).await?,
+            None => None,
+        };
+        let Some(table) = source else {
+            if if_exists {
+                return Self::empty(ctx);
+            }
+            return Err(DataFusionError::Plan(format!(
+                "{noun} '{catalog}.{schema}.{name}' does not exist"
+            )));
+        };
+        let is_view = table.table_type() == datafusion::datasource::TableType::View;
+        match (kind, is_view) {
+            (RelationKind::Table, true) => {
+                return Err(DataFusionError::Plan(format!(
+                    "Table '{catalog}.{schema}.{name}' does not exist, but a view with that name exists. \
+                     Did you mean ALTER VIEW {catalog}.{schema}.{name} RENAME TO ...?"
+                )));
+            }
+            (RelationKind::View, false) => {
+                return Err(DataFusionError::Plan(format!(
+                    "View '{catalog}.{schema}.{name}' does not exist, but a table with that name exists. \
+                     Did you mean ALTER TABLE {catalog}.{schema}.{name} RENAME TO ...?"
+                )));
+            }
+            _ => {}
+        }
+        if ctx.catalog(&target_catalog).is_none() {
+            return Err(DataFusionError::Plan(format!(
+                "Target catalog '{target_catalog}' does not exist"
+            )));
+        }
+        let Some(target) = provider
+            .schema(&target_schema)
+            .filter(|_| target_catalog == catalog)
+        else {
+            if target_catalog != catalog {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "{noun} rename across catalogs is not supported"
+                )));
+            }
+            return Err(DataFusionError::Plan(format!(
+                "Target schema '{target_catalog}.{target_schema}' does not exist"
+            )));
+        };
+        if target.table_exist(&target_name) {
+            return Err(DataFusionError::Plan(format!(
+                "Target {} '{target_catalog}.{target_schema}.{target_name}' already exists",
+                noun.to_lowercase()
+            )));
+        }
+        if let Some(writable) = self.writable(&catalog) {
+            match kind {
+                RelationKind::Table => {
+                    writable
+                        .rename_table(&schema, &name, &target_schema, &target_name)
+                        .await?;
+                }
+                RelationKind::View => {
+                    writable
+                        .rename_view(&schema, &name, &target_schema, &target_name)
+                        .await?;
+                }
+            }
+            return Self::empty(ctx);
+        }
+        let Some(source) = provider.schema(&schema) else {
+            return Err(DataFusionError::Plan(format!(
+                "Schema '{catalog}.{schema}' does not exist"
+            )));
+        };
+        let Some(removed) = source.deregister_table(&name)? else {
+            return Err(DataFusionError::Plan(format!(
+                "{noun} '{catalog}.{schema}.{name}' does not exist"
+            )));
+        };
+        if let Err(error) = target.register_table(target_name, Arc::clone(&removed)) {
+            // Put the source back: a failed rename leaves the relation as it was.
+            source.register_table(name, removed)?;
+            return Err(error);
+        }
+        Self::empty(ctx)
+    }
+
     async fn route_ddl(
         &self,
         ctx: &SessionContext,
@@ -378,12 +504,13 @@ impl Engine {
                 let Some(writable) = self.writable(&catalog) else {
                     return Ok(None);
                 };
-                let Some(Prepared::ViewSql(sql)) = prepared else {
+                let Some(Prepared::View { sql, security }) = prepared else {
                     return Err(DataFusionError::Internal("view SQL was not captured".into()));
                 };
                 let session = ctx.state().config().options().catalog.clone();
                 let definition = ViewDefinition {
                     sql,
+                    security,
                     output: Arc::new(view.input.schema().as_arrow().clone()),
                     catalog: session.default_catalog,
                     schema: session.default_schema,
@@ -448,6 +575,14 @@ impl Engine {
         Ok(Attach::Skipped(failure.to_string()))
     }
 
+    /// Attached catalogs and the connector family serving each.
+    pub fn connectors(&self) -> Vec<(String, &'static str)> {
+        self.sources
+            .iter()
+            .map(|(source, _)| (source.name().to_owned(), source.kind()))
+            .collect()
+    }
+
     /// Session properties clients may set: system ones plus each catalog's.
     pub fn session_properties(&self) -> &PropertyRegistry {
         &self.properties
@@ -488,7 +623,7 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::arrow::array::{Int64Array, RecordBatch};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
+    use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider};
     use datafusion::datasource::MemTable;
 
     #[derive(Debug)]
@@ -776,6 +911,272 @@ mod tests {
             .unwrap();
         let n = count[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(n.value(0), 1);
+    }
+
+    async fn run(engine: &Engine, sql: &str) -> Result<Vec<RecordBatch>, DataFusionError> {
+        engine.sql(sql).await?.collect().await
+    }
+
+    fn message(result: Result<Vec<RecordBatch>, DataFusionError>) -> String {
+        result.unwrap_err().to_string()
+    }
+
+    #[tokio::test]
+    async fn rename_in_the_memory_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        for sql in [
+            "CREATE SCHEMA datafusion.s",
+            "CREATE SCHEMA datafusion.u",
+            "CREATE TABLE datafusion.s.t AS SELECT 1 AS a",
+            "CREATE VIEW datafusion.s.v AS SELECT 2 AS b",
+            "ALTER TABLE datafusion.s.t RENAME TO datafusion.u.t2",
+            "ALTER VIEW s.v RENAME TO s.w",
+            "ALTER TABLE IF EXISTS datafusion.s.missing RENAME TO datafusion.s.x",
+        ] {
+            run(&engine, sql).await.unwrap();
+        }
+        let rows = run(&engine, "SELECT a FROM datafusion.u.t2").await.unwrap();
+        assert_eq!(rows[0].num_rows(), 1);
+        run(&engine, "SELECT b FROM datafusion.s.w").await.unwrap();
+        assert!(run(&engine, "SELECT a FROM datafusion.s.t").await.is_err());
+        assert!(run(&engine, "SELECT b FROM datafusion.s.v").await.is_err());
+        assert!(run(&engine, "SELECT * FROM datafusion.s.x").await.is_err());
+
+        for (sql, expected) in [
+            (
+                "ALTER TABLE s.missing RENAME TO s.x",
+                "Table 'datafusion.s.missing' does not exist",
+            ),
+            (
+                "ALTER VIEW s.missing RENAME TO s.x",
+                "View 'datafusion.s.missing' does not exist",
+            ),
+            (
+                "ALTER TABLE s.w RENAME TO s.x",
+                "but a view with that name exists",
+            ),
+            (
+                "ALTER VIEW u.t2 RENAME TO u.x",
+                "but a table with that name exists",
+            ),
+            (
+                "ALTER TABLE u.t2 RENAME TO s.w",
+                "Target table 'datafusion.s.w' already exists",
+            ),
+            (
+                "ALTER VIEW s.w RENAME TO u.t2",
+                "Target view 'datafusion.u.t2' already exists",
+            ),
+            (
+                "ALTER TABLE u.t2 RENAME TO nope.x",
+                "Target schema 'datafusion.nope' does not exist",
+            ),
+            (
+                "ALTER TABLE u.t2 RENAME TO erp.public.x",
+                "Target catalog 'erp' does not exist",
+            ),
+            (
+                "ALTER TABLE nocat.s.t RENAME TO nocat.s.x",
+                "Catalog 'nocat' does not exist",
+            ),
+        ] {
+            let error = message(run(&engine, sql).await);
+            assert!(error.contains(expected), "{sql}: {error}");
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingCatalog {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingCatalog {
+        fn record(&self, call: String) {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(call);
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WritableCatalog for RecordingCatalog {
+        async fn create_schema(&self, schema: &str, _: bool, _: &str) -> datafusion::error::Result<()> {
+            self.record(format!("create_schema {schema}"));
+            Ok(())
+        }
+        async fn create_table_as(
+            &self,
+            _: &str,
+            _: &str,
+            _: bool,
+            _: &str,
+            _: datafusion::physical_plan::SendableRecordBatchStream,
+            _: Arc<datafusion::execution::TaskContext>,
+        ) -> datafusion::error::Result<u64> {
+            Ok(0)
+        }
+        async fn drop_table(&self, _: &str, _: &str, _: bool) -> datafusion::error::Result<()> {
+            Ok(())
+        }
+        async fn create_view(
+            &self,
+            schema: &str,
+            view: &str,
+            _: bool,
+            owner: &str,
+            definition: ViewDefinition,
+        ) -> datafusion::error::Result<()> {
+            self.record(format!(
+                "create_view {schema}.{view} {owner} {:?} {}",
+                definition.security, definition.sql
+            ));
+            Ok(())
+        }
+        async fn drop_view(&self, _: &str, _: &str, _: bool) -> datafusion::error::Result<()> {
+            Ok(())
+        }
+        async fn add_column(&self, _: &str, _: &str, _: &str, _: &DataType) -> datafusion::error::Result<()> {
+            Ok(())
+        }
+        async fn rename_table(
+            &self,
+            schema: &str,
+            table: &str,
+            to_schema: &str,
+            to: &str,
+        ) -> datafusion::error::Result<()> {
+            self.record(format!("rename_table {schema}.{table} {to_schema}.{to}"));
+            Ok(())
+        }
+        async fn rename_view(
+            &self,
+            schema: &str,
+            view: &str,
+            to_schema: &str,
+            to: &str,
+        ) -> datafusion::error::Result<()> {
+            self.record(format!("rename_view {schema}.{view} {to_schema}.{to}"));
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct WritableSource(Arc<RecordingCatalog>);
+
+    #[async_trait]
+    impl Connector for WritableSource {
+        fn name(&self) -> &'static str {
+            "lake"
+        }
+        fn kind(&self) -> &'static str {
+            "fake"
+        }
+        async fn catalog(&self) -> Result<Arc<dyn CatalogProvider>, ConnectorError> {
+            let schema = MemorySchemaProvider::new();
+            let table = MemTable::try_new(
+                Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)])),
+                vec![vec![]],
+            )
+            .unwrap();
+            schema.register_table("t".into(), Arc::new(table)).unwrap();
+            let view = datafusion::catalog::view::ViewTable::new(
+                LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
+                    produce_one_row: true,
+                    schema: Arc::new(datafusion::common::DFSchema::empty()),
+                }),
+                None,
+            );
+            schema.register_table("v".into(), Arc::new(view)).unwrap();
+            let catalog = MemoryCatalogProvider::new();
+            catalog.register_schema("raw", Arc::new(schema)).unwrap();
+            catalog
+                .register_schema("mart", Arc::new(MemorySchemaProvider::new()))
+                .unwrap();
+            Ok(Arc::new(catalog))
+        }
+        async fn ping(&self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+        fn writable(&self) -> Option<Arc<dyn WritableCatalog>> {
+            Some(Arc::clone(&self.0) as Arc<dyn WritableCatalog>)
+        }
+    }
+
+    #[tokio::test]
+    async fn writable_catalogs_rename_and_store_view_security() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        let recorder = Arc::new(RecordingCatalog::default());
+        engine
+            .attach(Arc::new(WritableSource(Arc::clone(&recorder))), true, FAST)
+            .await
+            .unwrap();
+        let options = QueryOptions {
+            catalog: Some("lake".into()),
+            schema: Some("raw".into()),
+            ..QueryOptions::for_user("dbt")
+        };
+        for sql in [
+            "ALTER TABLE t RENAME TO mart.t2",
+            "ALTER VIEW lake.raw.v RENAME TO v2",
+            "CREATE VIEW mart.w SECURITY INVOKER AS SELECT 1 AS x",
+            "CREATE OR REPLACE VIEW mart.d security definer AS SELECT 2 AS x",
+            "CREATE VIEW mart.plain AS SELECT 3 AS x",
+        ] {
+            engine
+                .sql_with(&options, sql)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            *recorder.calls.lock().unwrap(),
+            [
+                "rename_table raw.t mart.t2",
+                "rename_view raw.v raw.v2",
+                "create_view mart.w dbt Invoker SELECT 1 AS x",
+                "create_view mart.d dbt Definer SELECT 2 AS x",
+                "create_view mart.plain dbt Definer SELECT 3 AS x",
+            ]
+        );
+        let error = engine
+            .sql_with(&options, "ALTER TABLE t RENAME TO datafusion.public.t")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("rename across catalogs"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn protocol_functions_replace_built_ins_for_one_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        let version = datafusion::logical_expr::create_udf(
+            "version",
+            Vec::new(),
+            DataType::Utf8,
+            datafusion::logical_expr::Volatility::Immutable,
+            Arc::new(|_| {
+                Ok(datafusion::logical_expr::ColumnarValue::Scalar(
+                    datafusion::common::ScalarValue::Utf8(Some("431".into())),
+                ))
+            }),
+        );
+        let options = QueryOptions {
+            functions: vec![Arc::new(version)],
+            ..QueryOptions::for_user("u")
+        };
+        let text = |batches: Vec<RecordBatch>| {
+            datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+                .unwrap()
+                .to_string()
+        };
+        let emulated = engine.sql_with(&options, "SELECT version()").await.unwrap();
+        assert!(text(emulated.collect().await.unwrap()).contains("| 431 "));
+        let native = run(&engine, "SELECT version()").await.unwrap();
+        assert!(text(native).contains("DataFusion"));
     }
 
     /// ~40 MiB of rows, sorted under a 16 MiB ceiling.

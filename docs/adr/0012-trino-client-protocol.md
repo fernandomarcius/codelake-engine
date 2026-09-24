@@ -93,6 +93,25 @@ A separate listener (`[server.trino]`, off by default) serves:
   by `max_query_length` characters (default 1,000,000, Trino's
   `query.max-length`; `QUERY_TEXT_TOO_LARGE`): the registry holds at most
   `max_active_queries + history_size` texts of bounded size.
+- **`system.metadata` and `system.jdbc`** have Trino 431's tables and columns
+  (`crates/codelake-server/src/trino/system_tables.rs`), filled at scan time
+  from the catalogs registered in the session: dbt-trino lists relations
+  through `system.metadata.materialized_views`, the JDBC driver answers
+  `DatabaseMetaData` (`getCatalogs`, `getTables`, `getColumns`, …) from
+  `system.jdbc.*`. What CodeLake does not have — materialized views,
+  procedures, user-defined types, comments, `WITH` properties — is listed
+  empty, as Trino lists it for a connector without the feature.
+  `SELECT version()` answers `431`, the version on `/v1/info`, on this
+  listener only (the PostgreSQL listener keeps DataFusion's).
+- **DDL Trino clients issue** beyond what `sqlparser` accepts:
+  `ALTER TABLE … RENAME TO` and `ALTER VIEW … RENAME TO` (dbt's table
+  materialization swaps names this way; the target resolves against the
+  session like in Trino, and must be in the same catalog), and
+  `CREATE VIEW … SECURITY DEFINER | INVOKER`. CodeLake has no access control
+  yet, so both security modes read with the querying user's rights; the mode
+  is stored with the view where the catalog persists views (Hive:
+  `runAsInvoker`, no owner for `INVOKER`, as Trino writes it), so Trino,
+  reading the same metastore, applies it.
 - The listener has **no client authentication yet**: like the PostgreSQL one, it
   must bind to loopback unless `allow_unauthenticated_network = true`.
 

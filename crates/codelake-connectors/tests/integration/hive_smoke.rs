@@ -260,7 +260,7 @@ async fn names_are_folded_to_lower_case() {
     .await;
     let columns = run(
         &engine,
-        "SELECT column_name FROM information_schema.columns \
+        "SELECT column_name FROM hive.information_schema.columns \
          WHERE table_catalog = 'hive' AND table_schema = 'vendas' AND table_name = 'mixedcase' \
          ORDER BY ordinal_position",
     )
