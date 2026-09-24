@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use codelake_core::WritableCatalog;
+use codelake_core::{ViewDefinition, WritableCatalog};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::{CatalogProvider, SchemaProvider, Session, TableProvider};
 use datafusion::datasource::TableType;
@@ -55,6 +55,9 @@ pub(crate) struct TrinoView {
     pub(crate) run_as_invoker: bool,
     #[serde(default)]
     pub(crate) path: Vec<serde_json::Value>,
+    /// Fields this version does not model (`comment`, …), kept on rewrite.
+    #[serde(flatten)]
+    pub(crate) extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -62,6 +65,8 @@ pub(crate) struct TrinoViewColumn {
     pub(crate) name: String,
     #[serde(rename = "type")]
     pub(crate) trino_type: String,
+    #[serde(flatten)]
+    pub(crate) extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl TrinoView {
@@ -116,8 +121,10 @@ pub(crate) fn arrow_to_trino(data_type: &DataType) -> Result<String> {
     })
 }
 
-/// A view stored in the metastore. Planned from its SQL at scan time, then
-/// cast to the declared column types.
+/// A view stored in the metastore. Planned from its SQL at scan time, in the
+/// catalog and schema stored with it (Trino resolves a view's unqualified
+/// names that way, not in the reader's session), then cast to the declared
+/// column types.
 #[derive(Debug)]
 struct HiveView {
     definition: TrinoView,
@@ -153,7 +160,17 @@ impl TableProvider for HiveView {
             .as_any()
             .downcast_ref::<SessionState>()
             .ok_or_else(|| DataFusionError::Internal("hive views need a SessionState".into()))?;
-        let plan = state.create_logical_plan(&self.definition.original_sql).await?;
+        let mut view_state = state.clone();
+        let defaults = &mut view_state.config_mut().options_mut().catalog;
+        if let Some(catalog) = &self.definition.catalog {
+            defaults.default_catalog.clone_from(catalog);
+        }
+        if let Some(schema) = &self.definition.schema {
+            defaults.default_schema.clone_from(schema);
+        }
+        let plan = view_state
+            .create_logical_plan(&self.definition.original_sql)
+            .await?;
         let output = plan.schema().clone();
         if output.fields().len() != self.schema.fields().len() {
             return Err(DataFusionError::Plan(format!(
@@ -492,8 +509,7 @@ impl WritableCatalog for HiveCatalog {
         view: &str,
         or_replace: bool,
         owner: &str,
-        sql: &str,
-        output: SchemaRef,
+        definition: ViewDefinition,
     ) -> Result<()> {
         self.require_schema(schema).await?;
         if let Some(existing) = self
@@ -512,25 +528,30 @@ impl WritableCatalog for HiveCatalog {
                 )));
             }
         }
-        let definition = TrinoView {
-            original_sql: sql.to_owned(),
-            catalog: Some(self.name.clone()),
-            schema: Some(schema.to_owned()),
-            columns: output
+        let trino_view = TrinoView {
+            original_sql: definition.sql,
+            // The session the SQL was planned in, not the view's own schema:
+            // unqualified names must keep resolving to the same tables.
+            catalog: Some(definition.catalog),
+            schema: Some(definition.schema),
+            columns: definition
+                .output
                 .fields()
                 .iter()
                 .map(|f| {
                     Ok(TrinoViewColumn {
                         name: f.name().clone(),
                         trino_type: arrow_to_trino(f.data_type())?,
+                        extra: BTreeMap::new(),
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
             owner: Some(owner.to_owned()),
             run_as_invoker: false,
             path: Vec::new(),
+            extra: BTreeMap::new(),
         };
-        let metadata = TableMetadata::trino_view(owner, definition.encode()?);
+        let metadata = TableMetadata::trino_view(owner, trino_view.encode()?);
         self.metastore
             .write_table(schema, view, &metadata)
             .await
@@ -620,16 +641,52 @@ mod tests {
             vec![
                 TrinoViewColumn {
                     name: "id".into(),
-                    trino_type: "bigint".into()
+                    trino_type: "bigint".into(),
+                    extra: BTreeMap::new(),
                 },
                 TrinoViewColumn {
                     name: "nome".into(),
-                    trino_type: "varchar".into()
+                    trino_type: "varchar".into(),
+                    extra: BTreeMap::new(),
                 },
             ]
         );
         assert_eq!(TrinoView::decode(&view.encode().unwrap()).unwrap(), view);
         assert!(TrinoView::decode("SELECT 1").is_err());
+    }
+
+    #[test]
+    fn view_definition_keeps_session_and_unknown_fields() {
+        let json = serde_json::json!({
+            "originalSql": "SELECT id FROM base",
+            "catalog": "hive",
+            "schema": "vw",
+            "columns": [{"name": "id", "type": "bigint", "comment": "chave"}],
+            "comment": "relative view",
+            "owner": "trino",
+            "runAsInvoker": false,
+            "path": []
+        });
+        let text = format!("{VIEW_PREFIX}{}{VIEW_SUFFIX}", BASE64.encode(json.to_string()));
+        let view = TrinoView::decode(&text).unwrap();
+        assert_eq!(
+            (view.catalog.as_deref(), view.schema.as_deref()),
+            (Some("hive"), Some("vw"))
+        );
+        let back: serde_json::Value = serde_json::from_slice(
+            &BASE64
+                .decode(
+                    view.encode()
+                        .unwrap()
+                        .strip_prefix(VIEW_PREFIX)
+                        .unwrap()
+                        .strip_suffix(VIEW_SUFFIX)
+                        .unwrap(),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(back, json);
     }
 
     #[test]

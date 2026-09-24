@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::common;
 use codelake_connectors::hive::{HiveConnector, HiveParams};
-use codelake_core::Engine;
+use codelake_core::{Engine, QueryOptions};
 
 fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
@@ -173,4 +173,57 @@ async fn reads_trino_warehouse_and_writes_compatible_tables() {
     run(&engine, "DROP TABLE hive.raw.orders").await;
     assert!(!table_dir.join(".trinoSchema").exists());
     assert!(engine.sql("SELECT * FROM hive.raw.orders").await.is_err());
+}
+
+async fn run_in(engine: &Engine, catalog: &str, schema: &str, sql: &str) -> String {
+    let options = QueryOptions {
+        catalog: Some(catalog.into()),
+        schema: Some(schema.into()),
+        ..QueryOptions::for_user("dbt")
+    };
+    let batches = engine
+        .sql_with(&options, sql)
+        .await
+        .unwrap_or_else(|e| panic!("planning `{sql}`: {e}"))
+        .collect()
+        .await
+        .unwrap_or_else(|e| panic!("running `{sql}`: {e}"));
+    datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string()
+}
+
+/// A view keeps resolving its unqualified names in the session it was
+/// created in, never in the reader's: a same-named table elsewhere must not
+/// change its rows (Trino semantics, ADR 0007).
+#[tokio::test]
+async fn views_resolve_unqualified_names_in_their_own_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let spill = tempfile::tempdir().unwrap();
+    let engine = open_engine(&dir.path().join("warehouse"), spill.path()).await;
+    run(&engine, "CREATE SCHEMA hive.vw").await;
+    run(&engine, "CREATE SCHEMA hive.other").await;
+    run(
+        &engine,
+        "CREATE TABLE hive.vw.base AS SELECT CAST(1 AS BIGINT) AS id",
+    )
+    .await;
+    run(
+        &engine,
+        "CREATE TABLE hive.other.base AS SELECT CAST(99 AS BIGINT) AS id",
+    )
+    .await;
+    run_in(&engine, "hive", "vw", "CREATE VIEW rel AS SELECT id FROM base").await;
+
+    for (catalog, schema) in [("hive", "other"), ("datafusion", "public")] {
+        let rows = run_in(&engine, catalog, schema, "SELECT id FROM hive.vw.rel").await;
+        assert!(
+            rows.contains("| 1  |") && !rows.contains("99"),
+            "{catalog}.{schema}: {rows}"
+        );
+    }
+    let definition: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("warehouse/vw/rel/.trinoSchema")).unwrap())
+            .unwrap();
+    assert_eq!(definition["tableType"], "VIRTUAL_VIEW");
 }

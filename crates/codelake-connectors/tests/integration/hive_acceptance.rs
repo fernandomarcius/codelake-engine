@@ -986,7 +986,6 @@ async fn views_survive_restart_and_cross_engines() {
 }
 
 #[tokio::test]
-#[ignore = "F2 defect: view catalog/schema ignored; unqualified names fail"]
 async fn trino_view_with_unqualified_names_reads_in_codelake() {
     let shared = shared().await;
     let spill = tempfile::tempdir().unwrap();

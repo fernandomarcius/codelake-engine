@@ -19,7 +19,7 @@ use serde::Serialize;
 use tracing::{info, warn};
 
 use crate::config::{ExecutionConfig, MemoryConfig};
-use crate::connector::{Connector, ConnectorError, WritableCatalog};
+use crate::connector::{Connector, ConnectorError, ViewDefinition, WritableCatalog};
 use crate::ddl::{self, Prepared};
 use crate::federation_guard::FederationFilterGuard;
 use crate::runtime::{EngineRuntime, MemoryStats};
@@ -312,9 +312,15 @@ impl Engine {
                 let Some(Prepared::ViewSql(sql)) = prepared else {
                     return Err(DataFusionError::Internal("view SQL was not captured".into()));
                 };
-                let output = Arc::new(view.input.schema().as_arrow().clone());
+                let session = ctx.state().config().options().catalog.clone();
+                let definition = ViewDefinition {
+                    sql,
+                    output: Arc::new(view.input.schema().as_arrow().clone()),
+                    catalog: session.default_catalog,
+                    schema: session.default_schema,
+                };
                 writable
-                    .create_view(&schema, &name, view.or_replace, user, &sql, output)
+                    .create_view(&schema, &name, view.or_replace, user, definition)
                     .await?;
                 Ok(Some(Self::empty(ctx)?))
             }
