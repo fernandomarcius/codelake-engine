@@ -89,6 +89,7 @@ pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + S
 fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = vec![Arc::new(FederationFilterGuard)];
     rules.extend(PhysicalOptimizer::new().rules);
+    rules.extend(crate::trino_functions::physical_rules());
     rules
 }
 
@@ -140,6 +141,7 @@ impl Engine {
         if let Some(partitions) = execution.target_partitions {
             session = session.with_target_partitions(partitions);
         }
+        let session = crate::trino_functions::session_config(session);
         let state = SessionStateBuilder::new()
             .with_config(session)
             .with_runtime_env(runtime.env())
@@ -148,8 +150,9 @@ impl Engine {
             .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
             .with_physical_optimizer_rules(physical_rules())
             .build();
-        let ctx = SessionContext::new_with_state(state);
+        let mut ctx = SessionContext::new_with_state(state);
         ctx.register_udf(crate::functions::varbinary_literal());
+        crate::trino_functions::install(&mut ctx)?;
         Ok(Self {
             ctx,
             runtime,
@@ -201,8 +204,10 @@ impl Engine {
     ) -> Result<DataFrame, DataFusionError> {
         let state = ctx.state();
         let dialect = state.config().options().sql_parser.dialect;
-        let mut statement = state.sql_to_statement(sql, &dialect)?;
+        let sql = crate::trino_functions::preprocess_sql(sql);
+        let mut statement = state.sql_to_statement(&sql, &dialect)?;
         let prepared = ddl::prepare(&mut statement)?;
+        crate::trino_functions::rewrite_statement(&mut statement)?;
         if let Some(Prepared::AddColumn {
             table,
             column,
@@ -218,6 +223,7 @@ impl Engine {
             return Ok(result);
         }
         let plan = crate::subquery::pre_evaluate_scalar_subqueries(ctx, plan).await?;
+        let plan = crate::trino_functions::analyze(ctx, plan)?;
         ctx.execute_logical_plan(plan).await
     }
 
