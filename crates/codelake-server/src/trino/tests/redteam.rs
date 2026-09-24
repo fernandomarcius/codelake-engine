@@ -31,7 +31,6 @@ const MIB: u64 = 1 << 20;
 /// success and sends `X-Trino-Set-Catalog/Schema` for objects that do not
 /// exist, so the client's next unqualified query fails far from the cause.
 #[tokio::test]
-#[ignore = "DEFECT-RT1: USE does not check that the catalog/schema exist"]
 async fn rt1_use_of_missing_schema_fails_like_trino() {
     let h = harness();
     let reply = h.submit("USE nocat.nope", &[]).await;
@@ -89,7 +88,6 @@ async fn rt_pass_set_session_values_cannot_inject_headers() {
 /// `QUERY_TEXT_TOO_LARGE` (35, `USER_ERROR`). `CodeLake` runs the first and
 /// answers the second with a bare `413` from axum's 2 MB body limit.
 #[tokio::test]
-#[ignore = "DEFECT-RT3: no query.max-length; >2 MiB answers 413 instead of QUERY_TEXT_TOO_LARGE"]
 async fn rt3_query_text_limit_matches_trino() {
     let h = harness();
     let mut wrong = Vec::new();
@@ -115,7 +113,6 @@ async fn rt3_query_text_limit_matches_trino() {
 /// (Java `Float` in JSON). `CodeLake` widens to f64 first:
 /// `0.10000000149011612`, `0.3333333432674408`.
 #[tokio::test]
-#[ignore = "DEFECT-RT4: REAL values are serialized with f64 noise digits"]
 async fn rt4_real_values_encode_like_trino() {
     let h = harness();
     let out = h
@@ -132,7 +129,6 @@ async fn rt4_real_values_encode_like_trino() {
 /// `cursor.fetchall()` after `DROP TABLE` returns `[[True]]` instead of `[]`
 /// and `cursor.description` is set.
 #[tokio::test]
-#[ignore = "DEFECT-RT5: DDL answers a result column that Trino 431 does not send"]
 async fn rt5_ddl_has_no_result_columns() {
     let h = harness();
     let created = h.run("CREATE TABLE datafusion.public.rt5 (a BIGINT)", &[]).await;
@@ -160,7 +156,6 @@ async fn rt5_ddl_has_no_result_columns() {
 /// `TrinoUserError` only for `USER_ERROR`; dbt shows `INTERNAL_ERROR` as a
 /// server bug.
 #[tokio::test]
-#[ignore = "DEFECT-RT6: user errors surface as GENERIC_INTERNAL_ERROR / wrong names"]
 async fn rt6_user_errors_keep_trino_names_and_type() {
     let h = harness();
     let cases = [
@@ -209,7 +204,6 @@ async fn rt15_statements_trino_rejects_do_not_return_rows() {
 /// text. Trino 431: `ROW(1,'a')` → `row(...)` `[1,"a"]`; `MAP(...)` → `map(...)`
 /// `{"k":1}`; `INTERVAL '1' DAY` → `interval day to second` `"1 00:00:00.000"`.
 #[tokio::test]
-#[ignore = "DEFECT-RT7: struct/map/interval results are sent as varchar text"]
 async fn rt7_struct_map_interval_are_typed() {
     let h = harness();
     let out = h
@@ -231,7 +225,6 @@ async fn rt7_struct_map_interval_are_typed() {
 /// `i64::MAX` is announced as `bigint` (Java clients overflow), and a decimal
 /// with negative scale prints its unscaled value (12300 → "123").
 #[tokio::test]
-#[ignore = "DEFECT-RT8: UInt64 > i64::MAX as bigint; negative-scale decimals lose their scale"]
 async fn rt8_values_fit_their_announced_type() {
     let h = harness();
     let out = h
@@ -289,7 +282,6 @@ async fn rt8_date64_and_time32_match_their_type() {
 /// precision (`timestamp`, `time`). `CodeLake` sends `decimal(10,2)` and always
 /// `timestamp(3)`. JDBC's `getColumnTypeName` shows the `type` text.
 #[tokio::test]
-#[ignore = "DEFECT-RT14: column type text differs from Trino 431 (decimal spacing, datetime capability)"]
 async fn rt14_type_text_matches_trino() {
     let h = harness();
     let out = h
@@ -308,7 +300,6 @@ async fn rt14_type_text_matches_trino() {
 /// `TIMESTAMP '2026-01-01 10:00:00.000 America/Sao_Paulo'` →
 /// `"2026-01-01 10:00:00.000 America/Sao_Paulo"`.
 #[tokio::test]
-#[ignore = "DEFECT-RT9: timestamp with time zone always rendered in UTC"]
 async fn rt9_timestamp_keeps_its_zone() {
     let h = harness();
     let out = h
@@ -320,7 +311,11 @@ async fn rt9_timestamp_keeps_its_zone() {
         .await;
     assert_eq!(out.state(), "FINISHED", "{}", out.last);
     let text = out.rows[0][0].as_str().unwrap_or_default().to_owned();
-    assert!(text.ends_with("America/Sao_Paulo"), "{text:?} ({})", out.columns[0].1);
+    assert!(
+        text.ends_with("America/Sao_Paulo"),
+        "{text:?} ({})",
+        out.columns[0].1
+    );
 }
 
 // ------------------------------------------------------- memory / CPU DoS ---
@@ -331,7 +326,6 @@ async fn rt9_timestamp_keeps_its_zone() {
 /// = 100 queries). Those batches are outside `DataFusion`'s memory pool. Trino
 /// frees a query's output buffers when it fails.
 #[tokio::test]
-#[ignore = "DEFECT-RT10: canceled queries retain buffered batches while in history"]
 async fn rt10_canceled_queries_release_their_buffers() {
     let h = harness_with(Limits {
         history_retention: Duration::from_secs(2),
@@ -421,7 +415,6 @@ async fn rt11_submit_cost_does_not_grow_with_history_text() {
 /// applied by the sweeper. A burst of failing statements accumulates without
 /// limit — each keeping its SQL text.
 #[tokio::test]
-#[ignore = "DEFECT-RT12: registry grows without bound between sweeps"]
 async fn rt12_registry_is_bounded_between_sweeps() {
     let h = harness_with(Limits {
         max_active: 5,
@@ -432,9 +425,7 @@ async fn rt12_registry_is_bounded_between_sweeps() {
         let out = h.run("SELECT 1 +", &[]).await;
         assert_eq!(out.error_name(), Some("SYNTAX_ERROR"));
     }
-    let listed = h
-        .run("SELECT count(*) FROM system.runtime.queries", &[])
-        .await;
+    let listed = h.run("SELECT count(*) FROM system.runtime.queries", &[]).await;
     let n = listed.rows[0][0].as_i64().unwrap();
     assert!(
         n <= 5 + 10 + 1,
@@ -494,8 +485,14 @@ async fn rt_pass_slug_is_required_for_statement_uris() {
     let slug = parts[5];
     assert_eq!(slug.len(), 32);
     let forged = format!("/v1/statement/executing/{}/{}/1", parts[4], "f".repeat(32));
-    assert_eq!(h.call(Method::DELETE, &forged, &[], "").await.status, StatusCode::NOT_FOUND);
-    assert_eq!(h.call(Method::GET, &forged, &[], "").await.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        h.call(Method::DELETE, &forged, &[], "").await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        h.call(Method::GET, &forged, &[], "").await.status,
+        StatusCode::NOT_FOUND
+    );
     let _ = h.call(Method::DELETE, &next, &[], "").await;
 }
 
@@ -521,7 +518,9 @@ async fn rt_pass_host_header_cannot_inject_paths() {
 async fn rt_pass_parallel_token_reuse_and_cancel_race() {
     let h = std::sync::Arc::new(harness());
     for _ in 0..20 {
-        let first = h.submit("SELECT value FROM generate_series(1, 3000000)", &[]).await;
+        let first = h
+            .submit("SELECT value FROM generate_series(1, 3000000)", &[])
+            .await;
         let one = path_of(first.body["nextUri"].as_str().unwrap());
         let mut tasks = Vec::new();
         for i in 0..6 {
@@ -545,7 +544,10 @@ async fn rt_pass_parallel_token_reuse_and_cancel_race() {
                 bodies.push(raw);
             }
         }
-        assert!(bodies.windows(2).all(|w| w[0] == w[1]), "same token, different pages");
+        assert!(
+            bodies.windows(2).all(|w| w[0] == w[1]),
+            "same token, different pages"
+        );
         let _ = h.call(Method::DELETE, &one, &[], "").await;
     }
 }

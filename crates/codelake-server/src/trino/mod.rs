@@ -3,7 +3,9 @@
 //! `CodeLake` unchanged. See `docs/adr/0012-trino-client-protocol.md`.
 
 mod errors;
+mod prepared;
 mod queries;
+mod rewrite;
 mod session;
 mod statement;
 mod types;

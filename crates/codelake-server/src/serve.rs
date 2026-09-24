@@ -115,6 +115,7 @@ async fn start_trino(
         client_timeout: Duration::from_secs(settings.client_timeout_secs),
         history_retention: Duration::from_secs(settings.history_retention_secs),
         history_size: settings.history_size,
+        max_query_length: settings.max_query_length,
     };
     let state = trino::TrinoState::new(Arc::clone(engine), limits, settings.listen);
     engine

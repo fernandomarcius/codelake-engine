@@ -1,6 +1,12 @@
 //! Trino error codes. Clients branch on `errorType` (the Python client raises
 //! `TrinoUserError` for `USER_ERROR`) and on `errorName`, so the mapping from
 //! `DataFusion` errors follows Trino's `StandardErrorCode`.
+//!
+//! The mapping looks at the error's structure first (parser, schema and Arrow
+//! errors), then at its message through [`MESSAGE_RULES`], a table that grows
+//! with each engine message worth a Trino name. A missing table is refined into
+//! `CATALOG_NOT_FOUND` / `SCHEMA_NOT_FOUND` by asking a [`Namespace`] which part
+//! of the name is missing, as Trino reports it.
 
 use datafusion::arrow::error::ArrowError;
 use datafusion::common::SchemaError;
@@ -13,13 +19,24 @@ pub(crate) enum Code {
     SyntaxError,
     AbandonedQuery,
     UserCanceled,
+    NotFound,
+    FunctionNotFound,
     DivisionByZero,
     InvalidCastArgument,
     NotSupported,
     InvalidSessionProperty,
+    NumericValueOutOfRange,
+    QueryTextTooLarge,
     CatalogNotFound,
+    SchemaNotFound,
     TableNotFound,
     ColumnNotFound,
+    SchemaAlreadyExists,
+    TableAlreadyExists,
+    ColumnAlreadyExists,
+    TypeMismatch,
+    AmbiguousName,
+    InvalidParameterUsage,
     QueryQueueFull,
     ExceededTimeLimit,
     ExceededLocalMemoryLimit,
@@ -33,13 +50,24 @@ impl Code {
             Self::SyntaxError => (1, "SYNTAX_ERROR", "USER_ERROR"),
             Self::AbandonedQuery => (2, "ABANDONED_QUERY", "USER_ERROR"),
             Self::UserCanceled => (3, "USER_CANCELED", "USER_ERROR"),
+            Self::NotFound => (5, "NOT_FOUND", "USER_ERROR"),
+            Self::FunctionNotFound => (6, "FUNCTION_NOT_FOUND", "USER_ERROR"),
             Self::DivisionByZero => (8, "DIVISION_BY_ZERO", "USER_ERROR"),
             Self::InvalidCastArgument => (9, "INVALID_CAST_ARGUMENT", "USER_ERROR"),
             Self::NotSupported => (13, "NOT_SUPPORTED", "USER_ERROR"),
             Self::InvalidSessionProperty => (14, "INVALID_SESSION_PROPERTY", "USER_ERROR"),
+            Self::NumericValueOutOfRange => (19, "NUMERIC_VALUE_OUT_OF_RANGE", "USER_ERROR"),
+            Self::QueryTextTooLarge => (35, "QUERY_TEXT_TOO_LARGE", "USER_ERROR"),
             Self::CatalogNotFound => (44, "CATALOG_NOT_FOUND", "USER_ERROR"),
+            Self::SchemaNotFound => (45, "SCHEMA_NOT_FOUND", "USER_ERROR"),
             Self::TableNotFound => (46, "TABLE_NOT_FOUND", "USER_ERROR"),
             Self::ColumnNotFound => (47, "COLUMN_NOT_FOUND", "USER_ERROR"),
+            Self::SchemaAlreadyExists => (49, "SCHEMA_ALREADY_EXISTS", "USER_ERROR"),
+            Self::TableAlreadyExists => (50, "TABLE_ALREADY_EXISTS", "USER_ERROR"),
+            Self::ColumnAlreadyExists => (51, "COLUMN_ALREADY_EXISTS", "USER_ERROR"),
+            Self::TypeMismatch => (58, "TYPE_MISMATCH", "USER_ERROR"),
+            Self::AmbiguousName => (62, "AMBIGUOUS_NAME", "USER_ERROR"),
+            Self::InvalidParameterUsage => (80, "INVALID_PARAMETER_USAGE", "USER_ERROR"),
             Self::GenericInternalError => (65_536, "GENERIC_INTERNAL_ERROR", "INTERNAL_ERROR"),
             Self::QueryQueueFull => (131_074, "QUERY_QUEUE_FULL", "INSUFFICIENT_RESOURCES"),
             Self::ExceededTimeLimit => (131_075, "EXCEEDED_TIME_LIMIT", "INSUFFICIENT_RESOURCES"),
@@ -50,7 +78,7 @@ impl Code {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ErrorLocation {
     line_number: u32,
@@ -111,9 +139,100 @@ impl QueryError {
         self.0.error_type
     }
 
+    #[cfg(test)]
+    pub(crate) fn message(&self) -> &str {
+        &self.0.message
+    }
+
+    #[cfg(test)]
+    pub(crate) fn location(&self) -> Option<(u32, u32)> {
+        self.0.error_location.map(|l| (l.line_number, l.column_number))
+    }
+
     fn at(mut self, location: Option<ErrorLocation>) -> Self {
         self.0.error_location = location;
         self
+    }
+
+    /// Maps an engine error on `sql` as Trino reports it: the missing part of a
+    /// table name, and the position of syntax and semantic errors (semantic
+    /// messages start with `line L:C: `, like Trino's analyzer).
+    pub(crate) fn from_engine(error: &DataFusionError, sql: &str, names: &dyn Namespace) -> Self {
+        let root = error.find_root();
+        if let DataFusionError::SQL(..) = root {
+            let text = root.to_string();
+            let location = parser_location(&text).or_else(|| text.contains("EOF").then(|| end_of(sql)));
+            return Self::new(Code::SyntaxError, text).at(location);
+        }
+        let code = code_of(root);
+        let message = raw_message(root);
+        let (code, message) = match code {
+            Code::TableNotFound => missing_table(&message, names).unwrap_or((code, message)),
+            _ => (code, message),
+        };
+        let location = error
+            .diagnostic()
+            .and_then(|d| d.span)
+            .filter(|span| span.start.line > 0 && span.start.column > 0)
+            .map(|span| ErrorLocation {
+                line_number: u32::try_from(span.start.line).unwrap_or(u32::MAX),
+                column_number: u32::try_from(span.start.column).unwrap_or(u32::MAX),
+            });
+        let message = match location {
+            Some(l) => format!("line {}:{}: {message}", l.line_number, l.column_number),
+            None => message,
+        };
+        Self::new(code, message).at(location)
+    }
+}
+
+/// Which catalogs and schemas exist, to name the missing part of a table name.
+pub(crate) trait Namespace {
+    fn has_catalog(&self, catalog: &str) -> bool;
+    fn has_schema(&self, catalog: &str, schema: &str) -> bool;
+}
+
+/// A namespace where every catalog and schema exists: a missing table stays
+/// `TABLE_NOT_FOUND`.
+pub(crate) struct Everything;
+
+impl Namespace for Everything {
+    fn has_catalog(&self, _: &str) -> bool {
+        true
+    }
+    fn has_schema(&self, _: &str, _: &str) -> bool {
+        true
+    }
+}
+
+/// `DataFusion` names a missing table by its resolved name:
+/// `table 'catalog.schema.table' not found`.
+fn missing_table(message: &str, names: &dyn Namespace) -> Option<(Code, String)> {
+    let name = message.strip_prefix("table '")?.strip_suffix("' not found")?;
+    let mut parts = name.splitn(3, '.');
+    let (catalog, schema, table) = (parts.next()?, parts.next()?, parts.next()?);
+    Some(if !names.has_catalog(catalog) {
+        (
+            Code::CatalogNotFound,
+            format!("Catalog '{catalog}' does not exist"),
+        )
+    } else if !names.has_schema(catalog, schema) {
+        (Code::SchemaNotFound, format!("Schema '{schema}' does not exist"))
+    } else {
+        (
+            Code::TableNotFound,
+            format!("Table '{catalog}.{schema}.{table}' does not exist"),
+        )
+    })
+}
+
+/// Position just after the last character, where Trino reports "found EOF".
+fn end_of(sql: &str) -> ErrorLocation {
+    let line = sql.matches('\n').count() + 1;
+    let last = sql.rsplit('\n').next().unwrap_or_default();
+    ErrorLocation {
+        line_number: u32::try_from(line).unwrap_or(u32::MAX),
+        column_number: u32::try_from(last.chars().count() + 1).unwrap_or(u32::MAX),
     }
 }
 
@@ -122,10 +241,112 @@ fn parser_location(message: &str) -> Option<ErrorLocation> {
     let (_, tail) = message.rsplit_once("Line: ")?;
     let (line, tail) = tail.split_once(", Column: ")?;
     let column: String = tail.chars().take_while(char::is_ascii_digit).collect();
-    Some(ErrorLocation {
+    let location = ErrorLocation {
         line_number: line.trim().parse().ok()?,
         column_number: column.parse().ok()?,
-    })
+    };
+    (location.line_number > 0).then_some(location)
+}
+
+/// The message without `DataFusion`'s variant prefix ("Error during planning: ").
+fn raw_message(error: &DataFusionError) -> String {
+    match error {
+        DataFusionError::Plan(message)
+        | DataFusionError::Execution(message)
+        | DataFusionError::NotImplemented(message)
+        | DataFusionError::ResourcesExhausted(message) => message.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// How a message rule matches the lower-cased message.
+#[derive(Debug, Clone, Copy)]
+enum Pattern {
+    StartsWith(&'static str),
+    Contains(&'static str),
+    /// Starts with the first text and contains the second.
+    Both(&'static str, &'static str),
+}
+
+impl Pattern {
+    fn matches(self, message: &str) -> bool {
+        match self {
+            Self::StartsWith(prefix) => message.starts_with(prefix),
+            Self::Contains(part) => message.contains(part),
+            Self::Both(prefix, part) => message.starts_with(prefix) && message.contains(part),
+        }
+    }
+}
+
+/// Engine messages with a Trino name, checked in order on planning and
+/// execution errors (`DataFusion`'s in-memory catalog and the connectors'
+/// writable catalogs word them slightly differently).
+const MESSAGE_RULES: &[(Pattern, Code)] = &[
+    (
+        Pattern::Both("table ", "already exists"),
+        Code::TableAlreadyExists,
+    ),
+    (Pattern::Both("view ", "already exists"), Code::TableAlreadyExists),
+    (
+        Pattern::Both("schema ", "already exists"),
+        Code::SchemaAlreadyExists,
+    ),
+    (
+        Pattern::Both("column ", "already exists"),
+        Code::ColumnAlreadyExists,
+    ),
+    (Pattern::Both("table '", "' not found"), Code::TableNotFound),
+    (Pattern::Both("table ", "doesn't exist"), Code::TableNotFound),
+    (Pattern::Both("table ", "does not exist"), Code::TableNotFound),
+    (Pattern::Both("view ", "doesn't exist"), Code::TableNotFound),
+    (Pattern::Both("view ", "does not exist"), Code::TableNotFound),
+    (Pattern::Both("schema ", "doesn't exist"), Code::SchemaNotFound),
+    (Pattern::Both("schema ", "does not exist"), Code::SchemaNotFound),
+    (
+        Pattern::StartsWith("failed to resolve schema"),
+        Code::SchemaNotFound,
+    ),
+    (
+        Pattern::StartsWith("failed to resolve catalog"),
+        Code::CatalogNotFound,
+    ),
+    (Pattern::Both("catalog ", "not found"), Code::CatalogNotFound),
+    (Pattern::StartsWith("invalid function '"), Code::FunctionNotFound),
+    (
+        Pattern::Contains("failed to coerce arguments to satisfy a call to"),
+        Code::FunctionNotFound,
+    ),
+    (
+        Pattern::StartsWith("cannot coerce arithmetic expression"),
+        Code::TypeMismatch,
+    ),
+    (Pattern::StartsWith("cannot infer common"), Code::TypeMismatch),
+    (
+        Pattern::StartsWith("cannot get result type for"),
+        Code::TypeMismatch,
+    ),
+];
+
+fn by_message(message: &str) -> Option<Code> {
+    let lower = message.to_lowercase();
+    MESSAGE_RULES
+        .iter()
+        .find(|(pattern, _)| pattern.matches(&lower))
+        .map(|(_, code)| *code)
+}
+
+/// Arrow's cast errors: a number that does not fit the target numeric type is
+/// Trino's `NUMERIC_VALUE_OUT_OF_RANGE`; text that is not a number is
+/// `INVALID_CAST_ARGUMENT`.
+fn cast_code(message: &str) -> Code {
+    if message.starts_with("Can't cast value")
+        || message.contains("Overflowing on")
+        || message.contains("overflows")
+    {
+        Code::NumericValueOutOfRange
+    } else {
+        Code::InvalidCastArgument
+    }
 }
 
 fn code_of(error: &DataFusionError) -> Code {
@@ -133,22 +354,18 @@ fn code_of(error: &DataFusionError) -> Code {
         DataFusionError::SQL(..) => Code::SyntaxError,
         DataFusionError::SchemaError(schema_error, _) => match schema_error.as_ref() {
             SchemaError::FieldNotFound { .. } => Code::ColumnNotFound,
+            SchemaError::AmbiguousReference { .. } => Code::AmbiguousName,
             _ => Code::GenericUserError,
         },
-        DataFusionError::Plan(message) => {
-            if message.starts_with("table '") && message.ends_with("not found") {
-                Code::TableNotFound
-            } else if message.contains("catalog") && message.contains("not found") {
-                Code::CatalogNotFound
-            } else {
-                Code::GenericUserError
-            }
-        }
+        DataFusionError::Plan(message) => by_message(message).unwrap_or(Code::GenericUserError),
+        DataFusionError::Execution(message) => by_message(message).unwrap_or(Code::GenericInternalError),
         DataFusionError::NotImplemented(_) => Code::NotSupported,
         DataFusionError::ResourcesExhausted(_) => Code::ExceededLocalMemoryLimit,
         DataFusionError::ArrowError(arrow, _) => match arrow.as_ref() {
             ArrowError::DivideByZero => Code::DivisionByZero,
-            ArrowError::CastError(_) | ArrowError::ParseError(_) => Code::InvalidCastArgument,
+            ArrowError::ArithmeticOverflow(_) => Code::NumericValueOutOfRange,
+            ArrowError::CastError(message) => cast_code(message),
+            ArrowError::ParseError(_) => Code::InvalidCastArgument,
             _ => Code::GenericInternalError,
         },
         _ => Code::GenericInternalError,
@@ -157,12 +374,7 @@ fn code_of(error: &DataFusionError) -> Code {
 
 impl From<&DataFusionError> for QueryError {
     fn from(error: &DataFusionError) -> Self {
-        let root = error.find_root();
-        let message = root.to_string();
-        let location = matches!(root, DataFusionError::SQL(..))
-            .then(|| parser_location(&message))
-            .flatten();
-        Self::new(code_of(root), message).at(location)
+        Self::from_engine(error, "", &Everything)
     }
 }
 
@@ -172,7 +384,7 @@ mod tests {
 
     fn map(sql: &str) -> QueryError {
         let error = datafusion::sql::parser::DFParser::parse_sql(sql).unwrap_err();
-        QueryError::from(&error)
+        QueryError::from_engine(&error, sql, &Everything)
     }
 
     #[test]
@@ -180,12 +392,20 @@ mod tests {
         let error = map("SELECT a FROM t ORDER x");
         assert_eq!(error.name(), "SYNTAX_ERROR");
         assert_eq!(error.kind(), "USER_ERROR");
-        let location = error
-            .0
-            .error_location
-            .clone()
-            .unwrap_or_else(|| panic!("no location: {error:?}"));
-        assert_eq!(location.line_number, 1);
+        assert_eq!(error.location().unwrap().0, 1);
+    }
+
+    #[test]
+    fn end_of_input_is_located_after_the_last_character() {
+        assert_eq!(map("SELECT 1 +").location(), Some((1, 11)));
+        assert_eq!(map("SELECT 1\n  FROM").location().map(|l| l.0), Some(2));
+        assert_eq!(
+            end_of("SELECT ação +"),
+            ErrorLocation {
+                line_number: 1,
+                column_number: 14
+            }
+        );
     }
 
     #[test]
@@ -215,10 +435,99 @@ mod tests {
                 ),
                 "TABLE_NOT_FOUND",
             ),
+            (
+                DataFusionError::Execution("Table 'datafusion.s.t' already exists".into()),
+                "TABLE_ALREADY_EXISTS",
+            ),
+            (
+                DataFusionError::Plan("table hive.s.t already exists".into()),
+                "TABLE_ALREADY_EXISTS",
+            ),
+            (
+                DataFusionError::Execution("Schema 's' already exists".into()),
+                "SCHEMA_ALREADY_EXISTS",
+            ),
+            (
+                DataFusionError::Plan("schema s already exists".into()),
+                "SCHEMA_ALREADY_EXISTS",
+            ),
+            (
+                DataFusionError::Execution("Table 'datafusion.s.nope' doesn't exist.".into()),
+                "TABLE_NOT_FOUND",
+            ),
+            (
+                DataFusionError::Plan("table hive.s.t does not exist".into()),
+                "TABLE_NOT_FOUND",
+            ),
+            (
+                DataFusionError::Execution("Schema 'x' doesn't exist.".into()),
+                "SCHEMA_NOT_FOUND",
+            ),
+            (
+                DataFusionError::Plan("Invalid function 'nofn'.\nDid you mean 'nvl'?".into()),
+                "FUNCTION_NOT_FOUND",
+            ),
+            (
+                DataFusionError::Plan(
+                    "Cannot coerce arithmetic expression Int64 + Utf8 to valid types".into(),
+                ),
+                "TYPE_MISMATCH",
+            ),
+            (
+                DataFusionError::from(ArrowError::CastError("Can't cast value 300 to type Int8".into())),
+                "NUMERIC_VALUE_OUT_OF_RANGE",
+            ),
+            (
+                DataFusionError::from(ArrowError::CastError(
+                    "Cannot cast string 'abc' to value of Int32 type".into(),
+                )),
+                "INVALID_CAST_ARGUMENT",
+            ),
+            (
+                DataFusionError::from(ArrowError::ArithmeticOverflow("Int64 + Int64".into())),
+                "NUMERIC_VALUE_OUT_OF_RANGE",
+            ),
+            (
+                DataFusionError::SchemaError(
+                    Box::new(SchemaError::AmbiguousReference {
+                        field: Box::new(datafusion::common::Column::from_name("a")),
+                    }),
+                    Box::new(None),
+                ),
+                "AMBIGUOUS_NAME",
+            ),
         ];
         for (error, name) in cases {
             assert_eq!(QueryError::from(&error).name(), name, "{error}");
         }
+    }
+
+    struct Only(&'static str, &'static str);
+
+    impl Namespace for Only {
+        fn has_catalog(&self, catalog: &str) -> bool {
+            catalog == self.0
+        }
+        fn has_schema(&self, catalog: &str, schema: &str) -> bool {
+            catalog == self.0 && schema == self.1
+        }
+    }
+
+    #[test]
+    fn missing_tables_name_the_missing_part() {
+        let names = Only("datafusion", "public");
+        let error = |name: &str| {
+            QueryError::from_engine(
+                &DataFusionError::Plan(format!("table '{name}' not found")),
+                "",
+                &names,
+            )
+        };
+        assert_eq!(error("nocat.s.t").name(), "CATALOG_NOT_FOUND");
+        assert_eq!(error("datafusion.nope.t").name(), "SCHEMA_NOT_FOUND");
+        let table = error("datafusion.public.t");
+        assert_eq!(table.name(), "TABLE_NOT_FOUND");
+        assert_eq!(table.message(), "Table 'datafusion.public.t' does not exist");
     }
 
     #[test]

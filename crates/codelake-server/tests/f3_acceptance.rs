@@ -1662,25 +1662,21 @@ async fn jdbc_431_driver_queries_ddl_and_errors() {
 // ---------------------------------------------------------------- defects
 
 #[tokio::test]
-#[ignore = "DEFECT-1: SELECT NULL sends \"\" instead of JSON null"]
 async fn defect_01_null_literal_is_json_null() {
     assert_codelake(&["d_null_literal"]).await;
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-2: REAL values carry float-to-double noise (1.100000023841858)"]
 async fn defect_02_real_values_encode_like_trino() {
     assert_codelake(&["d_real"]).await;
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-3: map and row (struct) results are sent as varchar text"]
 async fn defect_03_map_and_row_are_typed() {
     assert_codelake(&["d_map", "d_row"]).await;
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-4: timestamp with time zone values lose their zone (always shown as UTC)"]
 async fn defect_04_timestamp_with_time_zone_keeps_zone() {
     assert_codelake(&["d_timestamp_tz_keeps_zone"]).await;
 }
@@ -1692,7 +1688,6 @@ async fn defect_05_timestamp_literal_with_zone() {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-6: DDL answers a `result` column and a row; Trino sends neither"]
 async fn defect_06_ddl_has_no_result_rows() {
     assert_codelake(&[
         "d_ddl_create_schema",
@@ -1704,19 +1699,16 @@ async fn defect_06_ddl_has_no_result_rows() {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-7: CREATE TABLE AS has no updateCount / rows column"]
 async fn defect_07_ctas_reports_row_count() {
     assert_codelake(&["d_ctas_count"]).await;
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-8: DELETE/UPDATE have no updateType/updateCount (column named count)"]
 async fn defect_08_delete_update_report_row_count() {
     assert_codelake(&["d_delete_count", "d_update_count"]).await;
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-9: already-exists / drop-missing are GENERIC_INTERNAL_ERROR (INTERNAL_ERROR)"]
 async fn defect_09_ddl_user_errors_are_user_errors() {
     assert_codelake(&[
         "d_error_table_exists",
@@ -1727,7 +1719,6 @@ async fn defect_09_ddl_user_errors_are_user_errors() {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-10: FUNCTION/CATALOG/SCHEMA_NOT_FOUND, TYPE_MISMATCH, AMBIGUOUS_NAME map to other names"]
 async fn defect_10_error_names_match_trino() {
     assert_codelake(&[
         "d_error_function",
@@ -1740,31 +1731,26 @@ async fn defect_10_error_names_match_trino() {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-11: errorLocation missing at end of input and on semantic errors"]
 async fn defect_11_error_location_like_trino() {
     assert_codelake(&["d_error_location_eof", "d_error_location_semantic"]).await;
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-12: DESCRIBE system.runtime.queries uses DataFusion columns and Arrow types"]
 async fn defect_12_describe_runtime_queries_matches_trino() {
     assert_codelake(&["d_describe_runtime_queries"]).await;
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-13: SHOW SESSION LIKE fails; SHOW SESSION default not airlift text (100d vs 100.00d)"]
 async fn defect_13_show_session_like_and_defaults() {
     assert_codelake(&["d_show_session_like", "d_show_session_default_format"]).await;
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-14: unnamed columns get expression names, not _colN; some unaliased selects fail"]
 async fn defect_14_unnamed_columns_are_col_n() {
     assert_codelake(&["d_unnamed_column", "d_unaliased_expressions"]).await;
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-15: decimal type text is decimal(10,2); Trino sends decimal(10, 2)"]
 async fn defect_15_decimal_type_text() {
     assert_codelake(&["d_decimal_type_text"]).await;
 }
@@ -1776,7 +1762,6 @@ async fn defect_16_char_varchar_json_uuid_types() {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-17: client without PARAMETRIC_DATETIME still gets parametric datetime types"]
 async fn defect_17_legacy_datetime_without_capability() {
     assert_codelake(&["d_legacy_datetime"]).await;
 }
@@ -1816,7 +1801,6 @@ async fn defect_22_scalar_subquery_multiple_rows() {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-23: future token answers 410 (Trino 404); no user 400 (401); schema without catalog 200 (400)"]
 async fn defect_23_http_statuses_match_trino() {
     let server = Server::start(&Limits::default()).await;
     let report = token_report(&server.base(), CODELAKE_BIG).await;
@@ -1827,7 +1811,6 @@ async fn defect_23_http_statuses_match_trino() {
 /// Trino stops a canceled query; `CodeLake` reports `USER_CANCELED` but the
 /// query keeps a core busy (observed for minutes, until the process restarts).
 #[tokio::test]
-#[ignore = "DEFECT-24: canceled CPU-bound query keeps running (a core stays at 100%)"]
 async fn defect_24_cancel_stops_execution() {
     let server = Server::start(&Limits::default()).await;
     let base = server.base();
@@ -1890,7 +1873,6 @@ print("PARAMS OK")
 /// (falling back to `PREPARE` + `X-Trino-Prepared-Statement`); `SQLAlchemy`'s
 /// inspector binds its filters the same way. All pass against Trino 431.
 #[tokio::test]
-#[ignore = "DEFECT-25: bound parameters fail (EXECUTE IMMEDIATE / PREPARE unsupported): Python, SQLAlchemy"]
 async fn defect_25_python_and_sqlalchemy_bound_parameters() {
     let server = Server::start(&Limits::default()).await;
     let (code, out, err) = python(&server, "params", "'trino[sqlalchemy]>=0.328,<1'", PYTHON_PARAMS).await;

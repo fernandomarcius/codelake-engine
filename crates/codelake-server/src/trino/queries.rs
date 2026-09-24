@@ -6,7 +6,11 @@
 //! row is produced and the client has not fetched it yet, then `FINISHED` or
 //! `FAILED`. A client that stops polling for `client_timeout` abandons its
 //! query, which is then canceled (`ABANDONED_QUERY`). Completed queries stay
-//! listed for `history_retention`, at most `history_size` of them.
+//! listed for `history_retention`, at most `history_size` of them — enforced on
+//! every insertion, so the registry never holds more than `max_active +
+//! history_size` queries, each with at most `max_query_length` characters of
+//! SQL. A failed query drops its buffered results at once ([`Release`]); only
+//! its record stays in the history.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -60,7 +64,8 @@ impl State {
 pub(crate) struct Info {
     pub(crate) user: String,
     pub(crate) source: Option<String>,
-    pub(crate) query: String,
+    /// Shared, so snapshots do not copy the text.
+    pub(crate) query: Arc<str>,
     pub(crate) state: State,
     pub(crate) created: SystemTime,
     pub(crate) created_at: Instant,
@@ -93,8 +98,17 @@ impl<E> std::fmt::Debug for Query<E> {
     }
 }
 
-impl<E> Query<E> {
-    pub(crate) fn new(id: String, user: String, source: Option<String>, query: String, exec: E) -> Self {
+/// Paging state a failed query no longer needs (its buffered results).
+pub(crate) trait Release {
+    fn release(&mut self);
+}
+
+impl Release for () {
+    fn release(&mut self) {}
+}
+
+impl<E: Release> Query<E> {
+    pub(crate) fn new(id: String, user: String, source: Option<String>, query: &str, exec: E) -> Self {
         let now = SystemTime::now();
         let at = Instant::now();
         Self {
@@ -103,7 +117,7 @@ impl<E> Query<E> {
             info: Mutex::new(Info {
                 user,
                 source,
-                query,
+                query: Arc::from(query),
                 state: State::Queued,
                 created: now,
                 created_at: at,
@@ -132,6 +146,15 @@ impl<E> Query<E> {
 
     pub(crate) fn snapshot(&self) -> Info {
         self.info().clone()
+    }
+
+    pub(crate) fn is_done(&self) -> bool {
+        self.info().state.is_done()
+    }
+
+    /// When the query finished or failed.
+    fn ended_at(&self) -> Option<Instant> {
+        self.info().ended_at
     }
 
     pub(crate) fn heartbeat(&self) {
@@ -167,7 +190,9 @@ impl<E> Query<E> {
         self.info().rows += rows;
     }
 
-    /// Records the first failure; later ones are consequences of it.
+    /// Records the first failure (later ones are consequences of it), stops
+    /// the execution and drops the buffered results. When a page is being
+    /// built right now, that request releases them when it ends.
     pub(crate) fn fail(&self, error: QueryError) {
         {
             let mut info = self.info();
@@ -178,6 +203,9 @@ impl<E> Query<E> {
         }
         self.set_state(State::Failed);
         self.cancel.cancel();
+        if let Ok(mut exec) = self.exec.try_lock() {
+            exec.release();
+        }
     }
 
     pub(crate) fn finish(&self) {
@@ -199,6 +227,8 @@ pub(crate) struct Limits {
     pub(crate) client_timeout: Duration,
     pub(crate) history_retention: Duration,
     pub(crate) history_size: usize,
+    /// Longest SQL text accepted, in characters (Trino's `query.max-length`).
+    pub(crate) max_query_length: usize,
 }
 
 pub(crate) struct Registry<E> {
@@ -216,7 +246,7 @@ impl<E> std::fmt::Debug for Registry<E> {
     }
 }
 
-impl<E> Registry<E> {
+impl<E: Release> Registry<E> {
     pub(crate) fn new(limits: Limits) -> Self {
         let node: String = uuid::Uuid::new_v4()
             .simple()
@@ -256,9 +286,16 @@ impl<E> Registry<E> {
         )
     }
 
+    pub(crate) fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    /// Registers a query, forgetting completed ones beyond the history limits
+    /// first, so the registry stays bounded between sweeps.
     pub(crate) fn insert(&self, query: Arc<Query<E>>) -> Result<(), QueryError> {
         let mut map = self.map();
-        let active = map.values().filter(|q| !q.snapshot().state.is_done()).count();
+        Self::trim_history(&mut map, &self.limits);
+        let active = map.values().filter(|q| !q.is_done()).count();
         if active >= self.limits.max_active {
             return Err(QueryError::new(
                 Code::QueryQueueFull,
@@ -267,6 +304,21 @@ impl<E> Registry<E> {
         }
         map.insert(query.id.clone(), query);
         Ok(())
+    }
+
+    /// Keeps the newest `history_size` completed queries younger than
+    /// `history_retention`.
+    fn trim_history(map: &mut HashMap<String, Arc<Query<E>>>, limits: &Limits) {
+        let mut done: Vec<(String, Instant)> = map
+            .iter()
+            .filter_map(|(id, q)| q.ended_at().map(|at| (id.clone(), at)))
+            .collect();
+        done.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+        for (index, (id, at)) in done.into_iter().enumerate() {
+            if index >= limits.history_size || at.elapsed() > limits.history_retention {
+                map.remove(&id);
+            }
+        }
     }
 
     pub(crate) fn get(&self, id: &str) -> Option<Arc<Query<E>>> {
@@ -282,8 +334,11 @@ impl<E> Registry<E> {
     pub(crate) fn sweep(&self) {
         let queries: Vec<_> = self.map().values().cloned().collect();
         for query in &queries {
-            let info = query.snapshot();
-            if !info.state.is_done() && info.heartbeat_at.elapsed() > self.limits.client_timeout {
+            let (done, heartbeat) = {
+                let info = query.info();
+                (info.state.is_done(), info.heartbeat_at)
+            };
+            if !done && heartbeat.elapsed() > self.limits.client_timeout {
                 query.fail(QueryError::new(
                     Code::AbandonedQuery,
                     format!(
@@ -293,17 +348,7 @@ impl<E> Registry<E> {
                 ));
             }
         }
-        let mut map = self.map();
-        let mut done: Vec<(String, Instant)> = map
-            .iter()
-            .filter_map(|(id, q)| q.snapshot().ended_at.map(|at| (id.clone(), at)))
-            .collect();
-        done.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
-        for (index, (id, at)) in done.into_iter().enumerate() {
-            if index >= self.limits.history_size || at.elapsed() > self.limits.history_retention {
-                map.remove(&id);
-            }
-        }
+        Self::trim_history(&mut self.map(), &self.limits);
     }
 }
 
@@ -328,7 +373,7 @@ impl<E> std::fmt::Debug for QueriesTable<E> {
     }
 }
 
-impl<E> QueriesTable<E> {
+impl<E: Release> QueriesTable<E> {
     pub(crate) fn new(registry: Arc<Registry<E>>) -> Self {
         let timestamp = DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
         let schema = Arc::new(Schema::new(vec![
@@ -389,7 +434,7 @@ impl<E> QueriesTable<E> {
             text(&|i| Some(i.state.as_str().to_owned())),
             text(&|i| Some(i.user.clone())),
             text(&|i| i.source.clone()),
-            text(&|i| Some(i.query.clone())),
+            text(&|i| Some(i.query.to_string())),
             resource_groups,
             number(&|i| i.queued),
             number(&|i| i.analysis),
@@ -406,7 +451,7 @@ impl<E> QueriesTable<E> {
 }
 
 #[async_trait]
-impl<E: Send + 'static> TableProvider for QueriesTable<E> {
+impl<E: Release + Send + 'static> TableProvider for QueriesTable<E> {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -442,17 +487,12 @@ mod tests {
             client_timeout: Duration::from_millis(50),
             history_retention: Duration::from_secs(60),
             history_size: 2,
+            max_query_length: 1000,
         })
     }
 
     fn query(registry: &Registry<()>) -> Arc<Query<()>> {
-        Arc::new(Query::new(
-            registry.next_id(),
-            "u".into(),
-            None,
-            "SELECT 1".into(),
-            (),
-        ))
+        Arc::new(Query::new(registry.next_id(), "u".into(), None, "SELECT 1", ()))
     }
 
     #[test]
@@ -508,6 +548,37 @@ mod tests {
         assert!(cancel.is_cancelled());
         // history_size = 2: the abandoned one plus the newest finished one stay.
         assert_eq!(registry.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn history_is_bounded_on_insert() {
+        let registry = registry(10);
+        for _ in 0..20 {
+            let done = query(&registry);
+            done.finish();
+            registry.insert(done).unwrap();
+        }
+        // history_size = 2, plus the query just inserted; no sweep needed.
+        assert_eq!(registry.snapshot().len(), 3);
+    }
+
+    struct Buffer(bool);
+
+    impl Release for Buffer {
+        fn release(&mut self) {
+            self.0 = true;
+        }
+    }
+
+    #[test]
+    fn failing_releases_the_buffers() {
+        let q = Query::new("q".into(), "u".into(), None, "SELECT 1", Buffer(false));
+        q.fail(QueryError::new(Code::UserCanceled, "canceled"));
+        assert!(q.exec.try_lock().unwrap().0);
+        let finished = Query::new("f".into(), "u".into(), None, "SELECT 1", Buffer(false));
+        finished.finish();
+        finished.fail(QueryError::new(Code::UserCanceled, "late"));
+        assert!(!finished.exec.try_lock().unwrap().0);
     }
 
     #[tokio::test]
