@@ -250,7 +250,10 @@ def run(sql, session):
     return answer
 
 def run_once(sql, session):
-    headers = {"X-Trino-User": "f9", "Content-Type": "text/plain"}
+    # Without PARAMETRIC_DATETIME Trino rounds every timestamp to
+    # milliseconds on the wire: a timestamp(6) column must be seen as stored.
+    headers = {"X-Trino-User": "f9", "Content-Type": "text/plain",
+               "X-Trino-Client-Capabilities": "PARAMETRIC_DATETIME"}
     if session:
         headers["X-Trino-Session"] = ",".join(session)
     body = fetch(urllib.request.Request("http://localhost:8080/v1/statement", data=sql.encode(), headers=headers, method="POST"))
@@ -841,7 +844,6 @@ async fn every_type_extreme_and_null_survives_and_trino_reads_it() {
 /// = MICROSECONDS`, a Trino catalog setting) reads the same timestamps
 /// after `CodeLake` compacts its files.
 #[tokio::test]
-#[ignore = "DEFECT-3: OPTIMIZE rounds timestamps to milliseconds, a MICROSECONDS Trino catalog loses its microseconds"]
 async fn microsecond_timestamps_survive_compaction() {
     let local = tempfile::tempdir().unwrap();
     let spill = tempfile::tempdir().unwrap();
