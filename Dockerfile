@@ -10,10 +10,15 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends protobuf-compiler cmake clang lld \
  && rm -rf /var/lib/apt/lists/*
 COPY . .
+# Empty = the release profile as written. Machines too small to link with LTO
+# can pass --build-arg CARGO_PROFILE_RELEASE_LTO=off (never for a release).
+ARG CARGO_PROFILE_RELEASE_LTO
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --locked --release --bin codelake \
- && install -D target/release/codelake /out/codelake
+    { [ -n "$CARGO_PROFILE_RELEASE_LTO" ] || unset CARGO_PROFILE_RELEASE_LTO; } \
+ && cargo build --locked --release --bin codelake \
+ && install -D target/release/codelake /out/codelake \
+ && install -D "$(ldconfig -p | awk '/libz\.so\.1 / {print $NF; exit}')" /out/lib/libz.so.1
 
 # distroless/cc: glibc + libssl + CA certificates, no shell, no package manager.
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
@@ -21,6 +26,11 @@ LABEL org.opencontainers.image.source="https://github.com/fernandomarcius/CodeLa
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.description="CodeLake federated SQL engine"
 COPY --from=build --chown=65532:65532 /out/codelake /usr/local/bin/codelake
+# zlib is linked dynamically by the MySQL driver (flate2) and is not part of
+# distroless/cc. Same Debian release as the base, so the ABI matches.
+COPY --from=build /out/lib/libz.so.1 /usr/lib/libz.so.1
+# Fails the image build when any shared library is missing.
+RUN ["/usr/local/bin/codelake", "--version"]
 # 65532 = "nonroot" in distroless. Never run the engine as root.
 USER 65532:65532
 EXPOSE 5432 8080
