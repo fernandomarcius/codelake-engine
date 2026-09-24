@@ -43,6 +43,7 @@ use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStoreExt};
 
+use super::columns::HiveColumns;
 use super::metastore::{FileMetastore, TableMetadata};
 use super::optimize::MARKER;
 use super::trino_parquet::{ROW_GROUP_ROWS, TrinoParquetWriter};
@@ -219,11 +220,28 @@ impl HiveTable {
         Ok(files)
     }
 
-    /// A Parquet scan of `groups` in the table's schema: columns a file lacks
-    /// (added later) read as NULL, `INT96` timestamps as milliseconds.
+    /// A Parquet scan of `groups` in the table's schema: columns match by name
+    /// ignoring case, a column a file lacks (added later) reads as NULL, one
+    /// stored with a type the table's cannot hold is an error (`columns.rs`),
+    /// and `INT96` timestamps read at Trino's default precision, milliseconds.
     pub(crate) fn scan_files(
         &self,
         runtime: &RuntimeEnv,
+        groups: Vec<Vec<PartitionedFile>>,
+        projection: Option<&Vec<usize>>,
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.scan_files_as(runtime, Arc::clone(&self.schema), "ms", groups, projection, limit)
+    }
+
+    /// [`HiveTable::scan_files`] into `schema` (the table's columns, possibly
+    /// at another timestamp precision), reading `INT96` timestamps in `int96`
+    /// units (`"ms"`, `"us"`).
+    pub(crate) fn scan_files_as(
+        &self,
+        runtime: &RuntimeEnv,
+        schema: SchemaRef,
+        int96: &str,
         groups: Vec<Vec<PartitionedFile>>,
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
@@ -232,13 +250,16 @@ impl HiveTable {
             runtime.register_object_store(self.store_url.as_ref(), Arc::clone(self.metastore.store()));
         }
         let mut options = TableParquetOptions::default();
-        // Trino writes Hive timestamps as INT96; read them at its default precision.
-        options.global.coerce_int96 = Some("ms".into());
-        let source = ParquetSource::new(Arc::clone(&self.schema)).with_table_parquet_options(options);
+        options.global.coerce_int96 = Some(int96.into());
+        let source = ParquetSource::new(schema).with_table_parquet_options(options);
+        let columns = HiveColumns {
+            table: format!("{}.{}", self.schema_name, self.table),
+        };
         let config = FileScanConfigBuilder::new(self.store_url.clone(), Arc::new(source))
             .with_file_groups(groups.into_iter().map(FileGroup::new).collect())
             .with_projection_indices(projection.cloned())?
             .with_limit(limit)
+            .with_expr_adapter(Some(Arc::new(columns)))
             .build();
         Ok(DataSourceExec::from_data_source(config))
     }

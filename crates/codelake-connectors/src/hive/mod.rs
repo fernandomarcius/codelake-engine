@@ -3,6 +3,7 @@
 //! local directory or S3/MinIO.
 
 mod catalog;
+mod columns;
 mod crc;
 mod metastore;
 mod optimize;
