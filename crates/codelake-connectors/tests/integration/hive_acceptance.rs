@@ -608,7 +608,7 @@ async fn trino_writes_codelake_reads_every_type() {
     let engine = codelake(&shared.warehouse(), spill.path()).await;
     let types = cl(
         &engine,
-        "SELECT column_name, data_type FROM information_schema.columns \
+        "SELECT column_name, data_type FROM hive.information_schema.columns \
          WHERE table_catalog = 'hive' AND table_schema = 't2c' AND table_name = 'tipos' \
          ORDER BY ordinal_position",
     )
@@ -991,7 +991,7 @@ async fn views_survive_restart_and_cross_engines() {
     );
     let listed = cl(
         &engine,
-        "SELECT table_name, table_type FROM information_schema.tables \
+        "SELECT table_name, table_type FROM hive.information_schema.tables \
          WHERE table_catalog = 'hive' AND table_schema = 'vw' ORDER BY table_name",
     )
     .await;
@@ -1324,7 +1324,7 @@ async fn failures_leave_nothing_visible_and_are_errors() {
     );
     let tables = cl(
         &engine,
-        "SELECT table_name FROM information_schema.tables WHERE table_catalog = 'hive' AND table_schema = 'f'",
+        "SELECT table_name FROM hive.information_schema.tables WHERE table_catalog = 'hive' AND table_schema = 'f'",
     )
     .await;
     assert!(tables.is_empty(), "{tables:?}");

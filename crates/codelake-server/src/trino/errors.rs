@@ -8,6 +8,7 @@
 //! `CATALOG_NOT_FOUND` / `SCHEMA_NOT_FOUND` by asking a [`Namespace`] which part
 //! of the name is missing, as Trino reports it.
 
+use codelake_core::subquery::SubqueryMultipleRows;
 use datafusion::arrow::error::ArrowError;
 use datafusion::common::SchemaError;
 use datafusion::error::DataFusionError;
@@ -27,6 +28,7 @@ pub(crate) enum Code {
     InvalidSessionProperty,
     NumericValueOutOfRange,
     QueryTextTooLarge,
+    SubqueryMultipleRows,
     CatalogNotFound,
     SchemaNotFound,
     TableNotFound,
@@ -58,6 +60,7 @@ impl Code {
             Self::InvalidSessionProperty => (14, "INVALID_SESSION_PROPERTY", "USER_ERROR"),
             Self::NumericValueOutOfRange => (19, "NUMERIC_VALUE_OUT_OF_RANGE", "USER_ERROR"),
             Self::QueryTextTooLarge => (35, "QUERY_TEXT_TOO_LARGE", "USER_ERROR"),
+            Self::SubqueryMultipleRows => (28, "SUBQUERY_MULTIPLE_ROWS", "USER_ERROR"),
             Self::CatalogNotFound => (44, "CATALOG_NOT_FOUND", "USER_ERROR"),
             Self::SchemaNotFound => (45, "SCHEMA_NOT_FOUND", "USER_ERROR"),
             Self::TableNotFound => (46, "TABLE_NOT_FOUND", "USER_ERROR"),
@@ -361,6 +364,7 @@ fn code_of(error: &DataFusionError) -> Code {
         DataFusionError::Execution(message) => by_message(message).unwrap_or(Code::GenericInternalError),
         DataFusionError::NotImplemented(_) => Code::NotSupported,
         DataFusionError::ResourcesExhausted(_) => Code::ExceededLocalMemoryLimit,
+        DataFusionError::External(error) if error.is::<SubqueryMultipleRows>() => Code::SubqueryMultipleRows,
         DataFusionError::ArrowError(arrow, _) => match arrow.as_ref() {
             ArrowError::DivideByZero => Code::DivisionByZero,
             ArrowError::ArithmeticOverflow(_) => Code::NumericValueOutOfRange,

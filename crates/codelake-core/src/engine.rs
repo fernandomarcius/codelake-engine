@@ -22,6 +22,7 @@ use crate::config::{ExecutionConfig, MemoryConfig};
 use crate::connector::{Connector, ConnectorError, ViewDefinition, WritableCatalog};
 use crate::ddl::{self, Prepared};
 use crate::federation_guard::FederationFilterGuard;
+use crate::information_schema::CatalogList;
 use crate::runtime::{EngineRuntime, MemoryStats};
 use crate::session_properties::{PropertyRegistry, SessionProperties};
 
@@ -67,12 +68,17 @@ impl QueryOptions {
 /// so a filter over a cross-source join never reaches its source. Federating
 /// after *all* rules instead lets `optimize_projections` create derived tables
 /// that the unparser renders as invalid SQL for PostgreSQL and SQL Server.
+///
+/// Checked arithmetic (see [`crate::overflow`]) is turned back into operators
+/// right before federation, so a federated sub-plan renders as plain SQL, and
+/// checked again right after it for what runs in the engine.
 pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>> {
     let mut rules = datafusion::optimizer::Optimizer::new().rules;
     let position = rules
         .iter()
         .position(|r| r.name() == "scalar_subquery_to_join")
         .map_or(rules.len(), |p| p + 1);
+    rules.insert(position, Arc::new(crate::overflow::CheckAfterFederation));
     rules.insert(
         position,
         Arc::new(datafusion_federation::FederationOptimizerRule::new()),
@@ -81,6 +87,17 @@ pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + S
         position,
         Arc::new(datafusion::optimizer::push_down_filter::PushDownFilter::new()),
     );
+    rules.insert(position, Arc::new(crate::overflow::UncheckBeforeFederation));
+    rules
+}
+
+/// `DataFusion`'s analyzer rules followed by the engine's: checked arithmetic
+/// ([`crate::overflow`]) and the one-row rule of scalar subqueries
+/// ([`crate::subquery`]). Both need the types that type coercion settles.
+pub fn analyzer_rules() -> Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Send + Sync>> {
+    let mut rules = datafusion::optimizer::Analyzer::new().rules;
+    rules.push(Arc::new(crate::overflow::CheckedArithmetic));
+    rules.push(Arc::new(crate::subquery::EnforceScalarSubqueryRows));
     rules
 }
 
@@ -134,16 +151,19 @@ impl std::fmt::Debug for Engine {
 impl Engine {
     pub fn new(memory: &MemoryConfig, execution: &ExecutionConfig) -> Result<Self, EngineError> {
         let runtime = EngineRuntime::new(memory)?;
+        // `information_schema` is provided per catalog by `CatalogList`.
         let mut session = SessionConfig::new()
             .with_batch_size(execution.batch_size)
-            .with_information_schema(true);
+            .with_information_schema(false);
         if let Some(partitions) = execution.target_partitions {
             session = session.with_target_partitions(partitions);
         }
         let state = SessionStateBuilder::new()
             .with_config(session)
             .with_runtime_env(runtime.env())
+            .with_catalog_list(Arc::new(CatalogList::new()))
             .with_default_features()
+            .with_analyzer_rules(analyzer_rules())
             .with_optimizer_rules(optimizer_rules())
             .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
             .with_physical_optimizer_rules(physical_rules())
@@ -203,6 +223,8 @@ impl Engine {
         let dialect = state.config().options().sql_parser.dialect;
         let mut statement = state.sql_to_statement(sql, &dialect)?;
         let prepared = ddl::prepare(&mut statement)?;
+        // After `prepare`, which keeps a view's text as written.
+        crate::literals::rewrite_zoned_timestamps(&mut statement);
         if let Some(Prepared::AddColumn {
             table,
             column,
@@ -592,6 +614,89 @@ mod tests {
 
         assert!(engine.context().catalog("down").is_none());
         assert!(engine.context().catalog("opt").is_none());
+    }
+
+    /// Trino 431: `timestamp(3) with time zone`
+    /// `2026-01-01 10:00:00.123 America/Sao_Paulo`, the instant 13:00:00.123 UTC.
+    #[tokio::test]
+    async fn timestamp_literal_keeps_its_zone_and_precision() {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::{TimeUnit, TimestampMillisecondType, TimestampSecondType};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        let batches = engine
+            .sql("SELECT TIMESTAMP '2026-01-01 10:00:00.123 America/Sao_Paulo' p, TIMESTAMP '2026-01-01 10:00:00 +03:00' q, TIMESTAMP '2026-01-01 10:00:00.123' r")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let schema = batches[0].schema();
+        assert_eq!(
+            schema.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Millisecond, Some("America/Sao_Paulo".into()))
+        );
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_primitive::<TimestampMillisecondType>()
+                .value(0),
+            1_767_272_400_123
+        );
+        assert_eq!(
+            schema.field(1).data_type(),
+            &DataType::Timestamp(TimeUnit::Second, Some("+03:00".into()))
+        );
+        assert_eq!(
+            batches[0]
+                .column(1)
+                .as_primitive::<TimestampSecondType>()
+                .value(0),
+            1_767_250_800
+        );
+        // Without a zone: unchanged.
+        assert_eq!(
+            schema.field(2).data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+    }
+
+    /// `<catalog>.information_schema` lists that catalog only.
+    #[tokio::test]
+    async fn information_schema_is_per_catalog() {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Int64Type;
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        engine
+            .attach(source("erp", Behaviour::Healthy), true, FAST)
+            .await
+            .unwrap();
+        for (sql, expected) in [
+            (
+                "SELECT count(*) FROM datafusion.information_schema.schemata WHERE catalog_name <> 'datafusion'",
+                0,
+            ),
+            (
+                "SELECT count(*) FROM datafusion.information_schema.tables WHERE table_catalog <> 'datafusion'",
+                0,
+            ),
+            (
+                "SELECT count(*) FROM erp.information_schema.schemata WHERE catalog_name = 'erp'",
+                1,
+            ),
+            (
+                "SELECT count(*) FROM erp.information_schema.schemata WHERE catalog_name <> 'erp'",
+                0,
+            ),
+        ] {
+            let batches = engine.sql(sql).await.unwrap().collect().await.unwrap();
+            assert_eq!(
+                batches[0].column(0).as_primitive::<Int64Type>().value(0),
+                expected,
+                "{sql}"
+            );
+        }
     }
 
     #[tokio::test]

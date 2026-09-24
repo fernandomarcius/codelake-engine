@@ -161,7 +161,7 @@ async fn reads_trino_warehouse_and_writes_compatible_tables() {
     );
     let listed = run(
         &engine,
-        "SELECT table_name, table_type FROM information_schema.tables WHERE table_catalog = 'hive' AND table_schema = 'raw' ORDER BY table_name",
+        "SELECT table_name, table_type FROM hive.information_schema.tables WHERE table_catalog = 'hive' AND table_schema = 'raw' ORDER BY table_name",
     )
     .await;
     assert!(

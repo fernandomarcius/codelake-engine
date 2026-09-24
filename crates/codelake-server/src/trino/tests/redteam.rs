@@ -184,7 +184,6 @@ async fn rt6_user_errors_keep_trino_names_and_type() {
 /// A dbt model gets a wrong number instead of an error. (Engine semantics,
 /// observed through the Trino protocol.)
 #[tokio::test]
-#[ignore = "DEFECT-RT15: bigint overflow and multi-row scalar subqueries return wrong rows instead of failing"]
 async fn rt15_statements_trino_rejects_do_not_return_rows() {
     let h = harness();
     let mut wrong = Vec::new();
