@@ -49,6 +49,18 @@ crc32fast = "1.5"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 
+# Trino function library (versions already in the graph through DataFusion)
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
+chrono-tz = "0.10.4"
+regex = "1.13"
+num-traits = "0.2.19"
+twox-hash = { version = "2.1", default-features = false, features = ["xxhash64", "std"] }
+md5 = { package = "md-5", version = "0.10.6" }
+sha1 = "0.10.6"
+sha2 = "0.10.9"
+libm = "0.2.16"
+unicode-normalization = "0.1.25"
+
 # Runtime
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
 tokio-util = "0.7"

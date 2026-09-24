@@ -1280,18 +1280,32 @@ name = "codelake-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "chrono-tz",
+ "crc32fast",
  "criterion",
  "datafusion",
  "datafusion-federation",
  "futures",
+ "libm",
+ "md-5 0.10.6",
+ "num-traits",
  "proptest",
+ "regex",
  "secrecy",
  "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "toml",
  "tracing",
+ "twox-hash",
+ "unicode-normalization",
+ "uuid",
 ]
 
 [[package]]
