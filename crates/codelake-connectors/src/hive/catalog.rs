@@ -289,28 +289,13 @@ impl HiveCatalog {
         table: &str,
         metadata: &TableMetadata,
     ) -> Result<HiveTable> {
-        if metadata.storage_format.as_deref().is_some_and(|f| f != "PARQUET") {
-            return Err(DataFusionError::NotImplemented(format!(
-                "{schema}.{table}: only PARQUET hive tables are supported"
-            )));
-        }
-        if !metadata.partition_columns.is_empty() {
-            return Err(DataFusionError::NotImplemented(format!(
-                "{schema}.{table}: partitioned hive tables are not supported yet"
-            )));
-        }
-        let fields = metadata
-            .data_columns
-            .iter()
-            .map(|c| Ok(Field::new(&c.name, arrow_type(&c.hive_type)?, true)))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(HiveTable {
-            metastore: self.metastore.clone(),
-            store_url: self.store_url.clone(),
-            schema_name: schema.to_owned(),
-            table: table.to_owned(),
-            schema: Arc::new(Schema::new(fields)),
-        })
+        HiveTable::from_metadata(
+            self.metastore.clone(),
+            self.store_url.clone(),
+            schema,
+            table,
+            metadata,
+        )
     }
 
     /// Finishes or undoes `OPTIMIZE` runs interrupted by a crash, in every

@@ -187,9 +187,13 @@ pub(crate) async fn optimize(
     let _one_at_a_time = locks.optimize.lock().await;
     recover(table).await?;
 
-    let candidates: Vec<ObjectMeta> = table
-        .data_files()
-        .await?
+    // Files first, columns second: `ADD COLUMN` writes the metadata before
+    // any file with the new column exists, so every file listed here is
+    // readable with the columns read after it. Columns read before waiting
+    // for the lock above could miss one and drop its values.
+    let listed = table.data_files().await?;
+    let table = &table.reload().await?;
+    let candidates: Vec<ObjectMeta> = listed
         .into_iter()
         .filter(|meta| meta.size <= settings.threshold)
         .collect();

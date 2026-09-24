@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::config::TableParquetOptions;
@@ -43,9 +43,10 @@ use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStoreExt};
 
-use super::metastore::FileMetastore;
+use super::metastore::{FileMetastore, TableMetadata};
 use super::optimize::MARKER;
 use super::trino_parquet::{ROW_GROUP_ROWS, TrinoParquetWriter};
+use super::types::arrow_type;
 
 /// Casts `batch` to the declared column types of `schema`.
 pub(crate) fn conform(schema: &SchemaRef, batch: &RecordBatch) -> Result<RecordBatch> {
@@ -123,6 +124,62 @@ pub(crate) struct HiveTable {
 }
 
 impl HiveTable {
+    /// The table `schema.table` described by `metadata`.
+    pub(crate) fn from_metadata(
+        metastore: FileMetastore,
+        store_url: ObjectStoreUrl,
+        schema: &str,
+        table: &str,
+        metadata: &TableMetadata,
+    ) -> Result<Self> {
+        if metadata.storage_format.as_deref().is_some_and(|f| f != "PARQUET") {
+            return Err(DataFusionError::NotImplemented(format!(
+                "{schema}.{table}: only PARQUET hive tables are supported"
+            )));
+        }
+        if !metadata.partition_columns.is_empty() {
+            return Err(DataFusionError::NotImplemented(format!(
+                "{schema}.{table}: partitioned hive tables are not supported yet"
+            )));
+        }
+        let fields = metadata
+            .data_columns
+            .iter()
+            .map(|c| Ok(Field::new(&c.name, arrow_type(&c.hive_type)?, true)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            metastore,
+            store_url,
+            schema_name: schema.to_owned(),
+            table: table.to_owned(),
+            schema: Arc::new(Schema::new(fields)),
+        })
+    }
+
+    /// The same table as the metastore describes it now (its columns may
+    /// have changed since this handle was made).
+    pub(crate) async fn reload(&self) -> Result<Self> {
+        let metadata = self
+            .metastore
+            .table(&self.schema_name, &self.table)
+            .await
+            .map_err(external)?
+            .filter(|metadata| !metadata.is_view())
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "table {}.{} does not exist anymore",
+                    self.schema_name, self.table
+                ))
+            })?;
+        Self::from_metadata(
+            self.metastore.clone(),
+            self.store_url.clone(),
+            &self.schema_name,
+            &self.table,
+            &metadata,
+        )
+    }
+
     pub(crate) fn dir(&self) -> Path {
         self.metastore.table_dir(&self.schema_name, &self.table)
     }
@@ -197,10 +254,7 @@ impl HiveTable {
             .await
             .map_err(external)?;
         let pending = all.iter().any(|meta| meta.location == marker);
-        let mut files: Vec<ObjectMeta> = all
-            .into_iter()
-            .filter(|meta| is_data_file(&dir, meta))
-            .collect();
+        let mut files: Vec<ObjectMeta> = all.into_iter().filter(|meta| is_data_file(&dir, meta)).collect();
         files.sort_by(|a, b| a.location.cmp(&b.location));
         Ok((files, pending))
     }
