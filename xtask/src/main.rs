@@ -3,6 +3,7 @@
 //! ```text
 //! cargo xtask arch                         # architecture rules (dependency direction)
 //! cargo xtask bench-gate <criterion-dir> <base> <head>   # criterion regression gate
+//! cargo xtask bench-gate --e2e <base.json> <head.json>   # CodeLake-vs-Trino baseline gate
 //! ```
 
 use std::collections::BTreeMap;
@@ -36,10 +37,14 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("arch") => arch(),
+        Some("bench-gate") if args.len() == 4 && args[1] == "--e2e" => {
+            e2e_gate(Path::new(&args[2]), Path::new(&args[3]))
+        }
         Some("bench-gate") if args.len() == 4 => bench_gate(Path::new(&args[1]), &args[2], &args[3]),
-        _ => Err(
-            "usage: cargo xtask arch | cargo xtask bench-gate <criterion-dir> <base-name> <head-name>".into(),
-        ),
+        _ => Err("usage: cargo xtask arch\n       \
+                  cargo xtask bench-gate <criterion-dir> <base-name> <head-name>\n       \
+                  cargo xtask bench-gate --e2e <base-baseline.json> <head-baseline.json>"
+            .into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -204,6 +209,87 @@ fn bench_gate(dir: &Path, base_name: &str, head_name: &str) -> Result<(), String
     }
 }
 
+fn read_baseline(path: &Path) -> Result<serde_json::Value, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    serde_json::from_str(&raw).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// `CodeLake` p50 and eval status per case of a `bench/baselines/*.json` file.
+fn e2e_cases(baseline: &serde_json::Value) -> BTreeMap<String, (Option<f64>, String)> {
+    baseline["cases"]
+        .as_array()
+        .map(|cases| {
+            cases
+                .iter()
+                .filter_map(|case| {
+                    let id = case["id"].as_str()?.to_owned();
+                    let p50 = case["codelake"]["p50_us"].as_f64();
+                    let status = case["correctness"]["status"]
+                        .as_str()
+                        .unwrap_or("MISSING")
+                        .to_owned();
+                    Some((id, (p50, status)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// End-to-end gate over two baselines of `scripts/bench/run.sh`: `CodeLake`'s
+/// p50 per case against the same policy as criterion, and any case that
+/// matched Trino in `base` but not in `head` blocks (a wrong result is worse
+/// than a slow one). Baselines measured with different parameters (scale,
+/// limits, repetitions) are refused rather than compared.
+fn e2e_gate(base_path: &Path, head_path: &Path) -> Result<(), String> {
+    let base = read_baseline(base_path)?;
+    let head = read_baseline(head_path)?;
+    if base["comparable"] != head["comparable"] {
+        return Err(format!(
+            "baselines are not comparable: base {} vs head {}",
+            base["comparable"], head["comparable"]
+        ));
+    }
+    let base_cases = e2e_cases(&base);
+    let head_cases = e2e_cases(&head);
+    if head_cases.is_empty() {
+        return Err(format!("{}: no cases", head_path.display()));
+    }
+    let mut blocked = Vec::new();
+    for (id, (head_p50, head_status)) in &head_cases {
+        let Some((base_p50, base_status)) = base_cases.get(id) else {
+            println!("NEW      {id}: no baseline ({head_status})");
+            continue;
+        };
+        if base_status == "OK" && head_status != "OK" {
+            println!("BLOCK    {id}: result no longer matches Trino ({head_status})");
+            blocked.push(id.clone());
+            continue;
+        }
+        if head_status != "OK" {
+            println!("SKIP     {id}: {head_status} (not OK in base either, no timing compared)");
+            continue;
+        }
+        let (Some(base_p50), Some(head_p50)) = (base_p50, head_p50) else {
+            println!("SKIP     {id}: no CodeLake timing");
+            continue;
+        };
+        let pct = (head_p50 - base_p50) / base_p50 * 100.0;
+        let verdict = verdict(pct);
+        if verdict == "BLOCK" {
+            blocked.push(id.clone());
+        }
+        println!("{verdict:<8} {id}: {pct:+.1}% ({base_p50:.0}us -> {head_p50:.0}us)");
+    }
+    if blocked.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "end-to-end regression (>{BLOCK_PCT}% slower or result diverged) in: {}",
+            blocked.join(", ")
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +322,58 @@ mod tests {
         assert!(err.contains("g/a"), "{err}");
 
         assert!(bench_gate(&dir, "base", "missing").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn baseline(cases: &[(&str, f64, &str)], scale: &str) -> String {
+        let cases: Vec<serde_json::Value> = cases
+            .iter()
+            .map(|(id, p50, status)| {
+                serde_json::json!({
+                    "id": id,
+                    "codelake": { "p50_us": p50 },
+                    "correctness": { "status": status }
+                })
+            })
+            .collect();
+        serde_json::json!({ "comparable": { "scale": scale, "cpus": "4" }, "cases": cases }).to_string()
+    }
+
+    #[test]
+    fn e2e_gate_blocks_slowdowns_and_new_wrong_results() {
+        let dir = std::env::temp_dir().join(format!("xtask-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, head) = (dir.join("base.json"), dir.join("head.json"));
+        std::fs::write(
+            &base,
+            baseline(&[("q1", 100.0, "OK"), ("q2", 100.0, "FAIL")], "1"),
+        )
+        .unwrap();
+
+        std::fs::write(
+            &head,
+            baseline(
+                &[("q1", 120.0, "OK"), ("q2", 999.0, "FAIL"), ("q9", 1.0, "OK")],
+                "1",
+            ),
+        )
+        .unwrap();
+        assert!(
+            e2e_gate(&base, &head).is_ok(),
+            "20% is a warning, known FAIL is skipped"
+        );
+
+        std::fs::write(&head, baseline(&[("q1", 130.0, "OK")], "1")).unwrap();
+        assert!(e2e_gate(&base, &head).unwrap_err().contains("q1"));
+
+        std::fs::write(&head, baseline(&[("q1", 50.0, "FAIL")], "1")).unwrap();
+        assert!(
+            e2e_gate(&base, &head).unwrap_err().contains("q1"),
+            "faster but wrong blocks"
+        );
+
+        std::fs::write(&head, baseline(&[("q1", 100.0, "OK")], "10")).unwrap();
+        assert!(e2e_gate(&base, &head).unwrap_err().contains("not comparable"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
