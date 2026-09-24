@@ -210,9 +210,13 @@ impl Engine {
         let user = options.user.as_str();
         let state = ctx.state();
         let dialect = state.config().options().sql_parser.dialect;
-        if let Some(parser_dialect) = dialect_from_str(dialect)
-            && let Some(execute) = ddl::parse_table_execute(sql, parser_dialect.as_ref())?
-        {
+        // The parser's dialect is a `Box<dyn Dialect>` (not `Send`): it must be
+        // gone before any `.await`, or callers cannot spawn this future.
+        let execute = match dialect_from_str(dialect) {
+            Some(parser_dialect) => ddl::parse_table_execute(sql, parser_dialect.as_ref())?,
+            None => None,
+        };
+        if let Some(execute) = execute {
             return self.table_execute(ctx, options, execute).await;
         }
         let mut statement = state.sql_to_statement(sql, &dialect)?;
@@ -604,6 +608,38 @@ mod tests {
         let guard = names.iter().position(|n| n == "federation_filter_guard").unwrap();
         let pushdown = names.iter().position(|n| n.contains("FilterPushdown")).unwrap();
         assert!(guard < pushdown, "{names:?}");
+    }
+
+    /// Servers run each statement on its own task (`tokio::spawn`), so the
+    /// future of every kind of statement must be `Send`.
+    #[tokio::test]
+    async fn statements_run_on_spawned_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64)));
+        let mut answers = Vec::new();
+        for sql in [
+            "SELECT 1",
+            "ALTER TABLE nope.s.t EXECUTE optimize",
+            "ALTER TABLE nope.s.t ADD COLUMN c varchar",
+        ] {
+            let engine = Arc::clone(&engine);
+            let answer = tokio::spawn(async move {
+                let options = QueryOptions::for_user("u");
+                match engine.sql_with(&options, sql).await {
+                    Ok(frame) => frame.collect().await.map(|b| b.len()).map_err(|e| e.to_string()),
+                    Err(err) => Err(err.to_string()),
+                }
+            })
+            .await
+            .unwrap();
+            answers.push(answer);
+        }
+        assert_eq!(answers[0], Ok(1));
+        assert!(
+            answers[1].as_ref().unwrap_err().contains("Table 'nope.s.t' does not exist"),
+            "{answers:?}"
+        );
+        assert!(answers[2].is_err(), "{answers:?}");
     }
 
     #[tokio::test]
