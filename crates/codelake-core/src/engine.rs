@@ -1158,6 +1158,13 @@ impl Engine {
             )));
         }
         if let Some(writable) = self.writable(&catalog) {
+            // Names become paths in a writable catalog (see `statement_policy`).
+            let object = match kind {
+                RelationKind::Table => ObjectKind::Table,
+                RelationKind::View => ObjectKind::View,
+            };
+            check_object_name(ObjectKind::Schema, &target_schema)?;
+            check_object_name(object, &target_name)?;
             match kind {
                 RelationKind::Table => {
                     writable
@@ -2603,6 +2610,19 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("rename across catalogs"), "{error}");
+        // A target name that is not a directory name is refused (owner
+        // decision: '/' and '\' are never part of a name), nothing renamed.
+        for (sql, noun) in [
+            ("ALTER TABLE t RENAME TO \"a/b\"", "table"),
+            ("ALTER VIEW v RENAME TO \"a\\b\"", "view"),
+        ] {
+            let error = engine.sql_with(&options, sql).await.unwrap_err();
+            assert!(
+                error.to_string().contains(&format!("Invalid {noun} name")),
+                "{sql}: {error}"
+            );
+        }
+        assert_eq!(recorder.calls.lock().unwrap().len(), 5);
     }
 
     #[tokio::test]
