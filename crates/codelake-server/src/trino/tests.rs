@@ -16,6 +16,7 @@ use super::{Limits, TrinoState, router};
 
 struct Harness {
     state: Arc<TrinoState>,
+    engine: Arc<Engine>,
     router: Router,
     _dir: tempfile::TempDir,
 }
@@ -31,14 +32,19 @@ fn limits() -> Limits {
 }
 
 fn harness_with(limits: Limits) -> Harness {
+    harness_config(limits, ByteSize::mib(256), &ExecutionConfig::default())
+}
+
+/// A harness with its own memory limit and execution settings.
+fn harness_config(limits: Limits, memory_limit: ByteSize, execution: &ExecutionConfig) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let memory = MemoryConfig {
-        limit: ByteSize::mib(256),
+        limit: memory_limit,
         spill_dir: dir.path().to_owned(),
         spill_limit: ByteSize::mib(256),
         metadata_cache_limit: ByteSize::mib(1),
     };
-    let engine = Arc::new(Engine::new(&memory, &ExecutionConfig::default()).unwrap());
+    let engine = Arc::new(Engine::new(&memory, execution).unwrap());
     let state = TrinoState::new(Arc::clone(&engine), limits, "127.0.0.1:8081".parse().unwrap());
     engine
         .context()
@@ -46,6 +52,7 @@ fn harness_with(limits: Limits) -> Harness {
     Harness {
         router: router(Arc::clone(&state)),
         state,
+        engine,
         _dir: dir,
     }
 }
@@ -674,4 +681,5 @@ async fn submit_cost_does_not_grow_with_history_text() {
     );
 }
 
+mod ceiling;
 mod redteam;
