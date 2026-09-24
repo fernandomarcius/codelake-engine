@@ -56,6 +56,11 @@ pub trait Connector: Send + Sync + Debug {
     fn writable(&self) -> Option<Arc<dyn WritableCatalog>> {
         None
     }
+
+    /// Catalog session properties (`<catalog>.<name>`) this connector honors.
+    fn session_properties(&self) -> Vec<crate::session_properties::SessionProperty> {
+        Vec::new()
+    }
 }
 
 /// Statement-level writes a catalog accepts. The engine routes the matching

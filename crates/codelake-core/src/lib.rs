@@ -12,6 +12,7 @@ pub mod federation_guard;
 pub mod federation_policy;
 pub mod functions;
 pub mod runtime;
+pub mod session_properties;
 pub mod subquery;
 #[cfg(test)]
 mod testing;
@@ -19,5 +20,6 @@ mod testing;
 pub use bytes::ByteSize;
 pub use config::{Config, SourceConfig, SourceKind, ValidatedConfig};
 pub use connector::{BoxError, Connector, ConnectorError, WritableCatalog};
-pub use engine::{Attach, Engine, EngineError, SourceStatus};
+pub use engine::{Attach, Engine, EngineError, QueryOptions, SourceStatus};
 pub use runtime::MemoryStats;
+pub use session_properties::{Effect, PropertyRegistry, PropertyType, SessionProperties, SessionProperty};
