@@ -25,6 +25,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use serde::{Deserialize, Serialize};
 
 use super::metastore::{ColumnMetadata, FileMetastore, MetastoreError, TableMetadata};
+use super::statistics::MetastoreStatistics;
 use super::table::{HiveSink, HiveTable};
 use super::types::{arrow_type, hive_type};
 
@@ -303,6 +304,7 @@ impl HiveCatalog {
             schema_name: schema.to_owned(),
             table: table.to_owned(),
             schema: Arc::new(Schema::new(fields)),
+            statistics: Arc::new(MetastoreStatistics::from_metadata(metadata)),
         })
     }
 

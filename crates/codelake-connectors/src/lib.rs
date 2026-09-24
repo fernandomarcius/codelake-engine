@@ -11,6 +11,8 @@ use codelake_core::config::{Secrets, SourceConfig};
 use codelake_core::{Connector, ConnectorError, SourceKind};
 
 #[cfg(feature = "hive")]
+mod file_statistics;
+#[cfg(feature = "hive")]
 pub mod hive;
 #[cfg(feature = "iceberg")]
 pub mod iceberg;

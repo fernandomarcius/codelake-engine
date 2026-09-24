@@ -43,6 +43,7 @@ use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStoreExt};
 
 use super::metastore::FileMetastore;
+use super::statistics::{MetastoreStatistics, scan_statistics};
 use super::trino_parquet::{ROW_GROUP_ROWS, TrinoParquetWriter};
 
 static SEQUENCE: AtomicU32 = AtomicU32::new(0);
@@ -101,6 +102,8 @@ pub(crate) struct HiveTable {
     pub(crate) schema_name: String,
     pub(crate) table: String,
     pub(crate) schema: SchemaRef,
+    /// Statistics recorded in the metastore when the table was resolved.
+    pub(crate) statistics: Arc<MetastoreStatistics>,
 }
 
 impl HiveTable {
@@ -158,6 +161,7 @@ impl TableProvider for HiveTable {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         self.register_store(state);
         let files = self.data_files().await?;
+        let statistics = scan_statistics(self, state, &files).await;
         let partitions = state.config().target_partitions().max(1);
         let mut groups: Vec<Vec<PartitionedFile>> = vec![Vec::new(); partitions.min(files.len().max(1))];
         let group_count = groups.len();
@@ -172,6 +176,7 @@ impl TableProvider for HiveTable {
             .with_file_groups(groups.into_iter().map(FileGroup::new).collect())
             .with_projection_indices(projection.cloned())?
             .with_limit(limit)
+            .with_statistics(statistics)
             .build();
         Ok(DataSourceExec::from_data_source(config))
     }

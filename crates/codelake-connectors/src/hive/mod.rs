@@ -5,6 +5,7 @@
 mod catalog;
 mod crc;
 mod metastore;
+mod statistics;
 mod table;
 mod trino_parquet;
 mod types;
