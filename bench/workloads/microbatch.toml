@@ -1,0 +1,31 @@
+# Short, repeated queries: the latency floor a 2-minute micro-batch pipeline
+# pays on every cycle. `{i}` moves the key window on every repetition, so no
+# engine can answer from a result cache.
+workload = "microbatch"
+
+[[case]]
+id = "mb_orders_window_agg"
+reps = 30
+sql = """
+SELECT count(*) AS orders, sum(o_totalprice) AS total, min(o_orderdate) AS first, max(o_orderdate) AS last
+FROM {cat}.{tpch}.orders
+WHERE o_orderkey BETWEEN {i} * 40000 + 1 AND {i} * 40000 + 4000
+"""
+
+[[case]]
+id = "mb_lineitem_window_rows"
+reps = 30
+sql = """
+SELECT l_orderkey, l_linenumber, l_quantity, l_extendedprice, l_shipdate
+FROM {cat}.{tpch}.lineitem
+WHERE l_orderkey BETWEEN {i} * 40000 + 1 AND {i} * 40000 + 4000
+"""
+
+[[case]]
+id = "mb_point_lookup"
+reps = 30
+sql = """
+SELECT o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate
+FROM {cat}.{tpch}.orders
+WHERE o_orderkey = {i} * 40000 + 1
+"""

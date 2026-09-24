@@ -1,0 +1,74 @@
+# Write patterns of an ELT pipeline on a Hive/Parquet warehouse. Every engine
+# writes into its own scratch schema `{work}` of the shared warehouse. The eval
+# compares the `verify` query over what was written.
+workload = "pipeline"
+
+# Full rebuild of a large table (dbt `table` materialization).
+[[case]]
+id = "ctas_lineitem"
+writes = true
+reps = 3
+setup = ["CREATE SCHEMA IF NOT EXISTS {cat}.{work}"]
+before_each = ["DROP TABLE IF EXISTS {cat}.{work}.ctas_lineitem"]
+sql = "CREATE TABLE {cat}.{work}.ctas_lineitem WITH (format = 'PARQUET') AS SELECT * FROM {cat}.{tpch}.lineitem"
+verify = """
+SELECT count(*) AS n, sum(l_quantity) AS qty, sum(l_extendedprice) AS price, sum(l_discount) AS disc,
+       min(l_shipdate) AS first_ship, max(l_shipdate) AS last_ship,
+       count(DISTINCT l_orderkey) AS orders, min(l_comment) AS min_comment, max(l_comment) AS max_comment
+FROM {cat}.{work}.ctas_lineitem
+"""
+teardown = ["DROP TABLE IF EXISTS {cat}.{work}.ctas_lineitem"]
+
+# Aggregated rebuild (a mart): CTAS whose input is a join + group by.
+[[case]]
+id = "ctas_revenue_mart"
+writes = true
+reps = 3
+setup = ["CREATE SCHEMA IF NOT EXISTS {cat}.{work}"]
+before_each = ["DROP TABLE IF EXISTS {cat}.{work}.revenue_mart"]
+sql = """
+CREATE TABLE {cat}.{work}.revenue_mart WITH (format = 'PARQUET') AS
+SELECT o_orderdate, c_mktsegment, count(*) AS lines, sum(l_extendedprice * (1 - l_discount)) AS revenue
+FROM {cat}.{tpch}.lineitem
+JOIN {cat}.{tpch}.orders ON l_orderkey = o_orderkey
+JOIN {cat}.{tpch}.customer ON o_custkey = c_custkey
+GROUP BY o_orderdate, c_mktsegment
+"""
+verify = "SELECT o_orderdate, c_mktsegment, lines, revenue FROM {cat}.{work}.revenue_mart"
+teardown = ["DROP TABLE IF EXISTS {cat}.{work}.revenue_mart"]
+
+# Incremental append (dbt `incremental` with `append`): one new Parquet file
+# per INSERT, existing files untouched.
+[[case]]
+id = "insert_incremental"
+writes = true
+reps = 10
+setup = [
+  "CREATE SCHEMA IF NOT EXISTS {cat}.{work}",
+  "DROP TABLE IF EXISTS {cat}.{work}.orders_inc",
+  "CREATE TABLE {cat}.{work}.orders_inc WITH (format = 'PARQUET') AS SELECT * FROM {cat}.{tpch}.orders WHERE o_orderkey < 0",
+]
+sql = "INSERT INTO {cat}.{work}.orders_inc SELECT * FROM {cat}.{tpch}.orders WHERE o_orderkey % 20 = {i}"
+verify = """
+SELECT count(*) AS n, count(DISTINCT o_orderkey) AS keys, sum(o_totalprice) AS total,
+       min(o_orderdate) AS first, max(o_orderdate) AS last
+FROM {cat}.{work}.orders_inc
+"""
+teardown = ["DROP TABLE IF EXISTS {cat}.{work}.orders_inc"]
+
+# Micro-batch append: a small INSERT per cycle (~1000 rows).
+[[case]]
+id = "insert_microbatch"
+writes = true
+reps = 30
+setup = [
+  "CREATE SCHEMA IF NOT EXISTS {cat}.{work}",
+  "DROP TABLE IF EXISTS {cat}.{work}.orders_mb",
+  "CREATE TABLE {cat}.{work}.orders_mb WITH (format = 'PARQUET') AS SELECT * FROM {cat}.{tpch}.orders WHERE o_orderkey < 0",
+]
+sql = "INSERT INTO {cat}.{work}.orders_mb SELECT * FROM {cat}.{tpch}.orders WHERE o_orderkey BETWEEN {i} * 40000 + 1 AND {i} * 40000 + 4000"
+verify = """
+SELECT count(*) AS n, count(DISTINCT o_orderkey) AS keys, sum(o_totalprice) AS total
+FROM {cat}.{work}.orders_mb
+"""
+teardown = ["DROP TABLE IF EXISTS {cat}.{work}.orders_mb"]

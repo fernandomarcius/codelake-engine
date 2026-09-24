@@ -1,0 +1,2 @@
+# Raw per-run files (large: stored result rows). Baselines and reports are versioned.
+/out/
