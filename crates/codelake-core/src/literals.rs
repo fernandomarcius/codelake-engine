@@ -11,26 +11,36 @@
 //! local date-time is read in the literal's zone, so the instant is exact and
 //! the zone stays in the type. The unit is the smallest that holds `p` digits
 //! (0 → seconds, 1–3 → milliseconds, 4–6 → microseconds, 7–9 → nanoseconds).
-//! Literals without a zone, and anything this does not recognise, are left to
-//! `DataFusion`.
+//! A literal without a zone is a `timestamp(p)`, `p` its fractional digits
+//! (`DataFusion`: always nanoseconds), and becomes `arrow_cast('<date-time>',
+//! 'Timestamp(<unit>, None)')`. A precision no Arrow unit has (1, 2, 4, 5, 7,
+//! 8) is recorded with `codelake_trino_type` (see [`crate::declared`]).
+//! Anything this does not recognise is left to `DataFusion`.
+//!
+//! Numbers: the engine reads `1.5` as `decimal(2,1)`, like Trino
+//! (`sql_parser.parse_float_as_decimal`), but a number with an exponent
+//! (`1e5`, `2.5E-3`) is a `double` in Trino; [`rewrite_exponent_numbers`]
+//! turns it into `CAST('<number>' AS DOUBLE)` before planning.
 
 use std::ops::ControlFlow;
 
 use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
-    DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
-    ObjectName, TimezoneInfo, TypedString, Value, visit_expressions_mut,
+    CastKind, DataType, ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
+    FunctionArguments, Ident, ObjectName, Statement as SqlStatement, TimezoneInfo, TypedString, Value,
+    ValueWithSpan, visit_expressions_mut,
 };
 
 /// A timestamp literal split into its parts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ZonedTimestamp {
-    /// `YYYY-MM-DDTHH:MM:SS[.f…]`, without zone.
+    /// `YYYY-MM-DD HH:MM:SS[.f…]`, without zone.
     local: String,
     /// Fractional digits (0–9).
     precision: usize,
-    /// Arrow time zone: an IANA name, `UTC` or `+HH:MM`.
-    zone: String,
+    /// Arrow time zone: an IANA name, `UTC` or `+HH:MM`; `None` for a
+    /// `timestamp(p)` literal.
+    zone: Option<String>,
 }
 
 fn is_date(text: &str) -> bool {
@@ -101,7 +111,7 @@ fn parse_zone(text: &str) -> Option<String> {
     (valid && text.chars().next().is_some_and(|c| c.is_ascii_alphabetic())).then(|| text.to_owned())
 }
 
-/// `YYYY-MM-DD[ HH:MM[:SS[.f…]]] <zone>`; `None` without a zone.
+/// `YYYY-MM-DD[ HH:MM[:SS[.f…]]][ <zone>]`.
 fn parse(literal: &str) -> Option<ZonedTimestamp> {
     let literal = literal.trim();
     let date = literal.get(..10).filter(|d| is_date(d))?;
@@ -114,17 +124,19 @@ fn parse(literal: &str) -> Option<ZonedTimestamp> {
     } else {
         (None, rest)
     };
-    if zone.is_empty() {
-        return None;
-    }
     let (clock, precision) = match time {
         Some(time) => parse_time(time)?,
         None => ("00:00:00".to_owned(), 0),
     };
+    let zone = if zone.is_empty() {
+        None
+    } else {
+        Some(parse_zone(zone)?)
+    };
     Some(ZonedTimestamp {
-        local: format!("{date}T{clock}"),
+        local: format!("{date} {clock}"),
         precision,
-        zone: parse_zone(zone)?,
+        zone,
     })
 }
 
@@ -136,7 +148,10 @@ impl ZonedTimestamp {
             4..=6 => "Microsecond",
             _ => "Nanosecond",
         };
-        format!("Timestamp({unit}, Some(\"{}\"))", self.zone)
+        match &self.zone {
+            Some(zone) => format!("Timestamp({unit}, Some(\"{zone}\"))"),
+            None => format!("Timestamp({unit}, None)"),
+        }
     }
 
     fn to_expr(&self) -> Expr {
@@ -145,25 +160,42 @@ impl ZonedTimestamp {
                 text,
             ))))
         };
-        Expr::Function(Function {
-            name: ObjectName::from(vec![Ident::new("arrow_cast")]),
-            uses_odbc_syntax: false,
-            parameters: FunctionArguments::None,
-            args: FunctionArguments::List(FunctionArgumentList {
-                duplicate_treatment: None,
-                args: vec![arg(self.local.clone()), arg(self.arrow_type())],
-                clauses: vec![],
-            }),
-            filter: None,
-            null_treatment: None,
-            over: None,
-            within_group: vec![],
-        })
+        let call = |name: &str, args: Vec<FunctionArg>| {
+            Expr::Function(Function {
+                name: ObjectName::from(vec![Ident::new(name)]),
+                uses_odbc_syntax: false,
+                parameters: FunctionArguments::None,
+                args: FunctionArguments::List(FunctionArgumentList {
+                    duplicate_treatment: None,
+                    args,
+                    clauses: vec![],
+                }),
+                filter: None,
+                null_treatment: None,
+                over: None,
+                within_group: vec![],
+            })
+        };
+        let value = call(
+            "arrow_cast",
+            vec![arg(self.local.clone()), arg(self.arrow_type())],
+        );
+        if [0, 3, 6, 9].contains(&self.precision) {
+            return value;
+        }
+        // No Arrow unit has these digits: the type is recorded aside.
+        call(
+            crate::declared::TRINO_TYPED,
+            vec![
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(value)),
+                arg(format!("timestamp({})", self.precision)),
+            ],
+        )
     }
 }
 
-/// Rewrites every `TIMESTAMP '… <zone>'` literal of `statement` (see the
-/// module documentation).
+/// Rewrites every `TIMESTAMP '…'` literal of `statement` (see the module
+/// documentation).
 pub(crate) fn rewrite_zoned_timestamps(statement: &mut DFStatement) {
     let DFStatement::Statement(inner) = statement else {
         return;
@@ -183,16 +215,227 @@ pub(crate) fn rewrite_zoned_timestamps(statement: &mut DFStatement) {
     });
 }
 
+/// `TIMESTAMP` without precision is `timestamp(3)` in Trino.
+fn trino_precision(precision: Option<u64>) -> Option<u64> {
+    Some(precision.unwrap_or(3)).filter(|p| [0, 3, 6, 9].contains(p))
+}
+
+fn unit_name(precision: u64) -> &'static str {
+    match precision {
+        0 => "Second",
+        3 => "Millisecond",
+        6 => "Microsecond",
+        _ => "Nanosecond",
+    }
+}
+
+/// The zone a text literal names, as Trino prints it.
+fn literal_zone(expr: &Expr) -> Option<String> {
+    let Expr::Value(ValueWithSpan {
+        value: Value::SingleQuotedString(text),
+        ..
+    }) = expr
+    else {
+        return None;
+    };
+    crate::timestamps::zone_of_text(text)
+}
+
+/// `<function>(expr, '<Arrow type>')`: `arrow_cast` or its `TRY_CAST`
+/// counterpart.
+fn named_cast(function: &str, expr: Expr, arrow_type: String) -> Expr {
+    let arg = |e: Expr| FunctionArg::Unnamed(FunctionArgExpr::Expr(e));
+    Expr::Function(Function {
+        name: ObjectName::from(vec![Ident::new(function)]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![arg(expr), arg(Expr::value(Value::SingleQuotedString(arrow_type)))],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    })
+}
+
+fn with_time_zone(tz: TimezoneInfo) -> bool {
+    matches!(tz, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz)
+}
+
+/// Trino's timestamp types (see the module documentation of
+/// [`crate::timestamps`]): `TIMESTAMP` is `timestamp(3)` in casts and column
+/// definitions, and `CAST(x AS TIMESTAMP(p) WITH TIME ZONE)` keeps a zone —
+/// the one a text literal names, or `session_zone` — instead of none.
+pub(crate) fn rewrite_timestamp_types(statement: &mut DFStatement, session_zone: &str) {
+    let DFStatement::Statement(inner) = statement else {
+        return;
+    };
+    if let SqlStatement::CreateTable(create) = inner.as_mut() {
+        for column in &mut create.columns {
+            if let DataType::Timestamp(precision @ None, tz) = &column.data_type {
+                column.data_type = DataType::Timestamp(trino_precision(*precision), *tz);
+            }
+        }
+    }
+    let _ = visit_expressions_mut(inner.as_mut(), |expr| {
+        let Expr::Cast {
+            kind,
+            expr: source,
+            data_type: DataType::Timestamp(precision, tz),
+            ..
+        } = expr
+        else {
+            return ControlFlow::<()>::Continue(());
+        };
+        let Some(p) = trino_precision(*precision) else {
+            return ControlFlow::Continue(());
+        };
+        if with_time_zone(*tz) {
+            let zone = literal_zone(source).unwrap_or_else(|| session_zone.to_owned());
+            let arrow_type = format!("Timestamp({}, Some(\"{zone}\"))", unit_name(p));
+            let function = if matches!(kind, CastKind::TryCast | CastKind::SafeCast) {
+                crate::timestamp_casts::TRY_ARROW_CAST
+            } else {
+                "arrow_cast"
+            };
+            *expr = named_cast(function, source.as_ref().clone(), arrow_type);
+        } else {
+            *precision = Some(p);
+        }
+        ControlFlow::Continue(())
+    });
+}
+
+/// Whether a numeric literal has an exponent (`1e5`): a `double` in Trino.
+fn has_exponent(number: &str) -> bool {
+    number.contains(['e', 'E'])
+}
+
+/// Rewrites every number with an exponent of `statement` as a `double` (see
+/// the module documentation).
+pub(crate) fn rewrite_exponent_numbers(statement: &mut DFStatement) {
+    let DFStatement::Statement(inner) = statement else {
+        return;
+    };
+    let _ = visit_expressions_mut(inner.as_mut(), |expr| {
+        if let Expr::Value(ValueWithSpan {
+            value: Value::Number(number, _),
+            ..
+        }) = expr
+            && has_exponent(number)
+        {
+            *expr = Expr::Cast {
+                kind: CastKind::Cast,
+                expr: Box::new(Expr::value(Value::SingleQuotedString(number.clone()))),
+                data_type: DataType::Double(ExactNumberInfo::None),
+                array: false,
+                format: None,
+            };
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rewritten(sql: &str) -> String {
+        use datafusion::sql::parser::DFParser;
+        let mut statement = DFParser::parse_sql(sql).unwrap().pop_front().unwrap();
+        rewrite_timestamp_types(&mut statement, "UTC");
+        statement.to_string()
+    }
+
+    #[test]
+    fn timestamps_take_trino_precision_and_zone() {
+        assert_eq!(
+            rewritten("SELECT CAST(x AS TIMESTAMP), CAST(x AS TIMESTAMP(6)), x::timestamp FROM t"),
+            "SELECT CAST(x AS TIMESTAMP(3)), CAST(x AS TIMESTAMP(6)), x::TIMESTAMP(3) FROM t"
+        );
+        assert_eq!(
+            rewritten("SELECT CAST('2026-01-01 10:00:00 America/Sao_Paulo' AS TIMESTAMP(3) WITH TIME ZONE)"),
+            "SELECT arrow_cast('2026-01-01 10:00:00 America/Sao_Paulo', \
+             'Timestamp(Millisecond, Some(\"America/Sao_Paulo\"))')"
+        );
+        assert_eq!(
+            rewritten(
+                "SELECT CAST(x AS TIMESTAMP WITH TIME ZONE), CAST('2026-01-01' AS TIMESTAMP(0) WITH TIME ZONE)"
+            ),
+            "SELECT arrow_cast(x, 'Timestamp(Millisecond, Some(\"UTC\"))'), \
+             arrow_cast('2026-01-01', 'Timestamp(Second, Some(\"UTC\"))')"
+        );
+        assert_eq!(
+            rewritten("SELECT CAST('2026-01-01 10:00 +03' AS TIMESTAMP(6) WITH TIME ZONE)"),
+            "SELECT arrow_cast('2026-01-01 10:00 +03', 'Timestamp(Microsecond, Some(\"+03:00\"))')"
+        );
+        // Precisions Arrow cannot hold are left to the planner, which refuses them.
+        assert_eq!(
+            rewritten("SELECT CAST(x AS TIMESTAMP(1))"),
+            "SELECT CAST(x AS TIMESTAMP(1))"
+        );
+        assert_eq!(
+            rewritten("CREATE TABLE t (a TIMESTAMP, b TIMESTAMP(6), c INT)"),
+            "CREATE TABLE t (a TIMESTAMP(3), b TIMESTAMP(6), c INT)"
+        );
+    }
+
+    #[test]
+    fn only_numbers_with_an_exponent_become_double() {
+        use datafusion::sql::parser::DFParser;
+        let mut statements =
+            DFParser::parse_sql("SELECT 1e5, 2.5E-3, -1e0, 1.5, 10, x FROM t WHERE y > 1e3").unwrap();
+        let mut statement = statements.pop_front().unwrap();
+        rewrite_exponent_numbers(&mut statement);
+        assert_eq!(
+            statement.to_string(),
+            "SELECT CAST('1e5' AS DOUBLE), CAST('2.5E-3' AS DOUBLE), -CAST('1e0' AS DOUBLE), 1.5, 10, x \
+             FROM t WHERE y > CAST('1e3' AS DOUBLE)"
+        );
+    }
 
     fn zoned(local: &str, precision: usize, zone: &str) -> ZonedTimestamp {
         ZonedTimestamp {
             local: local.into(),
             precision,
-            zone: zone.into(),
+            zone: Some(zone.into()),
         }
+    }
+
+    /// Trino 431: `TIMESTAMP '2026-01-01 10:00:00.123'` is `timestamp(3)`,
+    /// `TIMESTAMP '2026-01-01'` is `timestamp(0)` at midnight.
+    #[test]
+    fn a_literal_without_zone_takes_its_digits() {
+        let local = |text: &str, precision| ZonedTimestamp {
+            local: text.into(),
+            precision,
+            zone: None,
+        };
+        assert_eq!(
+            parse("2026-01-01 10:00:00.123"),
+            Some(local("2026-01-01 10:00:00.123", 3))
+        );
+        assert_eq!(parse("2026-01-01"), Some(local("2026-01-01 00:00:00", 0)));
+        assert_eq!(
+            parse("1969-12-31 23:59:59.5"),
+            Some(local("1969-12-31 23:59:59.5", 1))
+        );
+        assert_eq!(local("x", 3).arrow_type(), "Timestamp(Millisecond, None)");
+        let mut statement = datafusion::sql::parser::DFParser::parse_sql(
+            "SELECT TIMESTAMP '2026-01-01 10:00:00.123', TIMESTAMP '1969-12-31 23:59:59.5'",
+        )
+        .unwrap()
+        .pop_front()
+        .unwrap();
+        rewrite_zoned_timestamps(&mut statement);
+        assert_eq!(
+            statement.to_string(),
+            "SELECT arrow_cast('2026-01-01 10:00:00.123', 'Timestamp(Millisecond, None)'), \
+             codelake_trino_type(arrow_cast('1969-12-31 23:59:59.5', 'Timestamp(Millisecond, None)'), 'timestamp(1)')"
+        );
     }
 
     #[test]
@@ -200,47 +443,47 @@ mod tests {
         let cases = [
             (
                 "2026-01-01 10:00:00.123 America/Sao_Paulo",
-                zoned("2026-01-01T10:00:00.123", 3, "America/Sao_Paulo"),
+                zoned("2026-01-01 10:00:00.123", 3, "America/Sao_Paulo"),
             ),
             (
                 "2026-01-01 10:00:00 +03:00",
-                zoned("2026-01-01T10:00:00", 0, "+03:00"),
+                zoned("2026-01-01 10:00:00", 0, "+03:00"),
             ),
             (
                 "2026-01-01 10:00:00.1 -03:00",
-                zoned("2026-01-01T10:00:00.1", 1, "-03:00"),
+                zoned("2026-01-01 10:00:00.1", 1, "-03:00"),
             ),
             (
                 "2026-01-01 10:00:00.123456 UTC",
-                zoned("2026-01-01T10:00:00.123456", 6, "UTC"),
+                zoned("2026-01-01 10:00:00.123456", 6, "UTC"),
             ),
             (
                 "2026-01-01 10:00:00.123456789 Z",
-                zoned("2026-01-01T10:00:00.123456789", 9, "UTC"),
+                zoned("2026-01-01 10:00:00.123456789", 9, "UTC"),
             ),
             (
                 "2026-01-01 10:00:00.123 GMT",
-                zoned("2026-01-01T10:00:00.123", 3, "UTC"),
+                zoned("2026-01-01 10:00:00.123", 3, "UTC"),
             ),
             (
                 "2026-01-01 10:00:00.123 +03",
-                zoned("2026-01-01T10:00:00.123", 3, "+03:00"),
+                zoned("2026-01-01 10:00:00.123", 3, "+03:00"),
             ),
             (
                 "2026-01-01 10:00:00.123+03:00",
-                zoned("2026-01-01T10:00:00.123", 3, "+03:00"),
+                zoned("2026-01-01 10:00:00.123", 3, "+03:00"),
             ),
             (
                 "2026-01-01 America/Sao_Paulo",
-                zoned("2026-01-01T00:00:00", 0, "America/Sao_Paulo"),
+                zoned("2026-01-01 00:00:00", 0, "America/Sao_Paulo"),
             ),
             (
                 "2026-01-01 10:00 America/Sao_Paulo",
-                zoned("2026-01-01T10:00:00", 0, "America/Sao_Paulo"),
+                zoned("2026-01-01 10:00:00", 0, "America/Sao_Paulo"),
             ),
             (
                 "  2026-01-01 10:00:00 Europe/Lisbon ",
-                zoned("2026-01-01T10:00:00", 0, "Europe/Lisbon"),
+                zoned("2026-01-01 10:00:00", 0, "Europe/Lisbon"),
             ),
         ];
         for (literal, expected) in cases {
@@ -251,9 +494,6 @@ mod tests {
     #[test]
     fn leaves_other_literals_to_datafusion() {
         for literal in [
-            "2026-01-01 10:00:00.123",
-            "2026-01-01",
-            "2026-01-01 10:00:00",
             "2026-1-1 10:00:00 UTC",
             "2026-01-01 10:00:00.1234567890 UTC",
             "2026-01-01 10:00:00 +25:00",
@@ -273,7 +513,7 @@ mod tests {
                 ZonedTimestamp {
                     local: String::new(),
                     precision,
-                    zone: "UTC".into(),
+                    zone: Some("UTC".into()),
                 }
                 .arrow_type()
             })

@@ -14,7 +14,7 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -88,6 +88,8 @@ pub(crate) struct Query<E> {
     info: Mutex<Info>,
     pub(crate) exec: tokio::sync::Mutex<E>,
     cancel: CancellationToken,
+    /// Requests paging this query right now (holding or awaiting `exec`).
+    fetchers: AtomicUsize,
 }
 
 impl<E> std::fmt::Debug for Query<E> {
@@ -134,6 +136,7 @@ impl<E: Release> Query<E> {
             }),
             exec: tokio::sync::Mutex::new(exec),
             cancel: CancellationToken::new(),
+            fetchers: AtomicUsize::new(0),
         }
     }
 
@@ -191,8 +194,9 @@ impl<E: Release> Query<E> {
     }
 
     /// Records the first failure (later ones are consequences of it), stops
-    /// the execution and drops the buffered results. When a page is being
-    /// built right now, that request releases them when it ends.
+    /// the execution and drops the buffered results. When pages are being
+    /// requested right now, the last of those requests releases them as it
+    /// ends ([`Query::leave_fetch`]), so they all answer the same page.
     pub(crate) fn fail(&self, error: QueryError) {
         {
             let mut info = self.info();
@@ -203,7 +207,28 @@ impl<E: Release> Query<E> {
         }
         self.set_state(State::Failed);
         self.cancel.cancel();
-        if let Ok(mut exec) = self.exec.try_lock() {
+        self.release_if_idle();
+    }
+
+    /// A page request starts.
+    pub(crate) fn enter_fetch(&self) {
+        self.fetchers.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A page request ended (its `exec` guard dropped): the client was there
+    /// until now, so the heartbeat moves to the end of the request. The last
+    /// request out of a failed query releases what the failure could not.
+    pub(crate) fn leave_fetch(&self) {
+        self.heartbeat();
+        if self.fetchers.fetch_sub(1, Ordering::SeqCst) == 1 && self.error().is_some() {
+            self.release_if_idle();
+        }
+    }
+
+    fn release_if_idle(&self) {
+        if self.fetchers.load(Ordering::SeqCst) == 0
+            && let Ok(mut exec) = self.exec.try_lock()
+        {
             exec.release();
         }
     }
@@ -331,6 +356,12 @@ impl<E: Release> Registry<E> {
     }
 
     /// Cancels abandoned queries and forgets old completed ones.
+    ///
+    /// A query is abandoned when no page request came for `client_timeout`.
+    /// A request still being answered is the client waiting, not gone: a page
+    /// can take longer than the timeout when the node is busy (a spilling
+    /// aggregation kept every worker for seconds, and its client was told it
+    /// had abandoned the query while it waited for the answer).
     pub(crate) fn sweep(&self) {
         let queries: Vec<_> = self.map().values().cloned().collect();
         for query in &queries {
@@ -338,7 +369,8 @@ impl<E: Release> Registry<E> {
                 let info = query.info();
                 (info.state.is_done(), info.heartbeat_at)
             };
-            if !done && heartbeat.elapsed() > self.limits.client_timeout {
+            let fetching = query.fetchers.load(Ordering::SeqCst) > 0;
+            if !done && !fetching && heartbeat.elapsed() > self.limits.client_timeout {
                 query.fail(QueryError::new(
                     Code::AbandonedQuery,
                     format!(
@@ -548,6 +580,28 @@ mod tests {
         assert!(cancel.is_cancelled());
         // history_size = 2: the abandoned one plus the newest finished one stay.
         assert_eq!(registry.snapshot().len(), 2);
+    }
+
+    /// A client waiting for a page is not gone, however long the page takes;
+    /// the timeout counts from the end of its last request.
+    #[test]
+    fn a_page_request_in_progress_keeps_the_query_alive() {
+        let registry = registry(10);
+        let waiting = query(&registry);
+        registry.insert(Arc::clone(&waiting)).unwrap();
+        waiting.enter_fetch();
+        std::thread::sleep(Duration::from_millis(60));
+        registry.sweep();
+        assert!(
+            waiting.error().is_none(),
+            "abandoned while its page was being built"
+        );
+        waiting.leave_fetch();
+        registry.sweep();
+        assert!(waiting.error().is_none(), "the request just ended");
+        std::thread::sleep(Duration::from_millis(60));
+        registry.sweep();
+        assert_eq!(waiting.error().unwrap().name(), "ABANDONED_QUERY");
     }
 
     #[test]

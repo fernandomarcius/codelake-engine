@@ -2,11 +2,20 @@
 //!
 //! Each query runs in its own task that plans it and pushes record batches into
 //! a small bounded channel, so execution moves ahead of the client by at most a
-//! few batches, like Trino's output buffer; the buffered batches are reserved
-//! in the engine's memory pool. `GET nextUri` drains the channel into a page of
-//! about 1 MiB of JSON. Pages are numbered by the token in the URI; asking again
-//! for the current token returns the same page (a client retry after a lost
-//! response), an older token is gone (`410`) and a later one unknown (`404`).
+//! few batches, like Trino's output buffer. `GET nextUri` drains the channel
+//! into a page of about 1 MiB of JSON. Pages are numbered by the token in the
+//! URI; asking again for the current token returns the same page (a client
+//! retry after a lost response), an older token is gone (`410`) and a later one
+//! unknown (`404`).
+//!
+//! Memory: every buffer between the engine and the client is reserved in the
+//! engine's pool — the batches in the channel and the one being paged, the
+//! rows of the page being built and the body kept for a retry. A reservation
+//! the pool refuses fails the query with `EXCEEDED_LOCAL_MEMORY_LIMIT` (a page
+//! that already has rows is sent short instead). A failed, canceled or
+//! abandoned query drops all of it at once — once the requests paging it at
+//! that moment have their (same) page — and so does a query whose final page
+//! has been sent: that page is not kept for a retry (`410` instead).
 //!
 //! Every operator of the physical plan is made cooperative, so a canceled,
 //! abandoned or timed-out query stops within one budget of batches even when
@@ -23,6 +32,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
+use codelake_core::output::ReservedOutputExec;
 use codelake_core::session_properties::parse_duration;
 use codelake_core::{Engine, PropertyType, QueryOptions};
 use datafusion::arrow::array::{Array, AsArray, RecordBatch, StringArray};
@@ -31,7 +41,7 @@ use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaPr
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
@@ -85,7 +95,11 @@ impl Shape {
 fn shape(sql: &str) -> Shape {
     use datafusion::sql::parser::{DFParser, Statement as DfStatement};
     use datafusion::sql::sqlparser::ast::{AlterTableOperation, ObjectType, Statement};
-    let Ok(mut statements) = DFParser::parse_sql(sql) else {
+    if let Some(update_type) = codelake_core::ddl_update_type(sql) {
+        return Shape::Ack(update_type);
+    }
+    let typed = codelake_core::trino_type_syntax(sql);
+    let Ok(mut statements) = DFParser::parse_sql(&codelake_core::engine::trino_text(&typed)) else {
         // The engine reports the parse error.
         return Shape::Rows;
     };
@@ -119,10 +133,14 @@ fn shape(sql: &str) -> Shape {
     }
 }
 
-/// The table of `DESCRIBE <table>` (Trino's columns `Column, Type, Extra, Comment`).
-fn describe_target(sql: &str) -> Option<String> {
+/// The table of `DESCRIBE <table>` or `SHOW COLUMNS FROM <table> [LIKE
+/// 'pattern']` (Trino answers both with `Column, Type, Extra, Comment`), and
+/// the pattern.
+fn describe_target(sql: &str) -> Option<(String, Option<Like>)> {
     use datafusion::sql::parser::{DFParser, Statement as DfStatement};
-    use datafusion::sql::sqlparser::ast::{DescribeAlias, Statement};
+    use datafusion::sql::sqlparser::ast::{
+        DescribeAlias, ShowStatementFilter, ShowStatementFilterPosition, ShowStatementIn, Statement,
+    };
     let mut statements = DFParser::parse_sql(sql).ok()?;
     match statements.pop_front()? {
         DfStatement::Statement(statement) => match *statement {
@@ -131,7 +149,32 @@ fn describe_target(sql: &str) -> Option<String> {
                 hive_format: None,
                 table_name,
                 ..
-            } => Some(table_name.to_string()),
+            } => Some((table_name.to_string(), None)),
+            Statement::ShowColumns {
+                extended: false,
+                full: false,
+                show_options,
+            } => {
+                let Some(ShowStatementIn {
+                    parent_name: Some(table),
+                    ..
+                }) = show_options.show_in
+                else {
+                    return None;
+                };
+                let like = match show_options.filter_position {
+                    None => None,
+                    Some(
+                        ShowStatementFilterPosition::Infix(ShowStatementFilter::Like(pattern))
+                        | ShowStatementFilterPosition::Suffix(ShowStatementFilter::Like(pattern)),
+                    ) => Some(Like {
+                        pattern,
+                        escape: None,
+                    }),
+                    Some(_) => return None,
+                };
+                Some((table.to_string(), like))
+            }
             _ => None,
         },
         _ => None,
@@ -257,7 +300,7 @@ enum Work {
         planned: Option<String>,
     },
     Frame(Box<DataFrame>),
-    Describe(String),
+    Describe(String, Option<Like>),
 }
 
 /// Paging state of one query, behind the query's async mutex.
@@ -266,42 +309,58 @@ pub(crate) struct Exec {
     shape: Shape,
     encoding: Encoding,
     columns: Option<Arc<Vec<Column>>>,
+    /// The Trino type each result column declares beyond its Arrow type.
+    declared: Vec<Option<codelake_core::trino_types::Declared>>,
     count: Option<u64>,
     pending: Option<(Buffered, usize)>,
     finished: bool,
     next_token: u64,
     last: Option<(u64, Bytes)>,
+    /// The rows of the page being built, then the body in `last`.
+    memory: MemoryReservation,
     warnings: Vec<Value>,
 }
 
 impl Release for Exec {
-    /// Drops every buffered batch (and its reservation) and stops the
-    /// producer, whose next send fails.
+    /// Drops every buffered batch and the last page (and their reservations)
+    /// and stops the producer, whose next send fails.
     fn release(&mut self) {
         self.events.close();
         while self.events.try_recv().is_ok() {}
         self.pending = None;
         self.finished = true;
+        self.last = None;
+        self.memory.free();
     }
 }
 
 impl Exec {
-    fn new(events: mpsc::Receiver<Event>, encoding: Encoding, warnings: Vec<Value>) -> Self {
+    fn new(
+        events: mpsc::Receiver<Event>,
+        encoding: Encoding,
+        warnings: Vec<Value>,
+        pool: &Arc<dyn MemoryPool>,
+        id: &str,
+    ) -> Self {
         Self {
             events,
             shape: Shape::Rows,
             encoding,
             columns: None,
+            declared: Vec::new(),
             count: None,
             pending: None,
             finished: false,
             next_token: 1,
             last: None,
+            memory: MemoryConsumer::new(format!("Trino page {id}")).register(pool),
             warnings,
         }
     }
 
-    /// Encodes pending rows until the page is full.
+    /// Encodes pending rows until the page is full, reserving each row. A row
+    /// the pool cannot hold ends the page early, or fails the query when the
+    /// page has no row yet.
     fn take_rows(
         &mut self,
         query: &TrinoQuery,
@@ -313,12 +372,21 @@ impl Exec {
         };
         let start = offset;
         let batch = &buffered.batch;
+        let mut refused = None;
         while offset < batch.num_rows() && *bytes < PAGE_TARGET_BYTES {
             let row = batch
                 .columns()
                 .iter()
-                .map(|column| types::value(column, offset, self.encoding))
+                .enumerate()
+                .map(|(i, column)| {
+                    let declared = self.declared.get(i).copied().flatten();
+                    types::declared_value(column, offset, self.encoding, declared)
+                })
                 .collect::<Result<Vec<_>, _>>()?;
+            if let Err(error) = self.memory.try_grow(row_memory(&row)) {
+                refused = Some(error);
+                break;
+            }
             *bytes += row.iter().map(approximate_size).sum::<usize>();
             rows.push(row);
             offset += 1;
@@ -327,7 +395,15 @@ impl Exec {
         if offset < batch.num_rows() {
             self.pending = Some((buffered, offset));
         }
-        Ok(())
+        match refused {
+            Some(error) if rows.is_empty() => Err(QueryError::from(&error)),
+            // Sent short: the next page starts at the refused row.
+            Some(_) => {
+                *bytes = PAGE_TARGET_BYTES;
+                Ok(())
+            }
+            None => Ok(()),
+        }
     }
 
     fn absorb(&mut self, event: Event) -> Result<(), QueryError> {
@@ -335,6 +411,11 @@ impl Exec {
             Event::Started(schema) => {
                 if self.shape == Shape::Rows {
                     self.columns = Some(Arc::new(types::columns(&schema, self.encoding)?));
+                    self.declared = schema
+                        .fields()
+                        .iter()
+                        .map(|f| codelake_core::trino_types::declared(f))
+                        .collect();
                 }
             }
             Event::Batch(buffered) => match self.shape {
@@ -436,6 +517,14 @@ impl Exec {
                 .unwrap_or_else(|| QueryError::new(Code::GenericInternalError, "Query failed")),
         )
     }
+}
+
+/// Memory of one decoded row: its JSON text plus the `Value`s holding it.
+fn row_memory(row: &[Value]) -> usize {
+    row.iter()
+        .map(|value| approximate_size(value) + std::mem::size_of::<Value>())
+        .sum::<usize>()
+        + std::mem::size_of::<Vec<Value>>()
 }
 
 fn approximate_size(value: &Value) -> usize {
@@ -600,7 +689,7 @@ impl TrinoState {
         })
     }
 
-    /// Catalog `system` with `runtime.queries`.
+    /// Catalog `system` with `runtime.queries`, `metadata.*` and `jdbc.*`.
     pub(crate) fn system_catalog(&self) -> datafusion::error::Result<Arc<dyn CatalogProvider>> {
         let runtime = MemorySchemaProvider::new();
         runtime.register_table(
@@ -609,11 +698,16 @@ impl TrinoState {
         )?;
         let catalog = MemoryCatalogProvider::new();
         catalog.register_schema("runtime", Arc::new(runtime))?;
+        super::system_tables::register(&catalog, self.engine.connectors())?;
         Ok(Arc::new(catalog))
     }
 
     pub(crate) fn sweep(&self) {
         self.queries.sweep();
+    }
+
+    fn pool(&self) -> Arc<dyn MemoryPool> {
+        Arc::clone(&self.engine.context().runtime_env().memory_pool)
     }
 
     /// New submissions are refused; running queries keep paging.
@@ -714,13 +808,9 @@ fn refuse(
     error: QueryError,
 ) -> Response {
     let (_, receiver) = mpsc::channel(1);
-    let query = Arc::new(Query::new(
-        state.queries.next_id(),
-        user,
-        source,
-        sql,
-        Exec::new(receiver, Encoding::MODERN, Vec::new()),
-    ));
+    let id = state.queries.next_id();
+    let exec = Exec::new(receiver, Encoding::MODERN, Vec::new(), &state.pool(), &id);
+    let query = Arc::new(Query::new(id, user, source, sql, exec));
     // A full registry reports its own error instead.
     let error = state.queries.insert(Arc::clone(&query)).err().unwrap_or(error);
     query.fail(error.clone());
@@ -797,13 +887,9 @@ async fn submit(State(state): State<Arc<TrinoState>>, request: Request) -> Respo
         .unwrap_or_default();
     let encoding = session.as_ref().map_or(Encoding::MODERN, |s| s.encoding);
     let (sender, receiver) = mpsc::channel(BUFFERED_BATCHES);
-    let query = Arc::new(Query::new(
-        state.queries.next_id(),
-        user,
-        source,
-        sql,
-        Exec::new(receiver, encoding, warnings),
-    ));
+    let id = state.queries.next_id();
+    let exec = Exec::new(receiver, encoding, warnings, &state.pool(), &id);
+    let query = Arc::new(Query::new(id, user, source, sql, exec));
     if let Err(error) = state.queries.insert(Arc::clone(&query)) {
         query.fail(error.clone());
         return json_response(
@@ -918,8 +1004,8 @@ fn start(
         Work::Frame(Box::new(
             show_session(&state.engine, &session, like).map_err(|e| QueryError::from(&e))?,
         ))
-    } else if let Some(table) = describe_target(sql) {
-        Work::Describe(table)
+    } else if let Some((table, like)) = describe_target(sql) {
+        Work::Describe(table, like)
     } else {
         Work::Sql {
             planned: rewrite::name_unnamed_columns(sql),
@@ -930,7 +1016,9 @@ fn start(
     let options = QueryOptions {
         catalog: session.catalog,
         schema: session.schema,
+        time_zone: session.time_zone,
         properties: session.properties,
+        functions: vec![super::system_tables::version_function(PROTOCOL_VERSION)],
         ..QueryOptions::for_user(&session.user)
     };
     tokio::spawn(execute(
@@ -1014,28 +1102,39 @@ fn show_session(
     engine.context().read_batch(batch)
 }
 
-/// `DESCRIBE <table>` as Trino answers it: `Column, Type, Extra, Comment`, with
-/// Trino type names.
-async fn describe(engine: &Engine, options: &QueryOptions, table: &str) -> Result<DataFrame, QueryError> {
+/// `DESCRIBE <table>` and `SHOW COLUMNS` as Trino answers them: `Column,
+/// Type, Extra, Comment`, with Trino type names and empty `Extra` and
+/// `Comment`.
+async fn describe(
+    engine: &Engine,
+    options: &QueryOptions,
+    table: &str,
+    like: Option<&Like>,
+) -> Result<DataFrame, QueryError> {
     let names = EngineNames(engine);
     let target = engine
         .sql_with(options, &format!("SELECT * FROM {table}"))
         .await
         .map_err(|e| QueryError::from_engine(e.find_root(), "", &names))?;
-    let fields = target.schema().fields();
+    let schema = codelake_core::engine::analyzed_schema(&engine.context().state(), target.logical_plan())
+        .map_err(|e| QueryError::from_engine(e.find_root(), "", &names))?;
+    let fields = schema.fields();
     let mut column_names = Vec::with_capacity(fields.len());
     let mut type_names = Vec::with_capacity(fields.len());
-    for field in fields {
+    for field in fields
+        .iter()
+        .filter(|f| like.is_none_or(|like| like.matches(f.name())))
+    {
         column_names.push(field.name().clone());
-        type_names.push(types::trino_type(field.data_type(), Encoding::MODERN)?.0);
+        type_names.push(codelake_core::trino_types::field_display_name(field));
     }
     let schema = Arc::new(Schema::new(vec![
         Field::new("Column", DataType::Utf8, false),
         Field::new("Type", DataType::Utf8, false),
-        Field::new("Extra", DataType::Utf8, true),
-        Field::new("Comment", DataType::Utf8, true),
+        Field::new("Extra", DataType::Utf8, false),
+        Field::new("Comment", DataType::Utf8, false),
     ]));
-    let empty = vec![None::<String>; column_names.len()];
+    let empty = vec![String::new(); column_names.len()];
     let batch = RecordBatch::try_new(
         schema,
         vec![
@@ -1056,7 +1155,7 @@ async fn plan(engine: &Engine, options: &QueryOptions, work: Work) -> Result<Dat
     let names = EngineNames(engine);
     match work {
         Work::Frame(frame) => Ok(*frame),
-        Work::Describe(table) => describe(engine, options, &table).await,
+        Work::Describe(table, like) => describe(engine, options, &table, like.as_ref()).await,
         Work::Sql { sql, planned } => {
             let Some(planned) = planned else {
                 return engine
@@ -1105,7 +1204,11 @@ async fn run(
     let analysis = analysis.elapsed();
     let planning = Instant::now();
     let task = Arc::new(frame.task_ctx());
-    let physical = frame.create_physical_plan().await.map_err(error)?;
+    let mut physical = frame.create_physical_plan().await.map_err(error)?;
+    // This protocol reserves the batches it holds itself (`Buffered`).
+    if let Some(reserved) = physical.as_any().downcast_ref::<ReservedOutputExec>() {
+        physical = Arc::clone(reserved.input());
+    }
     let mut stream = execute_stream(cooperative(physical).map_err(error)?, task).map_err(error)?;
     query.record_timing(analysis, planning.elapsed());
     query.set_state(QueryState::Running);
@@ -1192,6 +1295,30 @@ async fn fetch(
     };
     query.heartbeat();
     let base = state.base_uri(&headers);
+    fetch_page(&query, &base, token).await
+}
+
+/// Counts a page request while it lives, also when the client goes away
+/// mid-request (the handler's future is dropped).
+struct Fetching<'a>(&'a TrinoQuery);
+
+impl<'a> Fetching<'a> {
+    fn new(query: &'a TrinoQuery) -> Self {
+        query.enter_fetch();
+        Self(query)
+    }
+}
+
+impl Drop for Fetching<'_> {
+    fn drop(&mut self) {
+        self.0.leave_fetch();
+    }
+}
+
+async fn fetch_page(query: &TrinoQuery, base: &str, token: u64) -> Response {
+    // Declared before the `exec` guard, so dropped after it: the last request
+    // out of a canceled query can then release what the cancel left.
+    let _fetching = Fetching::new(query);
     let mut exec = query.exec.lock().await;
     if let Some((last, body)) = &exec.last
         && *last == token
@@ -1204,16 +1331,34 @@ async fn fetch(
     if token < exec.next_token {
         return (StatusCode::GONE, "Invalid token").into_response();
     }
-    let page = exec.page(&query).await;
-    if query.error().is_some() {
-        // Failed while this page was built: nothing buffered is needed anymore.
+    let page = exec.page(query).await;
+    let failed = query.error().is_some();
+    if failed {
+        // Failed while this page was built: no buffered batch is needed anymore.
         exec.release();
     }
     let next = (!page.done).then_some(token + 1);
-    let body = TrinoState::body(&query, &base, &page, next, &exec.warnings);
-    exec.last = Some((token, body.clone()));
+    let body = TrinoState::body(query, base, &page, next, &exec.warnings);
+    drop(page);
+    if page_is_final(next, failed) {
+        // The query finished: nothing is kept for it, not even this page.
+        exec.last = None;
+        exec.memory.free();
+    } else {
+        // Kept for a retry of this token; a failed query drops it once no
+        // request for it is left (`Query::leave_fetch`).
+        exec.last = Some((token, body.clone()));
+        // The body replaces the rows it was encoded from (reserved above
+        // them) and the previous body.
+        exec.memory.resize(body.len());
+    }
     exec.next_token = token + 1;
     json_response(body, &[])
+}
+
+/// The last page of a query that finished (not failed).
+fn page_is_final(next: Option<u64>, failed: bool) -> bool {
+    next.is_none() && !failed
 }
 
 async fn cancel_statement(
@@ -1280,7 +1425,12 @@ mod tests {
         assert_eq!(shape("DROP TABLE t"), Shape::Ack("DROP TABLE"));
         assert_eq!(shape("DROP VIEW IF EXISTS v"), Shape::Ack("DROP VIEW"));
         assert_eq!(shape("ALTER TABLE t ADD COLUMN c INT"), Shape::Ack("ADD COLUMN"));
-        assert_eq!(shape("ALTER TABLE t RENAME TO t2"), Shape::Ack("RENAME TABLE"));
+        assert_eq!(shape("ALTER TABLE t RENAME TO u"), Shape::Ack("RENAME TABLE"));
+        assert_eq!(shape("ALTER VIEW v RENAME TO w"), Shape::Ack("RENAME VIEW"));
+        assert_eq!(
+            shape("CREATE OR REPLACE VIEW v SECURITY DEFINER AS SELECT 1"),
+            Shape::Ack("CREATE VIEW")
+        );
         assert_eq!(shape("SELECT 1 +"), Shape::Rows);
     }
 
@@ -1301,9 +1451,18 @@ mod tests {
         assert!(!like.matches("queryXmax_run_time"));
         assert!(show_session_filter("SHOW SESSION LIKE").is_err());
         assert_eq!(
-            describe_target("DESCRIBE system.runtime.queries").as_deref(),
-            Some("system.runtime.queries")
+            describe_target("DESCRIBE system.runtime.queries"),
+            Some(("system.runtime.queries".to_owned(), None))
         );
+        assert_eq!(
+            describe_target("SHOW COLUMNS FROM hive.s.t"),
+            Some(("hive.s.t".to_owned(), None))
+        );
+        let Some((table, Some(like))) = describe_target("SHOW COLUMNS FROM hive.s.t LIKE 'd%'") else {
+            panic!("SHOW COLUMNS … LIKE");
+        };
+        assert_eq!(table, "hive.s.t");
+        assert!(like.matches("dc") && !like.matches("id"));
         assert_eq!(describe_target("DESCRIBE SELECT 1"), None);
         assert_eq!(describe_target("SELECT 1"), None);
     }

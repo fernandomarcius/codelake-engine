@@ -38,6 +38,7 @@ thiserror.workspace = true
 futures.workspace = true
 uuid.workspace = true
 base64.workspace = true
+tikv-jemallocator.workspace = true
 
 [dev-dependencies]
 tokio-postgres = "0.7"

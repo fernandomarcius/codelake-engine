@@ -5,6 +5,8 @@
 //! `bigint addition overflow` / `Decimal overflow`. [`CheckedSum`] keeps the
 //! name, signature and result type of `DataFusion`'s `sum` (so plans, column
 //! names and pushed-down SQL do not change) and replaces only the arithmetic.
+//! [`CheckedSum::trino`] also takes Trino's result type for decimals,
+//! `decimal(38,s)`.
 
 use std::any::Any;
 use std::fmt::Display;
@@ -27,13 +29,29 @@ use datafusion::logical_expr::{
 
 use super::arith::{check_decimal, overflow, sql_type_name};
 
+/// Context of a decimal `sum` that overflows: Trino 431 reports it as
+/// `GENERIC_INTERNAL_ERROR` (`Decimal overflow`), not as the
+/// `NUMERIC_VALUE_OUT_OF_RANGE` of decimal arithmetic. The overflow itself
+/// stays the root of the error (see [`super::is_trino_internal_error`]).
+pub(crate) const TRINO_INTERNAL_ERROR: &str = "Trino GENERIC_INTERNAL_ERROR";
+
+/// A decimal `sum` that does not fit its type.
+fn decimal_sum_overflow(error: datafusion::error::DataFusionError) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::Context(TRINO_INTERNAL_ERROR.to_owned(), Box::new(error))
+}
+
+/// [`check_decimal`] of a `sum`'s result.
+fn check_sum(array: &ArrayRef) -> Result<()> {
+    check_decimal(array).map_err(decimal_sum_overflow)
+}
+
 fn addition_overflow(
     data_type: &DataType,
     a: impl Display,
     b: impl Display,
 ) -> datafusion::error::DataFusionError {
     if super::arith::is_decimal(data_type) {
-        overflow("Decimal overflow")
+        decimal_sum_overflow(overflow("Decimal overflow"))
     } else {
         overflow(format!(
             "{} addition overflow: {a} + {b}",
@@ -48,7 +66,7 @@ fn subtraction_overflow(
     b: impl Display,
 ) -> datafusion::error::DataFusionError {
     if super::arith::is_decimal(data_type) {
-        overflow("Decimal overflow")
+        decimal_sum_overflow(overflow("Decimal overflow"))
     } else {
         overflow(format!(
             "{} subtraction overflow: {a} - {b}",
@@ -80,7 +98,7 @@ fn checked_result<T: ArrowPrimitiveType>(
     data_type: &DataType,
 ) -> Result<ScalarValue> {
     let array: ArrayRef = Arc::new(PrimitiveArray::<T>::from_iter([value]).with_data_type(data_type.clone()));
-    check_decimal(&array)?;
+    check_sum(&array)?;
     ScalarValue::try_from_array(&array, 0)
 }
 
@@ -318,7 +336,7 @@ where
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
         let array = self.emit(emit_to);
-        check_decimal(&array)?;
+        check_sum(&array)?;
         Ok(array)
     }
 
@@ -363,6 +381,18 @@ pub(super) fn is_checked_sum_type(data_type: &DataType) -> bool {
 #[derive(Debug, PartialEq, Eq, Hash, Default)]
 pub(crate) struct CheckedSum {
     inner: Sum,
+    /// Trino's result type for `decimal(p,s)`: `decimal(38,s)`.
+    trino_decimal: bool,
+}
+
+impl CheckedSum {
+    /// `sum` typed like Trino: `decimal(p,s)` sums to `decimal(38,s)`.
+    pub(crate) fn trino() -> Self {
+        Self {
+            inner: Sum::new(),
+            trino_decimal: true,
+        }
+    }
 }
 
 impl AggregateUDFImpl for CheckedSum {
@@ -379,7 +409,12 @@ impl AggregateUDFImpl for CheckedSum {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        self.inner.return_type(arg_types)
+        match arg_types.first() {
+            Some(DataType::Decimal128(_, s)) if self.trino_decimal && *s >= 0 => {
+                Ok(DataType::Decimal128(super::decimal::MAX_PRECISION, *s))
+            }
+            _ => self.inner.return_type(arg_types),
+        }
     }
 
     fn accumulator(&self, args: AccumulatorArgs<'_>) -> Result<Box<dyn Accumulator>> {

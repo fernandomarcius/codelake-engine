@@ -8,6 +8,7 @@ mod queries;
 mod rewrite;
 mod session;
 mod statement;
+mod system_tables;
 mod types;
 
 pub(crate) use queries::Limits;

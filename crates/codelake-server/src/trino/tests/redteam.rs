@@ -9,20 +9,10 @@ use std::time::{Duration, Instant};
 use axum::http::{Method, StatusCode};
 use serde_json::{Value, json};
 
-use super::{Limits, Outcome, harness, harness_with, limits, path_of};
+use codelake_core::ByteSize;
 
-fn rss_bytes() -> u64 {
-    // Linux only (the dev container); resident pages * 4 KiB.
-    let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
-    statm
-        .split_whitespace()
-        .nth(1)
-        .and_then(|p| p.parse::<u64>().ok())
-        .unwrap_or(0)
-        * 4096
-}
-
-const MIB: u64 = 1 << 20;
+use super::ceiling::{Probe, partitions, released, settle};
+use super::{Limits, Outcome, harness, harness_config, harness_with, limits, path_of};
 
 // ---------------------------------------------------------------- session ---
 
@@ -116,7 +106,7 @@ async fn rt3_query_text_limit_matches_trino() {
 async fn rt4_real_values_encode_like_trino() {
     let h = harness();
     let out = h
-        .run("SELECT CAST(0.1 AS REAL) AS a, CAST(1.0 / 3 AS REAL) AS b", &[])
+        .run("SELECT CAST(0.1 AS REAL) AS a, CAST(1.0E0 / 3 AS REAL) AS b", &[])
         .await;
     assert_eq!(out.columns[0].1, "real");
     assert_eq!(out.rows[0][0].to_string(), "0.1", "{:?}", out.rows);
@@ -319,55 +309,89 @@ async fn rt9_timestamp_keeps_its_zone() {
 
 // ------------------------------------------------------- memory / CPU DoS ---
 
-/// A query canceled (or abandoned) after its first page keeps its buffered
-/// record batches (`Exec.events` + `Exec.pending`) for as long as it stays in
-/// the history (`history_retention_secs`, default 900 s, up to `history_size`
-/// = 100 queries). Those batches are outside `DataFusion`'s memory pool. Trino
-/// frees a query's output buffers when it fails.
+/// A query canceled, killed or abandoned after its first page must drop its
+/// buffered record batches (`Exec.events` + `Exec.pending`, and the plan's own
+/// buffers) when it fails, not when it leaves the history
+/// (`history_retention_secs`, default 900 s, up to `history_size` = 100
+/// queries). Trino frees a query's output buffers when it fails.
+///
+/// Measured by exact accounting (see `ceiling`): the bytes still referenced of
+/// the `rt_payload` buffers and the bytes reserved in the engine's pool, read
+/// while the FAILED query is still listed. This replaced a process-RSS
+/// reading, which cannot tell: the allocator keeps freed pages resident (RSS
+/// read 1324 MiB before and after the sweep, "held 0", so the pass proved
+/// nothing) and other tests in the same process move it (it failed 2/2 in the
+/// full suite).
 #[tokio::test]
 async fn rt10_canceled_queries_release_their_buffers() {
-    let h = harness_with(Limits {
-        history_retention: Duration::from_secs(2),
-        ..limits()
-    });
-    let before = rss_bytes();
-    // 8192-row batches of 8 KiB strings: 64 MiB per batch.
-    let sql = "SELECT repeat('x', 8192) || CAST(value AS VARCHAR) AS s FROM generate_series(1, 1000000)";
-    for _ in 0..3 {
+    let h = harness_config(
+        Limits {
+            client_timeout: Duration::from_secs(1),
+            ..limits()
+        },
+        ByteSize::mib(256),
+        &partitions(4),
+    );
+    // 1 KiB rows: 8 MiB per 8192-row batch.
+    let probe = Probe::register(&h, 1024);
+    let sql = "SELECT rt_payload(value) AS s FROM generate_series(1, 2000000)";
+    let mut held = Vec::new();
+    for how in ["DELETE nextUri", "DELETE /v1/query/{id}", "abandoned"] {
         let first = h.submit(sql, &[]).await;
+        let id = first.body["id"].as_str().unwrap().to_owned();
         let one = path_of(first.body["nextUri"].as_str().unwrap());
         let page = h.call(Method::GET, &one, &[], "").await;
         assert_eq!(page.status, StatusCode::OK);
-        // Let execution fill the channel, then cancel.
-        let mut next = page.body["nextUri"].as_str().map(path_of);
-        if next.as_deref().is_some_and(|n| !n.is_empty()) {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+        let rows = page.body["data"].as_array().map_or(0, Vec::len);
+        assert!(rows > 0, "{how}: first page without rows: {}", page.body);
+        for row in page.body["data"].as_array().into_iter().flatten() {
+            probe.check(&row[0]).unwrap();
         }
-        let _ = h.call(Method::DELETE, &one, &[], "").await;
-        if let Some(n) = next.take() {
-            let after = h.call(Method::GET, &n, &[], "").await;
-            assert_eq!(after.body["stats"]["state"], "FAILED");
+        let two = path_of(page.body["nextUri"].as_str().unwrap());
+        let (live, reserved) = settle(&h, &probe).await;
+        assert!(
+            live > 0 && reserved > 0,
+            "{how}: nothing buffered ({live}, {reserved})"
+        );
+        match how {
+            "DELETE nextUri" => {
+                let r = h.call(Method::DELETE, &two, &[], "").await;
+                assert_eq!(r.status, StatusCode::NO_CONTENT);
+            }
+            "DELETE /v1/query/{id}" => {
+                let r = h
+                    .call(
+                        Method::DELETE,
+                        &format!("/v1/query/{id}"),
+                        &[("x-trino-user", "tester")],
+                        "",
+                    )
+                    .await;
+                assert_eq!(r.status, StatusCode::NO_CONTENT);
+            }
+            _ => {
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+                h.state.sweep();
+            }
+        }
+        let (live_after, reserved_after) = released(&h, &probe).await;
+        let listed = h
+            .run(
+                &format!("SELECT state FROM system.runtime.queries WHERE query_id = '{id}'"),
+                &[],
+            )
+            .await;
+        assert_eq!(listed.rows, vec![vec![json!("FAILED")]], "{how}");
+        eprintln!(
+            "{how}: before {live} B payload / {reserved} B reserved; FAILED in history {live_after} B / {reserved_after} B"
+        );
+        if (live_after, reserved_after) != (0, 0) {
+            held.push(format!(
+                "{how}: {live_after} B of payload and {reserved_after} B reserved still held"
+            ));
         }
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let while_in_history = rss_bytes();
-    tokio::time::sleep(Duration::from_millis(2200)).await;
-    h.state.sweep();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let after_sweep = rss_bytes();
-    let held = while_in_history.saturating_sub(after_sweep);
-    eprintln!(
-        "RSS before {} MiB, canceled-in-history {} MiB, after sweep {} MiB, held by 3 canceled queries {} MiB",
-        before / MIB,
-        while_in_history / MIB,
-        after_sweep / MIB,
-        held / MIB
-    );
-    assert!(
-        held < 32 * MIB,
-        "3 FAILED queries still held {} MiB until they left the history",
-        held / MIB
-    );
+    assert!(held.is_empty(), "{held:#?}");
 }
 
 async fn median_submit(h: &super::Harness) -> Duration {

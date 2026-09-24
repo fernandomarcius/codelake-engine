@@ -783,15 +783,8 @@ async fn codelake_to_trino(metadata: Metadata) {
         .collect();
     let mut want_types: Vec<Vec<String>> = COLS
         .iter()
-        .map(|c| {
-            // Hive keeps no varchar length for tables CodeLake creates.
-            let ty = if c.trino == "varchar(10)" {
-                "varchar"
-            } else {
-                c.trino
-            };
-            vec![c.name.to_owned(), ty.to_owned()]
-        })
+        // A declared varchar(n) keeps its length, as Trino 431 shows it.
+        .map(|c| vec![c.name.to_owned(), c.trino.to_owned()])
         .collect();
     want_types.push(vec!["extra".into(), "varchar".into()]);
     assert_rows("2. Trino DESCRIBE of the CodeLake table", &described, &want_types);
@@ -867,7 +860,7 @@ async fn insert_appends_exactly_one_file_and_never_rewrites() {
     cl(&engine, "CREATE SCHEMA hive.app").await;
     cl(
         &engine,
-        "CREATE TABLE hive.app.t WITH (format = 'PARQUET') AS SELECT CAST(0 AS BIGINT) AS id, 'zero' AS s",
+        "CREATE TABLE hive.app.t WITH (format = 'PARQUET') AS SELECT CAST(0 AS BIGINT) AS id, CAST('zero' AS VARCHAR) AS s",
     )
     .await;
     let dir = shared.warehouse().join("app/t");
@@ -1498,7 +1491,7 @@ async fn insert_with_column_list_in_another_order() {
     cl(&engine, "CREATE SCHEMA hive.ord").await;
     cl(
         &engine,
-        "CREATE TABLE hive.ord.t AS SELECT CAST(1 AS BIGINT) AS a, 'um' AS b, CAST('1.50' AS DECIMAL(18,2)) AS c",
+        "CREATE TABLE hive.ord.t AS SELECT CAST(1 AS BIGINT) AS a, CAST('um' AS VARCHAR) AS b, CAST('1.50' AS DECIMAL(18,2)) AS c",
     )
     .await;
     cl(

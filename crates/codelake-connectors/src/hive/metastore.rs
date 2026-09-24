@@ -487,6 +487,76 @@ impl FileMetastore {
         }
         Ok(())
     }
+
+    /// Moves a table or view to a new name, like Trino's file metastore,
+    /// which renames the table directory.
+    ///
+    /// On a local warehouse the directory is renamed in one step (`rename(2)`),
+    /// so readers see the old name or the new one, and no empty directory is
+    /// left behind (Trino refuses to create a table over one). Object stores
+    /// have no directories: there the metadata file is the commit point. Data
+    /// files and permissions are copied first, the metadata copy makes the new
+    /// name visible, then the old metadata goes (the old name disappears) and
+    /// its files with it. A failure part way leaves the old name intact, or
+    /// both names over identical files; never a name without its data.
+    ///
+    /// A target directory holding any object is refused: its files would
+    /// otherwise become rows of the renamed table.
+    pub(crate) async fn rename_table(
+        &self,
+        schema: &str,
+        table: &str,
+        new_schema: &str,
+        new_table: &str,
+    ) -> MetastoreResult<()> {
+        let (old_dir, new_dir) = (
+            self.table_dir(schema, table),
+            self.table_dir(new_schema, new_table),
+        );
+        let (old_metadata, new_metadata) = (
+            self.table_file(schema, table),
+            self.table_file(new_schema, new_table),
+        );
+        if self.store.head(&old_metadata).await.is_err() {
+            return Err(MetastoreError::NotFound(format!("table {schema}.{table}")));
+        }
+        let occupied: Vec<_> = self.store.list(Some(&new_dir)).try_collect().await?;
+        if !occupied.is_empty() {
+            return Err(MetastoreError::AlreadyExists(format!(
+                "table {new_schema}.{new_table}"
+            )));
+        }
+        match self.store.rename(&old_dir, &new_dir).await {
+            // A local directory: renamed as a whole.
+            Ok(()) => {
+                return match self.store.head(&new_metadata).await {
+                    Ok(_) => Ok(()),
+                    Err(err) => Err(err.into()),
+                };
+            }
+            // Object stores: the directory is not an object.
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(err) => return Err(err.into()),
+        }
+        let objects: Vec<_> = self.store.list(Some(&old_dir)).try_collect().await?;
+        let files: Vec<&Path> = objects
+            .iter()
+            .map(|o| &o.location)
+            .filter(|location| **location != old_metadata)
+            .collect();
+        for location in &files {
+            if let Some(relative) = location.prefix_match(&old_dir) {
+                let to = Path::from_iter(new_dir.parts().chain(relative));
+                self.store.copy(location, &to).await?;
+            }
+        }
+        self.store.copy(&old_metadata, &new_metadata).await?;
+        self.store.delete(&old_metadata).await?;
+        for location in files {
+            self.store.delete(location).await?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -697,6 +767,44 @@ mod tests {
         assert!(!bare.table_location_exists("raw", "u").await.unwrap());
     }
 
+    /// Object stores have no directories: the rename copies, commits the
+    /// metadata, then removes the old objects.
+    #[tokio::test]
+    async fn rename_on_an_object_store() {
+        let metastore = FileMetastore::new(Arc::new(object_store::memory::InMemory::new()), Path::from("wh"));
+        let table = fixture().table("pilot", "t1").await.unwrap().unwrap();
+        metastore.create_schema("raw", "dbt").await.unwrap();
+        metastore.write_table("raw", "t", &table).await.unwrap();
+        metastore
+            .write_owner_permissions("raw", "t", "dbt")
+            .await
+            .unwrap();
+        let data = Path::from("wh/raw/t/part-0");
+        metastore
+            .store()
+            .put(&data, PutPayload::from_static(b"rows"))
+            .await
+            .unwrap();
+
+        metastore.rename_table("raw", "t", "raw", "t2").await.unwrap();
+        assert!(metastore.table("raw", "t").await.unwrap().is_none());
+        assert_eq!(metastore.table("raw", "t2").await.unwrap().unwrap(), table);
+        let left: Vec<_> = metastore
+            .store()
+            .list(Some(&Path::from("wh/raw/t")))
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(left.is_empty(), "{left:?}");
+        let moved = metastore
+            .store()
+            .get(&Path::from("wh/raw/t2/part-0"))
+            .await
+            .unwrap();
+        assert_eq!(moved.bytes().await.unwrap().as_ref(), b"rows");
+        assert_eq!(metastore.list_tables("raw").await.unwrap(), vec!["t2"]);
+    }
+
     #[tokio::test]
     async fn schema_and_table_lifecycle() {
         let (dir, metastore) = scratch();
@@ -738,6 +846,34 @@ mod tests {
 
         assert!(dir.path().join("raw").is_dir(), "schema directory, as Trino");
         assert!(metastore.table_location_exists("raw", "t").await.unwrap());
+        metastore.create_schema("mart", "dbt").await.unwrap();
+        metastore.rename_table("raw", "t", "mart", "t2").await.unwrap();
+        assert!(metastore.table("raw", "t").await.unwrap().is_none());
+        assert_eq!(metastore.table("mart", "t2").await.unwrap().unwrap(), table);
+        assert!(
+            !dir.path().join("raw/t").exists(),
+            "the directory moves as a whole"
+        );
+        for moved in [
+            "..trinoSchema.crc",
+            ".trinoPermissions/user_dbt",
+            "20260101_000000_x_y",
+        ] {
+            assert!(dir.path().join("mart/t2").join(moved).exists(), "{moved}");
+        }
+        assert!(matches!(
+            metastore.rename_table("raw", "t", "mart", "t3").await,
+            Err(MetastoreError::NotFound(_))
+        ));
+        metastore.write_table("raw", "t", &table).await.unwrap();
+        assert!(matches!(
+            metastore.rename_table("raw", "t", "mart", "t2").await,
+            Err(MetastoreError::AlreadyExists(_))
+        ));
+        metastore.drop_table("raw", "t").await.unwrap();
+        metastore.rename_table("mart", "t2", "raw", "t").await.unwrap();
+        assert!(dir.path().join("raw/t/20260101_000000_x_y").exists());
+
         metastore.drop_table("raw", "t").await.unwrap();
         assert!(metastore.list_tables("raw").await.unwrap().is_empty());
         assert!(

@@ -16,6 +16,7 @@ use super::{Limits, TrinoState, router};
 
 struct Harness {
     state: Arc<TrinoState>,
+    engine: Arc<Engine>,
     router: Router,
     _dir: tempfile::TempDir,
 }
@@ -31,14 +32,19 @@ fn limits() -> Limits {
 }
 
 fn harness_with(limits: Limits) -> Harness {
+    harness_config(limits, ByteSize::mib(256), &ExecutionConfig::default())
+}
+
+/// A harness with its own memory limit and execution settings.
+fn harness_config(limits: Limits, memory_limit: ByteSize, execution: &ExecutionConfig) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let memory = MemoryConfig {
-        limit: ByteSize::mib(256),
+        limit: memory_limit,
         spill_dir: dir.path().to_owned(),
         spill_limit: ByteSize::mib(256),
         metadata_cache_limit: ByteSize::mib(1),
     };
-    let engine = Arc::new(Engine::new(&memory, &ExecutionConfig::default()).unwrap());
+    let engine = Arc::new(Engine::new(&memory, execution).unwrap());
     let state = TrinoState::new(Arc::clone(&engine), limits, "127.0.0.1:8081".parse().unwrap());
     engine
         .context()
@@ -46,6 +52,7 @@ fn harness_with(limits: Limits) -> Harness {
     Harness {
         router: router(Arc::clone(&state)),
         state,
+        engine,
         _dir: dir,
     }
 }
@@ -185,8 +192,10 @@ async fn select_returns_typed_rows() {
     assert_eq!(
         out.columns,
         [
-            ("a", "bigint"),
-            ("b", "varchar"),
+            // Trino 431: an integer literal that fits 32 bits is `integer`, a
+            // text literal `varchar(<its length>)`.
+            ("a", "integer"),
+            ("b", "varchar(4)"),
             ("c", "bigint"),
             ("d", "decimal(10, 2)"),
             ("e", "boolean")
@@ -558,7 +567,15 @@ async fn statements_report_like_trino() {
     let names: Vec<&str> = described.columns.iter().map(|c| c.0.as_str()).collect();
     assert_eq!(names, ["Column", "Type", "Extra", "Comment"]);
     assert_eq!(described.rows[0][0], "a");
-    assert_eq!(described.rows[0][1], "bigint");
+    // Trino 431: `VALUES (1, …)` is `integer`; `Extra` and `Comment` empty.
+    assert_eq!(described.rows[0][1], "integer");
+    assert_eq!(described.rows[0][2], "");
+    let shown = h.run("SHOW COLUMNS FROM datafusion.st.t LIKE 'b'", &[]).await;
+    let names: Vec<&str> = shown.columns.iter().map(|c| c.0.as_str()).collect();
+    assert_eq!(names, ["Column", "Type", "Extra", "Comment"]);
+    assert_eq!(shown.rows.len(), 1);
+    assert_eq!(shown.rows[0][0], "b");
+    assert_eq!(shown.rows[0][1], "varchar(1)");
 }
 
 #[tokio::test]
@@ -674,4 +691,5 @@ async fn submit_cost_does_not_grow_with_history_text() {
     );
 }
 
+mod ceiling;
 mod redteam;

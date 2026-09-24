@@ -1767,19 +1767,16 @@ async fn defect_17_legacy_datetime_without_capability() {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-18: ALTER TABLE RENAME TO is not supported (dbt table materialization)"]
 async fn defect_18_rename_table() {
     assert_codelake(&["d_rename_table"]).await;
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-19: CREATE VIEW ... SECURITY DEFINER is a syntax error (dbt views)"]
 async fn defect_19_view_security_clause() {
     assert_codelake(&["d_view_security_definer"]).await;
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-20: system.metadata.materialized_views is missing (dbt relation listing)"]
 async fn defect_20_metadata_materialized_views() {
     assert_codelake(&["d_metadata_materialized_views"]).await;
 }
@@ -1927,7 +1924,6 @@ print("DBT OK")
 /// incremental model twice; against Trino 431 (memory catalog) both runs pass
 /// with `agg_table = (3, 6)` and `events_inc` = 4 rows summing 9.
 #[tokio::test]
-#[ignore = "DEFECT-27: dbt-trino cannot run a view/table/incremental project (see DEFECT-18/19/20)"]
 async fn defect_27_dbt_trino_runs_view_table_incremental() {
     let server = Server::start(&Limits::default()).await;
     let (host, port) = server.external();
