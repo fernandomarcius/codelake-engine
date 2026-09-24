@@ -73,7 +73,23 @@ async fn trino(files: Vec<(String, Vec<u8>)>) -> ContainerAsync<GenericImage> {
     panic!("trino did not accept queries");
 }
 
+/// Runs `sql` with the Trino CLI. A coordinator under load can drop out of
+/// its own worker list for a moment ("No nodes available to run query");
+/// nothing ran then, so the statement is sent again.
 async fn run_trino(container: &ContainerAsync<GenericImage>, sql: &str) -> Result<String, String> {
+    let mut attempt = 0;
+    loop {
+        match run_trino_once(container, sql).await {
+            Err(err) if err.contains("No nodes available to run query") && attempt < 60 => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+async fn run_trino_once(container: &ContainerAsync<GenericImage>, sql: &str) -> Result<String, String> {
     let mut result = container
         .exec(ExecCommand::new([
             "trino",
