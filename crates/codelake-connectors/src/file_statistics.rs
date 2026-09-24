@@ -3,10 +3,12 @@
 //!
 //! The planner uses them to choose join sides (the smaller input builds the
 //! hash table) and to collect a small input once instead of repartitioning
-//! it. They steer the plan and never the result: every value is `Inexact`, so
-//! no rule answers a query from them (answering `COUNT(*)` or `MIN` from
-//! statistics requires `Exact`), and anything that cannot be trusted is
-//! `Absent`.
+//! it. They steer the plan and never the result: every value is `Inexact`, and
+//! anything that cannot be trusted is `Absent`. Being `Inexact` alone is not
+//! enough: `DataFusion` turns some estimates into exact counts on the way up
+//! (an estimate of 0 rows, or below an `OFFSET`), so the engine answers
+//! aggregates from statistics only over sources whose counts are exact (see
+//! `codelake_core::statistics_guard`).
 //!
 //! Min/max are kept only where the file orders values as the engine does:
 //! signed integers, dates and decimals compared by value, strings compared as
@@ -272,10 +274,13 @@ impl TableSummary {
     }
 
     /// Scales a sample covering `sampled` bytes of files to `total` bytes.
-    /// Only sizes scale; per-column counts and bounds become unknown.
+    /// Only sizes scale; per-column counts and bounds become unknown. A sample
+    /// without rows says nothing about the files left out (a writer's empty
+    /// files can fill it): rows and sizes are then unknown too.
     fn extrapolate(self, total: u64, sampled: u64) -> Self {
+        let empty_sample = self.rows == Some(0) && total > sampled;
         let scale = |value: Option<u64>| {
-            let value = u128::from(value?);
+            let value = u128::from(value.filter(|_| !empty_sample)?);
             u64::try_from(value * u128::from(total) / u128::from(sampled.max(1))).ok()
         };
         Self {
@@ -718,6 +723,34 @@ mod tests {
         assert_eq!(stats.num_rows, Precision::Inexact(10));
         assert_eq!(stats.column_statistics[0].min_value, Precision::Absent);
         assert_eq!(stats.column_statistics[0].byte_size, Precision::Inexact(80));
+    }
+
+    #[tokio::test]
+    async fn a_sample_of_empty_files_gives_unknown_rows_and_sizes() {
+        let empty = parquet(&[batch(&[], &[])], 10);
+        let one = parquet(&[batch(&[Some(1), Some(2)], &[Some("a"), Some("b")])], 10);
+        // The sample (files 0 and 2 of 4) holds only the empty files.
+        let files = files(vec![empty.clone(), one.clone(), empty, one]).await;
+        let runtime = runtime(64 * 1024 * 1024);
+        let limits = FooterLimits {
+            max_footers: 2,
+            size_hint: None,
+        };
+        let reservation = MemoryConsumer::new("t").register(&runtime.memory_pool);
+        let summary = summarize(
+            &files.store,
+            &files.metas,
+            &schema(),
+            &runtime,
+            limits,
+            &reservation,
+        )
+        .await
+        .unwrap();
+        let stats = summary.into_statistics();
+        assert_eq!(stats.num_rows, Precision::Absent);
+        assert_eq!(stats.total_byte_size, Precision::Absent);
+        assert_eq!(stats.column_statistics[0].byte_size, Precision::Absent);
     }
 
     #[test]
