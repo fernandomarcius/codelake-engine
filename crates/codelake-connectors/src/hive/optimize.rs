@@ -298,7 +298,7 @@ impl Compactor<'_> {
             Ok::<_, DataFusionError>(())
         }
         .await;
-        let size = (open.writer.bytes_written() + open.writer.memory_size()) as u64;
+        let size = (open.writer.bytes_written() + open.writer.in_progress_size()) as u64;
         self.open = Some(open);
         written?;
         if size >= self.target {

@@ -135,6 +135,14 @@ enum Column {
 }
 
 impl Column {
+    /// Estimated encoded size of what the open row group holds.
+    fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::Arrow(writer) => writer.get_estimated_total_bytes(),
+            Self::Int96 { values, .. } => values.len() * INT96_BYTES,
+        }
+    }
+
     fn memory_size(&self) -> usize {
         match self {
             Self::Arrow(writer) => writer.memory_size(),
@@ -237,6 +245,14 @@ impl<W: AsyncFileWriter> TrinoParquetWriter<W> {
     /// Bytes of closed row groups already handed to the output.
     pub(crate) fn bytes_written(&self) -> usize {
         self.written
+    }
+
+    /// Estimated encoded size of the open row group (not its buffers, which
+    /// can be much larger).
+    pub(crate) fn in_progress_size(&self) -> usize {
+        self.open
+            .as_ref()
+            .map_or(0, |columns| columns.iter().map(Column::estimated_bytes).sum())
     }
 
     /// Bytes buffered for the open row group.
