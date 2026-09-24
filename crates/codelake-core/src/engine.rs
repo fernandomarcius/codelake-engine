@@ -250,6 +250,53 @@ impl Engine {
         ctx.read_batch(batch)
     }
 
+    /// `CREATE TABLE [AS]` in `DataFusion`'s in-memory catalogs, as `DataFusion`
+    /// does it, but answering the rows written, like a writable catalog (and
+    /// like Trino's `CREATE TABLE AS`).
+    async fn create_memory_table(
+        ctx: &SessionContext,
+        create: &datafusion::logical_expr::CreateMemoryTable,
+    ) -> Result<DataFrame, DataFusionError> {
+        use datafusion::datasource::MemTable;
+        if create.temporary {
+            return Err(DataFusionError::NotImplemented(
+                "Temporary tables not supported".into(),
+            ));
+        }
+        if create.if_not_exists && create.or_replace {
+            return Err(DataFusionError::Execution(
+                "'IF NOT EXISTS' cannot coexist with 'REPLACE'".into(),
+            ));
+        }
+        let exists = ctx.table_exist(create.name.clone())?;
+        if exists && create.if_not_exists {
+            return Self::row_count(ctx, 0);
+        }
+        if exists && !create.or_replace {
+            return Err(DataFusionError::Execution(format!(
+                "Table '{}' already exists",
+                create.name
+            )));
+        }
+        let input =
+            crate::subquery::pre_evaluate_scalar_subqueries(ctx, create.input.as_ref().clone()).await?;
+        let schema = Arc::clone(input.schema().inner());
+        let batches = DataFrame::new(ctx.state(), input).collect_partitioned().await?;
+        let rows = batches
+            .iter()
+            .flatten()
+            .map(|batch| u64::try_from(batch.num_rows()).unwrap_or(u64::MAX))
+            .sum();
+        let table = MemTable::try_new(schema, batches)?
+            .with_constraints(create.constraints.clone())
+            .with_column_defaults(create.column_defaults.iter().cloned().collect());
+        if exists {
+            ctx.deregister_table(create.name.clone())?;
+        }
+        ctx.register_table(create.name.clone(), Arc::new(table))?;
+        Self::row_count(ctx, rows)
+    }
+
     async fn add_column(
         &self,
         ctx: &SessionContext,
@@ -282,7 +329,7 @@ impl Engine {
             DdlStatement::CreateMemoryTable(create) => {
                 let (catalog, schema, table) = Self::resolve(ctx, &create.name);
                 let Some(writable) = self.writable(&catalog) else {
-                    return Ok(None);
+                    return Self::create_memory_table(ctx, create).await.map(Some);
                 };
                 if create.or_replace {
                     writable.drop_table(&schema, &table, true).await?;
@@ -587,6 +634,43 @@ mod tests {
                 .contains("connection refused")
         );
         assert!(statuses[1].error.as_deref().unwrap().contains("no answer"));
+    }
+
+    async fn rows_written(engine: &Engine, sql: &str) -> u64 {
+        let batches = engine.sql(sql).await.unwrap().collect().await.unwrap();
+        let rows = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+            .unwrap();
+        rows.value(0)
+    }
+
+    #[tokio::test]
+    async fn in_memory_create_table_as_reports_rows_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        let sql = "CREATE TABLE t AS SELECT * FROM (VALUES (1), (2), (3)) v(a)";
+        assert_eq!(rows_written(&engine, sql).await, 3);
+        assert_eq!(
+            rows_written(&engine, "CREATE TABLE IF NOT EXISTS t AS SELECT 9 AS a").await,
+            0
+        );
+        let exists = engine.sql("CREATE TABLE t AS SELECT 9 AS a").await.unwrap_err();
+        assert!(exists.to_string().contains("already exists"), "{exists}");
+        assert_eq!(
+            rows_written(&engine, "CREATE OR REPLACE TABLE t AS SELECT 9 AS a").await,
+            1
+        );
+        let count = engine
+            .sql("SELECT count(*) AS n FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let n = count[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(n.value(0), 1);
     }
 
     /// ~40 MiB of rows, sorted under a 16 MiB ceiling.

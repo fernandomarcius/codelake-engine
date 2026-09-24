@@ -26,6 +26,7 @@ fn limits() -> Limits {
         client_timeout: Duration::from_mins(5),
         history_retention: Duration::from_mins(15),
         history_size: 100,
+        max_query_length: 1_000_000,
     }
 }
 
@@ -187,7 +188,7 @@ async fn select_returns_typed_rows() {
             ("a", "bigint"),
             ("b", "varchar"),
             ("c", "bigint"),
-            ("d", "decimal(10,2)"),
+            ("d", "decimal(10, 2)"),
             ("e", "boolean")
         ]
         .map(|(n, t)| (n.to_owned(), t.to_owned()))
@@ -266,7 +267,7 @@ async fn errors_follow_trino_codes() {
 async fn missing_user_and_empty_statement_are_rejected() {
     let h = harness();
     let no_user = h.call(Method::POST, "/v1/statement", &[], "SELECT 1").await;
-    assert_eq!(no_user.status, StatusCode::BAD_REQUEST);
+    assert_eq!(no_user.status, StatusCode::UNAUTHORIZED);
     let empty = h.submit("   ", &[]).await;
     assert_eq!(empty.status, StatusCode::BAD_REQUEST);
 }
@@ -428,8 +429,8 @@ async fn dml_reports_update_count() {
 
     let drop = h.run("DROP TABLE datafusion.public.items", &[]).await;
     assert_eq!(drop.last["updateType"], "DROP TABLE");
-    assert_eq!(drop.columns, vec![("result".to_owned(), "boolean".to_owned())]);
-    assert_eq!(drop.rows, vec![vec![serde_json::json!(true)]]);
+    // Trino answers DDL with the update type only.
+    assert!(drop.columns.is_empty() && drop.rows.is_empty(), "{drop:?}");
 }
 
 #[tokio::test]
@@ -495,3 +496,182 @@ async fn info_reports_protocol_version() {
     assert_eq!(reply.body["nodeVersion"]["version"], "431");
     assert_eq!(reply.body["coordinator"], true);
 }
+
+#[tokio::test]
+async fn tokens_ahead_are_unknown_and_malformed_sessions_are_bad_requests() {
+    let h = harness();
+    let first = h.submit("SELECT value FROM generate_series(1, 50000)", &[]).await;
+    let one = path_of(first.body["nextUri"].as_str().unwrap());
+    let ahead = format!("{}/5", one.rsplit_once('/').unwrap().0);
+    assert_eq!(
+        h.call(Method::GET, &ahead, &[], "").await.status,
+        StatusCode::NOT_FOUND
+    );
+    let _ = h.call(Method::DELETE, &one, &[], "").await;
+    let schema_only = h.submit("SELECT 1", &[("x-trino-schema", "public")]).await;
+    assert_eq!(schema_only.status, StatusCode::BAD_REQUEST);
+    let bad_session = h
+        .submit("SELECT 1", &[("x-trino-session", "no_equals_sign")])
+        .await;
+    assert_eq!(bad_session.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn statements_report_like_trino() {
+    let h = harness();
+    let schema = h.run("CREATE SCHEMA datafusion.st", &[]).await;
+    assert_eq!(schema.last["updateType"], "CREATE SCHEMA");
+    assert_eq!(schema.last["columns"], serde_json::json!([]), "{}", schema.last);
+    assert!(schema.last.get("data").is_none(), "{}", schema.last);
+    let ctas = h
+        .run(
+            "CREATE TABLE datafusion.st.t AS SELECT * FROM (VALUES (1, 'x'), (2, 'y'), (3, 'z')) v(a, b)",
+            &[],
+        )
+        .await;
+    assert_eq!(ctas.last["updateType"], "CREATE TABLE");
+    assert_eq!(ctas.last["updateCount"], 3);
+    assert_eq!(ctas.rows, vec![vec![serde_json::json!(3)]]);
+    let exists = h.run("CREATE TABLE datafusion.st.t (a BIGINT)", &[]).await;
+    assert_eq!(
+        exists.error_name(),
+        Some("TABLE_ALREADY_EXISTS"),
+        "{}",
+        exists.last
+    );
+    let schema_exists = h.run("CREATE SCHEMA datafusion.st", &[]).await;
+    assert_eq!(schema_exists.error_name(), Some("SCHEMA_ALREADY_EXISTS"));
+    let missing = h.run("DROP TABLE datafusion.st.nope", &[]).await;
+    assert_eq!(missing.error_name(), Some("TABLE_NOT_FOUND"));
+    let unnamed = h
+        .run("SELECT count(*), max(a) AS m FROM datafusion.st.t", &[])
+        .await;
+    let names: Vec<&str> = unnamed.columns.iter().map(|c| c.0.as_str()).collect();
+    assert_eq!(names, ["_col0", "m"]);
+    let located = h.run("SELECT 1\n  FROM\n  datafusion.st.missing", &[]).await;
+    assert_eq!(located.error_name(), Some("TABLE_NOT_FOUND"));
+    assert_eq!(
+        located.last["error"]["errorLocation"],
+        serde_json::json!({"lineNumber": 3, "columnNumber": 3})
+    );
+    let described = h.run("DESCRIBE datafusion.st.t", &[]).await;
+    let names: Vec<&str> = described.columns.iter().map(|c| c.0.as_str()).collect();
+    assert_eq!(names, ["Column", "Type", "Extra", "Comment"]);
+    assert_eq!(described.rows[0][0], "a");
+    assert_eq!(described.rows[0][1], "bigint");
+}
+
+#[tokio::test]
+async fn show_session_filters_and_formats_defaults() {
+    let h = harness();
+    let out = h.run("SHOW SESSION LIKE 'query_max_run%'", &[]).await;
+    assert_eq!(out.rows.len(), 1, "{:?}", out.rows);
+    assert_eq!(out.rows[0][0], "query_max_run_time");
+    assert_eq!(out.rows[0][1], "100.00d");
+    assert_eq!(out.rows[0][2], "100.00d");
+}
+
+#[tokio::test]
+async fn prepared_statements_travel_in_headers() {
+    let h = harness();
+    let prepare = h.submit("PREPARE st1 FROM SELECT ? + 1 AS y, ? AS s", &[]).await;
+    assert_eq!(prepare.body["updateType"], "PREPARE");
+    let added = prepare.headers["x-trino-added-prepare"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(added.starts_with("st1="), "{added}");
+    let executed = h
+        .run(
+            "EXECUTE st1 USING 41, 'it''s'",
+            &[("x-trino-prepared-statement", added.as_str())],
+        )
+        .await;
+    assert_eq!(executed.state(), "FINISHED", "{}", executed.last);
+    assert_eq!(
+        executed.rows,
+        vec![vec![serde_json::json!(42), serde_json::json!("it's")]]
+    );
+    let unknown = h.run("EXECUTE nope USING 1", &[]).await;
+    assert_eq!(unknown.error_name(), Some("NOT_FOUND"));
+    let wrong_count = h
+        .run(
+            "EXECUTE st1 USING 1",
+            &[("x-trino-prepared-statement", added.as_str())],
+        )
+        .await;
+    assert_eq!(wrong_count.error_name(), Some("INVALID_PARAMETER_USAGE"));
+    let deallocated = h
+        .submit(
+            "DEALLOCATE PREPARE st1",
+            &[("x-trino-prepared-statement", added.as_str())],
+        )
+        .await;
+    assert_eq!(deallocated.body["updateType"], "DEALLOCATE");
+    assert_eq!(deallocated.headers["x-trino-deallocated-prepare"], "st1");
+    let immediate = h
+        .run(
+            "EXECUTE IMMEDIATE 'SELECT ?, ? AS d' USING 'a''b OR 1=1', DATE '1969-07-20'",
+            &[("x-trino-client-capabilities", "PARAMETRIC_DATETIME")],
+        )
+        .await;
+    assert_eq!(immediate.state(), "FINISHED", "{}", immediate.last);
+    assert_eq!(immediate.columns[0].0, "_col0");
+    assert_eq!(
+        immediate.rows,
+        vec![vec![
+            serde_json::json!("a'b OR 1=1"),
+            serde_json::json!("1969-07-20")
+        ]]
+    );
+}
+
+#[tokio::test]
+async fn statements_over_the_length_limit_fail_like_trino() {
+    let h = harness_with(Limits {
+        max_query_length: 100,
+        ..limits()
+    });
+    let out = h.run(&format!("SELECT 1 /*{}*/", "x".repeat(200)), &[]).await;
+    assert_eq!(out.error_name(), Some("QUERY_TEXT_TOO_LARGE"));
+    assert_eq!(
+        out.last["error"]["message"],
+        "Query text length (213) exceeds the maximum length (100)"
+    );
+    let ok = h.run("SELECT 1 AS x", &[]).await;
+    assert_eq!(ok.state(), "FINISHED");
+}
+
+async fn median_submit_time(h: &Harness) -> Duration {
+    let mut times = Vec::new();
+    for _ in 0..15 {
+        let start = std::time::Instant::now();
+        let reply = h.submit("SELECT 1", &[]).await;
+        times.push(start.elapsed());
+        let _ = h.follow(reply).await;
+    }
+    times.sort();
+    times[times.len() / 2]
+}
+
+/// Submitting stays cheap however much SQL the history holds (the history
+/// shares the text instead of copying it on every request).
+#[tokio::test]
+async fn submit_cost_does_not_grow_with_history_text() {
+    let h = harness_with(Limits {
+        max_active: 200,
+        ..limits()
+    });
+    let baseline = median_submit_time(&h).await;
+    let big = format!("SELECT 1 /*{}*/", "x".repeat(990_000));
+    for _ in 0..100 {
+        assert_eq!(h.run(&big, &[]).await.state(), "FINISHED");
+    }
+    let loaded = median_submit_time(&h).await;
+    assert!(
+        loaded < baseline * 4 + Duration::from_millis(2),
+        "POST SELECT 1 went from {baseline:?} to {loaded:?}"
+    );
+}
+
+mod redteam;
