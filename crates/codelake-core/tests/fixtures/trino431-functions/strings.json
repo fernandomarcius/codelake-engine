@@ -1,0 +1,1451 @@
+{
+  "category": "strings",
+  "cases": [
+    {
+      "name": "substr_negative",
+      "sql": "SELECT substr('abcde', -2), substr('abcde', 0), substr('abcde', 2, 2), substr('abcde', 6), substr('abcde', 2, -1), substr('abcde', -9, 2)",
+      "trino": {
+        "types": [
+          "varchar(5)",
+          "varchar(5)",
+          "varchar(5)",
+          "varchar(5)",
+          "varchar(5)",
+          "varchar(5)"
+        ],
+        "rows": [
+          [
+            "de",
+            "",
+            "bc",
+            "",
+            "",
+            ""
+          ]
+        ]
+      }
+    },
+    {
+      "name": "substr_unicode",
+      "sql": "SELECT substr('ação', 2, 2), substr('ação', -1), substring('ação' FROM 2), substring('ação' FROM 2 FOR 1)",
+      "trino": {
+        "types": [
+          "varchar(4)",
+          "varchar(4)",
+          "varchar(4)",
+          "varchar(4)"
+        ],
+        "rows": [
+          [
+            "çã",
+            "o",
+            "ção",
+            "ç"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "substr_null",
+      "sql": "SELECT substr(CAST(NULL AS varchar), 1), substr('abc', CAST(NULL AS bigint)), substr('abc', 1, CAST(NULL AS bigint))",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar(3)",
+          "varchar(3)"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "substr_varbinary",
+      "sql": "SELECT substr(X'0102030405', 3), substr(X'0102030405', -2, 1), substr(X'0102', 5), substr(CAST(NULL AS varbinary), 1)",
+      "trino": {
+        "types": [
+          "varbinary",
+          "varbinary",
+          "varbinary",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "AwQF",
+            "BA==",
+            "",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "substr_lsn_csf",
+      "sql": "SELECT from_big_endian_64(substr(X'0001000000000000002A', 3)), CAST(from_big_endian_64(substr(X'00000000000000000102', 3)) % 2147483647 AS integer)",
+      "trino": {
+        "types": [
+          "bigint",
+          "integer"
+        ],
+        "rows": [
+          [
+            42,
+            258
+          ]
+        ]
+      }
+    },
+    {
+      "name": "length_basic",
+      "sql": "SELECT length('ação'), length(''), length(CAST(NULL AS varchar)), length(X'0102')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            4,
+            0,
+            null,
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "lower_upper",
+      "sql": "SELECT lower('AÇÃO'), upper('ação'), lower('İ'), upper('ß'), lower(CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "varchar(4)",
+          "varchar(4)",
+          "varchar(1)",
+          "varchar(1)",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "ação",
+            "AÇÃO",
+            "i",
+            "ß",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "trim_family",
+      "sql": "SELECT trim('  a b  '), ltrim('  a '), rtrim(' a  '), trim(chr(9) || 'a' || chr(10)), trim(chr(160) || 'a'), trim(CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "varchar(7)",
+          "varchar(4)",
+          "varchar(4)",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "a b",
+            "a ",
+            " a",
+            "a",
+            " a",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "trim_chars",
+      "sql": "SELECT trim('xxaxx', 'x'), ltrim('xyaxy', 'yx'), rtrim('axyxy', 'xy'), TRIM(BOTH 'x' FROM 'xxaxx'), TRIM(LEADING 'x' FROM 'xxaxx'), TRIM(TRAILING 'x' FROM 'xxaxx')",
+      "trino": {
+        "types": [
+          "varchar(5)",
+          "varchar(5)",
+          "varchar(5)",
+          "varchar(5)",
+          "varchar(5)",
+          "varchar(5)"
+        ],
+        "rows": [
+          [
+            "a",
+            "axy",
+            "a",
+            "a",
+            "axx",
+            "xxa"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "concat_nulls",
+      "sql": "SELECT concat('a', 'b', 'c'), concat(CAST('a' AS varchar), CAST(NULL AS varchar)), concat('', ''), 'a' || 'b', 'a' || CAST(NULL AS varchar)",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "abc",
+            null,
+            "",
+            "ab",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "concat_varbinary",
+      "sql": "SELECT concat(X'01', X'0203'), concat(X'01', CAST(NULL AS varbinary))",
+      "trino": {
+        "types": [
+          "varbinary",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "AQID",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "concat_ws_skip_nulls",
+      "sql": "SELECT concat_ws('_', 'a', CAST(NULL AS varchar), 'b'), concat_ws(CAST(NULL AS varchar), 'a', 'b'), concat_ws(',', 'a'), concat_ws('||', CAST(1 AS varchar), CAST(2 AS varchar))",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "a_b",
+            null,
+            "a",
+            "1||2"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "concat_ws_array",
+      "sql": "SELECT concat_ws('-', ARRAY['a', NULL, 'c']), concat_ws('-', CAST(ARRAY[] AS array(varchar)))",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "a-c",
+            ""
+          ]
+        ]
+      }
+    },
+    {
+      "name": "replace_basic",
+      "sql": "SELECT replace('abcabc', 'b', 'X'), replace('abcabc', 'b'), replace('abc', '', 'x'), replace(CAST(NULL AS varchar), 'a', 'b'), replace('abc', 'z', 'y')",
+      "trino": {
+        "types": [
+          "varchar(13)",
+          "varchar(6)",
+          "varchar(7)",
+          "varchar",
+          "varchar(7)"
+        ],
+        "rows": [
+          [
+            "aXcaXc",
+            "acac",
+            "xaxbxcx",
+            null,
+            "abc"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "strpos_basic",
+      "sql": "SELECT strpos('ação ação', 'ç'), strpos('ação ação', 'ç', 2), strpos('ação ação', 'ç', -1), strpos('abc', 'x'), strpos('abc', ''), strpos(CAST(NULL AS varchar), 'a')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            2,
+            7,
+            7,
+            0,
+            1,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "strpos_instance_zero",
+      "sql": "SELECT strpos('abc', 'a', 0)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "'instance' must be a positive or negative number."
+      }
+    },
+    {
+      "name": "position_syntax",
+      "sql": "SELECT position('c' IN 'abc'), position('x' IN 'abc')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            3,
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "starts_with_basic",
+      "sql": "SELECT starts_with('abc', 'ab'), starts_with('abc', 'b'), starts_with('abc', ''), starts_with(CAST(NULL AS varchar), 'a')",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            false,
+            true,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "lpad_rpad",
+      "sql": "SELECT lpad('ab', 5, 'xy'), rpad('ab', 5, 'xy'), lpad('abcdef', 3, 'x'), rpad('ação', 6, '*'), lpad(CAST(NULL AS varchar), 3, 'x')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "xyxab",
+            "abxyx",
+            "abc",
+            "ação**",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "lpad_empty_error",
+      "sql": "SELECT lpad('a', 3, '')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Padding string must not be empty"
+      }
+    },
+    {
+      "name": "lpad_negative_error",
+      "sql": "SELECT lpad('a', -1, 'x')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Target length must be in the range [0..2147483647]"
+      }
+    },
+    {
+      "name": "split_basic",
+      "sql": "SELECT split('a,b,,c,', ','), split('a,b,c', ',', 2), split('', ','), split(CAST(NULL AS varchar), ',')",
+      "trino": {
+        "types": [
+          "array(varchar(7))",
+          "array(varchar(5))",
+          "array(varchar(0))",
+          "array(varchar)"
+        ],
+        "rows": [
+          [
+            [
+              "a",
+              "b",
+              "",
+              "c",
+              ""
+            ],
+            [
+              "a",
+              "b,c"
+            ],
+            [
+              ""
+            ],
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "split_empty_delimiter",
+      "sql": "SELECT split('abc', '')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "The delimiter may not be the empty string"
+      }
+    },
+    {
+      "name": "split_part_basic",
+      "sql": "SELECT split_part('a,b,c', ',', 2), split_part('a,b,c', ',', 4), split_part('abc', '', 2), split_part('a::b', '::', 2), split_part(CAST(NULL AS varchar), ',', 1)",
+      "trino": {
+        "types": [
+          "varchar(5)",
+          "varchar(5)",
+          "varchar(3)",
+          "varchar(4)",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "b",
+            null,
+            "b",
+            "b",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "split_part_zero",
+      "sql": "SELECT split_part('a,b', ',', 0)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Index must be greater than zero"
+      }
+    },
+    {
+      "name": "chr_codepoint",
+      "sql": "SELECT chr(65), chr(231), chr(128512), codepoint('ç'), chr(CAST(NULL AS bigint))",
+      "trino": {
+        "types": [
+          "varchar(1)",
+          "varchar(1)",
+          "varchar(1)",
+          "integer",
+          "varchar(1)"
+        ],
+        "rows": [
+          [
+            "A",
+            "ç",
+            "😀",
+            231,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "chr_invalid",
+      "sql": "SELECT chr(1114112)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Not a valid Unicode code point: 1114112"
+      }
+    },
+    {
+      "name": "reverse_basic",
+      "sql": "SELECT reverse('ação'), reverse(''), reverse(X'010203'), reverse(CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "varchar(4)",
+          "varchar(0)",
+          "varbinary",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "oãça",
+            "",
+            "AwIB",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "levenshtein_hamming",
+      "sql": "SELECT levenshtein_distance('kitten', 'sitting'), levenshtein_distance('', 'ação'), hamming_distance('abcde', 'abxdz'), levenshtein_distance(CAST(NULL AS varchar), 'a')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            3,
+            4,
+            2,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "hamming_length_error",
+      "sql": "SELECT hamming_distance('abc', 'ab')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "The input strings to hamming_distance function must have the same length"
+      }
+    },
+    {
+      "name": "translate_basic",
+      "sql": "SELECT translate('abcd', 'ab', 'z'), translate('ação', 'çã', 'ca'), translate('abc', 'aa', 'xy')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "zcd",
+            "acao",
+            "xbc"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "utf8_round_trip",
+      "sql": "SELECT to_utf8('ação'), from_utf8(X'61FF62'), from_utf8(X'61FF62', '?'), from_utf8(X'61FF62', 35), from_utf8(to_utf8('ç'))",
+      "trino": {
+        "types": [
+          "varbinary",
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "YcOnw6Nv",
+            "a�b",
+            "a?b",
+            "a#b",
+            "ç"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "lower_upper_edge",
+      "sql": "SELECT lower(''), upper('abc123!'), upper(CAST(NULL AS varchar)), lower('ÀÉÎ')",
+      "trino": {
+        "types": [
+          "varchar(0)",
+          "varchar(7)",
+          "varchar",
+          "varchar(3)"
+        ],
+        "rows": [
+          [
+            "",
+            "ABC123!",
+            null,
+            "àéî"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "length_edge",
+      "sql": "SELECT length('😀'), length(' a '), length(chr(0))",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            1,
+            3,
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "replace_edge",
+      "sql": "SELECT replace('aaa', 'aa', 'b'), replace('ação', 'ç', 'c'), replace('abc', 'abc', ''), replace('', '', 'x')",
+      "trino": {
+        "types": [
+          "varchar(7)",
+          "varchar(9)",
+          "varchar(3)",
+          "varchar(1)"
+        ],
+        "rows": [
+          [
+            "ba",
+            "acão",
+            "",
+            "x"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "replace_null_args",
+      "sql": "SELECT replace('abc', CAST(NULL AS varchar), 'x'), replace('abc', 'a', CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "varchar(7)",
+          "varchar"
+        ],
+        "rows": [
+          [
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "rpad_edge",
+      "sql": "SELECT rpad('abc', 2, 'x'), rpad('', 3, 'ab'), rpad('a', 0, 'x'), rpad(CAST(NULL AS varchar), 2, 'x'), rpad('a', 3, CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "ab",
+            "aba",
+            "",
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "lpad_edge",
+      "sql": "SELECT lpad('', 3, 'ab'), lpad('a', 0, 'x'), lpad('abc', 3, 'x'), lpad('a', CAST(NULL AS bigint), 'x'), lpad('ação', 5, 'ç')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "aba",
+            "",
+            "abc",
+            null,
+            "çação"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "rpad_negative_error",
+      "sql": "SELECT rpad('a', -1, 'x')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Target length must be in the range [0..2147483647]"
+      }
+    },
+    {
+      "name": "starts_with_edge",
+      "sql": "SELECT starts_with('', ''), starts_with('ação', 'aç'), starts_with('a', 'ab'), starts_with('abc', CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            true,
+            false,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "translate_null_edge",
+      "sql": "SELECT translate(CAST(NULL AS varchar), 'a', 'b'), translate('abc', '', 'x'), translate('abc', 'abc', ''), translate('aaa', 'a', 'bc')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            null,
+            "abc",
+            "",
+            "bbb"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "chr_codepoint_edge",
+      "sql": "SELECT chr(0) = chr(0), codepoint('😀'), codepoint(CAST(NULL AS varchar(1))), length(chr(1114111))",
+      "trino": {
+        "types": [
+          "boolean",
+          "integer",
+          "integer",
+          "bigint"
+        ],
+        "rows": [
+          [
+            true,
+            128512,
+            null,
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "levenshtein_edge",
+      "sql": "SELECT levenshtein_distance('', ''), levenshtein_distance('ação', 'acao'), levenshtein_distance('abc', 'abc'), levenshtein_distance('abc', CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            0,
+            2,
+            0,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "hamming_null_edge",
+      "sql": "SELECT hamming_distance('', ''), hamming_distance('ação', 'acao'), hamming_distance(CAST(NULL AS varchar), 'a')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            0,
+            2,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "split_edge",
+      "sql": "SELECT split('a', ','), split('a,,b', ',', 1), split('aXbXc', 'X', 5), split('ação;x', ';')",
+      "trino": {
+        "types": [
+          "array(varchar(1))",
+          "array(varchar(4))",
+          "array(varchar(5))",
+          "array(varchar(6))"
+        ],
+        "rows": [
+          [
+            [
+              "a"
+            ],
+            [
+              "a,,b"
+            ],
+            [
+              "a",
+              "b",
+              "c"
+            ],
+            [
+              "ação",
+              "x"
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "split_limit_zero",
+      "sql": "SELECT split('a,b', ',', 0)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Limit must be positive"
+      }
+    },
+    {
+      "name": "split_part_edge",
+      "sql": "SELECT split_part('', ',', 1), split_part(',a', ',', 1), split_part('a,b', ',', CAST(NULL AS bigint)), split_part('abc', 'abc', 2)",
+      "trino": {
+        "types": [
+          "varchar(0)",
+          "varchar(2)",
+          "varchar(3)",
+          "varchar(3)"
+        ],
+        "rows": [
+          [
+            "",
+            "",
+            null,
+            ""
+          ]
+        ]
+      }
+    },
+    {
+      "name": "strpos_edge",
+      "sql": "SELECT strpos('', ''), strpos('aaa', 'aa', 2), strpos('aaa', 'aa', -2), strpos('abc', CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            1,
+            2,
+            1,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "position_null",
+      "sql": "SELECT position(CAST(NULL AS varchar) IN 'abc'), position('' IN 'abc'), position('ç' IN 'ação')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            null,
+            1,
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "substring_null_edge",
+      "sql": "SELECT substring('abc' FROM 0), substring(CAST(NULL AS varchar) FROM 1), substring('abc' FROM 2 FOR 0), substring('abc', -1, 5)",
+      "trino": {
+        "types": [
+          "varchar(3)",
+          "varchar",
+          "varchar(3)",
+          "varchar(3)"
+        ],
+        "rows": [
+          [
+            "",
+            null,
+            "",
+            "c"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "concat_ws_null_edge",
+      "sql": "SELECT concat_ws(',', CAST(NULL AS varchar)), concat_ws('', 'a', 'b'), concat_ws(',', CAST(ARRAY[NULL] AS array(varchar))), concat_ws(CAST(NULL AS varchar), ARRAY['a'])",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "",
+            "ab",
+            "",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "concat_unicode_many",
+      "sql": "SELECT concat('ação', '😀', '', 'x'), concat(CAST(NULL AS varchar), CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "ação😀x",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "trim_null_chars",
+      "sql": "SELECT trim('abc', CAST(NULL AS varchar)), trim('', 'x'), ltrim('aaa', 'a'), rtrim(CAST(NULL AS varchar), 'a')",
+      "trino": {
+        "types": [
+          "varchar(3)",
+          "varchar(0)",
+          "varchar(3)",
+          "varchar"
+        ],
+        "rows": [
+          [
+            null,
+            "",
+            "",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "reverse_edge",
+      "sql": "SELECT reverse('😀a'), reverse(X''), reverse(CAST(NULL AS varbinary))",
+      "trino": {
+        "types": [
+          "varchar(2)",
+          "varbinary",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "a😀",
+            "",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "utf8_null_edge",
+      "sql": "SELECT to_utf8(''), to_utf8(CAST(NULL AS varchar)), from_utf8(X''), from_utf8(CAST(NULL AS varbinary)), from_utf8(X'C3')",
+      "trino": {
+        "types": [
+          "varbinary",
+          "varbinary",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "",
+            null,
+            "",
+            null,
+            "�"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "soundex_fn",
+      "sql": "SELECT soundex('Robert'), soundex('Rupert'), soundex('Tymczak'), soundex('Pfister'), soundex('Ashcraft'), soundex('Honeyman')",
+      "trino": {
+        "types": [
+          "varchar(4)",
+          "varchar(4)",
+          "varchar(4)",
+          "varchar(4)",
+          "varchar(4)",
+          "varchar(4)"
+        ],
+        "rows": [
+          [
+            "R163",
+            "R163",
+            "T522",
+            "P236",
+            "A261",
+            "H555"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "soundex_null_edge",
+      "sql": "SELECT soundex(''), soundex(CAST(NULL AS varchar)), soundex('123'), soundex('A'), soundex(' jackson'), soundex('Lee-Ann')",
+      "trino": {
+        "types": [
+          "varchar(4)",
+          "varchar(4)",
+          "varchar(4)",
+          "varchar(4)",
+          "varchar(4)",
+          "varchar(4)"
+        ],
+        "rows": [
+          [
+            "",
+            null,
+            "",
+            "A000",
+            "J250",
+            "L500"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "luhn_check_fn",
+      "sql": "SELECT luhn_check('79927398713'), luhn_check('79927398714'), luhn_check(CAST(NULL AS varchar)), luhn_check('4111111111111111')",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            false,
+            null,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "luhn_check_edge",
+      "sql": "SELECT luhn_check('0'), luhn_check('00'), luhn_check('18')",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            true,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "luhn_check_invalid",
+      "sql": "SELECT luhn_check('12a')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Input contains non-digit character"
+      }
+    },
+    {
+      "name": "luhn_check_empty",
+      "sql": "SELECT luhn_check('')",
+      "trino": {
+        "types": [
+          "boolean"
+        ],
+        "rows": [
+          [
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "name": "split_to_map_fn",
+      "sql": "SELECT split_to_map('a=1,b=2', ',', '='), split_to_map('', ',', '='), split_to_map(CAST(NULL AS varchar), ',', '=')",
+      "trino": {
+        "types": [
+          "map(varchar, varchar)",
+          "map(varchar, varchar)",
+          "map(varchar, varchar)"
+        ],
+        "rows": [
+          [
+            {
+              "a": "1",
+              "b": "2"
+            },
+            {},
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "split_to_map_edge",
+      "sql": "SELECT split_to_map('a=1,b=', ',', '='), split_to_map('a:=1', ',', ':='), split_to_map('a=1,', ',', '=')",
+      "trino": {
+        "types": [
+          "map(varchar, varchar)",
+          "map(varchar, varchar)",
+          "map(varchar, varchar)"
+        ],
+        "rows": [
+          [
+            {
+              "a": "1",
+              "b": ""
+            },
+            {
+              "a": "1"
+            },
+            {
+              "a": "1"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "name": "split_to_map_duplicate",
+      "sql": "SELECT split_to_map('a=1,a=2', ',', '=')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Duplicate keys (a) are not allowed"
+      }
+    },
+    {
+      "name": "split_to_map_no_separator",
+      "sql": "SELECT split_to_map('a', ',', '=')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Key-value delimiter must appear exactly once in each entry. Bad input: 'a'"
+      }
+    },
+    {
+      "name": "varchar_n_cast_truncates",
+      "sql": "SELECT CAST('abcdef' AS varchar(3)), CAST('ação' AS varchar(2)), CAST('ab' AS varchar(5)), CAST(CAST(NULL AS varchar) AS varchar(1))",
+      "trino": {
+        "types": [
+          "varchar(3)",
+          "varchar(2)",
+          "varchar(5)",
+          "varchar(1)"
+        ],
+        "rows": [
+          [
+            "abc",
+            "aç",
+            "ab",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "varchar_n_cast_number",
+      "sql": "SELECT CAST(12345 AS varchar(3)), CAST(1.5E0 AS varchar(20))",
+      "trino": {
+        "error": "INVALID_CAST_ARGUMENT",
+        "message": "Value 12345 cannot be represented as varchar(3)"
+      }
+    },
+    {
+      "name": "soundex_unmapped_letter",
+      "sql": "SELECT soundex('ação')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "The character is not mapped: Ç (index=134)"
+      }
+    },
+    {
+      "name": "split_to_map_two_separators",
+      "sql": "SELECT split_to_map('k=v=w', ',', '=')",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Key-value delimiter must appear exactly once in each entry. Bad input: 'k=v=w'"
+      }
+    },
+    {
+      "name": "normalize_fn",
+      "sql": "SELECT length(normalize('e' || chr(769))), length(normalize('é', NFD)), normalize(CAST(NULL AS varchar)), normalize('ﬁ', NFKC)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            1,
+            2,
+            null,
+            "fi"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "normalize_forms",
+      "sql": "SELECT length(normalize('Å', NFKD)), normalize('abc', NFC), length(normalize('ﬁ', NFD))",
+      "trino": {
+        "types": [
+          "bigint",
+          "varchar",
+          "bigint"
+        ],
+        "rows": [
+          [
+            2,
+            "abc",
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "normalize_edge",
+      "sql": "SELECT normalize(''), length(normalize('ação')), normalize('Å', NFC) = normalize('A' || chr(778))",
+      "trino": {
+        "types": [
+          "varchar",
+          "bigint",
+          "boolean"
+        ],
+        "rows": [
+          [
+            "",
+            4,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "codepoint_edge",
+      "sql": "SELECT codepoint('a'), codepoint(chr(0)), codepoint('ç')",
+      "trino": {
+        "types": [
+          "integer",
+          "integer",
+          "integer"
+        ],
+        "rows": [
+          [
+            97,
+            0,
+            231
+          ]
+        ]
+      }
+    },
+    {
+      "name": "from_utf8_edge",
+      "sql": "SELECT from_utf8(to_utf8('😀')), from_utf8(X'F0', 'x'), from_utf8(CAST(NULL AS varbinary), '?')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "😀",
+            "x",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "levenshtein_unicode",
+      "sql": "SELECT levenshtein_distance('😀a', 'a'), levenshtein_distance('abc', ''), levenshtein_distance(CAST(NULL AS varchar), CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            1,
+            3,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "lower_upper_unicode_null",
+      "sql": "SELECT lower('ÇÃO ΣΑ'), upper('straße'), lower(CAST(NULL AS varchar(3)))",
+      "trino": {
+        "types": [
+          "varchar(6)",
+          "varchar(6)",
+          "varchar(3)"
+        ],
+        "rows": [
+          [
+            "ção σα",
+            "STRAßE",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "position_edge",
+      "sql": "SELECT position('a' IN ''), position('aa' IN 'aaa'), position('😀' IN 'x😀')",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            0,
+            1,
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "starts_with_unicode",
+      "sql": "SELECT starts_with('😀abc', '😀'), starts_with('abc', 'abcd'), starts_with(CAST(NULL AS varchar), CAST(NULL AS varchar))",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            false,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "substring_edge",
+      "sql": "SELECT substring('ação' FROM 3), substring('ação' FROM -2 FOR 1), substring('abc' FROM 1 FOR CAST(NULL AS bigint))",
+      "trino": {
+        "types": [
+          "varchar(4)",
+          "varchar(4)",
+          "varchar(3)"
+        ],
+        "rows": [
+          [
+            "ão",
+            "ã",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "translate_unicode",
+      "sql": "SELECT translate('😀ab', '😀', 'x'), translate('abc', 'cba', 'CBA'), translate(CAST(NULL AS varchar), '', '')",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "xab",
+            "ABC",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "normalize_null_edge",
+      "sql": "SELECT normalize(CAST(NULL AS varchar), NFD), length(normalize('ﬃ', NFKD)), normalize('', NFKC)",
+      "trino": {
+        "types": [
+          "varchar",
+          "bigint",
+          "varchar"
+        ],
+        "rows": [
+          [
+            null,
+            3,
+            ""
+          ]
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,1588 @@
+{
+  "category": "aggregate",
+  "cases": [
+    {
+      "name": "checksum_varchar",
+      "sql": "SELECT checksum(x) FROM (VALUES CAST('a' AS varchar), 'b', NULL) t(x)",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "QUNJzwd1EhA="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "checksum_bigint",
+      "sql": "SELECT checksum(x) FROM (VALUES CAST(1 AS bigint), 2) t(x)",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "Y4fQ9YZf0TY="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "checksum_integer",
+      "sql": "SELECT checksum(x) FROM (VALUES 1, 2) t(x)",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "Y4fQ9YZf0TY="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "checksum_only_null",
+      "sql": "SELECT checksum(x) FROM (VALUES CAST(NULL AS varchar)) t(x)",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "h8rrhbF5N54="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "checksum_empty",
+      "sql": "SELECT checksum(x) FROM (VALUES CAST('a' AS varchar)) t(x) WHERE false",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "checksum_double",
+      "sql": "SELECT checksum(x) FROM (VALUES 1.5E0, -0.25E0, 1E300) t(x)",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "5z7QiBB4n1Y="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "checksum_real",
+      "sql": "SELECT checksum(x) FROM (VALUES REAL '1.5', REAL '-0.25') t(x)",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "gL5I/eGTZC4="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "checksum_boolean",
+      "sql": "SELECT checksum(x) FROM (VALUES true, false, NULL) t(x)",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "t4fFCdP3rV0="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "checksum_date",
+      "sql": "SELECT checksum(x) FROM (VALUES DATE '2024-01-01', DATE '1969-12-31') t(x)",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "NZnWG5L/r8A="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "checksum_timestamp3",
+      "sql": "SELECT checksum(x) FROM (VALUES CAST(TIMESTAMP '2024-01-01 10:00:00.123' AS timestamp(3)), CAST(TIMESTAMP '1969-12-31 23:59:59.999' AS timestamp(3))) t(x)",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "U2rGDeD9Hzw="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "checksum_timestamp6",
+      "sql": "SELECT checksum(x) FROM (VALUES TIMESTAMP '2024-01-01 10:00:00.123456') t(x)",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "t09h+fiOrP8="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "checksum_timestamp9",
+      "sql": "SELECT checksum(x) FROM (VALUES TIMESTAMP '2024-01-01 10:00:00.123456789') t(x)",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "HgesdlTZ8RA="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "checksum_tstz",
+      "sql": "SELECT checksum(x) FROM (VALUES TIMESTAMP '2024-01-01 10:00:00.123 UTC', TIMESTAMP '2024-01-01 10:00:00.123 America/Sao_Paulo') t(x)",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "o6yi/UAHAsw="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "checksum_decimal_short",
+      "sql": "SELECT checksum(x) FROM (VALUES CAST(10.5 AS decimal(18,6)), CAST(-3.25 AS decimal(18,6))) t(x)",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "vm6joqPh9CI="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "checksum_decimal_long",
+      "sql": "SELECT checksum(x) FROM (VALUES CAST(10.5 AS decimal(38,6)), CAST(-3.25 AS decimal(38,6))) t(x)",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "kj07+bIS6zQ="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "checksum_varbinary",
+      "sql": "SELECT checksum(x) FROM (VALUES X'00', X'0102', X'') t(x)",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "cVTks0vOCtA="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "checksum_grouped",
+      "sql": "SELECT g, checksum(v) FROM (VALUES (1, CAST('a' AS varchar)), (1, 'b'), (2, 'a'), (2, NULL)) t(g, v) GROUP BY g ORDER BY g",
+      "trino": {
+        "types": [
+          "integer",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            1,
+            "unhdSVb72nE="
+          ],
+          [
+            2,
+            "hMqWUhTu4n0="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "checksum_recon_csf",
+      "sql": "SELECT CHECKSUM(CASE WHEN p IS NOT NULL THEN CAST(v AS VARCHAR) END) FROM (VALUES (1, CAST(10.5 AS decimal(18,6))), (NULL, CAST(1 AS decimal(18,6)))) t(p, v)",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "MUK37dCAK+g="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "max_by_min_by",
+      "sql": "SELECT max_by(x, y), min_by(x, y) FROM (VALUES ('a', 1), ('b', 3), ('c', 2)) t(x, y)",
+      "trino": {
+        "types": [
+          "varchar(1)",
+          "varchar(1)"
+        ],
+        "rows": [
+          [
+            "b",
+            "a"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "max_by_nulls",
+      "sql": "SELECT max_by(x, y) FROM (VALUES (CAST('a' AS varchar), 1), (NULL, 3), ('c', NULL)) t(x, y)",
+      "trino": {
+        "types": [
+          "varchar"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "max_by_timestamp_csf",
+      "sql": "SELECT g, MAX_BY(CAST(v AS timestamp(3)), s) FROM (VALUES (1, TIMESTAMP '2024-01-01 10:00:00.000', 1), (1, TIMESTAMP '2024-01-02 10:00:00.000', 2), (2, TIMESTAMP '2024-01-03 10:00:00.000', 5)) t(g, v, s) GROUP BY g ORDER BY g",
+      "trino": {
+        "types": [
+          "integer",
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            1,
+            "2024-01-02 10:00:00.000"
+          ],
+          [
+            2,
+            "2024-01-03 10:00:00.000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "max_by_empty",
+      "sql": "SELECT max_by(x, y) FROM (VALUES (1, 1)) t(x, y) WHERE false",
+      "trino": {
+        "types": [
+          "integer"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "count_if_fn",
+      "sql": "SELECT count_if(x > 1), count_if(CAST(NULL AS boolean)) FROM (VALUES 1, 2, 3) t(x)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            2,
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "arbitrary_fn",
+      "sql": "SELECT arbitrary(x), any_value(x) FROM (VALUES CAST(NULL AS bigint), 5, 5) t(x)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            5,
+            5
+          ]
+        ]
+      }
+    },
+    {
+      "name": "approx_distinct_fn",
+      "sql": "SELECT approx_distinct(x) FROM (VALUES 1, 2, 2, 3, NULL) t(x)",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            3
+          ]
+        ]
+      }
+    },
+    {
+      "name": "approx_distinct_varchar",
+      "sql": "SELECT approx_distinct(CAST(x AS varchar)) FROM (VALUES 1, 2, 2, 3, NULL) t(x)",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            3
+          ]
+        ]
+      }
+    },
+    {
+      "name": "approx_distinct_empty",
+      "sql": "SELECT approx_distinct(x) FROM (VALUES 1) t(x) WHERE false",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "approx_percentile_bigint",
+      "sql": "SELECT approx_percentile(x, 0.5), approx_percentile(x, 0.25), approx_percentile(x, 0.0), approx_percentile(x, 1.0) FROM (VALUES CAST(1 AS bigint), 2, 3, 4) t(x)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            3,
+            2,
+            1,
+            4
+          ]
+        ]
+      }
+    },
+    {
+      "name": "approx_percentile_double",
+      "sql": "SELECT approx_percentile(x, 0.5), approx_percentile(x, 0.95), approx_percentile(x, 0.99) FROM (VALUES 1.5E0, 2.5E0, 10E0, 3E0, 7E0) t(x)",
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            3.0,
+            10.0,
+            10.0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "approx_percentile_array",
+      "sql": "SELECT approx_percentile(x, ARRAY[0.5, 0.9]) FROM (VALUES CAST(1 AS bigint), 2, 3, 4, 5, 6, 7, 8, 9, 10) t(x)",
+      "trino": {
+        "types": [
+          "array(bigint)"
+        ],
+        "rows": [
+          [
+            [
+              6,
+              10
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "approx_percentile_weighted",
+      "sql": "SELECT approx_percentile(x, w, 0.5) FROM (VALUES (CAST(1 AS bigint), CAST(1 AS bigint)), (2, 10), (3, 1)) t(x, w)",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "approx_percentile_csf",
+      "sql": "SELECT CAST(approx_percentile(lat, 0.50) AS bigint), APPROX_PERCENTILE(CAST(lat AS DOUBLE), 0.95) FROM (VALUES CAST(12 AS bigint), 30, 45, 120, 7) t(lat)",
+      "trino": {
+        "types": [
+          "bigint",
+          "double"
+        ],
+        "rows": [
+          [
+            30,
+            120.0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "approx_percentile_bad",
+      "sql": "SELECT approx_percentile(x, 1.5) FROM (VALUES 1E0) t(x)",
+      "trino": {
+        "error": "INVALID_FUNCTION_ARGUMENT",
+        "message": "Percentile must be between 0 and 1"
+      }
+    },
+    {
+      "name": "approx_percentile_empty",
+      "sql": "SELECT approx_percentile(x, 0.5) FROM (VALUES 1E0) t(x) WHERE false",
+      "trino": {
+        "types": [
+          "double"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "avg_decimal",
+      "sql": "SELECT avg(x) FROM (VALUES CAST(1.0 AS decimal(5,1)), CAST(1.1 AS decimal(5,1))) t(x)",
+      "trino": {
+        "types": [
+          "decimal(5, 1)"
+        ],
+        "rows": [
+          [
+            "1.1"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "avg_decimal_negative",
+      "sql": "SELECT avg(x) FROM (VALUES CAST(-1.0 AS decimal(5,1)), CAST(-1.1 AS decimal(5,1))) t(x)",
+      "trino": {
+        "types": [
+          "decimal(5, 1)"
+        ],
+        "rows": [
+          [
+            "-1.1"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "avg_bigint_double",
+      "sql": "SELECT avg(x) FROM (VALUES CAST(1 AS bigint), 2) t(x)",
+      "trino": {
+        "types": [
+          "double"
+        ],
+        "rows": [
+          [
+            1.5
+          ]
+        ]
+      }
+    },
+    {
+      "name": "avg_double",
+      "sql": "SELECT avg(CAST(x AS double)) FROM (VALUES CAST(1 AS bigint), 2) t(x)",
+      "trino": {
+        "types": [
+          "double"
+        ],
+        "rows": [
+          [
+            1.5
+          ]
+        ]
+      }
+    },
+    {
+      "name": "bool_aggs",
+      "sql": "SELECT bool_and(x), bool_or(x), every(x) FROM (VALUES true, false, NULL) t(x)",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            false,
+            true,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "name": "bitwise_aggs",
+      "sql": "SELECT bitwise_and_agg(x), bitwise_or_agg(x) FROM (VALUES CAST(12 AS bigint), 10) t(x)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            8,
+            14
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_agg_join_csf",
+      "sql": "SELECT ARRAY_JOIN(ARRAY_AGG(c ORDER BY c), ',') FROM (VALUES 'b', 'a', 'c') t(c)",
+      "trino": {
+        "types": [
+          "varchar"
+        ],
+        "rows": [
+          [
+            "a,b,c"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "stddev_window_csf",
+      "sql": "SELECT x, STDDEV_POP(x) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES 1E0, 2E0, 4E0) t(x) ORDER BY x",
+      "trino": {
+        "types": [
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            1.0,
+            0.0
+          ],
+          [
+            2.0,
+            0.5
+          ],
+          [
+            4.0,
+            1.0
+          ]
+        ]
+      },
+      "ulps": 4
+    },
+    {
+      "name": "count_if_empty_null",
+      "sql": "SELECT count_if(x) FROM (VALUES CAST(NULL AS boolean)) t(x)",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "count_if_empty",
+      "sql": "SELECT count_if(x > 0) FROM (VALUES 1) t(x) WHERE false",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "arbitrary_all_null",
+      "sql": "SELECT arbitrary(x), any_value(x) FROM (VALUES CAST(NULL AS varchar)) t(x)",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "arbitrary_grouped",
+      "sql": "SELECT g, arbitrary(v), any_value(v) FROM (VALUES (1, 'a'), (1, 'a'), (2, 'b')) t(g, v) GROUP BY g ORDER BY g",
+      "trino": {
+        "types": [
+          "integer",
+          "varchar(1)",
+          "varchar(1)"
+        ],
+        "rows": [
+          [
+            1,
+            "a",
+            "a"
+          ],
+          [
+            2,
+            "b",
+            "b"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "approx_distinct_types",
+      "sql": "SELECT approx_distinct(x) FROM (VALUES DATE '2024-01-01', DATE '2024-01-02', NULL) t(x)",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "approx_distinct_error_arg",
+      "sql": "SELECT approx_distinct(x, 0.1) FROM (VALUES 1, 2, 2) t(x)",
+      "trino": {
+        "types": [
+          "bigint"
+        ],
+        "rows": [
+          [
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "bool_aggs_null",
+      "sql": "SELECT bool_and(x), bool_or(x), every(x) FROM (VALUES CAST(NULL AS boolean)) t(x)",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "bool_aggs_grouped",
+      "sql": "SELECT g, bool_and(v), bool_or(v) FROM (VALUES (1, true), (1, true), (2, false), (2, true)) t(g, v) GROUP BY g ORDER BY g",
+      "trino": {
+        "types": [
+          "integer",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            1,
+            true,
+            true
+          ],
+          [
+            2,
+            false,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "bitwise_aggs_null",
+      "sql": "SELECT bitwise_and_agg(x), bitwise_or_agg(x) FROM (VALUES CAST(NULL AS bigint)) t(x)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "min_by_nulls",
+      "sql": "SELECT min_by(x, y) FROM (VALUES ('a', 2), ('b', CAST(NULL AS integer)), (NULL, 1)) t(x, y)",
+      "trino": {
+        "types": [
+          "varchar(1)"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "min_by_empty",
+      "sql": "SELECT min_by(x, y) FROM (VALUES (1, 1)) t(x, y) WHERE false",
+      "trino": {
+        "types": [
+          "integer"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "max_by_n",
+      "sql": "SELECT max_by(x, y, 2), min_by(x, y, 2) FROM (VALUES ('a', 1), ('b', 3), ('c', 2)) t(x, y)",
+      "trino": {
+        "types": [
+          "array(varchar(1))",
+          "array(varchar(1))"
+        ],
+        "rows": [
+          [
+            [
+              "b",
+              "c"
+            ],
+            [
+              "a",
+              "c"
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "listagg_fn",
+      "sql": "SELECT listagg(x, ',') WITHIN GROUP (ORDER BY x) FROM (VALUES 'b', 'a', 'c') t(x)",
+      "trino": {
+        "types": [
+          "varchar"
+        ],
+        "rows": [
+          [
+            "a,b,c"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "listagg_nulls",
+      "sql": "SELECT listagg(x, '-') WITHIN GROUP (ORDER BY x) FROM (VALUES CAST('a' AS varchar), NULL, 'b') t(x)",
+      "trino": {
+        "types": [
+          "varchar"
+        ],
+        "rows": [
+          [
+            "a-b"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "listagg_empty",
+      "sql": "SELECT listagg(x, ',') WITHIN GROUP (ORDER BY x) FROM (VALUES 'a') t(x) WHERE false",
+      "trino": {
+        "types": [
+          "varchar"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "listagg_grouped_desc",
+      "sql": "SELECT g, listagg(v, '; ') WITHIN GROUP (ORDER BY v DESC) FROM (VALUES (1, 'a'), (1, 'b'), (2, 'c')) t(g, v) GROUP BY g ORDER BY g",
+      "trino": {
+        "types": [
+          "integer",
+          "varchar"
+        ],
+        "rows": [
+          [
+            1,
+            "b; a"
+          ],
+          [
+            2,
+            "c"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "listagg_distinct",
+      "sql": "SELECT listagg(DISTINCT x, ',') WITHIN GROUP (ORDER BY x) FROM (VALUES 'b', 'a', 'b') t(x)",
+      "trino": {
+        "types": [
+          "varchar"
+        ],
+        "rows": [
+          [
+            "a,b"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "listagg_default_separator",
+      "sql": "SELECT listagg(x) WITHIN GROUP (ORDER BY x) FROM (VALUES 'b', 'a') t(x)",
+      "trino": {
+        "types": [
+          "varchar"
+        ],
+        "rows": [
+          [
+            "ab"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "listagg_order_other_column",
+      "sql": "SELECT listagg(v, ',') WITHIN GROUP (ORDER BY k DESC) FROM (VALUES (1, 'x'), (3, 'y'), (2, 'z')) t(k, v)",
+      "trino": {
+        "types": [
+          "varchar"
+        ],
+        "rows": [
+          [
+            "y,z,x"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "sum_decimal_type",
+      "sql": "SELECT sum(x), typeof(sum(x)) FROM (VALUES CAST(1.5 AS decimal(18,6)), CAST(2.25 AS decimal(18,6))) t(x)",
+      "trino": {
+        "types": [
+          "decimal(38, 6)",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "3.750000",
+            "decimal(38,6)"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "sum_integer_types",
+      "sql": "SELECT sum(x), typeof(sum(x)) FROM (VALUES 1, 2) t(x)",
+      "trino": {
+        "types": [
+          "bigint",
+          "varchar"
+        ],
+        "rows": [
+          [
+            3,
+            "bigint"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "sum_real_type",
+      "sql": "SELECT sum(x), typeof(sum(x)) FROM (VALUES REAL '1.5', REAL '2.25') t(x)",
+      "trino": {
+        "types": [
+          "real",
+          "varchar"
+        ],
+        "rows": [
+          [
+            3.75,
+            "real"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "sum_double_type",
+      "sql": "SELECT sum(x), typeof(sum(x)) FROM (VALUES 1.5E0, 2.25E0) t(x)",
+      "trino": {
+        "types": [
+          "double",
+          "varchar"
+        ],
+        "rows": [
+          [
+            3.75,
+            "double"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "sum_bigint_overflow",
+      "sql": "SELECT sum(x) FROM (VALUES CAST(9223372036854775807 AS bigint), 1) t(x)",
+      "trino": {
+        "error": "NUMERIC_VALUE_OUT_OF_RANGE",
+        "message": "bigint addition overflow: 9223372036854775807 + 1"
+      }
+    },
+    {
+      "name": "aggregates_empty",
+      "sql": "SELECT sum(x), count(x), count(*), min(x), max(x), avg(x), array_agg(x) FROM (VALUES 1) t(x) WHERE false",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint",
+          "integer",
+          "integer",
+          "double",
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            null,
+            0,
+            0,
+            null,
+            null,
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "min_max_varchar_nan",
+      "sql": "SELECT min(x), max(x) FROM (VALUES 'b', 'a', NULL) t(x)",
+      "trino": {
+        "types": [
+          "varchar(1)",
+          "varchar(1)"
+        ],
+        "rows": [
+          [
+            "a",
+            "b"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "min_max_double_nan",
+      "sql": "SELECT min(x), max(x) FROM (VALUES nan(), 1E0, -1E0) t(x)",
+      "trino": {
+        "types": [
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            -1.0,
+            1.0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "count_distinct",
+      "sql": "SELECT count(DISTINCT x), count(x), count(*) FROM (VALUES 1, 1, NULL, 2) t(x)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            2,
+            3,
+            4
+          ]
+        ]
+      }
+    },
+    {
+      "name": "stddev_variance",
+      "sql": "SELECT stddev(x), stddev_samp(x), stddev_pop(x), variance(x), var_samp(x), var_pop(x) FROM (VALUES 1E0, 2E0, 4E0) t(x)",
+      "ulps": 4,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            1.5275252316519465,
+            1.5275252316519465,
+            1.247219128924647,
+            2.333333333333333,
+            2.333333333333333,
+            1.5555555555555554
+          ]
+        ]
+      }
+    },
+    {
+      "name": "stddev_single_row",
+      "sql": "SELECT stddev(x), variance(x), stddev_pop(x), var_pop(x) FROM (VALUES 1E0) t(x)",
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            0.0,
+            0.0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "stddev_integer_arg",
+      "sql": "SELECT typeof(stddev(x)), var_pop(x) FROM (VALUES 1, 2, 3, 4) t(x)",
+      "ulps": 2,
+      "trino": {
+        "types": [
+          "varchar",
+          "double"
+        ],
+        "rows": [
+          [
+            "double",
+            1.25
+          ]
+        ]
+      }
+    },
+    {
+      "name": "corr_covar_regr",
+      "sql": "SELECT corr(y, x), covar_pop(y, x), covar_samp(y, x), regr_slope(y, x), regr_intercept(y, x) FROM (VALUES (1E0, 2E0), (2E0, 4.5E0), (3E0, 5.5E0)) t(x, y)",
+      "ulps": 8,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            0.9707253433941511,
+            1.1666666666666667,
+            1.75,
+            1.75,
+            0.5
+          ]
+        ]
+      }
+    },
+    {
+      "name": "corr_single_row",
+      "sql": "SELECT corr(y, x), covar_samp(y, x), covar_pop(y, x), regr_slope(y, x) FROM (VALUES (1E0, 2E0)) t(x, y)",
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            0.0,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_agg_nulls",
+      "sql": "SELECT array_agg(x) FROM (VALUES 1, NULL, 2) t(x)",
+      "trino": {
+        "types": [
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            [
+              1,
+              null,
+              2
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_agg_order_desc",
+      "sql": "SELECT array_agg(x ORDER BY x DESC) FROM (VALUES 1, 3, 2, 3) t(x)",
+      "trino": {
+        "types": [
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            [
+              3,
+              3,
+              2,
+              1
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "array_agg_distinct_order",
+      "sql": "SELECT array_agg(DISTINCT x ORDER BY x) FROM (VALUES 1, 3, 2, 3) t(x)",
+      "trino": {
+        "types": [
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            [
+              1,
+              2,
+              3
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "name": "geometric_mean_fn",
+      "sql": "SELECT geometric_mean(x) FROM (VALUES 1E0, 2E0, 4E0) t(x)",
+      "ulps": 2,
+      "trino": {
+        "types": [
+          "double"
+        ],
+        "rows": [
+          [
+            2.0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "geometric_mean_null_edge",
+      "sql": "SELECT geometric_mean(x) FROM (VALUES CAST(NULL AS double)) t(x)",
+      "trino": {
+        "types": [
+          "double"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "geometric_mean_bigint",
+      "sql": "SELECT geometric_mean(CAST(x AS bigint)) FROM (VALUES 1, 8) t(x)",
+      "trino": {
+        "types": [
+          "double"
+        ],
+        "rows": [
+          [
+            2.82842712474619
+          ]
+        ]
+      }
+    },
+    {
+      "name": "skewness_kurtosis",
+      "sql": "SELECT skewness(x), kurtosis(x) FROM (VALUES 1E0, 2E0, 3E0, 10E0) t(x)",
+      "ulps": 8,
+      "trino": {
+        "types": [
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            1.0182337649086284,
+            3.2280000000000015
+          ]
+        ]
+      }
+    },
+    {
+      "name": "skewness_kurtosis_small",
+      "sql": "SELECT skewness(x), kurtosis(x) FROM (VALUES 1E0, 2E0) t(x)",
+      "trino": {
+        "types": [
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "skewness_kurtosis_empty",
+      "sql": "SELECT skewness(x), kurtosis(x) FROM (VALUES 1E0) t(x) WHERE false",
+      "trino": {
+        "types": [
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "histogram_fn",
+      "sql": "SELECT histogram(x) FROM (VALUES 'a', 'b', 'a', NULL) t(x)",
+      "trino": {
+        "types": [
+          "map(varchar(1), bigint)"
+        ],
+        "rows": [
+          [
+            {
+              "a": 2,
+              "b": 1
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "name": "histogram_empty",
+      "sql": "SELECT histogram(x) FROM (VALUES 1) t(x) WHERE false",
+      "trino": {
+        "types": [
+          "map(integer, bigint)"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "histogram_grouped",
+      "sql": "SELECT g, histogram(v) FROM (VALUES (1, 10), (1, 10), (2, 5)) t(g, v) GROUP BY g ORDER BY g",
+      "trino": {
+        "types": [
+          "integer",
+          "map(integer, bigint)"
+        ],
+        "rows": [
+          [
+            1,
+            {
+              "10": 2
+            }
+          ],
+          [
+            2,
+            {
+              "5": 1
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "name": "map_agg_fn",
+      "sql": "SELECT map_agg(k, v) FROM (VALUES ('a', 1), ('b', 2)) t(k, v)",
+      "trino": {
+        "types": [
+          "map(varchar(1), integer)"
+        ],
+        "rows": [
+          [
+            {
+              "a": 1,
+              "b": 2
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "name": "map_agg_null_key",
+      "sql": "SELECT map_agg(k, v) FROM (VALUES (CAST(NULL AS varchar), 1), ('b', CAST(NULL AS integer))) t(k, v)",
+      "trino": {
+        "types": [
+          "map(varchar, integer)"
+        ],
+        "rows": [
+          [
+            {
+              "b": null
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "name": "map_agg_empty",
+      "sql": "SELECT map_agg(k, v) FROM (VALUES ('a', 1)) t(k, v) WHERE false",
+      "trino": {
+        "types": [
+          "map(varchar(1), integer)"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "checksum_null_group_empty",
+      "sql": "SELECT checksum(x) FROM (VALUES CAST(NULL AS bigint), NULL) t(x)",
+      "trino": {
+        "types": [
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "DpXXC2Pzbjw="
+          ]
+        ]
+      }
+    },
+    {
+      "name": "approx_percentile_null_values",
+      "sql": "SELECT approx_percentile(x, 0.5) FROM (VALUES CAST(NULL AS double), 2E0, NULL) t(x)",
+      "trino": {
+        "types": [
+          "double"
+        ],
+        "rows": [
+          [
+            2.0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "bool_every_more",
+      "sql": "SELECT every(x), bool_and(x), bool_or(x) FROM (VALUES true, true) t(x)",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            true,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "bitwise_aggs_more",
+      "sql": "SELECT bitwise_and_agg(x), bitwise_or_agg(x) FROM (VALUES CAST(-1 AS bigint), -2, -4) t(x)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            -4,
+            -1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "corr_covar_null_edge",
+      "sql": "SELECT corr(y, x), covar_pop(y, x), covar_samp(y, x), regr_slope(y, x), regr_intercept(y, x) FROM (VALUES (CAST(NULL AS double), 1E0), (2E0, CAST(NULL AS double))) t(x, y)",
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            null,
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "corr_constant_x",
+      "sql": "SELECT corr(y, x), regr_slope(y, x), regr_intercept(y, x), covar_pop(y, x) FROM (VALUES (1E0, 2E0), (1E0, 3E0), (1E0, 4E0)) t(x, y)",
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            null,
+            0.0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "variance_samp_more",
+      "sql": "SELECT variance(x), var_samp(x), stddev_samp(x) FROM (VALUES 2E0, 4E0, 4E0, 4E0, 5E0, 5E0, 7E0, 9E0) t(x)",
+      "ulps": 4,
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            4.571428571428571,
+            4.571428571428571,
+            2.138089935299395
+          ]
+        ]
+      }
+    },
+    {
+      "name": "variance_null_edge",
+      "sql": "SELECT variance(x), var_samp(x), stddev_samp(x), var_pop(x) FROM (VALUES CAST(NULL AS double)) t(x)",
+      "trino": {
+        "types": [
+          "double",
+          "double",
+          "double",
+          "double"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            null,
+            null
+          ]
+        ]
+      }
+    }
+  ]
+}

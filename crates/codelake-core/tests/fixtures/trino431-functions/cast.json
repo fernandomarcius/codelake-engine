@@ -1,0 +1,672 @@
+{
+  "category": "cast",
+  "cases": [
+    {
+      "name": "double_to_varchar",
+      "sql": "SELECT CAST(x AS varchar) FROM (VALUES 1.5E0, 1E10, 0.001E0, 123456789.123E0, 0E0, -1.5E0, 1E0/3, 1E-7, 1.7976931348623157E308, 4.9E-324) t(x)",
+      "trino": {
+        "types": [
+          "varchar"
+        ],
+        "rows": [
+          [
+            "1.5E0"
+          ],
+          [
+            "1.0E10"
+          ],
+          [
+            "1.0E-3"
+          ],
+          [
+            "1.23456789123E8"
+          ],
+          [
+            "0E0"
+          ],
+          [
+            "-1.5E0"
+          ],
+          [
+            "3.333333333333333E-1"
+          ],
+          [
+            "1.0E-7"
+          ],
+          [
+            "1.7976931348623157E308"
+          ],
+          [
+            "4.9E-324"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "double_special_to_varchar",
+      "sql": "SELECT CAST(nan() AS varchar), CAST(infinity() AS varchar), CAST(-infinity() AS varchar), CAST(CAST(NULL AS double) AS varchar)",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "NaN",
+            "Infinity",
+            "-Infinity",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "real_to_varchar",
+      "sql": "SELECT CAST(x AS varchar) FROM (VALUES REAL '0', REAL '0.1', REAL '1e10', REAL '3.4028235E38', REAL '1.1') t(x)",
+      "trino": {
+        "types": [
+          "varchar"
+        ],
+        "rows": [
+          [
+            "0E0"
+          ],
+          [
+            "1.0E-1"
+          ],
+          [
+            "1.0E10"
+          ],
+          [
+            "3.402823E38"
+          ],
+          [
+            "1.1E0"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "timestamp_to_varchar",
+      "sql": "SELECT CAST(TIMESTAMP '2026-01-01 10:00:00.123' AS varchar), CAST(TIMESTAMP '2026-01-01 10:00:00' AS varchar), CAST(TIMESTAMP '2026-01-01 10:00:00.123456' AS varchar)",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "2026-01-01 10:00:00.123",
+            "2026-01-01 10:00:00",
+            "2026-01-01 10:00:00.123456"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "tstz_to_varchar",
+      "sql": "SELECT CAST(TIMESTAMP '2026-01-01 10:00:00.123 America/Sao_Paulo' AS varchar)",
+      "trino": {
+        "types": [
+          "varchar"
+        ],
+        "rows": [
+          [
+            "2026-01-01 10:00:00.123 America/Sao_Paulo"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "date_bool_decimal_to_varchar",
+      "sql": "SELECT CAST(DATE '2026-01-01' AS varchar), CAST(true AS varchar), CAST(DECIMAL '10.50' AS varchar), CAST(CAST(7 AS bigint) AS varchar)",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "2026-01-01",
+            "true",
+            "10.50",
+            "7"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "decimal_to_integer_rounds",
+      "sql": "SELECT CAST(2.5 AS integer), CAST(-2.5 AS integer), CAST(1.4999 AS bigint), CAST(CAST(-0.5 AS decimal(3,1)) AS bigint)",
+      "trino": {
+        "types": [
+          "integer",
+          "integer",
+          "bigint",
+          "bigint"
+        ],
+        "rows": [
+          [
+            3,
+            -3,
+            1,
+            -1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "double_to_integer_rounds",
+      "sql": "SELECT CAST(2.5E0 AS bigint), CAST(-2.5E0 AS bigint), CAST(1.4999E0 AS integer), CAST(-0.4E0 AS integer)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "integer",
+          "integer"
+        ],
+        "rows": [
+          [
+            3,
+            -3,
+            1,
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "name": "double_to_integer_overflow",
+      "sql": "SELECT CAST(1E20 AS bigint)",
+      "trino": {
+        "error": "INVALID_CAST_ARGUMENT",
+        "message": "Unable to cast 1.0E20 to bigint"
+      }
+    },
+    {
+      "name": "double_nan_to_integer",
+      "sql": "SELECT CAST(nan() AS integer)",
+      "trino": {
+        "error": "INVALID_CAST_ARGUMENT",
+        "message": "Cannot cast double NaN to integer"
+      }
+    },
+    {
+      "name": "double_to_integer_try",
+      "sql": "SELECT TRY_CAST(1E20 AS bigint), TRY_CAST(nan() AS integer), TRY_CAST(2.5E0 AS integer)",
+      "trino": {
+        "types": [
+          "bigint",
+          "integer",
+          "integer"
+        ],
+        "rows": [
+          [
+            null,
+            null,
+            3
+          ]
+        ]
+      }
+    },
+    {
+      "name": "decimal_to_integer_overflow",
+      "sql": "SELECT CAST(DECIMAL '3000000000.5' AS integer)",
+      "trino": {
+        "error": "INVALID_CAST_ARGUMENT",
+        "message": "Cannot cast '3000000001' to INTEGER"
+      }
+    },
+    {
+      "name": "decimal_downscale_half_up",
+      "sql": "SELECT CAST(CAST(1.25 AS decimal(5,2)) AS decimal(5,1)), CAST(CAST(-1.25 AS decimal(5,2)) AS decimal(5,1))",
+      "trino": {
+        "types": [
+          "decimal(5, 1)",
+          "decimal(5, 1)"
+        ],
+        "rows": [
+          [
+            "1.3",
+            "-1.3"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "timestamp_round_half_up",
+      "sql": "SELECT CAST(TIMESTAMP '2024-01-01 10:00:00.1235' AS timestamp(3)), CAST(TIMESTAMP '1969-12-31 23:59:59.9995' AS timestamp(3)), CAST(TIMESTAMP '2024-01-01 10:00:00.1234' AS timestamp(3))",
+      "trino": {
+        "types": [
+          "timestamp(3)",
+          "timestamp(3)",
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2024-01-01 10:00:00.124",
+            "1970-01-01 00:00:00.000",
+            "2024-01-01 10:00:00.123"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "timestamp_default_precision",
+      "sql": "SELECT CAST('2026-02-01 10:00:00.123456' AS timestamp), CAST(DATE '2026-02-01' AS timestamp)",
+      "trino": {
+        "types": [
+          "timestamp(3)",
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2026-02-01 10:00:00.123",
+            "2026-02-01 00:00:00.000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "tstz_to_timestamp_local",
+      "sql": "SELECT CAST(TIMESTAMP '2024-01-01 10:00:00.000 America/Sao_Paulo' AS timestamp(3)), CAST(TIMESTAMP '2024-01-01 10:00:00.000 +05:30' AS timestamp(3))",
+      "trino": {
+        "types": [
+          "timestamp(3)",
+          "timestamp(3)"
+        ],
+        "rows": [
+          [
+            "2024-01-01 10:00:00.000",
+            "2024-01-01 10:00:00.000"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "timestamp_to_tstz_session",
+      "sql": "SELECT CAST(TIMESTAMP '2024-01-01 10:00:00.000' AS timestamp(3) with time zone), CAST('2024-01-01 10:00:00' AS timestamp with time zone), CAST('2024-01-01 10:00:00 America/Sao_Paulo' AS timestamp(3) with time zone)",
+      "trino": {
+        "types": [
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone",
+          "timestamp(3) with time zone"
+        ],
+        "rows": [
+          [
+            "2024-01-01 10:00:00.000 UTC",
+            "2024-01-01 10:00:00.000 UTC",
+            "2024-01-01 10:00:00.000 America/Sao_Paulo"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "tstz_to_date",
+      "sql": "SELECT CAST(TIMESTAMP '2024-01-01 01:00:00.000 Asia/Tokyo' AS date), CAST(TIMESTAMP '2024-01-01 23:00:00.000 America/Sao_Paulo' AS date)",
+      "trino": {
+        "types": [
+          "date",
+          "date"
+        ],
+        "rows": [
+          [
+            "2024-01-01",
+            "2024-01-01"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "compare_naive_tstz",
+      "sql": "SELECT TIMESTAMP '2024-01-01 10:00:00.000' = TIMESTAMP '2024-01-01 10:00:00.000 UTC', TIMESTAMP '2024-01-01 10:00:00.000' < TIMESTAMP '2024-01-01 10:00:00.000 America/Sao_Paulo'",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean"
+        ],
+        "rows": [
+          [
+            true,
+            true
+          ]
+        ]
+      }
+    },
+    {
+      "name": "decimal_literal",
+      "sql": "SELECT DECIMAL '1.50', DECIMAL '-12', DECIMAL '0.05'",
+      "trino": {
+        "types": [
+          "decimal(3, 2)",
+          "decimal(2, 0)",
+          "decimal(2, 2)"
+        ],
+        "rows": [
+          [
+            "1.50",
+            "-12",
+            "0.05"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "varbinary_literal",
+      "sql": "SELECT X'00ab', X'', CAST(X'616263' AS varbinary)",
+      "trino": {
+        "types": [
+          "varbinary",
+          "varbinary",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "AKs=",
+            "",
+            "YWJj"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "try_cast_varchar",
+      "sql": "SELECT TRY_CAST('12' AS bigint), TRY_CAST('abc' AS bigint), TRY_CAST('2024-02-30' AS date)",
+      "trino": {
+        "types": [
+          "bigint",
+          "bigint",
+          "date"
+        ],
+        "rows": [
+          [
+            12,
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "try_cast_edge",
+      "sql": "SELECT TRY_CAST('  12 ' AS bigint), TRY_CAST('1e3' AS double), TRY_CAST('true' AS boolean), TRY_CAST('yes' AS boolean), TRY_CAST('1.5' AS decimal(3,1)), TRY_CAST('1.55' AS decimal(3,1))",
+      "trino": {
+        "types": [
+          "bigint",
+          "double",
+          "boolean",
+          "boolean",
+          "decimal(3, 1)",
+          "decimal(3, 1)"
+        ],
+        "rows": [
+          [
+            null,
+            1000.0,
+            true,
+            null,
+            "1.5",
+            "1.6"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "varchar_to_numbers",
+      "sql": "SELECT CAST('1.5' AS double), CAST('-0' AS integer), CAST('1.25' AS decimal(3,1)), CAST('Infinity' AS double), CAST('NaN' AS double), CAST('+7' AS bigint)",
+      "trino": {
+        "types": [
+          "double",
+          "integer",
+          "decimal(3, 1)",
+          "double",
+          "double",
+          "bigint"
+        ],
+        "rows": [
+          [
+            1.5,
+            0,
+            "1.3",
+            "Infinity",
+            "NaN",
+            7
+          ]
+        ]
+      }
+    },
+    {
+      "name": "varchar_to_integer_invalid",
+      "sql": "SELECT CAST('1.5' AS integer)",
+      "trino": {
+        "error": "INVALID_CAST_ARGUMENT",
+        "message": "Cannot cast '1.5' to INT"
+      }
+    },
+    {
+      "name": "boolean_casts",
+      "sql": "SELECT CAST('true' AS boolean), CAST('FALSE' AS boolean), CAST('1' AS boolean), CAST('0' AS boolean), CAST(0 AS boolean), CAST(2 AS boolean), CAST(true AS integer)",
+      "trino": {
+        "types": [
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean",
+          "boolean",
+          "integer"
+        ],
+        "rows": [
+          [
+            true,
+            false,
+            true,
+            false,
+            false,
+            true,
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "name": "varchar_to_date_ts",
+      "sql": "SELECT CAST('2024-02-29' AS date), CAST('2024-02-29 10:11:12' AS timestamp(3)), CAST('2024-02-29 10:11:12.123456' AS timestamp(6)), CAST(' 2024-02-29 ' AS date)",
+      "trino": {
+        "types": [
+          "date",
+          "timestamp(3)",
+          "timestamp(6)",
+          "date"
+        ],
+        "rows": [
+          [
+            "2024-02-29",
+            "2024-02-29 10:11:12.000",
+            "2024-02-29 10:11:12.123456",
+            "2024-02-29"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "varchar_to_date_invalid",
+      "sql": "SELECT CAST('2024-02-30' AS date)",
+      "trino": {
+        "error": "INVALID_CAST_ARGUMENT",
+        "message": "Value cannot be cast to date: 2024-02-30"
+      }
+    },
+    {
+      "name": "cast_integer_overflow",
+      "sql": "SELECT CAST(CAST(3000000000 AS bigint) AS integer)",
+      "trino": {
+        "error": "NUMERIC_VALUE_OUT_OF_RANGE",
+        "message": "Out of range for integer: 3000000000"
+      }
+    },
+    {
+      "name": "cast_decimal_overflow",
+      "sql": "SELECT CAST(DECIMAL '123.45' AS decimal(4,2))",
+      "trino": {
+        "error": "INVALID_CAST_ARGUMENT",
+        "message": "Cannot cast DECIMAL(5, 2) '123.45' to DECIMAL(4, 2)"
+      }
+    },
+    {
+      "name": "cast_double_to_decimal",
+      "sql": "SELECT CAST(1.005E0 AS decimal(4,2)), CAST(-2.5E0 AS decimal(2,0)), CAST(0.125E0 AS decimal(3,2)), CAST(1E0/3 AS decimal(18,15))",
+      "trino": {
+        "types": [
+          "decimal(4, 2)",
+          "decimal(2, 0)",
+          "decimal(3, 2)",
+          "decimal(18, 15)"
+        ],
+        "rows": [
+          [
+            "1.01",
+            "-3",
+            "0.13",
+            "0.333333333333333"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "cast_decimal_to_floats",
+      "sql": "SELECT CAST(DECIMAL '0.1' AS double), CAST(DECIMAL '1.23456789' AS real), CAST(CAST(NULL AS decimal(5,2)) AS double)",
+      "trino": {
+        "types": [
+          "double",
+          "real",
+          "double"
+        ],
+        "rows": [
+          [
+            0.1,
+            1.2345679,
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "cast_to_varchar_misc",
+      "sql": "SELECT CAST(-5 AS varchar), CAST(CAST(1 AS tinyint) AS varchar), CAST(DECIMAL '-0.50' AS varchar), CAST(REAL '1.0' AS varchar), CAST(1E0 AS varchar)",
+      "trino": {
+        "types": [
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar",
+          "varchar"
+        ],
+        "rows": [
+          [
+            "-5",
+            "1",
+            "-0.50",
+            "1.0E0",
+            "1.0E0"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "cast_date_timestamp",
+      "sql": "SELECT CAST(TIMESTAMP '2024-02-29 23:59:59.999' AS date), CAST(DATE '2024-02-29' AS timestamp(6)), CAST(TIMESTAMP '2024-02-29 23:59:59.999999' AS timestamp(0)), CAST(TIMESTAMP '1969-12-31 23:59:59.5' AS timestamp(0))",
+      "trino": {
+        "types": [
+          "date",
+          "timestamp(6)",
+          "timestamp(0)",
+          "timestamp(0)"
+        ],
+        "rows": [
+          [
+            "2024-02-29",
+            "2024-02-29 00:00:00.000000",
+            "2024-03-01 00:00:00",
+            "1970-01-01 00:00:00"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "cast_integer_widths",
+      "sql": "SELECT CAST(300 AS smallint), CAST(-5 AS tinyint), CAST(CAST(127 AS tinyint) AS bigint), CAST(2147483647 AS integer)",
+      "trino": {
+        "types": [
+          "smallint",
+          "tinyint",
+          "bigint",
+          "integer"
+        ],
+        "rows": [
+          [
+            300,
+            -5,
+            127,
+            2147483647
+          ]
+        ]
+      }
+    },
+    {
+      "name": "cast_tinyint_overflow",
+      "sql": "SELECT CAST(300 AS tinyint)",
+      "trino": {
+        "error": "NUMERIC_VALUE_OUT_OF_RANGE",
+        "message": "Out of range for tinyint: 300"
+      }
+    },
+    {
+      "name": "cast_varchar_to_varbinary_like",
+      "sql": "SELECT CAST('abc' AS varbinary), CAST(CAST(NULL AS varchar) AS varbinary)",
+      "trino": {
+        "types": [
+          "varbinary",
+          "varbinary"
+        ],
+        "rows": [
+          [
+            "YWJj",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "cast_real_double",
+      "sql": "SELECT CAST(REAL '0.1' AS double), CAST(0.1E0 AS real), CAST(1E300 AS real)",
+      "trino": {
+        "types": [
+          "double",
+          "real",
+          "real"
+        ],
+        "rows": [
+          [
+            0.10000000149011612,
+            0.1,
+            "Infinity"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "cast_varbinary_to_varchar",
+      "sql": "SELECT CAST(X'41' AS varchar)",
+      "trino": {
+        "error": "TYPE_MISMATCH",
+        "message": "line 1:8: Cannot cast varbinary to varchar"
+      }
+    }
+  ]
+}
