@@ -16,7 +16,9 @@ use datafusion::catalog::CatalogProvider;
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
-use secrecy::{ExposeSecret, SecretString};
+#[cfg(feature = "hive-s3")]
+use secrecy::ExposeSecret;
+use secrecy::SecretString;
 use tokio::sync::OnceCell;
 
 pub use self::catalog::HiveCatalog;
