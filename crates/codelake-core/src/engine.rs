@@ -22,6 +22,7 @@ use crate::config::{ExecutionConfig, MemoryConfig};
 use crate::connector::{Connector, ConnectorError, WritableCatalog};
 use crate::ddl::{self, Prepared};
 use crate::federation_guard::FederationFilterGuard;
+use crate::information_schema::CatalogList;
 use crate::runtime::{EngineRuntime, MemoryStats};
 use crate::session_properties::{PropertyRegistry, SessionProperties};
 
@@ -150,15 +151,17 @@ impl std::fmt::Debug for Engine {
 impl Engine {
     pub fn new(memory: &MemoryConfig, execution: &ExecutionConfig) -> Result<Self, EngineError> {
         let runtime = EngineRuntime::new(memory)?;
+        // `information_schema` is provided per catalog by `CatalogList`.
         let mut session = SessionConfig::new()
             .with_batch_size(execution.batch_size)
-            .with_information_schema(true);
+            .with_information_schema(false);
         if let Some(partitions) = execution.target_partitions {
             session = session.with_target_partitions(partitions);
         }
         let state = SessionStateBuilder::new()
             .with_config(session)
             .with_runtime_env(runtime.env())
+            .with_catalog_list(Arc::new(CatalogList::new()))
             .with_default_features()
             .with_analyzer_rules(analyzer_rules())
             .with_optimizer_rules(optimizer_rules())
@@ -556,6 +559,44 @@ mod tests {
 
         assert!(engine.context().catalog("down").is_none());
         assert!(engine.context().catalog("opt").is_none());
+    }
+
+    /// `<catalog>.information_schema` lists that catalog only.
+    #[tokio::test]
+    async fn information_schema_is_per_catalog() {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Int64Type;
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        engine
+            .attach(source("erp", Behaviour::Healthy), true, FAST)
+            .await
+            .unwrap();
+        for (sql, expected) in [
+            (
+                "SELECT count(*) FROM datafusion.information_schema.schemata WHERE catalog_name <> 'datafusion'",
+                0,
+            ),
+            (
+                "SELECT count(*) FROM datafusion.information_schema.tables WHERE table_catalog <> 'datafusion'",
+                0,
+            ),
+            (
+                "SELECT count(*) FROM erp.information_schema.schemata WHERE catalog_name = 'erp'",
+                1,
+            ),
+            (
+                "SELECT count(*) FROM erp.information_schema.schemata WHERE catalog_name <> 'erp'",
+                0,
+            ),
+        ] {
+            let batches = engine.sql(sql).await.unwrap().collect().await.unwrap();
+            assert_eq!(
+                batches[0].column(0).as_primitive::<Int64Type>().value(0),
+                expected,
+                "{sql}"
+            );
+        }
     }
 
     #[tokio::test]

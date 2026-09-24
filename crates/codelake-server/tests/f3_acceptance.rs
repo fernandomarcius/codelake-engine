@@ -1800,7 +1800,6 @@ async fn defect_20_metadata_materialized_views() {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-21: <catalog>.information_schema lists other catalogs' schemas and tables"]
 async fn defect_21_information_schema_is_catalog_scoped() {
     assert_codelake(&[
         "d_information_schema_tables_scope",
