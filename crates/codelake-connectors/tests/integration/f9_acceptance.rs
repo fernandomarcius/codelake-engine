@@ -1013,14 +1013,18 @@ async fn zero_byte_file_is_skipped_like_trino() {
 // ---------------------------------------------------------------------------
 
 /// Columns with NULLs, empty strings, unicode, decimals, dates, timestamps.
+///
+/// Trino 431 SQL: `ts` is `value * 1000003` ms after the epoch as a
+/// `timestamp(3)`, in two `date_add` calls because Trino's `date_add` takes
+/// an `int` amount ("integer overflow" past 2^31 ms).
 fn generated(from: u64, to: u64) -> String {
     format!(
         "SELECT CAST(value AS BIGINT) AS id, CAST(value % 7 AS INT) AS grp, \
          CASE WHEN value % 5 = 0 THEN NULL WHEN value % 11 = 0 THEN '' ELSE concat('ação-', CAST(value AS VARCHAR)) END AS s, \
          CAST(value * 1.25 AS DECIMAL(18,4)) AS amount, \
          CASE WHEN value % 3 = 0 THEN NULL ELSE CAST(value AS DOUBLE) / 7 END AS ratio, \
-         to_timestamp_millis(value * 1000003) AS ts, \
-         CAST(to_timestamp_millis(value * 86400000) AS DATE) AS day, \
+         date_add('millisecond', value * 3, date_add('second', value * 1000, TIMESTAMP '1970-01-01 00:00:00.000')) AS ts, \
+         date_add('day', value, DATE '1970-01-01') AS day, \
          value % 2 = 0 AS even, \
          lower(to_hex(md5(to_utf8(CAST(value AS VARCHAR))))) AS digest \
          FROM generate_series({from}, {to})"
