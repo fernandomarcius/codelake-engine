@@ -28,7 +28,10 @@ Constraints:
    core has no OpenTelemetry dependency.
 2. **Export.** OTLP/HTTP with protobuf and the blocking `reqwest` client, batch
    span processor. `[telemetry] otlp_endpoint` enables it; the value is the
-   collector base URL (`/v1/traces` is appended). Only `http://` is accepted:
+   collector base URL (`/v1/traces` is appended). Validation (`check-config`
+   and startup) accepts exactly what the exporter can use:
+   `http://host[:port][/path]` with a DNS name, IPv4 or bracketed IPv6 host,
+   port 1–65535, no query, fragment or credentials. Only `http://` is accepted:
    export to a collector agent on the node/pod, which handles TLS upstream.
    `protocol = "grpc"` and `https://` are refused at startup rather than
    silently degraded. Only the `codelake::trace` target (plus WARN+ events
@@ -37,7 +40,11 @@ Constraints:
    `traceparent` decides for its own trace; new traces use the ratio.
 4. **Propagation in.** `QueryTrace::from_headers(traceparent, tracestate,
    trace_token)` implements W3C Trace Context (invalid `traceparent` ⇒ new
-   trace and `tracestate` dropped; future versions tolerated). The Trino
+   trace and `tracestate` dropped; future versions tolerated). `tracestate`
+   is kept whole or dropped whole, as Trino 431 does (OpenTelemetry Java's
+   propagator): more than 32 members, an empty or malformed member, an
+   invalid key or value, a duplicate key or more than 512 characters drop the
+   header; nothing is truncated to its first 32 members. The Trino
    protocol front passes `traceparent`/`tracestate` and `X-Trino-Trace-Token`
    (kept as `codelake.correlation_id`) through `QueryOptions::with_trace`.
    `QueryOptions::for_user` is unchanged (the new field defaults to "new trace").
@@ -55,6 +62,7 @@ Constraints:
    │     └─ sqlserver.query (client)  redacted T-SQL + hash, server, database,
    │                                  pool wait, rows, SQL Server error number
    └─ codelake.fetch                  rows streamed to the client; `cancelled` if dropped
+                                      before the end (a failed stream is ERROR, never `cancelled`)
       └─ … (remote/scan spans started while fetching)
    hive.write                         under the CTAS/INSERT execute: file name, rows
    ```
@@ -68,8 +76,17 @@ Constraints:
    becomes `?`; comments are removed; text is capped at 8 KiB. If the SQL does
    not tokenize, no text is recorded. `codelake.sql.hash` is FNV-1a 64 of the
    *redacted* text, so equal shapes group together and no low-entropy literal
-   can be confirmed by hashing guesses. Error descriptions drop quoted
-   segments and `0x…` values.
+   can be confirmed by hashing guesses. Error descriptions
+   (`otel.status_description`) replace every quoted segment and every number
+   (anything starting with a digit: `98765432101`, `0x…`, `10.5`) with `?`;
+   digits inside a word (`Int32`) stay. A quote opens a segment only at a
+   word start and closes one only at a word end (`Can't` is not a quote), and
+   when quotes nest the whole outermost segment goes: a driver that wraps the
+   server's message in quotes (tiberius: `'…value 'X' to int.' on server …`)
+   would otherwise leave `X` between two segments. The SQL Server connector
+   renders server errors as `sqlserver: error <n> (state, class): <message>`
+   so the message keeps its shape; the number is also on
+   `db.response.status_code`.
 7. **PostgreSQL wire.** The listener still runs statements inside
    `datafusion-postgres`, so a hook can only observe. Each session gets a
    synthetic trace parent (kept in the connection metadata, sampled once with
@@ -111,6 +128,14 @@ Constraints:
   `traceparent` under `sampling_ratio = 0` is not exported. A second test runs
   the binary with `[telemetry]` and checks that two PostgreSQL statements of
   one session share one trace.
-- Unit tests: W3C parsing (including property tests), redaction per literal
-  kind, span tree and error/cancel recording with an in-process capture layer
-  (`engine::tests::traces`), config validation.
+- Unit tests: W3C parsing (including property tests), `tracestate`
+  all-or-nothing rules, redaction per literal kind and of error messages
+  (property test: a value, quoted or bare, inside a quoted driver message
+  never survives), span tree and error/cancel recording with an in-process
+  capture layer (`engine::tests::traces`), config validation.
+- `crates/codelake-server/tests/e2e/f7_acceptance.rs` (integration lane,
+  independent tester): differential W3C decisions against a real Trino 431,
+  exact row/file/byte counts on SQL Server and Hive spans, a SQL Server error
+  mid-stream without the offending value, failed ≠ cancelled, a stalled
+  collector, PostgreSQL wire sessions, and endpoint validation against
+  `serve`.
