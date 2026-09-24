@@ -88,7 +88,8 @@ fn shape(sql: &str) -> Shape {
     if let Some(update_type) = codelake_core::ddl_update_type(sql) {
         return Shape::Ack(update_type);
     }
-    let Ok(mut statements) = DFParser::parse_sql(&codelake_core::trino_type_syntax(sql)) else {
+    let typed = codelake_core::trino_type_syntax(sql);
+    let Ok(mut statements) = DFParser::parse_sql(&codelake_core::engine::trino_text(&typed)) else {
         // The engine reports the parse error.
         return Shape::Rows;
     };

@@ -26,8 +26,10 @@ pub mod subquery;
 mod testing;
 mod timestamp_casts;
 mod timestamps;
+mod trino_datetime;
 mod trino_functions;
 mod trino_sql;
+mod trino_sql_checks;
 pub mod trino_types;
 
 pub use bytes::ByteSize;

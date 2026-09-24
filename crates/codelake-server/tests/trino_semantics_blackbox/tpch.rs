@@ -189,9 +189,6 @@ async fn tpch_on_hive_parquet_matches_trino() -> Res<()> {
 // ---------------------------------------------------------------- defects
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM39: date_trunc over a date is a date in Trino. Expected: \
-    date_trunc('month', DATE '1995-09-17') is date '1995-09-01' (the Q14-per-month grouping of \
-    this suite). Obtained: timestamp(9) '1995-09-01 00:00:00.000000000' (values right)"]
 async fn defect_sem39_date_trunc_of_a_date_is_a_date() -> Res<()> {
     expect_rows(
         &[],

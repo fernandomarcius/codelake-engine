@@ -121,11 +121,6 @@ async fn hive_add_column_matches_trino() -> Res<()> {
 // ---------------------------------------------------------------- defects
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM43: quoted mixed-case names keep their case in the in-memory catalog; \
-    Trino folds every identifier to lower case (hive already does, ADR 0007). Expected: CREATE \
-    TABLE \"MiXeD\" (\"CamelCol\" bigint) is listed as mixed/camelcol, SELECT camelcol FROM mixed \
-    works, table_name IN ('MiXeD') matches nothing. Obtained: listed as MiXeD/CamelCol, \
-    TABLE_NOT_FOUND for mixed, 'MiXeD' matches one table"]
 async fn defect_sem43_memory_catalog_folds_names_to_lower_case() -> Res<()> {
     expect_rows(
         &[
@@ -145,12 +140,6 @@ async fn defect_sem43_memory_catalog_folds_names_to_lower_case() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM44: hive view columns lose timestamp precisions other than 3. Expected \
-    (Trino): a view column CAST(ts AS timestamp(0)) has data_type 'timestamp(0)' and answers \
-    timestamp(0) '2026-01-01 10:00:01' (also through a view over the view); CAST(ts AS \
-    timestamp(1)) has data_type 'timestamp(1)'. Obtained: data_type 'timestamp(3)' for both, and \
-    SELECT of ts0 answers timestamp(3) '2026-01-01 10:00:01.000' (the same cast outside a view \
-    is right)"]
 async fn defect_sem44_hive_view_keeps_timestamp_precision() -> Res<()> {
     expect_rows(
         &[
@@ -172,8 +161,6 @@ async fn defect_sem44_hive_view_keeps_timestamp_precision() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM45: length(varchar) is bigint in Trino. Expected: length('abc') bigint 3, \
-    and a view column length(v) has data_type 'bigint'. Obtained: integer"]
 async fn defect_sem45_length_is_bigint() -> Res<()> {
     expect_rows(
         &[

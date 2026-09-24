@@ -169,6 +169,18 @@ impl QueryError {
             let location = parser_location(&text).or_else(|| text.contains("EOF").then(|| end_of(sql)));
             return Self::new(Code::SyntaxError, text).at(location);
         }
+        // Trino 431 reports the overflow of a decimal `sum` as an internal
+        // error, with the overflow's own message (`Decimal overflow`).
+        if codelake_core::overflow::is_trino_internal_error(error) {
+            let message = match root {
+                DataFusionError::ArrowError(arrow, _) => match arrow.as_ref() {
+                    ArrowError::ArithmeticOverflow(message) => message.clone(),
+                    _ => raw_message(root),
+                },
+                _ => raw_message(root),
+            };
+            return Self::new(Code::GenericInternalError, message);
+        }
         let code = code_of(root);
         let message = raw_message(root);
         let (code, message) = match code {
@@ -340,6 +352,8 @@ const MESSAGE_RULES: &[(Pattern, Code)] = &[
         Code::TypeMismatch,
     ),
     (Pattern::StartsWith("cannot infer common"), Code::TypeMismatch),
+    // A type Trino does not have (`timestamp(13)`).
+    (Pattern::StartsWith("unknown type: "), Code::TypeMismatch),
     (
         Pattern::StartsWith("cannot get result type for"),
         Code::TypeMismatch,

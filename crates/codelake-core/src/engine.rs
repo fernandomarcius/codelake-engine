@@ -185,6 +185,44 @@ fn table_schema(
     ))
 }
 
+/// The first name that appears twice.
+fn duplicate(names: &[String]) -> Option<&str> {
+    let mut seen = std::collections::HashSet::new();
+    names
+        .iter()
+        .find(|n| !seen.insert(n.as_str()))
+        .map(String::as_str)
+}
+
+fn duplicate_column(name: &str) -> DataFusionError {
+    DataFusionError::Plan(format!("Column name '{name}' specified more than once"))
+}
+
+/// The columns of a table of the in-memory catalog: lower case, as Trino
+/// folds every identifier (`"CamelCol"` is the column `camelcol`); two names
+/// that differ only in case are one column named twice.
+fn lower_case_columns(
+    schema: &datafusion::arrow::datatypes::SchemaRef,
+) -> Result<datafusion::arrow::datatypes::SchemaRef, DataFusionError> {
+    let names: Vec<String> = schema.fields().iter().map(|f| f.name().to_lowercase()).collect();
+    if let Some(name) = duplicate(&names) {
+        return Err(duplicate_column(name));
+    }
+    if schema.fields().iter().zip(&names).all(|(f, n)| f.name() == n) {
+        return Ok(Arc::clone(schema));
+    }
+    let fields: Vec<datafusion::arrow::datatypes::Field> = schema
+        .fields()
+        .iter()
+        .zip(names)
+        .map(|(f, name)| f.as_ref().clone().with_name(name))
+        .collect();
+    Ok(Arc::new(datafusion::arrow::datatypes::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    )))
+}
+
 /// `stream` announced with `schema`, which must hold its batches (same
 /// columns, more metadata or nullability).
 fn with_schema(
@@ -206,12 +244,23 @@ fn with_schema(
 /// engine plans goes through it, and so must the SQL of a view a connector
 /// plans itself.
 pub fn trino_statement(statement: &mut datafusion::sql::parser::Statement, session_zone: &str) {
+    crate::coercion::name_casts_in_aggregates(statement);
+    crate::trino_sql_checks::fold_quoted_columns(statement);
     crate::literals::rewrite_zoned_timestamps(statement);
     crate::literals::rewrite_exponent_numbers(statement);
     crate::coercion::mark_values(statement);
     crate::coercion::default_decimal_precision(statement);
     crate::declared::rewrite_declared_casts(statement);
     crate::literals::rewrite_timestamp_types(statement, session_zone);
+}
+
+/// Rewrites SQL text the parser cannot read into the spelling it reads, with
+/// Trino's meaning: `VALUES 1, 2` (rows without parentheses) becomes
+/// `VALUES (1), (2)` (a row without parentheses is one value). Applied
+/// before parsing to every statement the engine plans, and so to the SQL of
+/// a view a connector plans itself.
+pub fn trino_text(sql: &str) -> std::borrow::Cow<'_, str> {
+    crate::trino_sql_checks::values_rows(sql)
 }
 
 /// Result of attaching one source at startup.
@@ -262,6 +311,9 @@ impl Engine {
             .with_information_schema(false);
         // `1.5` is `decimal(2,1)`, as in Trino (and PostgreSQL), not a double.
         session.options_mut().sql_parser.parse_float_as_decimal = true;
+        // NULL sorts last in both directions in Trino (`DataFusion`, like
+        // PostgreSQL: first when descending), window ordering included.
+        session.options_mut().sql_parser.default_null_ordering = "nulls_last".into();
         // Trino's default session zone is the server's; `CodeLake` runs in UTC.
         session.options_mut().execution.time_zone = Some("UTC".into());
         if let Some(partitions) = execution.target_partitions {
@@ -282,6 +334,8 @@ impl Engine {
         ctx.register_udf(crate::coercion::values_cell());
         ctx.register_udf(crate::timestamp_casts::try_arrow_cast());
         ctx.register_udf(crate::declared::trino_typed());
+        ctx.register_udf(crate::coercion::named_cast());
+        crate::trino_functions::register(&ctx);
         Ok(Self {
             ctx,
             runtime,
@@ -348,7 +402,9 @@ impl Engine {
             None => (std::borrow::Cow::Borrowed(sql), ViewSecurity::default()),
         };
         let sql = crate::declared::trino_type_syntax(&sql);
+        let sql = trino_text(&sql);
         let mut statement = state.sql_to_statement(&sql, &dialect)?;
+        crate::trino_sql_checks::check_statement(&statement)?;
         let prepared = ddl::prepare(&mut statement, security)?;
         // After `prepare`, which keeps a view's text as written.
         let declared = crate::declared::declared_columns(&mut statement);
@@ -455,8 +511,26 @@ impl Engine {
         // Columns of `CREATE TABLE AS` are nullable in Trino, whatever the query.
         let from_query = !matches!(input, LogicalPlan::EmptyRelation(_));
         let physical = DataFrame::new(ctx.state(), input).create_physical_plan().await?;
-        let schema = table_schema(&physical.schema(), columns, from_query);
+        let schema = lower_case_columns(&table_schema(&physical.schema(), columns, from_query))?;
         let batches = datafusion::physical_plan::collect_partitioned(physical, ctx.task_ctx()).await?;
+        // Rows under the table's (lower-case) column names.
+        let batches = batches
+            .into_iter()
+            .map(|partition| {
+                partition
+                    .into_iter()
+                    .map(|batch| {
+                        let options = datafusion::arrow::array::RecordBatchOptions::new()
+                            .with_row_count(Some(batch.num_rows()));
+                        datafusion::arrow::array::RecordBatch::try_new_with_options(
+                            Arc::clone(&schema),
+                            batch.columns().to_vec(),
+                            &options,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let rows = batches
             .iter()
             .flatten()
@@ -464,7 +538,13 @@ impl Engine {
             .sum();
         let table = MemTable::try_new(schema, batches)?
             .with_constraints(create.constraints.clone())
-            .with_column_defaults(create.column_defaults.iter().cloned().collect());
+            .with_column_defaults(
+                create
+                    .column_defaults
+                    .iter()
+                    .map(|(name, default)| (name.to_lowercase(), default.clone()))
+                    .collect(),
+            );
         if exists {
             ctx.deregister_table(create.name.clone())?;
         }
@@ -502,9 +582,18 @@ impl Engine {
                 } else {
                     Expr::Cast(Cast::new(Box::new(column), typed.data_type().clone()))
                 };
-                column.alias(field.name())
+                // Lower case, as the columns of a table (see `lower_case_columns`).
+                column.alias(field.name().to_lowercase())
             })
             .collect();
+        let names: Vec<String> = analyzed
+            .fields()
+            .iter()
+            .map(|f| f.name().to_lowercase())
+            .collect();
+        if let Some(name) = duplicate(&names) {
+            return Err(duplicate_column(name));
+        }
         let plan = LogicalPlanBuilder::from(input).project(columns)?.build()?;
         let exists = ctx.table_exist(view.name.clone())?;
         if exists && !view.or_replace {

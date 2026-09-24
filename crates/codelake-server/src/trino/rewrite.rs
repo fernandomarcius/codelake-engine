@@ -48,7 +48,9 @@ fn name_set(body: &mut SetExpr) -> bool {
 /// The SQL to plan so that unnamed output columns can be renamed `_col<n>`:
 /// `None` when the statement is not a query or names every column already.
 pub(crate) fn name_unnamed_columns(sql: &str) -> Option<String> {
-    let mut statements = DFParser::parse_sql(sql).ok()?;
+    // The text the engine parses (`VALUES 1, 2` read as `VALUES (1), (2)`).
+    let sql = codelake_core::engine::trino_text(sql);
+    let mut statements = DFParser::parse_sql(&sql).ok()?;
     if statements.len() != 1 {
         return None;
     }

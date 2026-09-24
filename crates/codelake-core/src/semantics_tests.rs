@@ -456,3 +456,129 @@ async fn relations_describe_themselves_like_trino() {
     )
     .await;
 }
+
+/// Answers of the second black-box suite (`trino_semantics_blackbox`),
+/// observed on Trino 431.
+#[tokio::test]
+async fn second_suite_answers_follow_trino() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    for sql in [
+        "CREATE SCHEMA datafusion.bx",
+        "CREATE TABLE datafusion.bx.g AS SELECT CAST(x AS INTEGER) AS n FROM (VALUES 1, 2, 3) t(x)",
+        "CREATE TABLE datafusion.bx.\"MiXeD\" (\"CamelCol\" bigint)",
+        "CREATE VIEW datafusion.bx.\"ViewOne\" AS SELECT \"CamelCol\" AS \"OtherCol\" FROM datafusion.bx.\"MiXeD\"",
+    ] {
+        run(&engine, sql).await;
+    }
+    assert_same(
+        &engine,
+        &[
+            // Rows of VALUES without parentheses.
+            (
+                "SELECT x FROM (VALUES CAST(NULL AS DECIMAL(5,2)), 1.5, -2.25) t(x) ORDER BY x",
+                answer(&["decimal(5,2)"], &[&["-2.25"], &["1.50"], &["NULL"]]),
+            ),
+            // INTERSECT and EXCEPT answer the common type.
+            (
+                "SELECT v FROM (SELECT CAST(1.5 AS DECIMAL(5,1)) AS v INTERSECT SELECT CAST(1.50 AS DECIMAL(6,2)))",
+                answer(&["decimal(6,2)"], &[&["1.50"]]),
+            ),
+            (
+                "SELECT v FROM (SELECT CAST(1 AS INTEGER) AS v EXCEPT SELECT CAST(2 AS BIGINT))",
+                answer(&["bigint"], &[&["1"]]),
+            ),
+            // ceil, floor, round, truncate and sign of decimals.
+            (
+                "SELECT ceil(CAST(9.5 AS DECIMAL(2,1))), floor(CAST(-9.5 AS DECIMAL(2,1))), round(CAST(9.5 AS DECIMAL(2,1))), ceil(CAST(5 AS DECIMAL(3,0)))",
+                answer(
+                    &["decimal(2,0)", "decimal(2,0)", "decimal(2,0)", "decimal(3,0)"],
+                    &[&["10", "-10", "10", "5"]],
+                ),
+            ),
+            (
+                "SELECT ceil(CAST(99999999.9999 AS DECIMAL(12,4))), floor(CAST(-0.0005 AS DECIMAL(12,4))), round(CAST(-2.5 AS DECIMAL(12,4))), ceil(5)",
+                answer(
+                    &["decimal(9,0)", "decimal(9,0)", "decimal(9,0)", "integer"],
+                    &[&["100000000", "-1", "-3", "5"]],
+                ),
+            ),
+            (
+                "SELECT sign(CAST(-2.5 AS DECIMAL(12,4))), truncate(CAST(-2.5 AS DECIMAL(12,4))), sign(-3), sign(-2.5E0), truncate(2.7E0), truncate(CAST(12.345 AS DECIMAL(5,3)), 1)",
+                answer(
+                    &["decimal(1,0)", "decimal(8,0)", "integer", "double", "double", "decimal(5,3)"],
+                    &[&["-1", "-2", "-1", "-1.0", "2.0", "12.300"]],
+                ),
+            ),
+            // Zoned values: fields, offsets, date_diff, days of 24 hours.
+            (
+                "SELECT hour(CAST('2019-02-16 23:30:00 America/Sao_Paulo' AS TIMESTAMP WITH TIME ZONE)), timezone_hour(CAST('2019-02-16 23:30:00 America/Sao_Paulo' AS TIMESTAMP WITH TIME ZONE)), extract(TIMEZONE_MINUTE FROM CAST('2026-06-01 12:00:00 Asia/Kathmandu' AS TIMESTAMP WITH TIME ZONE))",
+                answer(&["bigint", "bigint", "bigint"], &[&["23", "-2", "45"]]),
+            ),
+            (
+                "SELECT date_diff('hour', CAST('2018-11-03 12:00:00 America/Sao_Paulo' AS TIMESTAMP WITH TIME ZONE), CAST('2018-11-04 12:00:00 America/Sao_Paulo' AS TIMESTAMP WITH TIME ZONE)), date_diff('day', DATE '2026-01-01', DATE '2025-12-01')",
+                answer(&["bigint", "bigint"], &[&["23", "-31"]]),
+            ),
+            (
+                "SELECT CAST(CAST('2018-11-03 12:00:00 America/Sao_Paulo' AS TIMESTAMP WITH TIME ZONE) + INTERVAL '1' DAY AS VARCHAR)",
+                answer(&["varchar"], &[&["2018-11-04 13:00:00.000 America/Sao_Paulo"]]),
+            ),
+            (
+                "SELECT k, CAST(CAST(x AS TIMESTAMP WITH TIME ZONE) AS DATE) FROM (VALUES (1, '1970-01-01 00:00:00 Europe/London'), (2, '2026-06-01 12:00:00 -12:00')) t(k, x) ORDER BY k",
+                answer(&["integer", "date"], &[&["1", "1970-01-01"], &["2", "2026-06-01"]]),
+            ),
+            (
+                "SELECT date_trunc('month', DATE '1995-09-17'), length('abc')",
+                answer(&["date", "bigint"], &[&["1995-09-01", "3"]]),
+            ),
+            // NULL last in both directions.
+            (
+                "SELECT v FROM (VALUES (CAST(NULL AS DECIMAL(5,2))), (1.5), (10)) t(v) ORDER BY v DESC",
+                answer(&["decimal(12,2)"], &[&["10.00"], &["1.50"], &["NULL"]]),
+            ),
+            // Aggregates that differ by a cast; real aggregates are real.
+            (
+                "SELECT sum(n), sum(CAST(n AS SMALLINT)), sum(CAST(n AS REAL)), avg(CAST(n AS REAL)) FROM datafusion.bx.g",
+                answer(&["bigint", "bigint", "real", "real"], &[&["6", "6", "6.0", "2.0"]]),
+            ),
+            // Names fold to lower case in the in-memory catalog.
+            (
+                "SELECT table_name, column_name FROM datafusion.information_schema.columns WHERE table_schema = 'bx' AND table_name <> 'g' ORDER BY table_name",
+                answer(
+                    &["varchar", "varchar"],
+                    &[&["mixed", "camelcol"], &["viewone", "othercol"]],
+                ),
+            ),
+        ],
+    )
+    .await;
+}
+
+/// A timestamp meets a zoned value in the session zone; what Trino 431
+/// rejects fails.
+#[tokio::test]
+async fn second_suite_session_zone_and_errors_follow_trino() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    let zoned = run_in(
+        &engine,
+        Some("Asia/Kathmandu"),
+        "SELECT k FROM (VALUES (1, TIMESTAMP '2026-01-01 10:00:00'), (2, TIMESTAMP '2026-01-01 16:00:00')) t(k, ts) WHERE ts >= CAST('2026-01-01 10:00:00 UTC' AS TIMESTAMP WITH TIME ZONE)",
+    )
+    .await
+    .unwrap();
+    assert_eq!(zoned, answer(&["integer"], &[&["2"]]));
+    assert_error(&engine, "SELECT 9223372036854775808", "Invalid numeric literal").await;
+    assert_error(
+        &engine,
+        "SELECT CAST(x AS TIMESTAMP(13)) FROM datafusion.bx.g",
+        "Unknown type: timestamp(13)",
+    )
+    .await;
+    assert_error(
+        &engine,
+        "SELECT sum(x) FROM (VALUES (CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))), (CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0)))) t(x)",
+        "Decimal overflow",
+    )
+    .await;
+}

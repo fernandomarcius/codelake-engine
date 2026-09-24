@@ -29,13 +29,29 @@ use datafusion::logical_expr::{
 
 use super::arith::{check_decimal, overflow, sql_type_name};
 
+/// Context of a decimal `sum` that overflows: Trino 431 reports it as
+/// `GENERIC_INTERNAL_ERROR` (`Decimal overflow`), not as the
+/// `NUMERIC_VALUE_OUT_OF_RANGE` of decimal arithmetic. The overflow itself
+/// stays the root of the error (see [`super::is_trino_internal_error`]).
+pub(crate) const TRINO_INTERNAL_ERROR: &str = "Trino GENERIC_INTERNAL_ERROR";
+
+/// A decimal `sum` that does not fit its type.
+fn decimal_sum_overflow(error: datafusion::error::DataFusionError) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::Context(TRINO_INTERNAL_ERROR.to_owned(), Box::new(error))
+}
+
+/// [`check_decimal`] of a `sum`'s result.
+fn check_sum(array: &ArrayRef) -> Result<()> {
+    check_decimal(array).map_err(decimal_sum_overflow)
+}
+
 fn addition_overflow(
     data_type: &DataType,
     a: impl Display,
     b: impl Display,
 ) -> datafusion::error::DataFusionError {
     if super::arith::is_decimal(data_type) {
-        overflow("Decimal overflow")
+        decimal_sum_overflow(overflow("Decimal overflow"))
     } else {
         overflow(format!(
             "{} addition overflow: {a} + {b}",
@@ -50,7 +66,7 @@ fn subtraction_overflow(
     b: impl Display,
 ) -> datafusion::error::DataFusionError {
     if super::arith::is_decimal(data_type) {
-        overflow("Decimal overflow")
+        decimal_sum_overflow(overflow("Decimal overflow"))
     } else {
         overflow(format!(
             "{} subtraction overflow: {a} - {b}",
@@ -82,7 +98,7 @@ fn checked_result<T: ArrowPrimitiveType>(
     data_type: &DataType,
 ) -> Result<ScalarValue> {
     let array: ArrayRef = Arc::new(PrimitiveArray::<T>::from_iter([value]).with_data_type(data_type.clone()));
-    check_decimal(&array)?;
+    check_sum(&array)?;
     ScalarValue::try_from_array(&array, 0)
 }
 
@@ -320,7 +336,7 @@ where
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
         let array = self.emit(emit_to);
-        check_decimal(&array)?;
+        check_sum(&array)?;
         Ok(array)
     }
 

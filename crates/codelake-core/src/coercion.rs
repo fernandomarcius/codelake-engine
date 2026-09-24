@@ -188,6 +188,261 @@ pub(crate) fn mark_values(statement: &mut DFStatement) {
     let _ = inner.as_mut().visit(&mut MarkValues::default());
 }
 
+// ---------------------------------------------------------------- cast names
+
+/// Name of the identity that names a cast in an aggregate's arguments.
+const NAMED_CAST: &str = "codelake_named_cast";
+
+/// `codelake_named_cast(CAST(x AS T), 'T')`: the cast, named with its type.
+///
+/// `DataFusion` leaves casts out of expression names, so `sum(n)` and
+/// `sum(CAST(n AS SMALLINT))` are both named `sum(n)`, and a query with both
+/// fails ("Projections require unique expression names", "Schema contains
+/// duplicate unqualified field name"); in Trino they are two columns.
+/// [`name_casts_in_aggregates`] wraps the casts of such functions before
+/// planning; the analyzer removes the wrapper ([`unname_cast`]), the names it
+/// gave staying as aliases.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct NamedCast {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for NamedCast {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &'static str {
+        NAMED_CAST
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn schema_name(&self, args: &[Expr]) -> Result<String> {
+        let [cast, spelled] = args else {
+            return exec_err!("{NAMED_CAST} expects two arguments");
+        };
+        let spelled = match spelled {
+            Expr::Literal(ScalarValue::Utf8(Some(text)), _) => text.clone(),
+            other => other.schema_name().to_string(),
+        };
+        Ok(format!("CAST({} AS {spelled})", cast.schema_name()))
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        let Some(first) = arg_types.first() else {
+            return exec_err!("{NAMED_CAST} expects two arguments");
+        };
+        Ok(first.clone())
+    }
+
+    fn return_field_from_args(&self, args: ReturnFieldArgs<'_>) -> Result<FieldRef> {
+        let Some(first) = args.arg_fields.first() else {
+            return exec_err!("{NAMED_CAST} expects two arguments");
+        };
+        Ok(Arc::new(first.as_ref().clone().with_name(NAMED_CAST)))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let Some(first) = args.args.first() else {
+            return exec_err!("{NAMED_CAST} expects two arguments");
+        };
+        Ok(first.clone())
+    }
+}
+
+static NAMED_CAST_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
+    Arc::new(ScalarUDF::new_from_impl(NamedCast {
+        signature: Signature::any(2, Volatility::Immutable),
+    }))
+});
+
+/// The function [`name_casts_in_aggregates`] calls; the engine registers it
+/// so a marked statement plans.
+pub(crate) fn named_cast() -> ScalarUDF {
+    NAMED_CAST_UDF.as_ref().clone()
+}
+
+/// `codelake_named_cast(x, '…')` → `x` (see [`NamedCast`]).
+pub(crate) fn unname_cast(expr: Expr) -> Transformed<Expr> {
+    match expr {
+        Expr::ScalarFunction(ScalarFunction { func, mut args })
+            if func.name() == NAMED_CAST && args.len() == 2 =>
+        {
+            args.truncate(1);
+            Transformed::yes(args.pop().unwrap_or_default())
+        }
+        other => Transformed::no(other),
+    }
+}
+
+/// `f(…)` with every cast removed, as `DataFusion` names it.
+fn without_casts(expr: &sql::Expr) -> String {
+    let mut stripped = expr.clone();
+    let _ = sql::visit_expressions_mut(&mut stripped, |e| {
+        if let sql::Expr::Cast { expr: inner, .. } = e {
+            *e = std::mem::replace(inner.as_mut(), sql::Expr::value(sql::Value::Null));
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    stripped.to_string()
+}
+
+/// Every function call of `expr` (at any depth): (name without casts, text).
+fn function_names(
+    expr: &sql::Expr,
+    names: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+) {
+    let _ = sql::visit_expressions(expr, |e| {
+        if let sql::Expr::Function(_) = e {
+            names.entry(without_casts(e)).or_default().insert(e.to_string());
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// Wraps the casts inside the functions whose name is in `colliding`.
+struct NameCasts<'a> {
+    colliding: &'a std::collections::HashSet<String>,
+    /// Enclosing colliding functions.
+    active: usize,
+}
+
+impl VisitorMut for NameCasts<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &mut sql::Expr) -> ControlFlow<()> {
+        if matches!(expr, sql::Expr::Function(_)) && self.colliding.contains(&without_casts(expr)) {
+            self.active += 1;
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, expr: &mut sql::Expr) -> ControlFlow<()> {
+        match expr {
+            sql::Expr::Function(f) if f.name.to_string() != NAMED_CAST => {
+                // The name as it was when visited first: its casts are
+                // already wrapped now.
+                let original = {
+                    let mut unwrapped = expr.clone();
+                    let _ = sql::visit_expressions_mut(&mut unwrapped, |e| {
+                        if let sql::Expr::Function(g) = e
+                            && g.name.to_string() == NAMED_CAST
+                            && let sql::FunctionArguments::List(list) = &mut g.args
+                            && let Some(sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(inner))) =
+                                list.args.first_mut()
+                        {
+                            *e = std::mem::replace(inner, sql::Expr::value(sql::Value::Null));
+                        }
+                        ControlFlow::<()>::Continue(())
+                    });
+                    without_casts(&unwrapped)
+                };
+                if self.colliding.contains(&original) {
+                    self.active = self.active.saturating_sub(1);
+                }
+            }
+            sql::Expr::Cast { data_type, .. } if self.active > 0 => {
+                let spelled = data_type.to_string();
+                let cast = std::mem::replace(expr, sql::Expr::value(sql::Value::Null));
+                *expr = named_cast_call(cast, spelled);
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn named_cast_call(cast: sql::Expr, spelled: String) -> sql::Expr {
+    use sql::{
+        Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident, ObjectName,
+    };
+    let arg = |e: sql::Expr| FunctionArg::Unnamed(FunctionArgExpr::Expr(e));
+    sql::Expr::Function(Function {
+        name: ObjectName::from(vec![Ident::new(NAMED_CAST)]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![
+                arg(cast),
+                arg(sql::Expr::value(sql::Value::SingleQuotedString(spelled))),
+            ],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    })
+}
+
+/// The expressions of a query whose aggregates meet in one plan node: the
+/// select list, `HAVING` and `ORDER BY`.
+fn aggregate_expressions(query: &mut Query) -> Vec<&mut sql::Expr> {
+    let mut exprs: Vec<&mut sql::Expr> = Vec::new();
+    if let SetExpr::Select(select) = query.body.as_mut() {
+        let select = select.as_mut();
+        for item in &mut select.projection {
+            if let sql::SelectItem::UnnamedExpr(e) | sql::SelectItem::ExprWithAlias { expr: e, .. } = item {
+                exprs.push(e);
+            }
+        }
+        if let Some(having) = &mut select.having {
+            exprs.push(having);
+        }
+    } else {
+        return exprs;
+    }
+    if let Some(order_by) = &mut query.order_by
+        && let sql::OrderByKind::Expressions(items) = &mut order_by.kind
+    {
+        for item in items {
+            exprs.push(&mut item.expr);
+        }
+    }
+    exprs
+}
+
+struct NameCastsInQueries;
+
+impl VisitorMut for NameCastsInQueries {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<()> {
+        let mut names = std::collections::HashMap::new();
+        for expr in aggregate_expressions(query) {
+            function_names(expr, &mut names);
+        }
+        let colliding: std::collections::HashSet<String> = names
+            .into_iter()
+            .filter(|(_, texts)| texts.len() > 1)
+            .map(|(name, _)| name)
+            .collect();
+        if colliding.is_empty() {
+            return ControlFlow::Continue(());
+        }
+        for expr in aggregate_expressions(query) {
+            let _ = expr.visit(&mut NameCasts {
+                colliding: &colliding,
+                active: 0,
+            });
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Names the casts of functions that `DataFusion` would name alike (see
+/// [`NamedCast`]): only where two calls differ by their casts alone.
+pub(crate) fn name_casts_in_aggregates(statement: &mut DFStatement) {
+    let DFStatement::Statement(inner) = statement else {
+        return;
+    };
+    let _ = inner.as_mut().visit(&mut NameCastsInQueries);
+}
+
 /// `DECIMAL` without precision is `decimal(38,0)` in Trino (`DataFusion`:
 /// `decimal(38,10)`).
 fn trino_decimal(data_type: &mut sql::DataType) {
@@ -302,14 +557,40 @@ fn cast_if_needed(expr: Expr, from: &DataType, to: &DataType) -> Expr {
     }
 }
 
-/// Casts every expression to Trino's common type of their numbers.
-fn unify(exprs: Vec<Expr>, schema: &DFSchema) -> Result<Transformed<Vec<Expr>>> {
+/// Where timestamps with and without time zone meet, a timestamp without
+/// time zone is the local time in the session zone (Trino casts it to
+/// `timestamp with time zone`); `DataFusion` reads it as UTC. Each such
+/// expression is cast to its own precision in the session zone.
+fn unify_timestamps(exprs: Vec<Expr>, types: &[DataType], session_zone: &str) -> Transformed<Vec<Expr>> {
+    let zoned = types.iter().any(|t| matches!(t, DataType::Timestamp(_, Some(_))));
+    let local = types.iter().any(|t| matches!(t, DataType::Timestamp(_, None)));
+    if !zoned || !local {
+        return Transformed::no(exprs);
+    }
+    Transformed::yes(
+        exprs
+            .into_iter()
+            .zip(types)
+            .map(|(e, t)| match t {
+                DataType::Timestamp(unit, None) => Expr::Cast(Cast::new(
+                    Box::new(e),
+                    DataType::Timestamp(*unit, Some(session_zone.into())),
+                )),
+                _ => e,
+            })
+            .collect(),
+    )
+}
+
+/// Casts every expression to Trino's common type of their numbers (or of
+/// their timestamps, see [`unify_timestamps`]).
+fn unify(exprs: Vec<Expr>, schema: &DFSchema, session_zone: &str) -> Result<Transformed<Vec<Expr>>> {
     let types = exprs
         .iter()
         .map(|e| e.get_type(schema))
         .collect::<Result<Vec<_>>>()?;
     let Some(common) = common_numeric_type(&types) else {
-        return Ok(Transformed::no(exprs));
+        return Ok(unify_timestamps(exprs, &types, session_zone));
     };
     if types.iter().all(|t| t.is_null() || *t == common) {
         return Ok(Transformed::no(exprs));
@@ -375,10 +656,10 @@ fn nullif(args: Vec<Expr>, func: &Arc<ScalarUDF>, schema: &DFSchema) -> Result<T
 
 /// Every construct of one expression node where values meet (see the module
 /// documentation).
-fn common_types(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
+fn common_types(expr: Expr, schema: &DFSchema, session_zone: &str) -> Result<Transformed<Expr>> {
     Ok(match expr {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_comparison(op) => {
-            unify(vec![*left, *right], schema)?.update_data(|mut pair| {
+            unify(vec![*left, *right], schema, session_zone)?.update_data(|mut pair| {
                 let right = pair.pop().unwrap_or_default();
                 let left = pair.pop().unwrap_or_default();
                 Expr::BinaryExpr(BinaryExpr::new(Box::new(left), op, Box::new(right)))
@@ -394,7 +675,7 @@ fn common_types(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
             let mut branches = thens;
             let has_else = else_expr.is_some();
             branches.extend(else_expr.map(|e| *e));
-            unify(branches, schema)?.update_data(|mut branches| {
+            unify(branches, schema, session_zone)?.update_data(|mut branches| {
                 let else_expr = has_else.then(|| Box::new(branches.pop().unwrap_or_default()));
                 Expr::Case(Case::new(
                     operand,
@@ -411,7 +692,7 @@ fn common_types(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
             return nullif(args, &func, schema);
         }
         Expr::ScalarFunction(ScalarFunction { func, args }) if unifies_arguments(func.name()) => {
-            unify(args, schema)?.update_data(|args| func.call(args))
+            unify(args, schema, session_zone)?.update_data(|args| func.call(args))
         }
         Expr::InList(InList {
             expr: value,
@@ -420,7 +701,7 @@ fn common_types(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
         }) => {
             let mut all = vec![*value];
             all.extend(list);
-            unify(all, schema)?.update_data(|mut all| {
+            unify(all, schema, session_zone)?.update_data(|mut all| {
                 let value = all.remove(0);
                 Expr::InList(InList::new(Box::new(value), all, negated))
             })
@@ -430,7 +711,7 @@ fn common_types(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
             negated,
             low,
             high,
-        }) => unify(vec![*value, *low, *high], schema)?.update_data(|mut all| {
+        }) => unify(vec![*value, *low, *high], schema, session_zone)?.update_data(|mut all| {
             let high = all.pop().unwrap_or_default();
             let low = all.pop().unwrap_or_default();
             let value = all.pop().unwrap_or_default();
@@ -443,6 +724,73 @@ fn common_types(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
         }),
         other => Transformed::no(other),
     })
+}
+
+/// A day-to-second interval literal as a plain duration: its days as
+/// 24-hour periods, the months (a year-to-month interval) kept.
+fn as_duration(value: &ScalarValue) -> Option<ScalarValue> {
+    use datafusion::arrow::datatypes::IntervalMonthDayNano;
+    const NANOS_PER_DAY: i64 = 86_400_000_000_000;
+    match value {
+        ScalarValue::IntervalMonthDayNano(Some(v)) if v.days != 0 => {
+            let nanos = i64::from(v.days)
+                .checked_mul(NANOS_PER_DAY)?
+                .checked_add(v.nanoseconds)?;
+            Some(ScalarValue::IntervalMonthDayNano(Some(
+                IntervalMonthDayNano::new(v.months, 0, nanos),
+            )))
+        }
+        ScalarValue::IntervalDayTime(Some(v)) if v.days != 0 => {
+            let millis = i64::from(v.days)
+                .checked_mul(86_400_000)?
+                .checked_add(i64::from(v.milliseconds))?;
+            Some(ScalarValue::IntervalMonthDayNano(Some(
+                IntervalMonthDayNano::new(0, 0, millis.checked_mul(1_000_000)?),
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// `<timestamp with time zone> ± INTERVAL 'n' DAY`: Trino 431 adds `n` times
+/// 24 hours (a day-to-second interval is a duration), so across a
+/// daylight-saving change the local time moves by an hour; `DataFusion` adds
+/// calendar days in the value's zone. The interval literal's days become
+/// nanoseconds.
+fn zoned_day_interval(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
+    use datafusion::logical_expr::Operator;
+    let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
+        return Ok(Transformed::no(expr));
+    };
+    if !matches!(op, Operator::Plus | Operator::Minus) {
+        return Ok(Transformed::no(Expr::BinaryExpr(BinaryExpr { left, op, right })));
+    }
+    let zoned =
+        |e: &Expr| -> Result<bool> { Ok(matches!(e.get_type(schema)?, DataType::Timestamp(_, Some(_)))) };
+    let duration = |e: &Expr| match e {
+        Expr::Literal(value, metadata) => as_duration(value).map(|v| Expr::Literal(v, metadata.clone())),
+        _ => None,
+    };
+    if zoned(&left)?
+        && let Some(interval) = duration(&right)
+    {
+        return Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr::new(
+            left,
+            op,
+            Box::new(interval),
+        ))));
+    }
+    if op == Operator::Plus
+        && zoned(&right)?
+        && let Some(interval) = duration(&left)
+    {
+        return Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(interval),
+            op,
+            right,
+        ))));
+    }
+    Ok(Transformed::no(Expr::BinaryExpr(BinaryExpr { left, op, right })))
 }
 
 /// A 32-bit integer literal → `integer` (see the module documentation).
@@ -772,6 +1120,80 @@ fn unify_union_numbers(union: Union) -> Result<Transformed<LogicalPlan>> {
     })))
 }
 
+/// The join `INTERSECT` or `EXCEPT` is planned as: a left semi (anti) join
+/// of every column, `NULL` equal to `NULL`, answering the left input.
+fn is_set_operation(join: &datafusion::logical_expr::Join) -> bool {
+    use datafusion::common::NullEquality;
+    use datafusion::logical_expr::JoinType;
+    let (left, right) = (join.left.schema(), join.right.schema());
+    matches!(join.join_type, JoinType::LeftSemi | JoinType::LeftAnti)
+        && join.null_equality == NullEquality::NullEqualsNull
+        && join.filter.is_none()
+        && join.on.len() == left.fields().len()
+        && join.on.len() == right.fields().len()
+        && join.on.iter().enumerate().all(|(i, (l, r))| {
+            matches!(l, Expr::Column(c) if left.index_of_column(c).ok() == Some(i))
+                && matches!(r, Expr::Column(c) if right.index_of_column(c).ok() == Some(i))
+        })
+}
+
+/// `plan` with each column cast to its target type (same qualifier and
+/// name), or `plan` itself when no type changes.
+fn cast_columns(plan: Arc<LogicalPlan>, targets: &[Option<DataType>]) -> Result<Arc<LogicalPlan>> {
+    if targets.iter().all(Option::is_none) {
+        return Ok(plan);
+    }
+    let exprs: Vec<Expr> = plan
+        .schema()
+        .iter()
+        .zip(targets)
+        .map(|((qualifier, field), target)| {
+            let column = Expr::Column(datafusion::common::Column::from((qualifier, field)));
+            match target {
+                Some(t) if t != field.data_type() => Expr::Cast(Cast::new(Box::new(column), t.clone()))
+                    .alias_qualified(qualifier.cloned(), field.name()),
+                _ => column,
+            }
+        })
+        .collect();
+    Ok(Arc::new(LogicalPlan::Projection(
+        datafusion::logical_expr::Projection::try_new(exprs, plan)?,
+    )))
+}
+
+/// `INTERSECT` and `EXCEPT` answer Trino's common type of each column, like
+/// `UNION` (`decimal(5,1) INTERSECT decimal(6,2)` is `decimal(6,2)`,
+/// `integer INTERSECT bigint` is `bigint`); `DataFusion` keeps the left
+/// input's type and compares the two in their common type. Both inputs are
+/// cast to the common type first.
+fn unify_set_operation(join: datafusion::logical_expr::Join) -> Result<Transformed<LogicalPlan>> {
+    let targets: Vec<Option<DataType>> = join
+        .left
+        .schema()
+        .fields()
+        .iter()
+        .zip(join.right.schema().fields())
+        .map(|(l, r)| common_numeric_type(&[l.data_type().clone(), r.data_type().clone()]))
+        .collect();
+    if targets.iter().all(Option::is_none) {
+        return Ok(Transformed::no(LogicalPlan::Join(join)));
+    }
+    let left = cast_columns(Arc::clone(&join.left), &targets)?;
+    let right = cast_columns(Arc::clone(&join.right), &targets)?;
+    let on = join.on.clone();
+    let plan = LogicalPlan::Join(datafusion::logical_expr::Join::try_new(
+        left,
+        right,
+        on,
+        None,
+        join.join_type,
+        join.join_constraint,
+        join.null_equality,
+        join.null_aware,
+    )?);
+    Ok(Transformed::yes(plan))
+}
+
 /// A subquery's references to the columns of `outer` take their types,
 /// which this rule may have changed (an integer literal of a `VALUES`).
 fn refresh_outer_references(expr: Expr, outer: &DFSchema) -> Result<Transformed<Expr>> {
@@ -845,13 +1267,15 @@ fn rewrite_expressions(plan: LogicalPlan, session_zone: &str) -> Result<Transfor
             let zoned = crate::timestamp_casts::at_time_zone(e, &schema, session_zone)?;
             let function = crate::trino_functions::trino_function(zoned.data, &schema, session_zone)?;
             let narrowed = narrow_literal(function.data);
-            let unified = common_types(narrowed.data, &schema)?;
+            let interval = zoned_day_interval(narrowed.data, &schema)?;
+            let unified = common_types(interval.data, &schema, session_zone)?;
             let outer = refresh_outer_references(unified.data, &schema)?;
             Ok(Transformed::new_transformed(
                 outer.data,
                 zoned.transformed
                     || function.transformed
                     || narrowed.transformed
+                    || interval.transformed
                     || unified.transformed
                     || outer.transformed,
             ))
@@ -886,6 +1310,7 @@ fn common_types_node(plan: LogicalPlan, session_zone: &str) -> Result<Transforme
             return retype_values(values);
         }
         LogicalPlan::Union(union) => return unify_union(union),
+        LogicalPlan::Join(join) if is_set_operation(&join) => return unify_set_operation(join),
         dml @ LogicalPlan::Dml(_) => return crate::declared::check_insert(dml),
         other => other,
     };

@@ -204,10 +204,6 @@ async fn decimal_errors_match_trino() -> Res<()> {
 // ---------------------------------------------------------------- defects
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM30: VALUES rows without parentheses are a syntax error. Expected (Trino): \
-    VALUES 1, 2 is two rows of integer; VALUES CAST(1 AS DECIMAL(10,0)), CAST(2 AS DECIMAL(10,0)) \
-    two rows of decimal(10,0). Obtained: SYNTAX_ERROR 'Expected: identifier, found: 1' (and \
-    'Expected: ), found: DECIMAL')"]
 async fn defect_sem30_values_rows_without_parentheses() -> Res<()> {
     expect_rows(
         &[],
@@ -222,10 +218,6 @@ async fn defect_sem30_values_rows_without_parentheses() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM31: INTERSECT and EXCEPT keep the left type instead of the common \
-    supertype. Expected (Trino): SELECT CAST(1.5 AS DECIMAL(5,1)) INTERSECT SELECT CAST(1.50 AS \
-    DECIMAL(6,2)) is decimal(6,2) '1.50', integer INTERSECT bigint is bigint. Obtained: \
-    decimal(5,1) '1.5' and integer (UNION is right)"]
 async fn defect_sem31_intersect_and_except_use_the_supertype() -> Res<()> {
     expect_rows(
         &[],
@@ -240,11 +232,6 @@ async fn defect_sem31_intersect_and_except_use_the_supertype() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM32: an integer literal beyond bigint is a syntax error in Trino. Expected: \
-    SELECT 9223372036854775808, SELECT 12345678901234567890123456789012345678 and SELECT \
-    1234567890123456789012345678901234567890 fail with SYNTAX_ERROR 'Invalid numeric literal'. \
-    Obtained: the first two are accepted as decimal(20,0) and decimal(38,0); the 40-digit one fails with NOT_SUPPORTED 'decimal(40, 0) (precision above 38) \
-    cannot be sent over the Trino protocol'"]
 async fn defect_sem32_integer_literal_beyond_bigint_is_rejected() -> Res<()> {
     expect_errors(
         &[
@@ -258,11 +245,6 @@ async fn defect_sem32_integer_literal_beyond_bigint_is_rejected() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM33: ceil, floor and round(decimal(p,s)) are decimal(p-s+1,0) in Trino \
-    (decimal(p,0) when s = 0). Expected for decimal(12,4): decimal(9,0); ceil(99999999.9999) = \
-    100000000, floor(-99999999.9999) = -100000000. Obtained: round is decimal(12,0) (values \
-    right); ceil and floor fail with GENERIC_INTERNAL_ERROR 'Decimal overflow while applying ceil' \
-    on the whole column"]
 async fn defect_sem33_ceil_floor_round_result_type() -> Res<()> {
     expect_rows(
         SIGNS_SETUP,
@@ -278,12 +260,6 @@ async fn defect_sem33_ceil_floor_round_result_type() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM34: Trino functions over decimals, doubles and zoned timestamps are \
-    missing. Expected: sign(decimal) decimal(1,0), truncate(decimal(12,4)) decimal(8,0), nan(), \
-    infinity(), current_timezone(), hour(), timezone_hour(), timezone_minute(), date_diff(), \
-    variance(), year(), month(), extract(TIMEZONE_HOUR/TIMEZONE_MINUTE FROM ...). Obtained: \
-    FUNCTION_NOT_FOUND for each ('Invalid function 'sign'', ...); extract fails with \
-    GENERIC_INTERNAL_ERROR 'Date part 'TIMEZONE_HOUR' not supported'"]
 async fn defect_sem34_trino_functions_exist() -> Res<()> {
     expect_rows(
         SIGNS_SETUP,
@@ -302,9 +278,6 @@ async fn defect_sem34_trino_functions_exist() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM40: ORDER BY ... DESC puts NULL first; Trino puts NULL last in both \
-    directions. Expected: ORDER BY v DESC over (NULL, 1.5, -2.25, 0, 10) = 10.00, 1.50, 0.00, \
-    -2.25, NULL. Obtained: NULL, 10.00, 1.50, 0.00, -2.25"]
 async fn defect_sem40_order_by_desc_puts_nulls_last() -> Res<()> {
     expect_rows(
         &[],
@@ -319,12 +292,6 @@ async fn defect_sem40_order_by_desc_puts_nulls_last() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM41: two aggregates of the same column that differ by a cast fail. \
-    Expected (Trino): SELECT sum(n), sum(CAST(n AS SMALLINT)) answers bigint 499500, 499500. \
-    Obtained: GENERIC_USER_ERROR 'Projections require unique expression names but the \
-    expression \"sum(datafusion.bx_agg.g.n)\" at position 0 and \"sum(CAST(datafusion.bx_agg.g.n \
-    AS Int16))\" at position 1 have the same name' (also avg(n) with avg(CAST(n AS REAL))); \
-    with aliases: 'Schema contains duplicate unqualified field name'"]
 async fn defect_sem41_aggregates_differing_by_a_cast() -> Res<()> {
     expect_rows(
         GENERATED,
@@ -340,10 +307,6 @@ async fn defect_sem41_aggregates_differing_by_a_cast() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM42: the overflow of sum(decimal) has another error name. Expected (Trino): \
-    GENERIC_INTERNAL_ERROR 'Decimal overflow' for sum of two decimal(38,0) of 38 nines. \
-    Obtained: NUMERIC_VALUE_OUT_OF_RANGE 'Arrow error: Arithmetic overflow: Decimal overflow'. \
-    Low severity: both fail; the name Trino uses is an internal-error name"]
 async fn defect_sem42_sum_overflow_error_name() -> Res<()> {
     expect_errors(
         &[
@@ -356,8 +319,6 @@ async fn defect_sem42_sum_overflow_error_name() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM46: sum and avg of real are real in Trino. Expected: sum(CAST(n AS REAL)) \
-    real 499500.0, avg real 499.5 (NULL real over no rows). Obtained: double for both"]
 async fn defect_sem46_real_aggregates_are_real() -> Res<()> {
     expect_rows(
         GENERATED,

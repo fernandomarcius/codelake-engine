@@ -211,7 +211,7 @@ enum Converted {
 
 /// Nanoseconds of each value of a timestamp or date array, and the zone of
 /// a timestamp with time zone.
-fn source_nanos(array: &ArrayRef) -> Result<(Vec<Option<i128>>, Option<String>, u32)> {
+pub(crate) fn source_nanos(array: &ArrayRef) -> Result<(Vec<Option<i128>>, Option<String>, u32)> {
     let scaled = |values: Vec<Option<i64>>, per: i128| -> Vec<Option<i128>> {
         values
             .into_iter()

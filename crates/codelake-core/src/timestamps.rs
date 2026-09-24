@@ -470,17 +470,30 @@ pub(crate) fn check_text_cast(expr: Expr, schema: &DFSchema) -> Result<Transform
 
 /// `CAST(<text → timestamp with time zone> AS timestamp(p))` → the text read
 /// as `timestamp(p)`: the local time each text names, moved forward out of a
-/// daylight-saving gap of its zone, as Trino answers it.
+/// daylight-saving gap of its zone, as Trino answers it. A cast to `date`
+/// takes the date of that local time.
 fn fuse(inner: &Expr, target: &DataType, safe: bool) -> Option<Expr> {
     let Expr::ScalarFunction(ScalarFunction { func, args }) = inner else {
         return None;
     };
     let text = func.inner().as_any().downcast_ref::<TextToTimestamp>()?;
-    let (DataType::Timestamp(zoned_unit, Some(_)), DataType::Timestamp(unit, None)) = (&text.target, target)
-    else {
+    let [arg] = args.as_slice() else {
         return None;
     };
-    let [arg] = args.as_slice() else {
+    // `CAST(<text → with time zone> AS DATE)`: the date where each value is,
+    // its local date (the zone of the column type would give UTC's).
+    if let (DataType::Timestamp(zoned_unit, Some(_)), DataType::Date32 | DataType::Date64) =
+        (&text.target, target)
+    {
+        let local = text_to_timestamp(
+            arg.clone(),
+            DataType::Timestamp(*zoned_unit, None),
+            safe || text.safe,
+        );
+        return Some(Expr::Cast(Cast::new(Box::new(local), target.clone())));
+    }
+    let (DataType::Timestamp(zoned_unit, Some(_)), DataType::Timestamp(unit, None)) = (&text.target, target)
+    else {
         return None;
     };
     // The coarser of the two precisions rounds; widening back is exact.

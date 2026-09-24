@@ -31,11 +31,14 @@
 //! wrapped in a cast to Trino's type, so the plan's types never change.
 //!
 //! Every overflow is an `ArrowError::ArithmeticOverflow` carrying Trino's
-//! message; the Trino protocol maps it to `NUMERIC_VALUE_OUT_OF_RANGE`.
+//! message; the Trino protocol maps it to `NUMERIC_VALUE_OUT_OF_RANGE`,
+//! except the overflow of a decimal `sum`, which Trino 431 reports as
+//! `GENERIC_INTERNAL_ERROR` ([`is_trino_internal_error`]).
 
 mod arith;
 mod avg;
 pub(crate) mod decimal;
+mod real;
 mod sum;
 
 use std::sync::{Arc, LazyLock};
@@ -60,6 +63,7 @@ use datafusion::optimizer::{AnalyzerRule, OptimizerConfig, OptimizerRule};
 use arith::{CheckedAbs, CheckedBinary, CheckedNegate, is_arithmetic, is_decimal, is_integer};
 use avg::TrinoAvg;
 use decimal::{DecimalBinary, as_decimal, as_decimal_operand, is_decimal_operation};
+use real::RealResult;
 use sum::{CheckedSum, is_checked_sum_type};
 
 static CHECKED_OPS: LazyLock<[(Operator, Arc<ScalarUDF>); 5]> = LazyLock::new(|| {
@@ -189,6 +193,29 @@ fn check_arithmetic(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> 
         Expr::TryCast(_) | Expr::ScalarFunction(_) => return check_cast(expr, schema),
         other => Transformed::no(other),
     })
+}
+
+/// Whether `error` is one Trino 431 reports as `GENERIC_INTERNAL_ERROR`
+/// although its root is an overflow: the overflow of a decimal `sum`.
+pub fn is_trino_internal_error(error: &datafusion::error::DataFusionError) -> bool {
+    use datafusion::error::DataFusionError;
+    let mut current = error;
+    loop {
+        current = match current {
+            DataFusionError::Context(context, _) if context == sum::TRINO_INTERNAL_ERROR => return true,
+            DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => inner.as_ref(),
+            DataFusionError::Shared(inner) => inner.as_ref(),
+            DataFusionError::Collection(errors) => match errors.first() {
+                Some(first) => first,
+                None => return false,
+            },
+            DataFusionError::External(inner) => match inner.downcast_ref::<DataFusionError>() {
+                Some(inner) => inner,
+                None => return false,
+            },
+            _ => return false,
+        };
+    }
 }
 
 /// Casts evaluated with Trino's semantics: text to timestamps
@@ -381,6 +408,12 @@ fn uncheck_node(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
         } => return Ok(done),
         other => other.data,
     };
+    let expr = match crate::trino_functions::uncheck_integral(expr, schema)? {
+        done @ Transformed {
+            transformed: true, ..
+        } => return Ok(done),
+        other => other.data,
+    };
     let Expr::ScalarFunction(ScalarFunction { func, mut args }) = expr else {
         return Ok(Transformed::no(expr));
     };
@@ -526,6 +559,16 @@ fn trino_aggregate(
     args: Vec<Expr>,
     schema: &DFSchema,
 ) -> Option<(Arc<AggregateUDF>, Vec<Expr>)> {
+    // `real` adds in `double` and answers `real` (module `real`).
+    if (is_builtin::<Avg>(func) || is_builtin::<Sum>(func))
+        && matches!(
+            args.first().map(|a| a.get_type(schema)),
+            Some(Ok(DataType::Float32))
+        )
+    {
+        let real = AggregateUDF::new_from_impl(RealResult::new(Arc::new(func.clone())));
+        return Some((Arc::new(real), args));
+    }
     if is_builtin::<Avg>(func) {
         return Some((Arc::clone(&TRINO_AVG), args));
     }
@@ -606,10 +649,24 @@ impl AnalyzerRule for TrinoDecimalTypes {
             .transform_up_with_subqueries(|node| {
                 let schema = expression_schema(&node)?;
                 let names = NamePreserver::new(&node);
+                // A window function keeps the wrapper that named a cast: an
+                // aliased window expression is re-planned above the window.
+                let window = matches!(node, LogicalPlan::Window(_));
                 node.map_expressions(|expr| {
                     let name = names.save(&expr);
-                    expr.transform_up(|e| Ok(trino_decimal_node(e, &schema)))
-                        .map(|t| t.update_data(|e| name.restore(e)))
+                    expr.transform_up(|e| {
+                        // The wrapper that only named a cast goes first.
+                        let unnamed = if window {
+                            Transformed::no(e)
+                        } else {
+                            crate::coercion::unname_cast(e)
+                        };
+                        if unnamed.transformed {
+                            return Ok(unnamed);
+                        }
+                        Ok(trino_decimal_node(unnamed.data, &schema))
+                    })
+                    .map(|t| t.update_data(|e| name.restore(e)))
                 })
             })?
             .data)

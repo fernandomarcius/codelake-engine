@@ -237,9 +237,6 @@ async fn invalid_zoned_text_fails_like_trino() -> Res<()> {
 // ---------------------------------------------------------------- defects
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM35: an unknown timestamp precision is TYPE_MISMATCH in Trino. Expected: \
-    CAST(... AS TIMESTAMP(13)) fails with TYPE_MISMATCH 'Unknown type: timestamp(13)'. Obtained: \
-    NOT_SUPPORTED 'Unsupported SQL type TIMESTAMP(13)'"]
 async fn defect_sem35_unknown_timestamp_precision_error_name() -> Res<()> {
     expect_errors(
         &[
@@ -252,11 +249,6 @@ async fn defect_sem35_unknown_timestamp_precision_error_name() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM36: comparing a timestamp with a timestamp with time zone ignores the \
-    session zone: the timestamp is read as UTC, a wrong answer in WHERE. Expected with session \
-    Asia/Kathmandu: TIMESTAMP '2026-01-01 10:00:00' < CAST('2026-01-01 10:00:00 UTC' AS TIMESTAMP \
-    WITH TIME ZONE) is true, and WHERE ts >= that value keeps only 16:00; with America/Sao_Paulo, \
-    > is true. Obtained: < and > both false (equal), WHERE keeps 10:00 and 16:00"]
 async fn defect_sem36_timestamp_meets_zoned_value_in_the_session_zone() -> Res<()> {
     let pair = Pair::start().await?;
     let mut wrong = Vec::new();
@@ -276,11 +268,6 @@ async fn defect_sem36_timestamp_meets_zoned_value_in_the_session_zone() -> Res<(
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM37: timestamp with time zone + INTERVAL 'n' DAY adds n * 24 hours in \
-    Trino 431. Expected: CAST('2018-11-03 12:00:00 America/Sao_Paulo' AS TIMESTAMP WITH TIME \
-    ZONE) + INTERVAL '1' DAY = '2018-11-04 13:00:00.000 America/Sao_Paulo' (DST began in \
-    between), '2019-02-16 12:00:00' + 1 day = '2019-02-17 11:00:00.000'. Obtained: 12:00:00.000 \
-    for both (calendar day)"]
 async fn defect_sem37_zoned_plus_day_interval() -> Res<()> {
     expect_rows(
         &[],
@@ -293,12 +280,6 @@ async fn defect_sem37_zoned_plus_day_interval() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM38: CAST(CAST(varchar column AS TIMESTAMP WITH TIME ZONE) AS DATE) is the \
-    UTC date, not the date where the value is. Expected (Trino): '1913-12-31 23:59:59.999 \
-    America/Sao_Paulo' -> 1913-12-31, '1970-01-01 00:00:00 Europe/London' -> 1970-01-01, \
-    '2026-01-01 00:00:00 Pacific/Kiritimati' -> 2026-01-01, '2026-06-01 12:00:00 -12:00' -> \
-    2026-06-01. Obtained: 1914-01-01, 1969-12-31, 2025-12-31, 2026-06-02 (the same literals are \
-    right)"]
 async fn defect_sem38_date_of_a_zoned_value_from_rows() -> Res<()> {
     let pair = Pair::start().await?;
     let from = format!("FROM {} ORDER BY k", values(&all_texts()));

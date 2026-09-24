@@ -41,7 +41,8 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::information_schema::{INFORMATION_SCHEMA, InformationSchemaProvider};
 use datafusion::catalog::streaming::StreamingTable;
 use datafusion::catalog::{
-    CatalogProvider, CatalogProviderList, MemoryCatalogProviderList, SchemaProvider, TableProvider,
+    CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList, SchemaProvider,
+    TableProvider,
 };
 use datafusion::common::ScalarValue;
 use datafusion::datasource::TableType;
@@ -84,10 +85,95 @@ impl CatalogProviderList for CatalogList {
 
     fn catalog(&self, name: &str) -> Option<Arc<dyn CatalogProvider>> {
         let catalog = self.catalogs.catalog(name)?;
+        // The engine's in-memory catalog folds names like Trino's `memory`.
+        let catalog: Arc<dyn CatalogProvider> = if catalog.as_any().is::<MemoryCatalogProvider>() {
+            Arc::new(LowerCaseCatalog { inner: catalog })
+        } else {
+            catalog
+        };
         Some(Arc::new(WithInformationSchema {
             name: name.to_owned(),
             catalog,
         }))
+    }
+}
+
+/// Trino folds identifiers to lower case, so its catalogs only have
+/// lower-case schemas and tables (`CREATE TABLE "MiXeD"` creates `mixed`,
+/// which `mixed` and `"MiXeD"` both name). `DataFusion`'s in-memory catalog
+/// keeps names as written; this wrapper folds them at every entry
+/// (registration and lookup). Its columns are folded where tables and views
+/// are created (`crate::engine`).
+#[derive(Debug)]
+struct LowerCaseCatalog {
+    inner: Arc<dyn CatalogProvider>,
+}
+
+impl CatalogProvider for LowerCaseCatalog {
+    fn as_any(&self) -> &dyn Any {
+        self.inner.as_any()
+    }
+
+    fn schema_names(&self) -> Vec<String> {
+        self.inner.schema_names()
+    }
+
+    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        let inner = self.inner.schema(&name.to_lowercase())?;
+        Some(Arc::new(LowerCaseSchema { inner }))
+    }
+
+    fn register_schema(
+        &self,
+        name: &str,
+        schema: Arc<dyn SchemaProvider>,
+    ) -> Result<Option<Arc<dyn SchemaProvider>>> {
+        self.inner.register_schema(&name.to_lowercase(), schema)
+    }
+
+    fn deregister_schema(&self, name: &str, cascade: bool) -> Result<Option<Arc<dyn SchemaProvider>>> {
+        self.inner.deregister_schema(&name.to_lowercase(), cascade)
+    }
+}
+
+/// A schema of [`LowerCaseCatalog`].
+#[derive(Debug)]
+struct LowerCaseSchema {
+    inner: Arc<dyn SchemaProvider>,
+}
+
+#[async_trait]
+impl SchemaProvider for LowerCaseSchema {
+    fn as_any(&self) -> &dyn Any {
+        self.inner.as_any()
+    }
+
+    fn table_names(&self) -> Vec<String> {
+        self.inner.table_names()
+    }
+
+    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+        self.inner.table(&name.to_lowercase()).await
+    }
+
+    async fn table_type(&self, name: &str) -> Result<Option<TableType>> {
+        self.inner.table_type(&name.to_lowercase()).await
+    }
+
+    fn register_table(
+        &self,
+        name: String,
+        table: Arc<dyn TableProvider>,
+    ) -> Result<Option<Arc<dyn TableProvider>>> {
+        self.inner.register_table(name.to_lowercase(), table)
+    }
+
+    fn deregister_table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+        self.inner.deregister_table(&name.to_lowercase())
+    }
+
+    fn table_exist(&self, name: &str) -> bool {
+        self.inner.table_exist(&name.to_lowercase())
     }
 }
 
