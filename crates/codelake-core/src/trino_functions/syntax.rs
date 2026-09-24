@@ -9,8 +9,8 @@
 //! - `x AT TIME ZONE z` becomes `at_timezone(x, z)` (Trino's definition:
 //!   same instant, other zone; a plain timestamp is read in the session zone).
 //! - `listagg(x [, sep]) WITHIN GROUP (ORDER BY …)` becomes
-//!   `array_join(array_agg(x ORDER BY …), sep)`: same order, NULLs skipped,
-//!   NULL for no rows (`DataFusion` has no `listagg`).
+//!   `array_join(array_agg(x ORDER BY …) FILTER (WHERE x IS NOT NULL), sep)`:
+//!   same order, NULLs skipped, NULL when no value is left (`DataFusion` has no `listagg`).
 //! - `CAST(x AS varchar(n))` keeps the length Arrow drops: a string is cut to
 //!   `n` characters, any other value that does not fit fails (`TRY_CAST`: NULL).
 //! - `CAST(x AS json)` and `JSON '…'` build Trino `json` values (see `json_cast`).
@@ -23,9 +23,10 @@ use std::ops::ControlFlow;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
-    AccessExpr, CastKind, CharacterLength, DataType, DateTimeField, ExactNumberInfo, Expr, Function,
-    FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments, Ident,
-    ObjectName, Subscript, TimezoneInfo, TypedString, Value, ValueWithSpan, visit_expressions_mut,
+    AccessExpr, BinaryOperator, CastKind, CharacterLength, DataType, DateTimeField, ExactNumberInfo, Expr,
+    Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments,
+    Ident, ObjectName, Subscript, TableFactor, TimezoneInfo, TypedString, Value, ValueWithSpan, VisitMut,
+    VisitorMut, visit_expressions_mut,
 };
 
 use super::cast::{TRY_VARCHAR_N, VARCHAR_N, parse_timestamp_text, render_timestamp};
@@ -140,6 +141,20 @@ fn listagg(function: &Function) -> Option<Expr> {
         [value, FunctionArg::Unnamed(FunctionArgExpr::Expr(separator))] => (value.clone(), separator.clone()),
         _ => return None,
     };
+    // NULLs are skipped: a group of only NULLs aggregates no row, so the
+    // result is NULL (Trino), not the empty string.
+    let FunctionArg::Unnamed(FunctionArgExpr::Expr(value_expr)) = &value else {
+        return None;
+    };
+    let not_null = Expr::IsNotNull(Box::new(value_expr.clone()));
+    let filter = Some(Box::new(match &function.filter {
+        Some(existing) => Expr::BinaryOp {
+            left: Box::new(Expr::Nested(existing.clone())),
+            op: BinaryOperator::And,
+            right: Box::new(not_null),
+        },
+        None => not_null,
+    }));
     let aggregate = Expr::Function(Function {
         name: ObjectName::from(vec![Ident::new("array_agg")]),
         uses_odbc_syntax: false,
@@ -149,7 +164,7 @@ fn listagg(function: &Function) -> Option<Expr> {
             args: vec![value],
             clauses: vec![FunctionArgumentClause::OrderBy(function.within_group.clone())],
         }),
-        filter: function.filter.clone(),
+        filter,
         null_treatment: None,
         over: None,
         within_group: vec![],
@@ -316,8 +331,31 @@ fn rewrite_builtin_syntax(expr: &mut Expr) -> bool {
     true
 }
 
+/// Operators and literals whose Trino meaning the engine lacks.
+fn rewrite_operators(expr: &mut Expr) -> bool {
+    match expr {
+        // `a || b` is Trino's `concat` (strings, varbinary, arrays and
+        // elements); the engine's operator only joins strings.
+        Expr::BinaryOp {
+            op: BinaryOperator::StringConcat,
+            left,
+            right,
+        } => {
+            let (left, right) = (take(left), take(right));
+            *expr = call(super::string::CONCAT_OPERATOR, vec![left, right]);
+        }
+        // `X'ED A0 80'`: Trino allows blanks between the hex digits.
+        Expr::Value(ValueWithSpan {
+            value: Value::HexStringLiteral(digits),
+            ..
+        }) if digits.contains(char::is_whitespace) => digits.retain(|c| !c.is_whitespace()),
+        _ => return false,
+    }
+    true
+}
+
 fn rewrite(expr: &mut Expr) {
-    if rewrite_builtin_syntax(expr) {
+    if rewrite_builtin_syntax(expr) || rewrite_operators(expr) {
         return;
     }
     match expr {
@@ -413,12 +451,45 @@ fn rewrite(expr: &mut Expr) {
     }
 }
 
+/// `UNNEST(x) AS t(a, b, …)`: one argument, several columns (a map, or an
+/// array of rows) becomes one array per column (see `collections`).
+#[derive(Debug)]
+struct UnnestColumns;
+
+impl VisitorMut for UnnestColumns {
+    type Break = ();
+
+    fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<()> {
+        if let TableFactor::UNNEST {
+            alias: Some(alias),
+            array_exprs,
+            with_ordinality: false,
+            ..
+        } = factor
+            && array_exprs.len() == 1
+            && alias.columns.len() >= 2
+        {
+            let argument = array_exprs.remove(0);
+            for i in 0..alias.columns.len() {
+                let index = Expr::Value(ValueWithSpan::from(Value::Number(i.to_string(), false)));
+                array_exprs.push(call(
+                    super::collections::UNNEST_PART,
+                    vec![argument.clone(), index],
+                ));
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 /// Applies the rewrites to every expression of a statement.
 pub(crate) fn rewrite_statement(statement: &mut DFStatement) -> Result<()> {
     match statement {
         DFStatement::Statement(inner) => {
-            super::literals::type_literals(inner.as_mut());
+            super::literals::type_literals(inner.as_mut())?;
             super::literals::name_columns(inner.as_mut());
+            let _ = inner.visit(&mut UnnestColumns);
+            super::lateral::rewrite(inner.as_mut());
             let flow: ControlFlow<DataFusionError> = visit_expressions_mut(inner.as_mut(), |expr| {
                 rewrite(expr);
                 ControlFlow::Continue(())
@@ -507,11 +578,11 @@ mod tests {
     fn listagg_and_varchar_length() {
         assert_eq!(
             rewritten("SELECT listagg(x, ',') WITHIN GROUP (ORDER BY y DESC) FROM t"),
-            "SELECT array_join(array_agg(x ORDER BY y DESC), ',') FROM t"
+            "SELECT array_join(array_agg(x ORDER BY y DESC) FILTER (WHERE x IS NOT NULL), ',') FROM t"
         );
         assert_eq!(
             rewritten("SELECT listagg(DISTINCT x) WITHIN GROUP (ORDER BY x) FROM t"),
-            "SELECT array_join(array_agg(DISTINCT x ORDER BY x), '') FROM t"
+            "SELECT array_join(array_agg(DISTINCT x ORDER BY x) FILTER (WHERE x IS NOT NULL), '') FROM t"
         );
         assert_eq!(
             rewritten("SELECT string_agg(x, ',') FROM t"),

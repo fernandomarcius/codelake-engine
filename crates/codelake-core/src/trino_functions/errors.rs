@@ -9,8 +9,10 @@ use datafusion::arrow::error::ArrowError;
 use datafusion::error::DataFusionError;
 
 /// Names this library puts at the start of its error messages.
-const PREFIXES: [&str; 9] = [
+const PREFIXES: [&str; 11] = [
     "INVALID_FUNCTION_ARGUMENT",
+    "SYNTAX_ERROR",
+    "GENERIC_INTERNAL_ERROR",
     "NUMERIC_VALUE_OUT_OF_RANGE",
     "INVALID_CAST_ARGUMENT",
     "DIVISION_BY_ZERO",

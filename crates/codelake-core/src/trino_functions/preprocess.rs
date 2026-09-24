@@ -4,6 +4,8 @@
 //! literals, comments and everything else stay byte for byte:
 //!
 //! - `VALUES 1, 2` (rows without parentheses) becomes `VALUES (1), (2)`;
+//! - `TRIM(TRAILING FROM s)` (a side without characters) becomes `rtrim(s)`
+//!   (`LEADING`: `ltrim`, `BOTH`: `trim`);
 //! - `CAST(x AS array(T))`, `map(K, V)` and `row(…)` targets, which the parser
 //!   only knows with angle brackets, become
 //!   `codelake_trino_cast_type(x, 'array(T)')` (`TRY_CAST`: the `try` form),
@@ -120,8 +122,9 @@ fn values_rows(text: &str, tokens: &[(Token, usize, usize)]) -> Option<String> {
                 row_start = None;
                 continue;
             }
-            Token::LParen => depth += 1,
-            Token::RParen => depth -= 1,
+            // Commas inside `ARRAY[…]`, `f(…)` or `x[i]` do not end a row.
+            Token::LParen | Token::LBracket => depth += 1,
+            Token::RParen | Token::RBracket => depth -= 1,
             _ => {}
         }
         row_start.get_or_insert(*from);
@@ -202,12 +205,48 @@ fn container_cast(text: &str, tokens: &[(Token, usize, usize)]) -> Option<String
     None
 }
 
+/// `TRIM(LEADING | TRAILING | BOTH FROM s)` (no characters: blanks) becomes
+/// `ltrim(s)`, `rtrim(s)` or `trim(s)`; the parser needs the characters.
+fn trim_side(text: &str, tokens: &[(Token, usize, usize)]) -> Option<String> {
+    for window in tokens.windows(4) {
+        let [
+            (trim, start, _),
+            (Token::LParen, _, _),
+            (side, _, _),
+            (from, _, from_end),
+        ] = window
+        else {
+            continue;
+        };
+        if !is_keyword(trim, Keyword::TRIM) || !is_keyword(from, Keyword::FROM) {
+            continue;
+        }
+        let function = if is_keyword(side, Keyword::LEADING) {
+            "ltrim("
+        } else if is_keyword(side, Keyword::TRAILING) {
+            "rtrim("
+        } else if is_keyword(side, Keyword::BOTH) {
+            "trim("
+        } else {
+            continue;
+        };
+        let mut out = String::with_capacity(text.len());
+        out.push_str(text.get(..*start)?);
+        out.push_str(function);
+        out.push_str(text.get(*from_end..)?);
+        return Some(out);
+    }
+    None
+}
+
 /// Rewrites the constructs listed in the module docs.
 pub(crate) fn preprocess(sql: &str) -> Cow<'_, str> {
     let mut text = Cow::Borrowed(sql);
     for _ in 0..MAX_PASSES {
         let Some(tokens) = tokens(&text) else { return text };
-        let next = container_cast(&text, &tokens).or_else(|| values_rows(&text, &tokens));
+        let next = container_cast(&text, &tokens)
+            .or_else(|| values_rows(&text, &tokens))
+            .or_else(|| trim_side(&text, &tokens));
         match next {
             Some(rewritten) => text = Cow::Owned(rewritten),
             None => return text,
@@ -236,6 +275,20 @@ mod tests {
         assert_eq!(
             preprocess("VALUES 1 UNION ALL VALUES 2"),
             "VALUES (1) UNION ALL VALUES (2)"
+        );
+        assert_eq!(
+            preprocess("SELECT * FROM (VALUES ARRAY[1, 2], ARRAY[3]) t(a)"),
+            "SELECT * FROM (VALUES (ARRAY[1, 2]), (ARRAY[3])) t(a)"
+        );
+    }
+
+    #[test]
+    fn trim_sides_without_characters() {
+        assert_eq!(
+            preprocess(
+                "SELECT trim(TRAILING FROM s), TRIM(leading FROM 'a'), trim(BOTH FROM x), trim(BOTH 'x' FROM y)"
+            ),
+            "SELECT rtrim( s), ltrim( 'a'), trim( x), trim(BOTH 'x' FROM y)"
         );
     }
 

@@ -17,11 +17,14 @@
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 
+use datafusion::error::{DataFusionError, Result};
 use datafusion::sql::sqlparser::ast::{
     CastKind, DataType, ExactNumberInfo, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    Ident, LimitClause, NamedWindowExpr, OrderByKind, Query, SelectItem, SetExpr, Statement, Value,
-    ValueWithSpan, VisitMut, VisitorMut, WindowFrameBound, WindowSpec, WindowType,
+    Ident, LimitClause, NamedWindowExpr, OrderByKind, Query, SelectItem, SetExpr, Statement, TableFactor,
+    UnaryOperator, Value, ValueWithSpan, VisitMut, VisitorMut, WindowFrameBound, WindowSpec, WindowType,
 };
+use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::parser::Parser;
 
 fn is_number(expr: &Expr) -> bool {
     matches!(
@@ -53,7 +56,8 @@ fn typed(number: &str) -> Option<Expr> {
         return Some(cast(text(number), DataType::Double(ExactNumberInfo::None)));
     }
     if number.contains('.') {
-        let (int_part, fraction) = number.split_once('.')?;
+        let unsigned = number.strip_prefix('-').unwrap_or(number);
+        let (int_part, fraction) = unsigned.split_once('.')?;
         let digits = int_part.trim_start_matches('0').len() + fraction.len();
         let scale = u64::try_from(fraction.len()).ok()?;
         let precision = u64::try_from(digits.max(1)).ok()?.max(scale);
@@ -73,6 +77,13 @@ fn typed(number: &str) -> Option<Expr> {
     Some(cast(literal, DataType::Integer(None)))
 }
 
+/// An integer literal Trino cannot read: beyond `bigint` (Trino fails with
+/// `SYNTAX_ERROR`; the engine would read a `double` or an unsigned integer).
+fn out_of_range_integer(number: &str) -> bool {
+    let digits = number.strip_prefix('-').unwrap_or(number);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) && number.parse::<i64>().is_err()
+}
+
 /// Functions that read numeric literal arguments when planned
 /// (`from_unixtime(t, hours, minutes)` takes its zone from them).
 const LITERAL_ARGUMENTS: [&str; 1] = ["from_unixtime"];
@@ -81,13 +92,22 @@ const LITERAL_ARGUMENTS: [&str; 1] = ["from_unixtime"];
 struct LiteralTyper {
     /// Literals whose meaning is positional or structural.
     keep: HashSet<*const Expr>,
+    /// The first integer literal out of the `bigint` range.
+    invalid: Option<String>,
     /// Depth of queries being visited: only literals in queries are typed.
     queries: usize,
 }
 
 impl LiteralTyper {
     fn keep_if_number(&mut self, expr: &Expr) {
-        if is_number(expr) {
+        let negative_number = matches!(
+            expr,
+            Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr: inner,
+            } if is_number(inner)
+        );
+        if is_number(expr) || negative_number {
             self.keep.insert(std::ptr::from_ref(expr));
         }
     }
@@ -170,6 +190,26 @@ impl VisitorMut for LiteralTyper {
     }
 
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+        // `-<number>`: the sign belongs to the literal (`-2147483648` is an
+        // `integer`, `-9223372036854775808` a `bigint`).
+        let folded = match &*expr {
+            Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr: inner,
+            } => match inner.as_ref() {
+                Expr::Value(ValueWithSpan {
+                    value: Value::Number(number, long),
+                    ..
+                }) if !number.starts_with('-') => Some((format!("-{number}"), *long)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((number, long)) = folded
+            && !self.keep.contains(&std::ptr::from_ref(&*expr))
+        {
+            *expr = Expr::Value(ValueWithSpan::from(Value::Number(number, long)));
+        }
         match expr {
             // Functions whose result type depends on a numeric literal
             // argument read it while the query is planned, before casts fold.
@@ -214,9 +254,12 @@ impl VisitorMut for LiteralTyper {
             value: Value::Number(number, _),
             ..
         }) = &*expr
-            && let Some(replacement) = typed(number)
         {
-            *expr = replacement;
+            if out_of_range_integer(number) {
+                self.invalid.get_or_insert_with(|| number.clone());
+            } else if let Some(replacement) = typed(number) {
+                *expr = replacement;
+            }
         }
         ControlFlow::Continue(())
     }
@@ -263,23 +306,86 @@ impl VisitorMut for ColumnNamer {
 /// Names unaliased output expressions `_col<i>`, as Trino does.
 pub(crate) fn name_columns(statement: &mut Statement) {
     let _ = statement.visit(&mut ColumnNamer);
+    if let Statement::Query(query) = statement {
+        name_values_columns(&mut query.body);
+    }
+    let _ = statement.visit(&mut DerivedValuesNamer);
+}
+
+const VALUES_ALIAS: &str = "codelake_values";
+
+/// `VALUES …` read as a query (not the rows of an `INSERT`): its columns are
+/// `_col0`, `_col1`, … in Trino (`column1`, … in the engine). The body
+/// becomes `SELECT column1 AS _col0, … FROM (VALUES …) AS codelake_values`.
+fn name_values_columns(body: &mut SetExpr) {
+    let SetExpr::Values(values) = &*body else {
+        return;
+    };
+    let Some(width) = values.rows.first().map(Vec::len) else {
+        return;
+    };
+    let items = (0..width)
+        .map(|i| format!("column{} AS _col{i}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("SELECT {items} FROM (VALUES (0)) AS {VALUES_ALIAS}");
+    let Ok(mut parsed) = Parser::parse_sql(&GenericDialect {}, &sql) else {
+        return;
+    };
+    let Some(Statement::Query(mut query)) = parsed.pop() else {
+        return;
+    };
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return;
+    };
+    let Some(TableFactor::Derived { subquery, .. }) = select.from.first_mut().map(|t| &mut t.relation) else {
+        return;
+    };
+    std::mem::swap(subquery.body.as_mut(), body);
+    std::mem::swap(body, query.body.as_mut());
+}
+
+/// Derived tables `(VALUES …) AS t` without column names get Trino's names.
+#[derive(Debug)]
+struct DerivedValuesNamer;
+
+impl VisitorMut for DerivedValuesNamer {
+    type Break = ();
+
+    fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<()> {
+        if let TableFactor::Derived { subquery, alias, .. } = factor
+            && alias
+                .as_ref()
+                .is_none_or(|a| a.columns.is_empty() && a.name.value != VALUES_ALIAS)
+        {
+            name_values_columns(&mut subquery.body);
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 /// Types the numeric literals of the queries in `statement` (module docs).
-pub(crate) fn type_literals(statement: &mut Statement) {
+///
+/// # Errors
+/// `SYNTAX_ERROR` for an integer literal beyond the `bigint` range, as Trino.
+pub(crate) fn type_literals(statement: &mut Statement) -> Result<()> {
     let mut typer = LiteralTyper::default();
     let _ = statement.visit(&mut typer);
+    match typer.invalid {
+        Some(number) => Err(DataFusionError::Plan(format!(
+            "SYNTAX_ERROR: Invalid numeric literal: {number}"
+        ))),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::sql::sqlparser::dialect::GenericDialect;
-    use datafusion::sql::sqlparser::parser::Parser;
 
     fn typed_sql(sql: &str) -> String {
         let mut statement = Parser::parse_sql(&GenericDialect {}, sql).unwrap().remove(0);
-        type_literals(&mut statement);
+        type_literals(&mut statement).unwrap();
         statement.to_string()
     }
 
@@ -314,7 +420,7 @@ mod tests {
         let sql = "CREATE TABLE t (a INT) WITH (bucket_count = 4)";
         let mut statement = Parser::parse_sql(&GenericDialect {}, sql).unwrap().remove(0);
         let before = statement.to_string();
-        type_literals(&mut statement);
+        type_literals(&mut statement).unwrap();
         assert_eq!(statement.to_string(), before);
     }
 }

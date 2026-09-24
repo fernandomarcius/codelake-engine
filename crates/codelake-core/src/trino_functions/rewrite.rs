@@ -11,13 +11,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue};
 use datafusion::config::ConfigOptions;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::expr_rewriter::FunctionRewrite;
-use datafusion::logical_expr::{Case, Expr, ExprSchemable, Operator, ScalarUDF, binary_expr};
+use datafusion::logical_expr::{Case, Expr, ExprSchemable, Operator, ScalarUDF, binary_expr, cast};
 
 #[derive(Debug)]
 pub(crate) struct TrinoRewrites {
@@ -175,6 +175,71 @@ fn exact_day_interval(expr: &Expr, schema: &DFSchema) -> Option<Expr> {
     ))
 }
 
+/// The argument of `try(…)` with its literals and columns behind the
+/// barrier: constants must fail at run time (where `try` catches them), not
+/// while the simplifier folds them, and common-subexpression elimination
+/// must not lift part of the argument out of `try`.
+///
+/// A literal that is a direct argument of a function call stays visible:
+/// functions read such constants while planning (the zone of
+/// `with_timezone(ts, 'America/Sao_Paulo')`), and the simplifier keeps a
+/// call that fails for run time.
+fn guard_try_argument(expr: Expr, barrier: &Arc<ScalarUDF>, function_argument: bool) -> Result<Expr> {
+    match expr {
+        Expr::Literal(..) if function_argument => Ok(expr),
+        Expr::Literal(..) | Expr::Column(_) => Ok(Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::clone(barrier),
+            vec![expr],
+        ))),
+        Expr::ScalarFunction(mut call) => {
+            call.args = call
+                .args
+                .into_iter()
+                .map(|a| guard_try_argument(a, barrier, true))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Expr::ScalarFunction(call))
+        }
+        other => other
+            .map_children(|child| guard_try_argument(child, barrier, false).map(Transformed::yes))
+            .map(|t| t.data),
+    }
+}
+
+/// `timestamp(p < 3) ± interval` (either order) is a `timestamp(3)` in Trino:
+/// intervals have millisecond precision. The engine keeps the seconds unit.
+fn interval_precision(expr: &Expr, schema: &DFSchema) -> Option<Expr> {
+    let Expr::BinaryExpr(binary) = expr else {
+        return None;
+    };
+    if !matches!(binary.op, Operator::Plus | Operator::Minus) {
+        return None;
+    }
+    let (left, right) = (
+        binary.left.get_type(schema).ok()?,
+        binary.right.get_type(schema).ok()?,
+    );
+    let widen = |e: &Expr, t: &DataType| match t {
+        DataType::Timestamp(TimeUnit::Second, zone) => Some(cast(
+            e.clone(),
+            DataType::Timestamp(TimeUnit::Millisecond, zone.clone()),
+        )),
+        _ => None,
+    };
+    match (&left, &right) {
+        (DataType::Timestamp(..), DataType::Interval(_)) => Some(binary_expr(
+            widen(&binary.left, &left)?,
+            binary.op,
+            binary.right.as_ref().clone(),
+        )),
+        (DataType::Interval(_), DataType::Timestamp(..)) if binary.op == Operator::Plus => Some(binary_expr(
+            binary.left.as_ref().clone(),
+            binary.op,
+            widen(&binary.right, &right)?,
+        )),
+        _ => None,
+    }
+}
+
 fn if_to_case(mut args: Vec<Expr>) -> Option<Expr> {
     if !(2..=3).contains(&args.len()) {
         return None;
@@ -213,6 +278,10 @@ impl FunctionRewrite for TrinoRewrites {
         if let Some(literal) = fold_typed_literal(&expr) {
             return Ok(Transformed::yes(literal));
         }
+        if let Some(widened) = interval_precision(&expr, schema) {
+            let exact = exact_day_interval(&widened, schema).unwrap_or(widened);
+            return Ok(Transformed::yes(exact));
+        }
         if let Some(exact) = exact_day_interval(&expr, schema) {
             return Ok(Transformed::yes(exact));
         }
@@ -243,17 +312,7 @@ impl FunctionRewrite for TrinoRewrites {
             let args = function
                 .args
                 .into_iter()
-                .map(|arg| {
-                    // Columns too: common-subexpression elimination must not
-                    // lift part of the argument out of `try`.
-                    arg.transform_up(|e| match e {
-                        Expr::Literal(..) | Expr::Column(_) => Ok(Transformed::yes(Expr::ScalarFunction(
-                            ScalarFunction::new_udf(Arc::clone(barrier), vec![e]),
-                        ))),
-                        other => Ok(Transformed::no(other)),
-                    })
-                    .map(|t| t.data)
-                })
+                .map(|arg| guard_try_argument(arg, barrier, false))
                 .collect::<Result<Vec<_>>>()?;
             return Ok(Transformed::yes(Expr::ScalarFunction(ScalarFunction::new_udf(
                 Arc::clone(guarded),
