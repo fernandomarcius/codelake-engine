@@ -18,7 +18,6 @@
 //! engine; [`uncheck_cast`] puts the cast back for a SQL source (see
 //! [`crate::overflow`], which calls both around federation).
 
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, Decimal128Array};
@@ -304,10 +303,6 @@ impl ToDecimal {
 }
 
 impl ScalarUDFImpl for ToDecimal {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         if self.safe {
             "codelake_try_to_decimal"
@@ -355,8 +350,8 @@ impl ScalarUDFImpl for ToDecimal {
 /// [`ToDecimal`].
 pub(crate) fn check_cast(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
     let (arg, data_type, safe) = match &expr {
-        Expr::Cast(Cast { expr: arg, data_type }) => (arg, data_type, false),
-        Expr::TryCast(TryCast { expr: arg, data_type }) => (arg, data_type, true),
+        Expr::Cast(Cast { expr: arg, field }) => (arg, field.data_type(), false),
+        Expr::TryCast(TryCast { expr: arg, field }) => (arg, field.data_type(), true),
         _ => return Ok(Transformed::no(expr)),
     };
     let DataType::Decimal128(p, s) = *data_type else {
@@ -374,7 +369,7 @@ pub(crate) fn uncheck_cast(expr: Expr) -> Transformed<Expr> {
     let Expr::ScalarFunction(ScalarFunction { func, mut args }) = expr else {
         return Transformed::no(expr);
     };
-    if let Some(cast) = func.inner().as_any().downcast_ref::<ToDecimal>()
+    if let Some(cast) = func.inner().downcast_ref::<ToDecimal>()
         && args.len() == 1
         && let Some(arg) = args.pop()
     {

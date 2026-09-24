@@ -20,7 +20,6 @@
 //! and decimal arithmetic does (`DataFusion` wraps around silently by
 //! default), and compares floats with IEEE NaN semantics (see `nan`).
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -151,10 +150,6 @@ impl fmt::Display for TryExpr {
 }
 
 impl PhysicalExpr for TryExpr {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn return_field(&self, input_schema: &Schema) -> Result<FieldRef> {
         let field = self.child.return_field(input_schema)?;
         Ok(Arc::new(Field::new(
@@ -204,20 +199,20 @@ impl PhysicalExpr for TryExpr {
 /// Replaces planned `try` calls by [`TryExpr`] and makes arithmetic check overflow.
 fn install_try(expr: Arc<dyn PhysicalExpr>, schema: &Schema) -> Result<Transformed<Arc<dyn PhysicalExpr>>> {
     expr.transform_up(|e| {
-        if let Some(function) = e.as_any().downcast_ref::<ScalarFunctionExpr>()
+        if let Some(function) = e.downcast_ref::<ScalarFunctionExpr>()
             && (function.name() == TRY || function.name() == GUARDED_TRY)
             && let [child] = function.args()
         {
             let replaced: Arc<dyn PhysicalExpr> = Arc::new(TryExpr::new(Arc::clone(child)));
             return Ok(Transformed::yes(replaced));
         }
-        if let Some(binary) = e.as_any().downcast_ref::<BinaryExpr>()
+        if let Some(binary) = e.downcast_ref::<BinaryExpr>()
             && super::nan::is_float_comparison(binary, schema)
         {
             let replaced: Arc<dyn PhysicalExpr> = Arc::new(super::nan::NanAwareComparison::new(binary));
             return Ok(Transformed::yes(replaced));
         }
-        if let Some(binary) = e.as_any().downcast_ref::<BinaryExpr>()
+        if let Some(binary) = e.downcast_ref::<BinaryExpr>()
             && matches!(binary.op(), Operator::Plus | Operator::Minus | Operator::Multiply)
         {
             let checked = BinaryExpr::new(
@@ -236,7 +231,7 @@ fn install_try(expr: Arc<dyn PhysicalExpr>, schema: &Schema) -> Result<Transform
 }
 
 fn rewrite_node(node: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
-    if let Some(projection) = node.as_any().downcast_ref::<ProjectionExec>() {
+    if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
         let mut changed = false;
         let exprs = projection
             .expr()
@@ -255,7 +250,7 @@ fn rewrite_node(node: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exec
                 Arc::new(ProjectionExec::try_new(exprs, Arc::clone(projection.input()))?);
             return Ok(Transformed::yes(plan));
         }
-    } else if let Some(filter) = node.as_any().downcast_ref::<FilterExec>() {
+    } else if let Some(filter) = node.downcast_ref::<FilterExec>() {
         let predicate = install_try(Arc::clone(filter.predicate()), &filter.input().schema())?;
         if predicate.transformed {
             let plan: Arc<dyn ExecutionPlan> = Arc::new(
@@ -265,15 +260,15 @@ fn rewrite_node(node: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exec
             );
             return Ok(Transformed::yes(plan));
         }
-    } else if let Some(aggregate) = node.as_any().downcast_ref::<AggregateExec>()
+    } else if let Some(aggregate) = node.downcast_ref::<AggregateExec>()
         && let Some(rewritten) = rewrite_aggregate(aggregate)?
     {
         return Ok(Transformed::yes(rewritten));
-    } else if let Some(join) = node.as_any().downcast_ref::<HashJoinExec>()
+    } else if let Some(join) = node.downcast_ref::<HashJoinExec>()
         && let Some(rewritten) = rewrite_hash_join(join)?
     {
         return Ok(Transformed::yes(rewritten));
-    } else if let Some(join) = node.as_any().downcast_ref::<NestedLoopJoinExec>()
+    } else if let Some(join) = node.downcast_ref::<NestedLoopJoinExec>()
         && let Some(filter) = rewrite_join_filter(join.filter())?
     {
         let plan: Arc<dyn ExecutionPlan> = Arc::new(
@@ -287,7 +282,7 @@ fn rewrite_node(node: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exec
             .build()?,
         );
         return Ok(Transformed::yes(plan));
-    } else if let Some(sort) = node.as_any().downcast_ref::<SortExec>()
+    } else if let Some(sort) = node.downcast_ref::<SortExec>()
         && let Some(ordering) = rewrite_ordering(sort.expr(), &sort.input().schema())?
     {
         let plan: Arc<dyn ExecutionPlan> = Arc::new(
@@ -296,7 +291,7 @@ fn rewrite_node(node: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exec
                 .with_fetch(sort.fetch()),
         );
         return Ok(Transformed::yes(plan));
-    } else if let Some(merge) = node.as_any().downcast_ref::<SortPreservingMergeExec>()
+    } else if let Some(merge) = node.downcast_ref::<SortPreservingMergeExec>()
         && let Some(ordering) = rewrite_ordering(merge.expr(), &merge.input().schema())?
     {
         let plan: Arc<dyn ExecutionPlan> = Arc::new(
@@ -520,9 +515,6 @@ mod tests {
             }
         }
         impl PhysicalExpr for Fails {
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
             fn return_field(&self, _: &Schema) -> Result<FieldRef> {
                 Ok(Arc::new(Field::new("f", DataType::Int64, true)))
             }

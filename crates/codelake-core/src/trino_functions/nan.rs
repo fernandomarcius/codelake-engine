@@ -6,7 +6,6 @@
 //! [`NanAwareComparison`] wraps a float comparison and corrects the rows where
 //! an operand is NaN; the physical rule in `try_expr` installs it.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -88,10 +87,6 @@ impl fmt::Display for NanAwareComparison {
 }
 
 impl PhysicalExpr for NanAwareComparison {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn return_field(&self, input_schema: &Schema) -> Result<FieldRef> {
         self.inner.return_field(input_schema)
     }

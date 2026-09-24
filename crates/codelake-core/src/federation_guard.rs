@@ -22,7 +22,6 @@
 //! SQL source, with the executor name, rows returned, duration and errors.
 //! Connectors add their own child spans below it (e.g. the SQL they sent).
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -40,8 +39,7 @@ use crate::trace::{self, TARGET, TracedStream};
 /// a renamed string upstream would silently disable the guard, a changed type
 /// fails to compile.
 fn is_federated_scan(plan: &dyn ExecutionPlan) -> bool {
-    plan.as_any()
-        .is::<datafusion_federation::sql::VirtualExecutionPlan>()
+    plan.is::<datafusion_federation::sql::VirtualExecutionPlan>()
 }
 
 /// Wraps every node matching `is_target` in a [`FederationFilterBarrier`].
@@ -109,10 +107,7 @@ impl FederationFilterBarrier {
 /// wrappers later optimizer rules add (e.g. `CooperativeExec`).
 fn executor_name(plan: &dyn ExecutionPlan) -> String {
     fn find(node: &dyn ExecutionPlan) -> Option<String> {
-        if let Some(remote) = node
-            .as_any()
-            .downcast_ref::<datafusion_federation::sql::VirtualExecutionPlan>()
-        {
+        if let Some(remote) = node.downcast_ref::<datafusion_federation::sql::VirtualExecutionPlan>() {
             return Some(remote.executor().name().to_owned());
         }
         match node.children().as_slice() {
@@ -132,10 +127,6 @@ impl DisplayAs for FederationFilterBarrier {
 impl ExecutionPlan for FederationFilterBarrier {
     fn name(&self) -> &'static str {
         "FederationFilterBarrier"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

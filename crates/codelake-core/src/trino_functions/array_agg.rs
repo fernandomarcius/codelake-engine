@@ -15,7 +15,6 @@
 //! Memory: the buffered values and keys are reported through
 //! `Accumulator::size`, which the aggregation operator reserves from the pool.
 
-use std::any::Any;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 

@@ -92,7 +92,7 @@ fn fold_typed_literal(expr: &Expr) -> Option<Expr> {
         return None;
     };
     let unsigned = |text: &str| text.strip_prefix(['+', '-']).unwrap_or(text).to_owned();
-    let foldable = match (value, &cast.data_type) {
+    let foldable = match (value, cast.field.data_type()) {
         (ScalarValue::Int64(Some(_)), DataType::Int8 | DataType::Int16 | DataType::Int32) => true,
         // Exact decimals only (rounding is Trino's cast's job).
         (ScalarValue::Utf8(Some(text)), DataType::Decimal128(_, scale)) => {
@@ -118,7 +118,7 @@ fn fold_typed_literal(expr: &Expr) -> Option<Expr> {
         return None;
     }
     value
-        .cast_to(&cast.data_type)
+        .cast_to(cast.field.data_type())
         .ok()
         .map(|v| Expr::Literal(v, None))
 }

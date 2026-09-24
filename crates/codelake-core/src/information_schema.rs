@@ -37,7 +37,6 @@
 //! listed without columns and logged; reading it still fails with its own
 //! error. Trino lists such tables too, and dbt lists a whole schema at once.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -73,10 +72,6 @@ impl CatalogList {
 }
 
 impl CatalogProviderList for CatalogList {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn register_catalog(
         &self,
         name: String,
@@ -92,7 +87,7 @@ impl CatalogProviderList for CatalogList {
     fn catalog(&self, name: &str) -> Option<Arc<dyn CatalogProvider>> {
         let catalog = self.catalogs.catalog(name)?;
         // The engine's in-memory catalog folds names like Trino's `memory`.
-        let catalog: Arc<dyn CatalogProvider> = if catalog.as_any().is::<MemoryCatalogProvider>() {
+        let catalog: Arc<dyn CatalogProvider> = if catalog.is::<MemoryCatalogProvider>() {
             Arc::new(LowerCaseCatalog { inner: catalog })
         } else {
             catalog
@@ -116,10 +111,6 @@ struct LowerCaseCatalog {
 }
 
 impl CatalogProvider for LowerCaseCatalog {
-    fn as_any(&self) -> &dyn Any {
-        self.inner.as_any()
-    }
-
     fn schema_names(&self) -> Vec<String> {
         self.inner.schema_names()
     }
@@ -150,10 +141,6 @@ struct LowerCaseSchema {
 
 #[async_trait]
 impl SchemaProvider for LowerCaseSchema {
-    fn as_any(&self) -> &dyn Any {
-        self.inner.as_any()
-    }
-
     fn table_names(&self) -> Vec<String> {
         self.inner.table_names()
     }
@@ -191,11 +178,6 @@ struct WithInformationSchema {
 }
 
 impl CatalogProvider for WithInformationSchema {
-    /// The wrapped catalog, so callers can still downcast to its type.
-    fn as_any(&self) -> &dyn Any {
-        self.catalog.as_any()
-    }
-
     fn schema_names(&self) -> Vec<String> {
         let mut names = self.catalog.schema_names();
         if !names.iter().any(|n| n == INFORMATION_SCHEMA) {
@@ -241,10 +223,6 @@ struct SingleCatalog {
 }
 
 impl CatalogProviderList for SingleCatalog {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn register_catalog(
         &self,
         _name: String,
@@ -358,10 +336,6 @@ impl TrinoInformationSchema {
 
 #[async_trait]
 impl SchemaProvider for TrinoInformationSchema {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         TABLES.iter().map(|t| (*t).to_owned()).collect()
     }
@@ -557,10 +531,6 @@ struct Tolerant {
 }
 
 impl CatalogProvider for Tolerant {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         self.catalog.schema_names()
     }
@@ -584,10 +554,6 @@ struct TolerantSchema {
 
 #[async_trait]
 impl SchemaProvider for TolerantSchema {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         self.schema.table_names()
     }
@@ -626,10 +592,6 @@ struct Unreadable {
 
 #[async_trait]
 impl TableProvider for Unreadable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -841,9 +803,6 @@ mod tests {
 
     #[async_trait]
     impl SchemaProvider for Broken {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn table_names(&self) -> Vec<String> {
             vec!["bad".into(), "good".into()]
         }
@@ -896,7 +855,9 @@ mod tests {
         ctx.sql("SHOW ALL").await.unwrap().collect().await.unwrap();
         let catalog = ctx.catalog("other").unwrap();
         assert!(catalog.schema_names().contains(&"information_schema".to_owned()));
-        assert!(catalog.as_any().is::<MemoryCatalogProvider>());
+        // DataFusion 54 downcasts to the concrete type: a wrapper can no
+        // longer answer as the catalog it wraps.
+        assert!(catalog.is::<WithInformationSchema>());
         assert!(
             catalog
                 .register_schema("information_schema", Arc::new(MemorySchemaProvider::new()))

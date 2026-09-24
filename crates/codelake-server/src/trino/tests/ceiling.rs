@@ -19,7 +19,6 @@
 //!
 //! [`Engine::memory`]: codelake_core::Engine::memory
 
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -138,10 +137,6 @@ impl Hash for PayloadUdf {
 }
 
 impl ScalarUDFImpl for PayloadUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "rt_payload"
     }

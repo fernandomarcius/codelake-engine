@@ -244,8 +244,8 @@ fn rewrite_node(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 
 fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
     let (inner, target, is_try) = match &expr {
-        Expr::Cast(c) => (c.expr.as_ref(), &c.data_type, false),
-        Expr::TryCast(c) => (c.expr.as_ref(), &c.data_type, true),
+        Expr::Cast(c) => (c.expr.as_ref(), c.field.data_type(), false),
+        Expr::TryCast(c) => (c.expr.as_ref(), c.field.data_type(), true),
         _ => return Ok(Transformed::no(expr)),
     };
     if let Ok((_, field)) = inner.to_field(schema)

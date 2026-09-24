@@ -3,7 +3,6 @@
 //! [`RealResult`] wraps `DataFusion`'s function (which adds in `double`) and
 //! casts its result, keeping its name and states.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, BooleanArray};
@@ -47,10 +46,6 @@ fn to_real(value: &ScalarValue) -> Result<ScalarValue> {
 }
 
 impl AggregateUDFImpl for RealResult {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.inner.name()
     }

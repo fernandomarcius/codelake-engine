@@ -4,7 +4,7 @@ Federated SQL engine in Rust with a **hard memory ceiling**. Query SQL Server,
 PostgreSQL, MySQL, MongoDB and Hive-layout Parquet tables as one database, join
 across them, and never let the process grow past the memory you gave it.
 
-Built on [Apache DataFusion](https://datafusion.apache.org/) 53,
+Built on [Apache DataFusion](https://datafusion.apache.org/) 54,
 [`datafusion-federation`](https://github.com/datafusion-contrib/datafusion-federation) and
 [`datafusion-table-providers`](https://github.com/datafusion-contrib/datafusion-table-providers).
 Goal: replace Trino in production workloads at a fraction of the memory

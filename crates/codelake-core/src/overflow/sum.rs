@@ -8,7 +8,6 @@
 //! [`CheckedSum::trino`] also takes Trino's result type for decimals,
 //! `decimal(38,s)`.
 
-use std::any::Any;
 use std::fmt::Display;
 use std::mem::size_of;
 use std::sync::Arc;
@@ -396,10 +395,6 @@ impl CheckedSum {
 }
 
 impl AggregateUDFImpl for CheckedSum {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.inner.name()
     }

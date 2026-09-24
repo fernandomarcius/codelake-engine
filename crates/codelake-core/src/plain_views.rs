@@ -33,7 +33,6 @@
 //! window columns that a function reads or that a computed `PARTITION BY` or
 //! `ORDER BY` uses, whose types are part of the expressions.
 
-use std::any::Any;
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
@@ -92,7 +91,7 @@ impl PhysicalOptimizerRule for PlainViews {
 /// their 16 bytes), so an aggregation whose output is shared keeps views on its
 /// exchange.
 fn rewrite(node: Arc<dyn ExecutionPlan>, shared: bool) -> Result<Arc<dyn ExecutionPlan>> {
-    let any = node.as_any();
+    let any = node.as_ref();
     let children_shared = if node.children().len() > 1 {
         true
     } else if any.is::<RepartitionExec>()
@@ -117,7 +116,7 @@ fn rewrite(node: Arc<dyn ExecutionPlan>, shared: bool) -> Result<Arc<dyn Executi
     } else {
         node
     };
-    let plain = if let Some(aggregate) = node.as_any().downcast_ref::<AggregateExec>() {
+    let plain = if let Some(aggregate) = node.downcast_ref::<AggregateExec>() {
         plain_keys(aggregate, shared)?
     } else {
         plain_window(&node)?
@@ -193,14 +192,14 @@ fn cast_keys(aggregate: &AggregateExec, input: Arc<dyn ExecutionPlan>) -> Result
 /// of the batch); `None` when `input` is not partial aggregation under
 /// exchanges, or it has no view key.
 fn plain_partial(input: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    if let Some(partial) = input.as_any().downcast_ref::<AggregateExec>() {
+    if let Some(partial) = input.downcast_ref::<AggregateExec>() {
         if *partial.mode() != AggregateMode::Partial || !simple(partial) {
             return Ok(None);
         }
         let plain = cast_keys(partial, Arc::clone(partial.input()))?;
         return Ok(plain.map(|plain| Arc::new(plain) as Arc<dyn ExecutionPlan>));
     }
-    let exchange = input.as_any().is::<RepartitionExec>() || input.as_any().is::<CoalescePartitionsExec>();
+    let exchange = input.is::<RepartitionExec>() || input.is::<CoalescePartitionsExec>();
     let [child] = input.children()[..] else {
         return Ok(None);
     };
@@ -243,7 +242,7 @@ fn plain_keys(aggregate: &AggregateExec, shared: bool) -> Result<Option<Arc<dyn 
 /// [`RetypeExec`] back to its own schema; `None` when it has no view column it
 /// can cast.
 fn plain_window(node: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    let Some(window) = node.as_any().downcast_ref::<BoundedWindowAggExec>() else {
+    let Some(window) = node.downcast_ref::<BoundedWindowAggExec>() else {
         return Ok(None);
     };
     let input = window.input();
@@ -256,7 +255,7 @@ fn plain_window(node: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn Executio
             .partition_by()
             .iter()
             .chain(expr.order_by().iter().map(|sort| &sort.expr))
-            .filter(|e| !e.as_any().is::<Column>());
+            .filter(|e| !e.is::<Column>());
         for e in expr.expressions().iter().chain(computed) {
             typed.extend(collect_columns(e).iter().map(Column::index));
         }
@@ -337,10 +336,6 @@ impl DisplayAs for RetypeExec {
 impl ExecutionPlan for RetypeExec {
     fn name(&self) -> &'static str {
         "RetypeExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

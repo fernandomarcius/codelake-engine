@@ -12,7 +12,6 @@
 //! `CodeLake` does not read yet fail only when the query reads them (see
 //! `types.rs`). Listings (`information_schema`) stay whole.
 
-use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
@@ -236,10 +235,6 @@ pub(crate) fn refuse_unsupported(schema: &Schema, projection: Option<&Vec<usize>
 
 #[async_trait]
 impl TableProvider for HiveView {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -538,10 +533,6 @@ impl HiveCatalog {
 pub(crate) struct HiveCatalogProvider(pub(crate) Arc<HiveCatalog>);
 
 impl CatalogProvider for HiveCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         if let Some(schemas) = self.0.metastore.local_schemas() {
             return schemas;
@@ -568,10 +559,6 @@ struct HiveSchema {
 
 #[async_trait]
 impl SchemaProvider for HiveSchema {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         if let Some(tables) = self.catalog.metastore.local_tables(&self.schema) {
             return tables;

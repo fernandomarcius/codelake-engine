@@ -641,7 +641,7 @@ fn expr(e: &Expr) -> Out<String> {
             expr: inner,
             pattern,
             escape_char,
-        } => like(inner, pattern, escape_char.as_ref(), *negated)?,
+        } => like(inner, pattern, escape_char.as_ref().map(|c| &c.value), *negated)?,
         Expr::Cast {
             kind,
             expr: inner,

@@ -124,6 +124,7 @@ fn unnesting_relation(
             explicit: true,
             name: qualifier.clone(),
             columns: vec![],
+            at: None,
         }),
         sample: None,
     })

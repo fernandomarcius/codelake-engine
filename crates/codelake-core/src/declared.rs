@@ -26,7 +26,6 @@
 //! A `char(n)` value is stored without its padding (comparisons ignore
 //! trailing spaces in Trino) and padded when sent to a client.
 
-use std::any::Any;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -195,10 +194,6 @@ fn rounded_timestamps(array: &ArrayRef, precision: u8) -> Result<ArrayRef> {
 }
 
 impl ScalarUDFImpl for TrinoTyped {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         TRINO_TYPED
     }
@@ -271,7 +266,7 @@ pub(crate) fn check_typed(expr: Expr, schema: &DFSchema) -> Result<Transformed<E
     let Expr::ScalarFunction(ScalarFunction { func, args }) = &expr else {
         return Ok(Transformed::no(expr));
     };
-    let Some(typed) = func.inner().as_any().downcast_ref::<TrinoTyped>() else {
+    let Some(typed) = func.inner().downcast_ref::<TrinoTyped>() else {
         return Ok(Transformed::no(expr));
     };
     let [value, name] = args.as_slice() else {

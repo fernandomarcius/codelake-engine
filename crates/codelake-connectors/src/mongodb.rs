@@ -12,8 +12,8 @@ use codelake_core::{Connector, ConnectorError};
 use datafusion::catalog::{CatalogProvider, TableProvider};
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::sql::TableReference;
-use datafusion_table_providers::mongodb::MongoDBTableFactory;
-use datafusion_table_providers::mongodb::connection_pool::MongoDBConnectionPool;
+use datafusion_table_providers_mongodb::MongoDBTableFactory;
+use datafusion_table_providers_mongodb::connection_pool::MongoDBConnectionPool;
 use secrecy::SecretString;
 use tokio::sync::OnceCell;
 

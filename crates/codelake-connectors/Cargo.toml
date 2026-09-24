@@ -11,21 +11,33 @@ publish.workspace = true
 
 [features]
 default = ["postgres", "mysql", "mongodb", "sqlserver", "hive"]
-postgres = ["datafusion-table-providers/postgres-federation"]
-mysql = ["datafusion-table-providers/mysql-federation"]
+# The federation feature lives in each table-provider crate since 0.13.
+postgres = [
+  "dep:datafusion-table-providers-common",
+  "dep:datafusion-table-providers-postgres",
+  "datafusion-table-providers-postgres/federation",
+]
+mysql = [
+  "dep:datafusion-table-providers-common",
+  "dep:datafusion-table-providers-mysql",
+  "datafusion-table-providers-mysql/federation",
+]
 # Not shipped: object_store's S3 client pulls quick-xml 0.39 (RUSTSEC-2026-0194/0195)
 # until the DataFusion train moves to object_store >= 0.14 (ROADMAP F11).
 hive-s3 = ["hive", "object_store/aws"]
 hive = ["dep:object_store", "dep:bytes", "dep:crc32fast", "dep:uuid", "dep:base64", "dep:serde", "dep:serde_json", "dep:futures"]
 sqlserver = ["dep:tiberius", "dep:bb8", "dep:tokio-util", "dep:futures", "dep:datafusion-federation"]
-mongodb = ["datafusion-table-providers/mongodb"]
+mongodb = ["dep:datafusion-table-providers-mongodb"]
 # No `iceberg` feature: the connector is parked in `parked/iceberg.rs`, outside
 # the build (docs/adr/0013).
 
 [dependencies]
 codelake-core.workspace = true
 datafusion.workspace = true
-datafusion-table-providers.workspace = true
+datafusion-table-providers-common = { workspace = true, optional = true }
+datafusion-table-providers-postgres = { workspace = true, optional = true }
+datafusion-table-providers-mysql = { workspace = true, optional = true }
+datafusion-table-providers-mongodb = { workspace = true, optional = true }
 tiberius = { workspace = true, optional = true }
 bb8 = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true, features = ["compat"] }

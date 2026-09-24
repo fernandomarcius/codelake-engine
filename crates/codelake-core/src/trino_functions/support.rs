@@ -5,7 +5,6 @@
 //! (`INVALID_FUNCTION_ARGUMENT: …`), so client protocols can report the same
 //! `errorName` Trino would and golden tests can compare it.
 
-use std::any::Any;
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -560,10 +559,6 @@ impl Func {
 }
 
 impl ScalarUDFImpl for Func {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.name
     }

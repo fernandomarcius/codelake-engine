@@ -26,6 +26,10 @@ versioning: [SemVer](https://semver.org/).
 - Session-property registry: system properties plus catalog properties declared by connectors;
   undeclared names are rejected, performance-only Trino knobs are accepted with a warning.
 
+### Changed
+- DataFusion 54.1 train: `datafusion-federation` 0.5.5, per-connector
+  `datafusion-table-providers` 0.13.1 crates, `datafusion-postgres` 0.18.0 (ADR 0002).
+
 ### Removed
 - Experimental Iceberg connector and its `iceberg` feature, out of the build until an Iceberg
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.

@@ -1181,7 +1181,7 @@ async fn plan(engine: &Engine, options: &QueryOptions, work: Work) -> Result<Dat
 /// the chance to stop.
 fn cooperative(plan: Arc<dyn ExecutionPlan>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
     plan.transform_up(|node| {
-        Ok(if node.as_any().is::<CooperativeExec>() {
+        Ok(if node.is::<CooperativeExec>() {
             Transformed::no(node)
         } else {
             Transformed::yes(Arc::new(CooperativeExec::new(node)) as Arc<dyn ExecutionPlan>)
@@ -1206,7 +1206,7 @@ async fn run(
     let task = Arc::new(frame.task_ctx());
     let mut physical = frame.create_physical_plan().await.map_err(error)?;
     // This protocol reserves the batches it holds itself (`Buffered`).
-    if let Some(reserved) = physical.as_any().downcast_ref::<ReservedOutputExec>() {
+    if let Some(reserved) = physical.downcast_ref::<ReservedOutputExec>() {
         physical = Arc::clone(reserved.input());
     }
     let mut stream = execute_stream(cooperative(physical).map_err(error)?, task).map_err(error)?;

@@ -9,7 +9,6 @@
 //!   cast to its type and convert the result (used by `avg(real)` and the
 //!   `decimal` `sum`).
 
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, BooleanArray};

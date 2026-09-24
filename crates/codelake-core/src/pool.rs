@@ -24,8 +24,13 @@
 //!    their reservation back, then reserve again to sort what they spill).
 //!
 //! Unchecked growth (`MemoryReservation::grow`) is recorded but not refused, as
-//! in every `DataFusion` pool; no operator of `DataFusion` 53 uses it.
+//! in every `DataFusion` pool. `DataFusion` 54 uses it only for memory an
+//! operator already holds and must keep: the nested loop join's visited
+//! bitmaps and the one batch it accepts to make progress when refused, and
+//! the sort-merge join's key arrays of a spilled batch and the spilled batch
+//! it reads back to emit.
 
+use std::fmt;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use datafusion::common::{human_readable_size, resources_datafusion_err};
@@ -137,7 +142,24 @@ fn refused(
     )
 }
 
+impl fmt::Display for CeilingPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reserved = self.state().total();
+        write!(
+            f,
+            "{}(used: {}, pool_size: {})",
+            self.name(),
+            human_readable_size(reserved),
+            human_readable_size(self.limit)
+        )
+    }
+}
+
 impl MemoryPool for CeilingPool {
+    fn name(&self) -> &'static str {
+        "ceiling"
+    }
+
     fn register(&self, consumer: &MemoryConsumer) {
         if class(consumer) == Class::Spiller {
             self.state().registered += 1;

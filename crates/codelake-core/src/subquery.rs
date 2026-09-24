@@ -27,7 +27,6 @@
 //! check per outer row), which also lets `DataFusion` decorrelate subqueries it
 //! would otherwise reject as not aggregated.
 
-use std::any::Any;
 use std::mem::size_of_val;
 use std::sync::{Arc, LazyLock};
 
@@ -213,10 +212,6 @@ struct SingleRow {
 }
 
 impl AggregateUDFImpl for SingleRow {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "codelake_single_row"
     }

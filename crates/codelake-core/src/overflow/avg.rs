@@ -10,7 +10,6 @@
 //! `s+4` digits, so truncating first never crosses it. Other argument types
 //! are `DataFusion`'s `avg` unchanged.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, BooleanArray};
@@ -229,10 +228,6 @@ impl TrinoAvg {
 }
 
 impl AggregateUDFImpl for TrinoAvg {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.inner.name()
     }

@@ -5,7 +5,6 @@
 //! memory pool, so buffered state (e.g. `approx_percentile`'s values) counts
 //! against the query's limit and spills or fails like any other operator.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -296,9 +295,6 @@ pub(crate) fn state_field(name: &str, field: &str, data_type: DataType) -> Field
 
 macro_rules! udaf_boilerplate {
     () => {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn signature(&self) -> &Signature {
             &self.signature
         }

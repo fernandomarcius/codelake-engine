@@ -24,7 +24,6 @@
 //! `codelake_try_arrow_cast(x, '<Arrow type>')` ([`TryArrowCast`]), the
 //! `TRY_CAST` counterpart of `arrow_cast`.
 
-use std::any::Any;
 use std::fmt::Write as _;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -249,10 +248,6 @@ pub(crate) fn source_nanos(array: &ArrayRef) -> Result<(Vec<Option<i128>>, Optio
 }
 
 impl ScalarUDFImpl for TimestampCast {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         if self.safe {
             "codelake_try_timestamp_cast"
@@ -349,10 +344,6 @@ fn named_type(scalar: Option<&ScalarValue>) -> Result<DataType> {
 }
 
 impl ScalarUDFImpl for TryArrowCast {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         TRY_ARROW_CAST
     }
@@ -393,9 +384,11 @@ impl ScalarUDFImpl for TryArrowCast {
 /// (argument, target, safe).
 fn spelled_cast(expr: &Expr, schema: &DFSchema) -> Result<Option<(Expr, DataType, bool)>> {
     Ok(match expr {
-        Expr::Cast(Cast { expr: arg, data_type }) => Some((arg.as_ref().clone(), data_type.clone(), false)),
-        Expr::TryCast(TryCast { expr: arg, data_type }) => {
-            Some((arg.as_ref().clone(), data_type.clone(), true))
+        Expr::Cast(Cast { expr: arg, field }) => {
+            Some((arg.as_ref().clone(), field.data_type().clone(), false))
+        }
+        Expr::TryCast(TryCast { expr: arg, field }) => {
+            Some((arg.as_ref().clone(), field.data_type().clone(), true))
         }
         Expr::ScalarFunction(ScalarFunction { func, args })
             if (func.name() == "arrow_cast" || func.name() == TRY_ARROW_CAST) && args.len() == 2 =>
@@ -437,7 +430,7 @@ pub(crate) fn uncheck_cast(expr: Expr) -> Transformed<Expr> {
     let Expr::ScalarFunction(ScalarFunction { func, mut args }) = expr else {
         return Transformed::no(expr);
     };
-    if let Some(cast) = func.inner().as_any().downcast_ref::<TimestampCast>()
+    if let Some(cast) = func.inner().downcast_ref::<TimestampCast>()
         && args.len() == 1
         && let Some(arg) = args.pop()
     {

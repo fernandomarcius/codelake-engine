@@ -18,7 +18,6 @@
 //! defined types, table and column comments, and catalog properties (no
 //! connector declares `WITH (…)` properties besides the Hive `format`).
 
-use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -440,10 +439,6 @@ struct SystemTable {
 
 #[async_trait]
 impl TableProvider for SystemTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -538,7 +533,7 @@ fn column_name(expr: &Expr) -> Option<&str> {
         Expr::Column(column) => Some(column.name.as_str()),
         Expr::Cast(cast)
             if matches!(
-                cast.data_type,
+                cast.field.data_type(),
                 DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8
             ) =>
         {
@@ -1156,9 +1151,6 @@ mod tests {
 
     #[async_trait]
     impl SchemaProvider for Unreadable {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn table_names(&self) -> Vec<String> {
             vec![self.broken.to_owned()]
         }

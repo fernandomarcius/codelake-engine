@@ -21,7 +21,6 @@
 //! spelling, checks the types, then hands over to the default adapter.
 //! A `raw` adapter (compaction) keeps stored values as they are.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -102,10 +101,6 @@ pub(crate) fn pad_char(value: &str, length: usize) -> String {
 }
 
 impl PhysicalExpr for HiveRead {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn return_field(&self, input_schema: &Schema) -> Result<FieldRef> {
         let child = self.child.return_field(input_schema)?;
         let data_type = match &self.read {
@@ -289,7 +284,7 @@ impl PhysicalExprAdapter for HiveColumnAdapter {
     fn rewrite(&self, expr: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
         let respelled = expr
             .transform(|expr| {
-                let Some(column) = expr.as_any().downcast_ref::<Column>() else {
+                let Some(column) = expr.downcast_ref::<Column>() else {
                     return Ok(Transformed::no(expr));
                 };
                 let index = column.index();
@@ -391,18 +386,11 @@ mod tests {
         let adapter = factory.create(Arc::clone(&table), Arc::clone(&file)).unwrap();
         let nome: Arc<dyn PhysicalExpr> = Arc::new(Column::new("nome", 1));
         let rewritten = adapter.rewrite(nome).unwrap();
-        let column = rewritten.as_any().downcast_ref::<Column>().unwrap();
+        let column = rewritten.downcast_ref::<Column>().unwrap();
         assert_eq!((column.name(), column.index()), ("NOME", 1));
         // Missing from the file: NULL, not an error.
         let extra: Arc<dyn PhysicalExpr> = Arc::new(Column::new("extra", 2));
-        assert!(
-            adapter
-                .rewrite(extra)
-                .unwrap()
-                .as_any()
-                .downcast_ref::<Column>()
-                .is_none()
-        );
+        assert!(adapter.rewrite(extra).unwrap().downcast_ref::<Column>().is_none());
 
         // A retyped column fails only when it is read.
         let retyped = Arc::new(Schema::new(vec![

@@ -25,7 +25,6 @@
 //! The rows, their order and the partitioning are the projection's; only the
 //! batch boundaries change.
 
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -70,12 +69,12 @@ impl PhysicalOptimizerRule for ComputedBatches {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_up(|node| {
-            let Some(projection) = node.as_any().downcast_ref::<ProjectionExec>() else {
+            let Some(projection) = node.downcast_ref::<ProjectionExec>() else {
                 return Ok(Transformed::no(node));
             };
             let input = projection.input();
             // Already sized (a view's plan is optimized again inside the outer one).
-            if input.as_any().is::<SliceExec>() || !computes_wide_values(projection)? {
+            if input.is::<SliceExec>() || !computes_wide_values(projection)? {
                 return Ok(Transformed::no(node));
             }
             let sizing = Arc::new(Sizing::new(input.output_partitioning().partition_count()));
@@ -103,7 +102,7 @@ impl PhysicalOptimizerRule for ComputedBatches {
 fn computes_wide_values(projection: &ProjectionExec) -> Result<bool> {
     let input_schema = projection.input().schema();
     for item in projection.expr() {
-        if item.expr.as_any().is::<Column>() {
+        if item.expr.is::<Column>() {
             continue;
         }
         if variable_width(&item.expr.data_type(&input_schema)?) {
@@ -265,10 +264,6 @@ impl ExecutionPlan for SliceExec {
         "SliceExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -374,10 +369,6 @@ impl DisplayAs for SizedBatchesExec {
 impl ExecutionPlan for SizedBatchesExec {
     fn name(&self) -> &'static str {
         "SizedBatchesExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

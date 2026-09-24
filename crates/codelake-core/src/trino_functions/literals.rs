@@ -329,7 +329,7 @@ fn name_values_columns(body: &mut SetExpr) {
     let SetExpr::Values(values) = &*body else {
         return;
     };
-    let Some(width) = values.rows.first().map(Vec::len) else {
+    let Some(width) = values.rows.first().map(|row| row.len()) else {
         return;
     };
     let items = (0..width)

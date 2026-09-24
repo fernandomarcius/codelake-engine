@@ -54,8 +54,8 @@ use datafusion::logical_expr::expr_rewriter::NamePreserver;
 use datafusion::logical_expr::type_coercion::binary::BinaryTypeCoercer;
 use datafusion::logical_expr::utils::merge_schema;
 use datafusion::logical_expr::{
-    AggregateUDF, BinaryExpr, Cast, Expr, ExprSchemable, LogicalPlan, Operator, ScalarUDF, ScalarUDFImpl,
-    TryCast, WindowFunctionDefinition,
+    AggregateUDF, AggregateUDFImpl, BinaryExpr, Cast, Expr, ExprSchemable, LogicalPlan, Operator, ScalarUDF,
+    ScalarUDFImpl, TryCast, WindowFunctionDefinition,
 };
 use datafusion::optimizer::optimizer::ApplyOrder;
 use datafusion::optimizer::{AnalyzerRule, OptimizerConfig, OptimizerRule};
@@ -102,7 +102,7 @@ fn decimal_op(op: Operator) -> Option<&'static Arc<ScalarUDF>> {
 }
 
 fn is_decimal_binary(expr: &Expr) -> bool {
-    matches!(expr, Expr::ScalarFunction(f) if f.func.inner().as_any().is::<DecimalBinary>())
+    matches!(expr, Expr::ScalarFunction(f) if f.func.inner().is::<DecimalBinary>())
 }
 
 fn checked_op(op: Operator) -> Option<&'static Arc<ScalarUDF>> {
@@ -150,20 +150,16 @@ fn check_decimal_operator(
 /// `CAST(CAST(<decimal function> AS a) AS b)` where `b` is the function's own
 /// type → the function: the inner cast could only lose digits.
 fn collapse_decimal_cast(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
-    let Expr::Cast(Cast {
-        expr: outer,
-        data_type,
-    }) = expr
-    else {
+    let Expr::Cast(Cast { expr: outer, field }) = expr else {
         return Ok(Transformed::no(expr));
     };
     if let Expr::Cast(Cast { expr: inner, .. }) = outer.as_ref()
         && is_decimal_binary(inner)
-        && inner.get_type(schema)? == data_type
+        && inner.get_type(schema)? == *field.data_type()
     {
         return Ok(Transformed::yes(inner.as_ref().clone()));
     }
-    Ok(Transformed::no(Expr::Cast(Cast::new(outer, data_type))))
+    Ok(Transformed::no(Expr::Cast(Cast::new_from_field(outer, field))))
 }
 
 /// Integer and decimal operators and integer negation → checked functions.
@@ -237,8 +233,8 @@ fn check_cast(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
     crate::casts::check_cast(typed.data, schema)
 }
 
-fn is_builtin<T: 'static>(udf: &AggregateUDF) -> bool {
-    udf.inner().as_any().is::<T>()
+fn is_builtin<T: AggregateUDFImpl>(udf: &AggregateUDF) -> bool {
+    udf.inner().is::<T>()
 }
 
 fn sums_exact_numbers(func: &AggregateUDF, args: &[Expr], schema: &DFSchema) -> Result<bool> {
@@ -285,7 +281,7 @@ fn check_node(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
         Expr::BinaryExpr(_) | Expr::Negative(_) => check_arithmetic(expr, schema),
         Expr::ScalarFunction(ScalarFunction { func, args })
             if func.name() == "abs"
-                && !func.inner().as_any().is::<CheckedAbs>()
+                && !func.inner().is::<CheckedAbs>()
                 && args.len() == 1
                 && args[0].get_type(schema)?.is_integer() =>
         {
@@ -322,31 +318,31 @@ fn check_node(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
             if text.transformed {
                 return Ok(text);
             }
-            let Expr::Cast(Cast { expr, data_type }) = text.data else {
+            let Expr::Cast(Cast { expr, field }) = text.data else {
                 return Ok(text);
             };
-            match rounded(&expr, &expr.get_type(schema)?, &data_type) {
-                Some(source) => Ok(Transformed::yes(Expr::Cast(Cast::new(
+            match rounded(&expr, &expr.get_type(schema)?, field.data_type()) {
+                Some(source) => Ok(Transformed::yes(Expr::Cast(Cast::new_from_field(
                     Box::new(source),
-                    data_type,
+                    field,
                 )))),
-                None => Ok(Transformed::no(Expr::Cast(Cast { expr, data_type }))),
+                None => Ok(Transformed::no(Expr::Cast(Cast { expr, field }))),
             }
         }
-        Expr::TryCast(TryCast { expr, data_type }) if !matches!(data_type, DataType::Timestamp(..)) => {
-            let checked = check_cast(Expr::TryCast(TryCast { expr, data_type }), schema)?;
+        Expr::TryCast(TryCast { expr, field }) if !matches!(field.data_type(), DataType::Timestamp(..)) => {
+            let checked = check_cast(Expr::TryCast(TryCast { expr, field }), schema)?;
             if checked.transformed {
                 return Ok(checked);
             }
-            let Expr::TryCast(TryCast { expr, data_type }) = checked.data else {
+            let Expr::TryCast(TryCast { expr, field }) = checked.data else {
                 return Ok(checked);
             };
-            match rounded(&expr, &expr.get_type(schema)?, &data_type) {
-                Some(source) => Ok(Transformed::yes(Expr::TryCast(TryCast::new(
+            match rounded(&expr, &expr.get_type(schema)?, field.data_type()) {
+                Some(source) => Ok(Transformed::yes(Expr::TryCast(TryCast::new_from_field(
                     Box::new(source),
-                    data_type,
+                    field,
                 )))),
-                None => Ok(Transformed::no(Expr::TryCast(TryCast { expr, data_type }))),
+                None => Ok(Transformed::no(Expr::TryCast(TryCast { expr, field }))),
             }
         }
         Expr::TryCast(_) | Expr::ScalarFunction(_) => check_cast(expr, schema),
@@ -405,13 +401,13 @@ fn uncheck_node(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
     let Expr::ScalarFunction(ScalarFunction { func, mut args }) = expr else {
         return Ok(Transformed::no(expr));
     };
-    if let Some(binary) = func.inner().as_any().downcast_ref::<DecimalBinary>()
+    if let Some(binary) = func.inner().downcast_ref::<DecimalBinary>()
         && args.len() == 2
         && let (Some(right), Some(left)) = (args.pop(), args.pop())
     {
         return Ok(Transformed::yes(unchecked_decimal(binary, left, right, schema)?));
     }
-    if let Some(binary) = func.inner().as_any().downcast_ref::<CheckedBinary>()
+    if let Some(binary) = func.inner().downcast_ref::<CheckedBinary>()
         && args.len() == 2
         && let (Some(right), Some(left)) = (args.pop(), args.pop())
     {
@@ -421,7 +417,7 @@ fn uncheck_node(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
             Box::new(right),
         ))));
     }
-    if func.inner().as_any().is::<CheckedNegate>()
+    if func.inner().is::<CheckedNegate>()
         && args.len() == 1
         && let Some(inner) = args.pop()
     {

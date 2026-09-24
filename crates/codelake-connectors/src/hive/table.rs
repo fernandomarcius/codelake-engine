@@ -25,7 +25,6 @@
 //! Tracing: `hive.scan` records the files a scan selected (count, bytes,
 //! names); `hive.write` records the file an `INSERT`/CTAS wrote and its rows.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -512,10 +511,6 @@ impl HiveTable {
 
 #[async_trait]
 impl TableProvider for HiveTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -746,10 +741,6 @@ impl HiveSink {
 
 #[async_trait]
 impl DataSink for HiveSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> &SchemaRef {
         &self.table.schema
     }

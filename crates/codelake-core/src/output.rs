@@ -29,7 +29,6 @@
 //! partition, about 2 MiB when it holds computed values
 //! (`crate::computed_batches`; see ADR 0003, "What the pool does not cover").
 
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -76,12 +75,12 @@ impl PhysicalOptimizerRule for AccountedOutput {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if plan.as_any().is::<ReservedOutputExec>() {
+        if plan.is::<ReservedOutputExec>() {
             return Ok(plan);
         }
         let plan = plan
             .transform_up(|node| {
-                let Some(coalesce) = node.as_any().downcast_ref::<CoalescePartitionsExec>() else {
+                let Some(coalesce) = node.downcast_ref::<CoalescePartitionsExec>() else {
                     return Ok(Transformed::no(node));
                 };
                 let input = coalesce.input();
@@ -147,10 +146,6 @@ impl DisplayAs for AccountedMergeExec {
 impl ExecutionPlan for AccountedMergeExec {
     fn name(&self) -> &'static str {
         "AccountedMergeExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -390,10 +385,6 @@ impl DisplayAs for ReservedOutputExec {
 impl ExecutionPlan for ReservedOutputExec {
     fn name(&self) -> &'static str {
         "ReservedOutputExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

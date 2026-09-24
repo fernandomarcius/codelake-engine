@@ -9,7 +9,6 @@
 //! (`bigint addition overflow: 9223372036854775807 + 1`, `Decimal overflow`).
 //! Integer `%` follows Java: `MIN % -1` is `0`, not an error.
 
-use std::any::Any;
 use std::fmt::Display;
 use std::sync::Arc;
 
@@ -259,10 +258,6 @@ impl CheckedBinary {
 }
 
 impl ScalarUDFImpl for CheckedBinary {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         match self.op {
             Operator::Plus => "codelake_checked_add",
@@ -384,10 +379,6 @@ impl CheckedNegate {
 }
 
 impl ScalarUDFImpl for CheckedNegate {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "codelake_checked_negate"
     }
@@ -439,10 +430,6 @@ impl CheckedAbs {
 }
 
 impl ScalarUDFImpl for CheckedAbs {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "abs"
     }

@@ -19,8 +19,10 @@
 //! exact counts only. Plans over estimated sources keep their aggregates and
 //! compute them from the rows; the estimates still steer the plan.
 //!
-//! Remove only when upstream no longer promotes an `Inexact` count to `Exact`
-//! **and** the `hive_statistics_acceptance` defect tests pass without it.
+//! `DataFusion` 54 fixed the promotion: `with_fetch` keeps an `Inexact` count
+//! inexact (see `upstream_keeps_estimates_inexact`). The guard stays until the
+//! `hive_statistics_acceptance` defect tests pass without it; only then remove
+//! it.
 
 use std::sync::Arc;
 
@@ -89,7 +91,6 @@ pub fn guard_aggregate_statistics(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::any::Any;
     use std::fmt;
 
     use async_trait::async_trait;
@@ -123,10 +124,6 @@ mod tests {
             "Reported"
         }
 
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn properties(&self) -> &Arc<PlanProperties> {
             self.input.properties()
         }
@@ -146,10 +143,10 @@ mod tests {
             self.input.execute(partition, context)
         }
 
-        fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
+        fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
             let mut stats = Statistics::new_unknown(&self.input.schema());
             stats.num_rows = self.rows;
-            Ok(stats)
+            Ok(Arc::new(stats))
         }
     }
 
@@ -165,10 +162,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for Table {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             schema()
         }
@@ -251,12 +244,14 @@ mod tests {
         assert_eq!(count(&ctx, OFFSET).await, 45);
     }
 
-    /// Documents the upstream promotion the guard exists for; when this
-    /// fails, upstream fixed it and the guard can go (see the module docs).
+    /// Documents that `DataFusion` 54 no longer promotes an estimate to an
+    /// exact count (it answered 0 and 0 on `DataFusion` 53); if this fails,
+    /// the promotion is back and the guard is load-bearing again.
     #[tokio::test]
-    async fn upstream_answers_from_an_estimate_promoted_to_exact() {
-        assert_eq!(count(&session(false, Precision::Inexact(0)), LIMIT).await, 0);
-        assert_eq!(count(&session(false, Precision::Inexact(1)), OFFSET).await, 0);
+    async fn upstream_keeps_estimates_inexact() {
+        assert_eq!(count(&session(false, Precision::Inexact(0)), LIMIT).await, 50);
+        assert_eq!(count(&session(false, Precision::Inexact(1)), OFFSET).await, 45);
+        assert_eq!(count(&session(false, Precision::Inexact(0)), DISJOINT).await, 46);
     }
 
     #[test]
@@ -287,9 +282,6 @@ mod tests {
             fn name(&self) -> &'static str {
                 "Failing"
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
             fn properties(&self) -> &Arc<PlanProperties> {
                 self.0.properties()
             }
@@ -309,7 +301,7 @@ mod tests {
             ) -> Result<SendableRecordBatchStream> {
                 self.0.execute(partition, context)
             }
-            fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
+            fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
                 Err(datafusion::error::DataFusionError::Internal(
                     "no statistics".into(),
                 ))

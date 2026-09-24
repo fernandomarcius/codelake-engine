@@ -6,7 +6,6 @@
 //! function lets each source dialect render its own literal syntax (T-SQL
 //! `0x0001`), while local evaluation decodes the same bytes.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, BinaryBuilder, StringArray};
@@ -75,10 +74,6 @@ struct VarbinaryLiteral {
 }
 
 impl ScalarUDFImpl for VarbinaryLiteral {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         VARBINARY_LITERAL
     }

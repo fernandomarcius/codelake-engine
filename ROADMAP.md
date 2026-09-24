@@ -103,14 +103,14 @@ Blocking items, in order:
   major (`iceberg` 0.11.0 final, still at RC on 2026-09-24, or
   `apache/datafusion-iceberg`) on `opendal ≥ 0.58.1` (quick-xml ^0.41, clears
   RUSTSEC-2026-0194/0195).
-- Dependency train (F11 survey, 2026-09-24): move to DataFusion 54 in one
-  train PR without Iceberg (ADR 0013), with
+- Dependency train (F11): on DataFusion 54.1 since 2026-09-24, with
   `datafusion-federation = "=0.5.5"`, the per-connector
   `datafusion-table-providers` 0.13.1 crates and `datafusion-postgres` 0.18.0,
-  then the full `semantics` suite (string/number coercion, codepoint
-  `lpad`/`rpad`/`translate`, `approx_percentile` change in DataFusion 54).
-  Skip DataFusion 55 (no `datafusion-table-providers` or `datafusion-postgres`
-  for it).
+  Iceberg left out (ADR 0002, ADR 0013). Pending: the full `semantics` suite
+  against DataFusion 54 (string/number coercion, codepoint
+  `lpad`/`rpad`/`translate`, `approx_percentile`, scalar subqueries executed by
+  their own operator). Skip DataFusion 55 (no `datafusion-table-providers` or
+  `datafusion-postgres` for it).
 - `hive-s3` (S3/MinIO warehouses) waits for DataFusion 56: DataFusion 53–55 need
   `object_store` ^0.13 (quick-xml ^0.39); DataFusion 56 moves to
   `object_store` 0.14.2 (quick-xml ^0.41).

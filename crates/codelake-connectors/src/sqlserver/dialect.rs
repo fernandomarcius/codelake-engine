@@ -340,7 +340,8 @@ fn safe_expr(expr: &Expr, schema: &DFSchema) -> bool {
         }
         Expr::Cast(cast) => {
             safe_expr(&cast.expr, schema)
-                && type_of(&cast.expr, schema).is_some_and(|from| widening_cast(&from, &cast.data_type))
+                && type_of(&cast.expr, schema)
+                    .is_some_and(|from| widening_cast(&from, cast.field.data_type()))
         }
         _ => false,
     }

@@ -424,7 +424,7 @@ mod tests {
             let state = ctx.state();
             async move {
                 let plan = table.scan(&state, None, &[], None).await.unwrap();
-                plan.partition_statistics(None).unwrap()
+                Arc::unwrap_or_clone(plan.partition_statistics(None).unwrap())
             }
         };
 

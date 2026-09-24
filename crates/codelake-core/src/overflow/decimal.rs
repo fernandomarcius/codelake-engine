@@ -23,7 +23,6 @@
 //! value does not fit (operands have at most 38 digits and rescaling factors
 //! at most 37, so 256 bits always hold the exact value).
 
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, AsArray, Decimal128Array, new_null_array};
@@ -346,10 +345,6 @@ impl DecimalBinary {
 }
 
 impl ScalarUDFImpl for DecimalBinary {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         match self.op {
             Operator::Plus => "codelake_decimal_add",

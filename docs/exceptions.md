@@ -19,5 +19,6 @@ invalid. Expired entries fail review until renewed or removed.
   0.13's S3 client pulls the same `quick-xml` 0.39. Local warehouses (the reference
   production case) ship; S3 waits for DataFusion 56, the first train on
   `object_store` 0.14.2 (quick-xml ^0.41) (ROADMAP M3, dependency train).
-- `datafusion-federation` 0.5.3 lost-filter defect: mitigated in code by
-  `federation_guard.rs`, covered by an integration test. Not suppressed; fixed.
+- `datafusion-federation` lost-filter defect (0.5.3, still present in 0.5.5):
+  mitigated in code by `federation_guard.rs`, covered by an integration test. Not
+  suppressed; fixed.

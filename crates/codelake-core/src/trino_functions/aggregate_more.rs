@@ -6,7 +6,6 @@
 //! through `Accumulator::size`, which the aggregation operator reserves from
 //! the pool.
 
-use std::any::Any;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
@@ -923,7 +922,7 @@ pub(crate) fn top_n(args: &AccumulatorArgs<'_>, name: &str) -> Result<usize> {
     let literal = args
         .exprs
         .get(2)
-        .and_then(|e| e.as_any().downcast_ref::<Literal>())
+        .and_then(|e| e.downcast_ref::<Literal>())
         .ok_or_else(|| {
             DataFusionError::Plan(format!(
                 "NOT_SUPPORTED: the third argument of {name} must be a constant"

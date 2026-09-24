@@ -7,7 +7,6 @@
 //! resolution through the connector's table factory returns federated providers,
 //! and the whole sub-plan is pushed down to the source instead.
 
-use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -36,10 +35,6 @@ impl FederatedCatalog {
 }
 
 impl CatalogProvider for FederatedCatalog {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         self.listing.schema_names()
     }
@@ -75,10 +70,6 @@ impl NameListing {
 }
 
 impl CatalogProvider for NameListing {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         self.schemas.keys().cloned().collect()
     }
@@ -97,10 +88,6 @@ struct NameSchema {
 
 #[async_trait]
 impl SchemaProvider for NameSchema {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         self.tables.clone()
     }
@@ -123,10 +110,6 @@ struct FederatedSchema {
 
 #[async_trait]
 impl SchemaProvider for FederatedSchema {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         self.listing.table_names()
     }

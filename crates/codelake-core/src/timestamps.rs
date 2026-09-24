@@ -23,7 +23,6 @@
 //! normalizes a zone the way Trino prints it (`+00:00` → `UTC`,
 //! `Etc/GMT+3` → `-03:00`).
 
-use std::any::Any;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -357,10 +356,6 @@ impl TextToTimestamp {
 }
 
 impl ScalarUDFImpl for TextToTimestamp {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         if self.safe {
             "codelake_try_text_to_timestamp"
@@ -434,12 +429,12 @@ fn text_to_timestamp(arg: Expr, target: DataType, safe: bool) -> Expr {
 /// 'Timestamp(…)')` → [`TextToTimestamp`].
 pub(crate) fn check_text_cast(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
     let replaced = match &expr {
-        Expr::Cast(Cast { expr: arg, data_type }) | Expr::TryCast(TryCast { expr: arg, data_type })
-            if matches!(data_type, DataType::Timestamp(..)) && is_text(&arg.get_type(schema)?) =>
+        Expr::Cast(Cast { expr: arg, field }) | Expr::TryCast(TryCast { expr: arg, field })
+            if matches!(field.data_type(), DataType::Timestamp(..)) && is_text(&arg.get_type(schema)?) =>
         {
             Some(text_to_timestamp(
                 arg.as_ref().clone(),
-                data_type.clone(),
+                field.data_type().clone(),
                 matches!(expr, Expr::TryCast(_)),
             ))
         }
@@ -457,8 +452,8 @@ pub(crate) fn check_text_cast(expr: Expr, schema: &DFSchema) -> Result<Transform
         // `CAST(CAST(<text> AS … WITH TIME ZONE) AS timestamp(p))`: each text's
         // own zone gives its local time (the zone of the column type would
         // give UTC's), see `fuse`.
-        Expr::Cast(Cast { expr: arg, data_type }) | Expr::TryCast(TryCast { expr: arg, data_type }) => {
-            fuse(arg, data_type, matches!(expr, Expr::TryCast(_)))
+        Expr::Cast(Cast { expr: arg, field }) | Expr::TryCast(TryCast { expr: arg, field }) => {
+            fuse(arg, field.data_type(), matches!(expr, Expr::TryCast(_)))
         }
         _ => None,
     };
@@ -476,7 +471,7 @@ fn fuse(inner: &Expr, target: &DataType, safe: bool) -> Option<Expr> {
     let Expr::ScalarFunction(ScalarFunction { func, args }) = inner else {
         return None;
     };
-    let text = func.inner().as_any().downcast_ref::<TextToTimestamp>()?;
+    let text = func.inner().downcast_ref::<TextToTimestamp>()?;
     let [arg] = args.as_slice() else {
         return None;
     };
@@ -515,7 +510,7 @@ pub(crate) fn uncheck_text_cast(expr: Expr) -> Transformed<Expr> {
     let Expr::ScalarFunction(ScalarFunction { func, mut args }) = expr else {
         return Transformed::no(expr);
     };
-    if let Some(cast) = func.inner().as_any().downcast_ref::<TextToTimestamp>()
+    if let Some(cast) = func.inner().downcast_ref::<TextToTimestamp>()
         && args.len() == 1
         && let Some(arg) = args.pop()
     {

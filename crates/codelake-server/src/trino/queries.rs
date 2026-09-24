@@ -12,7 +12,6 @@
 //! SQL. A failed query drops its buffered results at once ([`Release`]); only
 //! its record stays in the history.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -484,10 +483,6 @@ impl<E: Release> QueriesTable<E> {
 
 #[async_trait]
 impl<E: Release + Send + 'static> TableProvider for QueriesTable<E> {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

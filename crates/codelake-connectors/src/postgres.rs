@@ -9,10 +9,10 @@ use codelake_core::{Connector, ConnectorError};
 use datafusion::catalog::{CatalogProvider, TableProvider};
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::sql::TableReference;
-use datafusion_table_providers::common::DatabaseCatalogProvider;
-use datafusion_table_providers::postgres::PostgresTableFactory;
-use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
-use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers_common::common::DatabaseCatalogProvider;
+use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
+use datafusion_table_providers_postgres::PostgresTableFactory;
+use datafusion_table_providers_postgres::pool::PostgresConnectionPool;
 use secrecy::SecretString;
 use tokio::sync::OnceCell;
 

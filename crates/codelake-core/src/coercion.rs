@@ -29,7 +29,6 @@
 //! types the column again. The `VALUES` of an `INSERT` is left alone: the
 //! table's types decide there.
 
-use std::any::Any;
 use std::ops::ControlFlow;
 use std::sync::{Arc, LazyLock};
 
@@ -62,10 +61,6 @@ struct ValuesCell {
 }
 
 impl ScalarUDFImpl for ValuesCell {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         VALUES_CELL
     }
@@ -206,10 +201,6 @@ struct NamedCast {
 }
 
 impl ScalarUDFImpl for NamedCast {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         NAMED_CAST
     }
