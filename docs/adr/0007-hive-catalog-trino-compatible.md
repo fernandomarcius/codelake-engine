@@ -110,12 +110,11 @@ requires where Trino has no equivalent.
   never mix rows (the loser fails), an `ADD COLUMN` is never lost to a
   concurrent `INSERT` or `ADD COLUMN`, an `INSERT` whose metadata update fails
   leaves no file visible, and a failed CTAS removes only its own staging.
-- **`CREATE OR REPLACE TABLE … AS`** (not in Trino's Hive connector, which
-  answers "This connector does not support replacing tables") writes the new
-  table in staging and swaps directories only after every row is written, so
-  it may read the table it replaces and a failure keeps the old table. A
-  journal in `.codelake/replace/` puts the old table back if the process dies
-  between the two renames. Local warehouses only; object stores refuse it.
+- **`CREATE OR REPLACE TABLE`** is refused as Trino 431's Hive connector
+  refuses it (`NOT_SUPPORTED`, "This connector does not support replacing
+  tables"), whether the name exists or not (owner decision, 2026-09-24: the
+  catalog answers what Trino answers on the same metastore). The existing
+  table and the staging area are untouched.
 - **Stored views are queries.** The SQL of a view is parsed and must be one
   `SELECT`/`WITH`/`VALUES`, when it is created and every time it is read.
 - **Timestamps.** The catalog has Trino's `hive.timestamp-precision`

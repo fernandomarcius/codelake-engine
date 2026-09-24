@@ -19,7 +19,6 @@
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 
-use datafusion::error::{DataFusionError, Result};
 use datafusion::sql::sqlparser::ast::{
     CastKind, DataType, ExactNumberInfo, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
     Ident, LimitClause, NamedWindowExpr, OrderByKind, Query, SelectItem, SetExpr, Statement, TableFactor,
@@ -79,13 +78,6 @@ fn typed(number: &str) -> Option<Expr> {
     Some(cast(literal, DataType::Integer(None)))
 }
 
-/// An integer literal Trino cannot read: beyond `bigint` (Trino fails with
-/// `SYNTAX_ERROR`; the engine would read a `double` or an unsigned integer).
-fn out_of_range_integer(number: &str) -> bool {
-    let digits = number.strip_prefix('-').unwrap_or(number);
-    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) && number.parse::<i64>().is_err()
-}
-
 /// Functions that read numeric literal arguments when planned
 /// (`from_unixtime(t, hours, minutes)` takes its zone from them), and the
 /// engine's own `arrow_cast`, which Trino does not have: it builds an exact
@@ -97,8 +89,6 @@ const LITERAL_ARGUMENTS: [&str; 2] = ["from_unixtime", "arrow_cast"];
 struct LiteralTyper {
     /// Literals whose meaning is positional or structural.
     keep: HashSet<*const Expr>,
-    /// The first integer literal out of the `bigint` range.
-    invalid: Option<String>,
     /// Depth of queries being visited: only literals in queries are typed.
     queries: usize,
 }
@@ -273,9 +263,9 @@ impl VisitorMut for LiteralTyper {
             ..
         }) = &*expr
         {
-            if out_of_range_integer(number) {
-                self.invalid.get_or_insert_with(|| number.clone());
-            } else if let Some(replacement) = typed(number) {
+            // Integers beyond `bigint` are refused before (see
+            // `crate::trino_sql_checks`) and have no typed form.
+            if let Some(replacement) = typed(number) {
                 *expr = replacement;
             }
         }
@@ -383,18 +373,8 @@ impl VisitorMut for DerivedValuesNamer {
 }
 
 /// Types the numeric literals of the queries in `statement` (module docs).
-///
-/// # Errors
-/// `SYNTAX_ERROR` for an integer literal beyond the `bigint` range, as Trino.
-pub(crate) fn type_literals(statement: &mut Statement) -> Result<()> {
-    let mut typer = LiteralTyper::default();
-    let _ = statement.visit(&mut typer);
-    match typer.invalid {
-        Some(number) => Err(DataFusionError::Plan(format!(
-            "SYNTAX_ERROR: Invalid numeric literal: {number}"
-        ))),
-        None => Ok(()),
-    }
+pub(crate) fn type_literals(statement: &mut Statement) {
+    let _ = statement.visit(&mut LiteralTyper::default());
 }
 
 #[cfg(test)]
@@ -403,7 +383,7 @@ mod tests {
 
     fn typed_sql(sql: &str) -> String {
         let mut statement = Parser::parse_sql(&GenericDialect {}, sql).unwrap().remove(0);
-        type_literals(&mut statement).unwrap();
+        type_literals(&mut statement);
         statement.to_string()
     }
 
@@ -412,6 +392,16 @@ mod tests {
         assert_eq!(
             typed_sql("SELECT 1, 3000000000, 1.50, 0.05, 1.5E0 FROM t"),
             "SELECT CAST(1 AS INTEGER), 3000000000, CAST('1.50' AS DECIMAL(3,2)), CAST('0.05' AS DECIMAL(2,2)), CAST('1.5E0' AS DOUBLE) FROM t"
+        );
+    }
+
+    /// The cases of the engine's former exponent rewrite: a number with an
+    /// exponent is a `double`, wherever it is in a query.
+    #[test]
+    fn numbers_with_an_exponent_are_double() {
+        assert_eq!(
+            typed_sql("SELECT 1e5, 2.5E-3, -1e0, x FROM t WHERE y > 1e3"),
+            "SELECT CAST('1e5' AS DOUBLE), CAST('2.5E-3' AS DOUBLE), CAST('-1e0' AS DOUBLE), x FROM t WHERE y > CAST('1e3' AS DOUBLE)"
         );
     }
 
@@ -454,7 +444,7 @@ mod tests {
         let sql = "CREATE TABLE t (a INT) WITH (bucket_count = 4)";
         let mut statement = Parser::parse_sql(&GenericDialect {}, sql).unwrap().remove(0);
         let before = statement.to_string();
-        type_literals(&mut statement).unwrap();
+        type_literals(&mut statement);
         assert_eq!(statement.to_string(), before);
     }
 }

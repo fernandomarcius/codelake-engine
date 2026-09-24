@@ -19,10 +19,8 @@
 //! type coercion) casts each value to Trino's common type, so `DataFusion`'s
 //! coercion finds nothing left to do.
 //!
-//! Integer literals take Trino's type too: `integer` when the value fits 32
-//! bits, `bigint` otherwise (`DataFusion` reads every one as `bigint`), except
-//! as a direct argument of an aggregate or window function, where
-//! `DataFusion` expects its own type (`ntile(4)`, `lag(x, 1)`).
+//! Integer literals take their type (`integer` when the value fits 32 bits)
+//! from the function library's literal rewrite (`crate::trino_functions`).
 //!
 //! `DataFusion` settles the type of a `VALUES` column when it plans the SQL,
 //! before any analyzer rule. [`mark_values`] wraps every value of a `VALUES`
@@ -39,7 +37,7 @@ use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DFSchema, Result, ScalarValue, exec_err};
-use datafusion::logical_expr::expr::{AggregateFunction, InList, ScalarFunction, WindowFunction};
+use datafusion::logical_expr::expr::{InList, ScalarFunction};
 use datafusion::logical_expr::expr_rewriter::{NamePreserver, coerce_plan_expr_for_schema};
 use datafusion::logical_expr::{
     Between, BinaryExpr, Case, Cast, ColumnarValue, Expr, ExprSchemable, LogicalPlan, ReturnFieldArgs,
@@ -793,38 +791,6 @@ fn zoned_day_interval(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>
     Ok(Transformed::no(Expr::BinaryExpr(BinaryExpr { left, op, right })))
 }
 
-/// A 32-bit integer literal → `integer` (see the module documentation).
-fn narrow_literal(expr: Expr) -> Transformed<Expr> {
-    match expr {
-        Expr::Literal(ScalarValue::Int64(Some(v)), metadata) if i32::try_from(v).is_ok() => {
-            Transformed::yes(Expr::Literal(ScalarValue::Int32(i32::try_from(v).ok()), metadata))
-        }
-        // Aggregate and window functions keep their own literal arguments.
-        Expr::AggregateFunction(AggregateFunction { func, mut params }) => {
-            params.args = params.args.into_iter().map(widen_literal).collect();
-            Transformed::yes(Expr::AggregateFunction(AggregateFunction { func, params }))
-        }
-        Expr::WindowFunction(mut window) => {
-            let WindowFunction { params, .. } = window.as_mut();
-            params.args = std::mem::take(&mut params.args)
-                .into_iter()
-                .map(widen_literal)
-                .collect();
-            Transformed::yes(Expr::WindowFunction(window))
-        }
-        other => Transformed::no(other),
-    }
-}
-
-fn widen_literal(expr: Expr) -> Expr {
-    match expr {
-        Expr::Literal(ScalarValue::Int32(v), metadata) => {
-            Expr::Literal(ScalarValue::Int64(v.map(i64::from)), metadata)
-        }
-        other => other,
-    }
-}
-
 /// Schema that resolves the columns of `plan`'s expressions.
 fn expression_schema(plan: &LogicalPlan) -> Result<DFSchema> {
     let mut schema = datafusion::logical_expr::utils::merge_schema(&plan.inputs());
@@ -1264,13 +1230,12 @@ fn rewrite_expressions(plan: LogicalPlan, session_zone: &str) -> Result<Transfor
     plan.map_expressions(|expr| {
         let name = names.save(&expr);
         expr.transform_up(|e| {
-            let narrowed = narrow_literal(e);
-            let interval = zoned_day_interval(narrowed.data, &schema)?;
+            let interval = zoned_day_interval(e, &schema)?;
             let unified = common_types(interval.data, &schema, session_zone)?;
             let outer = refresh_outer_references(unified.data, &schema)?;
             Ok(Transformed::new_transformed(
                 outer.data,
-                narrowed.transformed || interval.transformed || unified.transformed || outer.transformed,
+                interval.transformed || unified.transformed || outer.transformed,
             ))
         })
         .map(|t| {
@@ -1287,18 +1252,11 @@ fn rewrite_expressions(plan: LogicalPlan, session_zone: &str) -> Result<Transfor
 fn common_types_node(plan: LogicalPlan, session_zone: &str) -> Result<Transformed<LogicalPlan>> {
     let plan = match plan {
         LogicalPlan::Values(values) => {
-            let narrowed = LogicalPlan::Values(values).map_expressions(|cell| {
-                // A rewrite that preserves expression names (the function
-                // library's) may alias a cell; names mean nothing in `VALUES`.
-                let cell = cell.unalias();
-                // Only the values as written, inside their marks.
-                if is_values_cell(&cell)
-                    || matches!(&cell, Expr::Cast(Cast { expr, .. }) if is_values_cell(expr))
-                {
-                    cell.transform_up(|e| Ok(narrow_literal(e)))
-                } else {
-                    Ok(Transformed::no(cell))
-                }
+            // A rewrite that preserves expression names (the function
+            // library's) may alias a cell; names mean nothing in `VALUES`.
+            let narrowed = LogicalPlan::Values(values).map_expressions(|cell| match cell {
+                Expr::Alias(_) => Ok(Transformed::yes(cell.unalias())),
+                other => Ok(Transformed::no(other)),
             })?;
             let LogicalPlan::Values(values) = narrowed.data else {
                 return Ok(narrowed);

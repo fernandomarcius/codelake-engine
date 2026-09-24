@@ -268,3 +268,43 @@ async fn json_values_read_from_columns_cast_as_trino() {
     assert_eq!(int64s(&out, 1), vec![Some(7), Some(8)]);
     assert_eq!(texts(2), vec![Some("1.5E0".to_owned()), None]);
 }
+
+/// A timestamp cast to a smaller precision rounds half up, toward the later
+/// instant also before 1970 (values observed on Trino 431; the cases of the
+/// library's former rescale, now the engine's `timestamp_casts`).
+#[tokio::test]
+async fn timestamps_round_half_up_to_a_smaller_precision() {
+    use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    let out = rows(
+        &engine,
+        "SELECT CAST(TIMESTAMP '1969-12-31 23:59:59.998500' AS TIMESTAMP(3)), \
+         CAST(TIMESTAMP '1969-12-31 23:59:59.998499' AS TIMESTAMP(3)), \
+         CAST(TIMESTAMP '1970-01-01 00:00:00.001500' AS TIMESTAMP(3)), \
+         CAST(TIMESTAMP '1970-01-01 00:00:00.001499' AS TIMESTAMP(3)), \
+         CAST(TIMESTAMP '1969-12-31 23:59:59.998501' AS TIMESTAMP(3))",
+    )
+    .await;
+    let options = FormatOptions::default();
+    let values: Vec<String> = out[0]
+        .columns()
+        .iter()
+        .map(|c| {
+            ArrayFormatter::try_new(c.as_ref(), &options)
+                .unwrap()
+                .value(0)
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        values,
+        [
+            "1969-12-31T23:59:59.999",
+            "1969-12-31T23:59:59.998",
+            "1970-01-01T00:00:00.002",
+            "1970-01-01T00:00:00.001",
+            "1969-12-31T23:59:59.999"
+        ]
+    );
+}

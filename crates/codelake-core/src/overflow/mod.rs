@@ -46,7 +46,7 @@ use std::sync::{Arc, LazyLock};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{DFSchema, Result, ScalarValue};
+use datafusion::common::{DFSchema, Result};
 use datafusion::functions_aggregate::average::Avg;
 use datafusion::functions_aggregate::sum::Sum;
 use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction, WindowFunction};
@@ -571,18 +571,6 @@ fn trino_aggregate(
     None
 }
 
-/// Trino types an integer literal `integer` when it fits 32 bits (`bigint`
-/// otherwise), which decides its decimal type (`decimal(10,0)`, not
-/// `decimal(19,0)`); `DataFusion` reads every integer literal as `bigint`.
-fn integer_literal(expr: Expr) -> Expr {
-    match expr {
-        Expr::Literal(ScalarValue::Int64(Some(v)), metadata) if i32::try_from(v).is_ok() => {
-            Expr::Literal(ScalarValue::Int32(i32::try_from(v).ok()), metadata)
-        }
-        other => other,
-    }
-}
-
 /// Everything [`TrinoDecimalTypes`] rewrites in one expression node.
 fn trino_decimal_node(expr: Expr, schema: &DFSchema) -> Transformed<Expr> {
     match expr {
@@ -592,9 +580,7 @@ fn trino_decimal_node(expr: Expr, schema: &DFSchema) -> Transformed<Expr> {
                 _ => false,
             };
             match decimal_op(op) {
-                Some(udf) if is_decimal => {
-                    Transformed::yes(udf.call(vec![integer_literal(*left), integer_literal(*right)]))
-                }
+                Some(udf) if is_decimal => Transformed::yes(udf.call(vec![*left, *right])),
                 _ => Transformed::no(Expr::BinaryExpr(BinaryExpr { left, op, right })),
             }
         }

@@ -217,6 +217,7 @@ pub fn parse_view_query(sql: &str, dialect: &dyn Dialect, session_zone: &str) ->
         _ => return Err(not_a_query()),
     };
     let mut statement = DFStatement::Statement(Box::new(Statement::Query(query)));
+    crate::trino_sql_checks::check_statement(&statement)?;
     crate::engine::trino_statement(&mut statement, session_zone)?;
     Ok(statement)
 }

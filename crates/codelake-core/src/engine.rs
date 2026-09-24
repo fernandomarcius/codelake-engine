@@ -387,7 +387,6 @@ pub fn trino_statement(
     crate::trino_sql_checks::fold_quoted_columns(statement);
     crate::trino_functions::rewrite_statement(statement)?;
     crate::literals::rewrite_zoned_timestamps(statement);
-    crate::literals::rewrite_exponent_numbers(statement);
     crate::coercion::mark_values(statement);
     crate::coercion::default_decimal_precision(statement);
     crate::declared::rewrite_declared_casts(statement);
@@ -1268,14 +1267,8 @@ impl Engine {
                 "Constant expression cannot contain a subquery".into(),
             ));
         }
-        // As in Trino, `1.5` is a DECIMAL literal (DataFusion's default is DOUBLE).
-        let mut state = ctx.state();
-        state.config_mut().options_mut().sql_parser.parse_float_as_decimal = true;
-        let batches = SessionContext::new_with_state(state)
-            .sql(&format!("SELECT {expr}"))
-            .await?
-            .collect()
-            .await?;
+        // The engine reads `1.5` as a DECIMAL literal (see `Engine::new`).
+        let batches = ctx.sql(&format!("SELECT {expr}")).await?.collect().await?;
         let batch = batches
             .iter()
             .find(|b| b.num_rows() > 0)

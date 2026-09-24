@@ -407,7 +407,7 @@ impl VisitorMut for UnnestColumns {
 pub(crate) fn rewrite_statement(statement: &mut DFStatement) -> Result<()> {
     match statement {
         DFStatement::Statement(inner) => {
-            super::literals::type_literals(inner.as_mut())?;
+            super::literals::type_literals(inner.as_mut());
             super::literals::name_columns(inner.as_mut());
             let _ = inner.visit(&mut UnnestColumns);
             super::lateral::rewrite(inner.as_mut());

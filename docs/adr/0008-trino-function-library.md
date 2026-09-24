@@ -175,3 +175,30 @@ categories for any client.
   a client that relied on names like `count(*)` sees `_col0`.
 - Gaps are listed in `docs/trino-functions.md`; each is either unimplemented
   (planning error, never a silent difference) or documented with its bound.
+
+## Amendment (2026-09-24): one implementation per rule after the F3 merge
+
+The F3 semantics front (`overflow`, `coercion`, `casts`, `timestamps`,
+`timestamp_casts`, `literals`, `declared`) and this library implemented
+several of the same Trino 431 rules in parallel. Integrating both, each rule
+keeps exactly one implementation, the one that passes both comparison
+suites (`trino_semantics*`, `f3_acceptance`, `f4_acceptance`, the golden
+fixtures):
+
+| Rule | Kept | Removed | Why |
+|---|---|---|---|
+| decimal `+ - * / %` types, rounding, overflow | engine (`overflow::decimal`) | library `decimal` operators | the engine also fails `Decimal overflow` when the rescale factor reaches 38 digits, as Trino does (`1 / CAST(3 AS DECIMAL(38,19))`); federation keeps the operator for SQL sources |
+| `avg` of a decimal | engine (`overflow::avg`), called by the library's `avg` | library `DecimalAvg` | 256-bit sum: two 38-digit values average without overflow, as in Trino; grouped accumulator |
+| `sum`, `avg(real)` | library (`aggregate_more`, `aggregate`) | — | the library's are the registered functions; the engine's `CheckedSum`/`RealResult` (from before F4) only replace the built-in `sum`/`avg`, which the engine no longer registers (they still serve plain sessions, such as the overflow tests) |
+| `round`, `ceil`, `floor`, `sign`, `truncate`, `nan`, `infinity`, `is_nan`, `variance`, date/time fields, `date_diff`, `to_unixtime`, `date_trunc`, `length`, ranking functions as `bigint` | library | engine `function_types`, `trino_datetime` | golden fixtures per function; the engine's `round` was turned back into the built-in before federation and broke `round(bigint, -1)` |
+| `TIMESTAMP '…'`, `CAST(x AS TIMESTAMP)`, `varchar(n)`/`char(n)` casts | engine (`literals`, `declared`) | library `syntax` branches and `codelake_trino_cast_varchar` | the engine keeps `timestamp(1)` and `varchar(5)` in the field metadata, so the client sees Trino's type |
+| casts between timestamps/dates/text, text/float → decimal | engine (`timestamp_casts`, `timestamps`, `casts`) | the same kinds in the library's `TrinoCasts` | the engine's run first; the library keeps `timestamp with time zone` → `date`, `double` → `varchar`, float/decimal → integer (Trino's `INVALID_CAST_ARGUMENT` for NaN and out of range) and text → integer/float/boolean/date |
+| `AT TIME ZONE` | library (`at_timezone`) | engine `at_time_zone` | the AST rewrite runs first |
+| numeric literals (`1` integer, `1.5` decimal, `1e5` double) | library (`literals`) | engine exponent rewrite and integer-literal narrowing | the engine's narrowing widened literal aggregate arguments back to `bigint` (`map_agg(x, 1)`) |
+| integer literal beyond `bigint` | engine (`trino_sql_checks`, also for view SQL) | library check | one SQL error, before any rewrite |
+| `VALUES 1, 2` | library (`preprocess`) with the engine's start rules | engine `values_rows` | a column named `values` is not a `VALUES` list |
+| NULLs last, UTC session zone | library (`session_config`) | engine settings | same settings, set once |
+
+`parse_float_as_decimal` stays on in the session: literals the library
+keeps as written (`arrow_cast` arguments, window frames) are read by the
+engine as decimals.

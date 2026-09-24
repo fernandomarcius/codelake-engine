@@ -17,16 +17,14 @@
 //! 8) is recorded with `codelake_trino_type` (see [`crate::declared`]).
 //! Anything this does not recognise is left to `DataFusion`.
 //!
-//! Numbers: the engine reads `1.5` as `decimal(2,1)`, like Trino
-//! (`sql_parser.parse_float_as_decimal`), but a number with an exponent
-//! (`1e5`, `2.5E-3`) is a `double` in Trino; [`rewrite_exponent_numbers`]
-//! turns it into `CAST('<number>' AS DOUBLE)` before planning.
+//! Numbers take their types from the function library's literal rewrite
+//! (`crate::trino_functions`: `1.5` is `decimal(2,1)`, `1e5` a `double`).
 
 use std::ops::ControlFlow;
 
 use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
-    CastKind, DataType, ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
+    CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
     FunctionArguments, Ident, ObjectName, Statement as SqlStatement, TimezoneInfo, TypedString, Value,
     ValueWithSpan, visit_expressions_mut,
 };
@@ -309,36 +307,6 @@ pub(crate) fn rewrite_timestamp_types(statement: &mut DFStatement, session_zone:
     });
 }
 
-/// Whether a numeric literal has an exponent (`1e5`): a `double` in Trino.
-fn has_exponent(number: &str) -> bool {
-    number.contains(['e', 'E'])
-}
-
-/// Rewrites every number with an exponent of `statement` as a `double` (see
-/// the module documentation).
-pub(crate) fn rewrite_exponent_numbers(statement: &mut DFStatement) {
-    let DFStatement::Statement(inner) = statement else {
-        return;
-    };
-    let _ = visit_expressions_mut(inner.as_mut(), |expr| {
-        if let Expr::Value(ValueWithSpan {
-            value: Value::Number(number, _),
-            ..
-        }) = expr
-            && has_exponent(number)
-        {
-            *expr = Expr::Cast {
-                kind: CastKind::Cast,
-                expr: Box::new(Expr::value(Value::SingleQuotedString(number.clone()))),
-                data_type: DataType::Double(ExactNumberInfo::None),
-                array: false,
-                format: None,
-            };
-        }
-        ControlFlow::<()>::Continue(())
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,20 +348,6 @@ mod tests {
         assert_eq!(
             rewritten("CREATE TABLE t (a TIMESTAMP, b TIMESTAMP(6), c INT)"),
             "CREATE TABLE t (a TIMESTAMP(3), b TIMESTAMP(6), c INT)"
-        );
-    }
-
-    #[test]
-    fn only_numbers_with_an_exponent_become_double() {
-        use datafusion::sql::parser::DFParser;
-        let mut statements =
-            DFParser::parse_sql("SELECT 1e5, 2.5E-3, -1e0, 1.5, 10, x FROM t WHERE y > 1e3").unwrap();
-        let mut statement = statements.pop_front().unwrap();
-        rewrite_exponent_numbers(&mut statement);
-        assert_eq!(
-            statement.to_string(),
-            "SELECT CAST('1e5' AS DOUBLE), CAST('2.5E-3' AS DOUBLE), -CAST('1e0' AS DOUBLE), 1.5, 10, x \
-             FROM t WHERE y > CAST('1e3' AS DOUBLE)"
         );
     }
 

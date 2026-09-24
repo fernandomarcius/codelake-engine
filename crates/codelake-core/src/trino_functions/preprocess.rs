@@ -25,17 +25,29 @@ use super::cast_type::{CAST_TYPE, TRY_CAST_TYPE};
 /// Guards against pathological inputs: each pass rewrites one construct.
 const MAX_PASSES: usize = 10_000;
 
-/// Byte offset of every line start, to turn token locations into offsets.
-struct Offsets<'a> {
-    text: &'a str,
+/// Byte offset of every character and the character index of every line
+/// start, to turn token locations into byte offsets in constant time (a long
+/// one-line statement, such as an `INSERT` of thousands of rows, has
+/// thousands of tokens on one line).
+struct Offsets {
+    /// Byte offset of each character, then the text's length.
+    bytes: Vec<usize>,
+    /// Character index of each line start.
     lines: Vec<usize>,
 }
 
-impl<'a> Offsets<'a> {
-    fn new(text: &'a str) -> Self {
+impl Offsets {
+    fn new(text: &str) -> Self {
+        let mut bytes = Vec::with_capacity(text.len() + 1);
         let mut lines = vec![0];
-        lines.extend(text.match_indices('\n').map(|(i, _)| i + 1));
-        Self { text, lines }
+        for (index, (byte, c)) in text.char_indices().enumerate() {
+            bytes.push(byte);
+            if c == '\n' {
+                lines.push(index + 1);
+            }
+        }
+        bytes.push(text.len());
+        Self { bytes, lines }
     }
 
     /// Byte offset of a 1-based (line, column-in-characters) location.
@@ -43,8 +55,8 @@ impl<'a> Offsets<'a> {
         let line = usize::try_from(location.line).ok()?.checked_sub(1)?;
         let column = usize::try_from(location.column).ok()?.checked_sub(1)?;
         let start = *self.lines.get(line)?;
-        let rest = self.text.get(start..)?;
-        Some(start + rest.char_indices().nth(column).map_or(rest.len(), |(i, _)| i))
+        let last = self.bytes.len() - 1;
+        Some(self.bytes[(start + column).min(last)])
     }
 }
 
