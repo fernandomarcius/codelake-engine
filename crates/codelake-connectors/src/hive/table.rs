@@ -11,6 +11,9 @@
 //! written under a hidden temporary name and renamed when complete, so no
 //! reader ever sees a partial file. The name starts with a UTC timestamp so
 //! that listing order is write order, as with Trino.
+//!
+//! Tracing: `hive.scan` records the files a scan selected (count, bytes,
+//! names); `hive.write` records the file an `INSERT`/CTAS wrote and its rows.
 
 use std::any::Any;
 use std::fmt;
@@ -19,6 +22,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use codelake_core::trace::{self, TARGET, field};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -43,8 +47,13 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStoreExt};
+use tracing::field::Empty;
+use tracing::{Instrument, Span};
 
 use super::metastore::FileMetastore;
+
+/// File names listed on a `hive.scan` span; the count is always complete.
+const MAX_TRACED_FILE_NAMES: usize = 50;
 
 /// Rows per Parquet row group. Bounded so the writer's buffer stays small.
 const ROW_GROUP_ROWS: usize = 128 * 1024;
@@ -163,7 +172,23 @@ impl TableProvider for HiveTable {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         self.register_store(state);
-        let files = self.data_files().await?;
+        let span = tracing::info_span!(
+            target: TARGET,
+            "hive.scan",
+            otel.status_code = Empty,
+            otel.status_description = Empty,
+            codelake.hive.schema = self.schema_name.as_str(),
+            codelake.hive.table = self.table.as_str(),
+            codelake.hive.files = Empty,
+            codelake.hive.bytes = Empty,
+            codelake.hive.file_names = Empty,
+        );
+        let files = self
+            .data_files()
+            .instrument(span.clone())
+            .await
+            .inspect_err(|err| trace::record_error(&span, err))?;
+        record_files(&span, &files);
         let partitions = state.config().target_partitions().max(1);
         let mut groups: Vec<Vec<PartitionedFile>> = vec![Vec::new(); partitions.min(files.len().max(1))];
         let group_count = groups.len();
@@ -200,6 +225,23 @@ impl TableProvider for HiveTable {
             None,
         )))
     }
+}
+
+/// Records what a scan will read: file count, total bytes, first names.
+fn record_files(span: &Span, files: &[ObjectMeta]) {
+    let bytes: u64 = files.iter().map(|meta| meta.size).sum();
+    let names: Vec<&str> = files
+        .iter()
+        .take(MAX_TRACED_FILE_NAMES)
+        .filter_map(|meta| meta.location.filename())
+        .collect();
+    let mut listed = names.join(",");
+    if files.len() > MAX_TRACED_FILE_NAMES {
+        listed.push_str(",…");
+    }
+    span.record("codelake.hive.files", files.len());
+    span.record("codelake.hive.bytes", bytes);
+    span.record("codelake.hive.file_names", listed.as_str());
 }
 
 /// Writes one Parquet file per `INSERT`.
@@ -302,8 +344,40 @@ impl HiveSink {
         data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> Result<u64> {
-        let dir = self.table.dir();
         let name = data_file_name(SystemTime::now());
+        let span = tracing::info_span!(
+            target: TARGET,
+            "hive.write",
+            otel.status_code = Empty,
+            otel.status_description = Empty,
+            codelake.hive.schema = self.table.schema_name.as_str(),
+            codelake.hive.table = self.table.table.as_str(),
+            codelake.hive.file = name.as_str(),
+            db.response.returned_rows = Empty,
+        );
+        let written = self
+            .write_named(data, context, name)
+            .instrument(span.clone())
+            .await;
+        match &written {
+            Ok(rows) => {
+                span.record(field::ROWS, rows);
+                if *rows == 0 {
+                    span.record("codelake.hive.file", "<none: no rows>");
+                }
+            }
+            Err(err) => trace::record_error(&span, err),
+        }
+        written
+    }
+
+    async fn write_named(
+        &self,
+        data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+        name: String,
+    ) -> Result<u64> {
+        let dir = self.table.dir();
         let temporary = dir.clone().join(format!(".{name}.inprogress"));
         let store = Arc::clone(self.table.metastore.store());
         let written = self.write_file(data, context, &temporary).await;
