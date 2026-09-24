@@ -1247,6 +1247,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bb8",
+ "bytes",
  "codelake-core",
  "crc32fast",
  "datafusion",

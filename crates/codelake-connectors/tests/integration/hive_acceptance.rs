@@ -619,7 +619,6 @@ async fn seed_trino_table(trino: &Trino) {
 }
 
 #[tokio::test]
-#[ignore = "F2 defect: INSERT drops columnStatistics; Trino 431 cannot read the table"]
 async fn codelake_insert_into_trino_table_keeps_it_readable_by_trino() {
     let shared = shared().await;
     let trino = Trino::start(&shared).await;
@@ -661,7 +660,6 @@ async fn codelake_insert_into_trino_table_keeps_it_readable_by_trino() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "F2 defect: Trino 431 rejects CodeLake metadata (writerVersion, columnStatistics, serdeParameters)"]
 async fn codelake_writes_trino_reads_table_and_view() {
     codelake_to_trino(Metadata::AsWritten).await;
 }
@@ -988,7 +986,6 @@ async fn views_survive_restart_and_cross_engines() {
 }
 
 #[tokio::test]
-#[ignore = "F2 defect: view catalog/schema ignored; unqualified names fail"]
 async fn trino_view_with_unqualified_names_reads_in_codelake() {
     let shared = shared().await;
     let spill = tempfile::tempdir().unwrap();
@@ -1102,7 +1099,6 @@ fn only_data_file(dir: &Path) -> PathBuf {
 }
 
 #[tokio::test]
-#[ignore = "F2 defect: timestamps land in SQL Server as bigint (epoch ms)"]
 #[allow(clippy::too_many_lines, reason = "one scenario, read top to bottom")]
 async fn sqlserver_2022_openrowset_reads_codelake_parquet() {
     let shared = shared().await;
@@ -1225,7 +1221,6 @@ async fn sqlserver_2022_openrowset_reads_codelake_parquet() {
 }
 
 #[tokio::test]
-#[ignore = "F2 defect: timestamps land in SQL Server as bigint (epoch ms)"]
 async fn sqlserver_2022_openrowset_reads_every_codelake_type() {
     let shared = shared().await;
     let spill = tempfile::tempdir().unwrap();
@@ -1362,7 +1357,6 @@ async fn failures_leave_nothing_visible_and_are_errors() {
 }
 
 #[tokio::test]
-#[ignore = "F2 defect: DROP TABLE and failed CTAS leave the table directory"]
 async fn trino_can_recreate_a_table_codelake_dropped_or_failed_to_create() {
     let shared = shared().await;
     let spill = tempfile::tempdir().unwrap();
@@ -1537,7 +1531,6 @@ async fn trino_partitioned_table_is_a_clear_error() {
 }
 
 #[tokio::test]
-#[ignore = "F2 defect: quoted mixed-case table is invisible to Trino"]
 async fn mixed_case_table_name_stays_visible_to_trino() {
     let shared = shared().await;
     let spill = tempfile::tempdir().unwrap();
