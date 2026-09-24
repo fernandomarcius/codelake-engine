@@ -44,6 +44,7 @@ use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStoreExt};
 
 use super::metastore::FileMetastore;
+use super::optimize::MARKER;
 use super::trino_parquet::{ROW_GROUP_ROWS, TrinoParquetWriter};
 
 /// Casts `batch` to the declared column types of `schema`.
@@ -145,7 +146,15 @@ impl HiveTable {
                 None
             }
         };
-        self.data_files().await
+        let (files, pending) = self.listing().await?;
+        if pending {
+            return Err(DataFusionError::Plan(format!(
+                "table {}.{} has an unfinished OPTIMIZE ({MARKER} in its directory): the next OPTIMIZE \
+                 of the table or opening the catalog again finishes it; if that fails, inspect the directory",
+                self.schema_name, self.table
+            )));
+        }
+        Ok(files)
     }
 
     /// A Parquet scan of `groups` in the table's schema: columns a file lacks
@@ -173,17 +182,27 @@ impl HiveTable {
     }
 
     pub(crate) async fn data_files(&self) -> Result<Vec<ObjectMeta>> {
+        Ok(self.listing().await?.0)
+    }
+
+    /// Data files sorted by name, and whether an `OPTIMIZE` marker is present.
+    async fn listing(&self) -> Result<(Vec<ObjectMeta>, bool)> {
         let dir = self.dir();
-        let mut files: Vec<ObjectMeta> = self
+        let marker = dir.clone().join(MARKER);
+        let all: Vec<ObjectMeta> = self
             .metastore
             .store()
             .list(Some(&dir))
-            .try_filter(|meta| std::future::ready(is_data_file(&dir, meta)))
             .try_collect()
             .await
             .map_err(external)?;
+        let pending = all.iter().any(|meta| meta.location == marker);
+        let mut files: Vec<ObjectMeta> = all
+            .into_iter()
+            .filter(|meta| is_data_file(&dir, meta))
+            .collect();
         files.sort_by(|a, b| a.location.cmp(&b.location));
-        Ok(files)
+        Ok((files, pending))
     }
 
     fn register_store(&self, state: &dyn Session) {

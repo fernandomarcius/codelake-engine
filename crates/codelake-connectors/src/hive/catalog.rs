@@ -315,7 +315,10 @@ impl HiveCatalog {
 
     /// Finishes or undoes `OPTIMIZE` runs interrupted by a crash, in every
     /// table. Called when the catalog is opened, before any query can list a
-    /// table whose files were half swapped.
+    /// table whose files were half swapped. A table whose swap cannot be
+    /// settled (unreadable or inconsistent marker) is logged and left as it
+    /// is: the other tables stay available, and that table refuses scans and
+    /// `OPTIMIZE` until someone inspects it (its marker stays in place).
     pub(crate) async fn recover_interrupted_optimize(&self) -> Result<usize> {
         let tables: Vec<(String, String)> = self
             .listing
@@ -329,28 +332,41 @@ impl HiveCatalog {
             .unwrap_or_default();
         let mut recovered = 0;
         for (schema, table) in tables {
-            let marker = self.metastore.table_dir(&schema, &table).join(optimize::MARKER);
-            match self.metastore.store().head(&marker).await {
-                Ok(_) => {}
-                Err(object_store::Error::NotFound { .. }) => continue,
-                Err(err) => return Err(DataFusionError::External(Box::new(err))),
-            }
-            let Some(metadata) = self
-                .metastore
-                .table(&schema, &table)
-                .await
-                .map_err(metastore_error)?
-            else {
-                continue;
-            };
-            let hive = self.table_provider(&schema, &table, &metadata)?;
-            let locks = self.metastore.table_locks(&schema, &table);
-            let _one_at_a_time = locks.optimize.lock().await;
-            if optimize::recover(&hive).await? {
-                recovered += 1;
+            match self.recover_table(&schema, &table).await {
+                Ok(true) => recovered += 1,
+                Ok(false) => {}
+                Err(err) => tracing::error!(
+                    catalog = %self.name,
+                    %schema,
+                    %table,
+                    error = %err,
+                    "an interrupted OPTIMIZE could not be settled; the table refuses scans until it is inspected"
+                ),
             }
         }
         Ok(recovered)
+    }
+
+    /// [`optimize::recover`] for one table; `false` when it has no marker.
+    async fn recover_table(&self, schema: &str, table: &str) -> Result<bool> {
+        let marker = self.metastore.table_dir(schema, table).join(optimize::MARKER);
+        match self.metastore.store().head(&marker).await {
+            Ok(_) => {}
+            Err(object_store::Error::NotFound { .. }) => return Ok(false),
+            Err(err) => return Err(DataFusionError::External(Box::new(err))),
+        }
+        let Some(metadata) = self
+            .metastore
+            .table(schema, table)
+            .await
+            .map_err(metastore_error)?
+        else {
+            return Ok(false);
+        };
+        let hive = self.table_provider(schema, table, &metadata)?;
+        let locks = self.metastore.table_locks(schema, table);
+        let _one_at_a_time = locks.optimize.lock().await;
+        optimize::recover(&hive).await
     }
 
     async fn require_schema(&self, schema: &str) -> Result<()> {
