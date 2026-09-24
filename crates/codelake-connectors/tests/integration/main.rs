@@ -29,6 +29,8 @@ mod hive_smoke;
 mod hive_statistics;
 #[cfg(feature = "hive")]
 mod hive_statistics_acceptance;
+#[cfg(feature = "hive")]
+mod join_regressions;
 
 #[cfg(feature = "mongodb")]
 mod mongodb;
