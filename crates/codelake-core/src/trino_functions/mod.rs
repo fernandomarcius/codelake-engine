@@ -27,7 +27,9 @@
 
 mod aggregate;
 mod aggregate_more;
+mod aggregate_types;
 mod array;
+mod array_agg;
 mod binary;
 mod cast;
 mod cast_type;
@@ -43,12 +45,15 @@ mod errors;
 mod golden;
 mod json;
 mod json_cast;
+mod keys;
+mod lateral;
 mod literals;
 mod math;
 mod nan;
 mod preprocess;
 mod regexp;
 mod rewrite;
+mod sketch;
 mod statistics;
 mod string;
 mod support;
@@ -98,6 +103,8 @@ fn scalar_udfs() -> Vec<ScalarUDF> {
 fn aggregate_udfs() -> Vec<AggregateUDF> {
     let mut all = aggregate::udafs();
     all.extend(aggregate_more::udafs());
+    all.extend(array_agg::udafs());
+    all.extend(aggregate_types::udafs());
     all
 }
 
@@ -124,8 +131,11 @@ pub fn is_trino_function(name: &str) -> bool {
 }
 
 /// Session defaults Trino semantics rely on: the session zone is UTC unless
-/// configured (`timestamp with time zone` needs a zone).
+/// configured (`timestamp with time zone` needs a zone), and `ORDER BY`
+/// without `NULLS FIRST|LAST` puts NULLs last in both directions (queries,
+/// windows and ordered aggregates; `DataFusion` puts them first for `DESC`).
 pub fn session_config(config: SessionConfig) -> SessionConfig {
+    let config = config.set_str("datafusion.sql_parser.default_null_ordering", "nulls_last");
     if config.options().execution.time_zone.is_some() {
         return config;
     }
@@ -148,6 +158,15 @@ pub fn install(ctx: &mut SessionContext) -> Result<()> {
     ctx.register_function_rewrite(Arc::new(rewrite::TrinoRewrites::new(overrides)))?;
     ctx.add_analyzer_rule(Arc::new(cast::TrinoCasts));
     Ok(())
+}
+
+/// Logical optimizer rules of the library, to run after the engine's own
+/// (float keys and window arguments, see `keys`).
+pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>> {
+    keys::TrinoKeys::new()
+        .map(|rule| Arc::new(rule) as Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>)
+        .into_iter()
+        .collect()
 }
 
 /// Physical optimizer rules of the library, to run after the engine's own

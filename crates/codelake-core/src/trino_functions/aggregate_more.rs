@@ -7,13 +7,15 @@
 //! the pool.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Decimal128Array, Float64Array, Int64Array, ListArray, MapArray,
+    Array, ArrayRef, BooleanArray, Decimal128Array, Decimal256Array, Float64Array, Int64Array, ListArray,
+    MapArray,
 };
 use datafusion::arrow::compute::cast;
+use datafusion::arrow::datatypes::i256;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
@@ -24,6 +26,7 @@ use datafusion::logical_expr::{
 use datafusion::physical_expr::expressions::Literal;
 
 use super::aggregate::{compare, hashable, state_field, udaf_boilerplate};
+use super::aggregate_types::{Retyped, RetypedGroups, engine_args, engine_state_args, fields};
 use super::collections::{build_maps, map_type};
 use super::support::{invalid_argument, is_decimal, is_integer, is_numeric, not_found, out_of_range};
 
@@ -132,6 +135,13 @@ impl AggregateUDFImpl for Sum {
         match (args.return_field.data_type(), args.is_distinct) {
             (DataType::Int64, false) => Ok(vec![state_field(args.name, "sum", WIDE)]),
             (DataType::Float32, false) => Ok(vec![state_field(args.name, "sum", DataType::Float64)]),
+            (DataType::Decimal128(_, scale), _) => {
+                let wide = wide_decimal(*scale);
+                let inputs = fields(args.name, std::slice::from_ref(&wide));
+                builtin_sum()
+                    .inner()
+                    .state_fields(engine_state_args(&args, &inputs, &wide))
+            }
             _ => builtin_sum().inner().state_fields(args),
         }
     }
@@ -143,12 +153,31 @@ impl AggregateUDFImpl for Sum {
         if Self::real(&args) && !args.is_distinct {
             return Ok(Box::new(RealSum::default()));
         }
+        if let DataType::Decimal128(_, scale) = args.return_field.data_type() {
+            let wide = wide_decimal(*scale);
+            let inputs = fields(args.name, std::slice::from_ref(&wide));
+            let inner = builtin_sum()
+                .inner()
+                .accumulator(engine_args(&args, &inputs, &wide))?;
+            return Ok(Box::new(Retyped {
+                inner,
+                inputs: vec![wide],
+                finish: Some(narrow_decimal),
+            }));
+        }
         builtin_sum().inner().accumulator(args)
     }
 
     fn groups_accumulator_supported(&self, args: AccumulatorArgs<'_>) -> bool {
         if Self::real(&args) {
             return false;
+        }
+        if let DataType::Decimal128(_, scale) = args.return_field.data_type() {
+            let wide = wide_decimal(*scale);
+            let inputs = fields(args.name, std::slice::from_ref(&wide));
+            return builtin_sum()
+                .inner()
+                .groups_accumulator_supported(engine_args(&args, &inputs, &wide));
         }
         builtin_sum().inner().groups_accumulator_supported(args)
     }
@@ -161,6 +190,18 @@ impl AggregateUDFImpl for Sum {
                 .create_groups_accumulator(Self::wide_args(&args, &wide_fields))?;
             return Ok(Box::new(ExactSumGroups { inner }));
         }
+        if let DataType::Decimal128(_, scale) = args.return_field.data_type() {
+            let wide = wide_decimal(*scale);
+            let inputs = fields(args.name, std::slice::from_ref(&wide));
+            let inner = builtin_sum()
+                .inner()
+                .create_groups_accumulator(engine_args(&args, &inputs, &wide))?;
+            return Ok(Box::new(RetypedGroups {
+                inner,
+                inputs: vec![wide],
+                finish: Some(narrow_decimal_array),
+            }));
+        }
         builtin_sum().inner().create_groups_accumulator(args)
     }
 
@@ -171,12 +212,67 @@ impl AggregateUDFImpl for Sum {
         if Self::real(&args) && !args.is_distinct {
             return Ok(Box::new(RealSum::default()));
         }
+        if let DataType::Decimal128(_, scale) = args.return_field.data_type() {
+            let wide = wide_decimal(*scale);
+            let inputs = fields(args.name, std::slice::from_ref(&wide));
+            let inner = builtin_sum()
+                .inner()
+                .create_sliding_accumulator(engine_args(&args, &inputs, &wide))?;
+            return Ok(Box::new(Retyped {
+                inner,
+                inputs: vec![wide],
+                finish: Some(narrow_decimal),
+            }));
+        }
         builtin_sum().inner().create_sliding_accumulator(args)
     }
 
     fn reverse_expr(&self) -> ReversedUDAF {
         ReversedUDAF::Identical
     }
+}
+
+/// `decimal(p, s)` sums run on 76 digits, so the running total never
+/// wraps; the result must fit Trino's `decimal(38, s)`.
+fn wide_decimal(scale: i8) -> DataType {
+    DataType::Decimal256(76, scale)
+}
+
+/// Largest unscaled `decimal(38, s)` value.
+const DECIMAL_38_MAX: i128 = 99_999_999_999_999_999_999_999_999_999_999_999_999;
+
+fn decimal_overflow() -> DataFusionError {
+    DataFusionError::Execution("GENERIC_INTERNAL_ERROR: Decimal overflow".into())
+}
+
+fn narrow(value: i256) -> Result<i128> {
+    value
+        .to_i128()
+        .filter(|v| (-DECIMAL_38_MAX..=DECIMAL_38_MAX).contains(v))
+        .ok_or_else(decimal_overflow)
+}
+
+fn narrow_decimal(value: &ScalarValue) -> Result<ScalarValue> {
+    match value {
+        ScalarValue::Decimal256(v, _, scale) => {
+            Ok(ScalarValue::Decimal128(v.map(narrow).transpose()?, 38, *scale))
+        }
+        other => Err(DataFusionError::Internal(format!("decimal sum: {other:?}"))),
+    }
+}
+
+fn narrow_decimal_array(values: &ArrayRef) -> Result<ArrayRef> {
+    let sums = values
+        .as_any()
+        .downcast_ref::<Decimal256Array>()
+        .ok_or_else(|| DataFusionError::Internal("decimal sum groups".into()))?;
+    let out = sums
+        .iter()
+        .map(|v| v.map(narrow).transpose())
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(
+        Decimal128Array::from(out).with_precision_and_scale(38, sums.scale())?,
+    ))
 }
 
 fn to_bigint(sum: i128) -> Result<i64> {
@@ -741,6 +837,7 @@ impl MapAccumulator {
         if key.is_null() {
             return Ok(());
         }
+        let key = super::aggregate::canonical_float(key);
         match self.index.get(&key) {
             Some(&slot) if self.histogram => {
                 let Some((_, ScalarValue::Int64(Some(count)))) = self.entries.get_mut(slot) else {
@@ -849,14 +946,58 @@ pub(crate) fn top_n(args: &AccumulatorArgs<'_>, name: &str) -> Result<usize> {
     usize::try_from(n).map_err(|_| invalid_argument(format!("third argument of {name} is too large")))
 }
 
-/// The `n` pairs with the largest (or smallest) `y`, best first.
+/// One candidate of `max_by(x, y, n)`: `seq` is its arrival order, which
+/// breaks ties (the first arrival ranks first).
+#[derive(Debug)]
+struct Candidate {
+    x: ScalarValue,
+    y: ScalarValue,
+    seq: u64,
+    /// `max_by`: larger `y` is better; `min_by`: smaller.
+    max: bool,
+}
+
+impl Candidate {
+    /// `Greater` when `self` ranks better than `other`.
+    fn rank(&self, other: &Self) -> std::cmp::Ordering {
+        let by_y = compare(&self.y, &other.y);
+        let by_y = if self.max { by_y } else { by_y.reverse() };
+        by_y.then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.rank(other).is_eq()
+    }
+}
+
+impl Eq for Candidate {}
+
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Heap order: the worst candidate on top.
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.rank(self)
+    }
+}
+
+/// The `n` pairs with the largest (or smallest) `y`, best first, in a
+/// bounded heap: `O(rows × log n)`.
 #[derive(Debug)]
 pub(crate) struct ByNAccumulator {
     n: usize,
     max: bool,
     x_type: DataType,
     y_type: DataType,
-    best: Vec<(ScalarValue, ScalarValue)>,
+    best: BinaryHeap<Candidate>,
+    seq: u64,
+    bytes: usize,
 }
 
 impl ByNAccumulator {
@@ -866,27 +1007,41 @@ impl ByNAccumulator {
             max,
             x_type,
             y_type,
-            best: Vec::new(),
+            best: BinaryHeap::new(),
+            seq: 0,
+            bytes: 0,
         }
     }
 
     fn offer(&mut self, x: ScalarValue, y: ScalarValue) {
-        if y.is_null() {
+        // NULL and NaN keys are never picked (see `max_by`).
+        if y.is_null() || super::aggregate::is_nan(&y) {
             return;
         }
-        let better = |a: &ScalarValue, b: &ScalarValue| {
-            let order = compare(a, b);
-            if self.max { order.is_gt() } else { order.is_lt() }
+        let candidate = Candidate {
+            x,
+            y,
+            seq: self.seq,
+            max: self.max,
         };
-        let at = self
-            .best
-            .iter()
-            .position(|(_, by)| better(&y, by))
-            .unwrap_or(self.best.len());
-        if at < self.n {
-            self.best.insert(at, (x, y));
-            self.best.truncate(self.n);
+        self.seq += 1;
+        if self.best.len() < self.n {
+            self.bytes += candidate.x.size() + candidate.y.size();
+            self.best.push(candidate);
+        } else if let Some(mut worst) = self.best.peek_mut()
+            && candidate.rank(&worst).is_gt()
+        {
+            self.bytes =
+                self.bytes + candidate.x.size() + candidate.y.size() - worst.x.size() - worst.y.size();
+            *worst = candidate;
         }
+    }
+
+    /// The kept pairs, best first.
+    fn ranked(&self) -> Vec<&Candidate> {
+        let mut all: Vec<&Candidate> = self.best.iter().collect();
+        all.sort_by(|a, b| b.rank(a));
+        all
     }
 
     pub(crate) fn state_fields(name: &str, x: &DataType, y: &DataType) -> Vec<FieldRef> {
@@ -928,8 +1083,9 @@ impl Accumulator for ByNAccumulator {
     }
 
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        let xs: Vec<ScalarValue> = self.best.iter().map(|(x, _)| x.clone()).collect();
-        let ys: Vec<ScalarValue> = self.best.iter().map(|(_, y)| y.clone()).collect();
+        let ranked = self.ranked();
+        let xs: Vec<ScalarValue> = ranked.iter().map(|c| c.x.clone()).collect();
+        let ys: Vec<ScalarValue> = ranked.iter().map(|c| c.y.clone()).collect();
         Ok(vec![
             list_scalar(&xs, &self.x_type),
             list_scalar(&ys, &self.y_type),
@@ -940,12 +1096,12 @@ impl Accumulator for ByNAccumulator {
         if self.best.is_empty() {
             return ScalarValue::try_from(&list_of(self.x_type.clone()));
         }
-        let xs: Vec<ScalarValue> = self.best.iter().map(|(x, _)| x.clone()).collect();
+        let xs: Vec<ScalarValue> = self.ranked().iter().map(|c| c.x.clone()).collect();
         Ok(list_scalar(&xs, &self.x_type))
     }
 
     fn size(&self) -> usize {
-        size_of::<Self>() + self.best.iter().map(|(x, y)| x.size() + y.size()).sum::<usize>()
+        size_of::<Self>() + self.bytes + self.best.capacity() * size_of::<Candidate>()
     }
 }
 
@@ -1204,7 +1360,7 @@ mod tests {
             acc.offer(ScalarValue::from(x), ScalarValue::Int64(Some(y)));
         }
         acc.offer(ScalarValue::from("n"), ScalarValue::Int64(None));
-        let xs: Vec<ScalarValue> = acc.best.iter().map(|(x, _)| x.clone()).collect();
+        let xs: Vec<ScalarValue> = acc.ranked().iter().map(|c| c.x.clone()).collect();
         assert_eq!(xs, vec![ScalarValue::from("b"), ScalarValue::from("c")]);
     }
 }

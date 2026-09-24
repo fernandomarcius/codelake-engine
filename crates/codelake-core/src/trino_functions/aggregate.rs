@@ -6,12 +6,11 @@
 //! against the query's limit and spills or fails like any other operator.
 
 use std::any::Any;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int64Array,
-    LargeStringArray, ListArray, StringArray, StringViewArray,
+    LargeStringArray, ListArray, StringArray, StringViewArray, StructArray,
 };
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, TimeUnit};
@@ -21,7 +20,11 @@ use datafusion::logical_expr::{
     Accumulator, AggregateUDF, AggregateUDFImpl, GroupsAccumulator, Signature, Volatility,
 };
 
+use super::aggregate_types::{
+    Retyped, RetypedGroups, engine_args, engine_state_args, fields, to_real, to_real_array,
+};
 use super::binary::xxhash64_bytes;
+use super::sketch::{Hll, QuantileSketch, Run};
 use super::support::{invalid_argument, is_decimal, is_float, is_integer, is_string, not_found};
 
 /// Trino's `ChecksumAggregationFunction.PRIME64`.
@@ -68,20 +71,29 @@ pub(crate) fn hash_column(array: &ArrayRef) -> Result<Vec<Option<u64>>> {
                 .collect())
         }
         DataType::Boolean => per_row::<BooleanArray>(array, |a, i| hash_long(i64::from(a.value(i)))),
-        DataType::Float64 => per_row::<Float64Array>(array, |a, i| {
-            let v = a.value(i);
-            let bits = if v.is_nan() {
-                0x7ff8_0000_0000_0000
-            } else {
-                v.to_bits()
-            };
-            hash_long(u64_bits(bits))
-        }),
-        DataType::Float32 => per_row::<Float32Array>(array, |a, i| {
-            let v = a.value(i);
-            let bits = if v.is_nan() { 0x7fc0_0000 } else { v.to_bits() };
-            hash_long(i64::from(i32::from_ne_bytes(bits.to_ne_bytes())))
-        }),
+        DataType::Float64 => per_row::<Float64Array>(array, |a, i| hash_long(double_bits(a.value(i)))),
+        DataType::Float32 => per_row::<Float32Array>(array, |a, i| hash_long(real_bits(a.value(i)))),
+        // Trino: an array hashes its elements' `xxhash64`, a row its fields'
+        // hash codes (`31 * h + element`, NULL as 0).
+        DataType::List(_) | DataType::LargeList(_) => {
+            let list = cast(
+                array,
+                &DataType::List(Arc::new(Field::new_list_field(
+                    list_element(array.data_type()),
+                    true,
+                ))),
+            )?;
+            let list = downcast::<ListArray>(&list)?;
+            (0..list.len())
+                .map(|i| {
+                    if list.is_null(i) {
+                        return Ok(None);
+                    }
+                    Ok(Some(combine(0, &hash_column(&list.value(i))?)))
+                })
+                .collect()
+        }
+        DataType::Struct(_) => struct_hash_codes(array),
         DataType::Utf8 => per_row::<StringArray>(array, |a, i| xxhash64_bytes(a.value(i).as_bytes())),
         DataType::LargeUtf8 => {
             per_row::<LargeStringArray>(array, |a, i| xxhash64_bytes(a.value(i).as_bytes()))
@@ -116,6 +128,124 @@ pub(crate) fn hash_column(array: &ArrayRef) -> Result<Vec<Option<u64>>> {
         other => Err(DataFusionError::Plan(format!(
             "NOT_SUPPORTED: hashing values of type {other} is not supported"
         ))),
+    }
+}
+
+/// `doubleToLongBits` with Trino's zero: `-0.0` hashes as `0.0`, every NaN
+/// as the canonical NaN.
+fn double_bits(v: f64) -> i64 {
+    let bits = if v.is_nan() {
+        0x7ff8_0000_0000_0000
+    } else if v == 0.0 {
+        0
+    } else {
+        v.to_bits()
+    };
+    u64_bits(bits)
+}
+
+/// `floatToIntBits` with Trino's zero (see `double_bits`).
+fn real_bits(v: f32) -> i64 {
+    let bits = if v.is_nan() {
+        0x7fc0_0000
+    } else if v == 0.0 {
+        0
+    } else {
+        v.to_bits()
+    };
+    i64::from(i32::from_ne_bytes(bits.to_ne_bytes()))
+}
+
+fn list_element(t: &DataType) -> DataType {
+    match t {
+        DataType::List(f) | DataType::LargeList(f) => f.data_type().clone(),
+        other => other.clone(),
+    }
+}
+
+/// `CombineHashFunction`: `31 * previous + value` over the elements, NULL as 0.
+fn combine(start: u64, hashes: &[Option<u64>]) -> u64 {
+    hashes
+        .iter()
+        .fold(start, |h, v| h.wrapping_mul(31).wrapping_add(v.unwrap_or(0)))
+}
+
+/// Trino's `AbstractLongType.hash` (the hash code of fixed-width values).
+fn long_hash_code(value: i64) -> u64 {
+    i64_bits(value)
+        .wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+        .rotate_left(31)
+        .wrapping_mul(PRIME64)
+}
+
+/// Trino's `HASH_CODE` operator (rows hash their fields with it).
+fn hash_codes(array: &ArrayRef) -> Result<Vec<Option<u64>>> {
+    match array.data_type() {
+        t if is_integer(t) || matches!(t, DataType::Date32) => {
+            let values = longs(array)?;
+            Ok((0..values.len())
+                .map(|i| (!values.is_null(i)).then(|| long_hash_code(values.value(i))))
+                .collect())
+        }
+        DataType::Boolean => per_row::<BooleanArray>(array, |a, i| if a.value(i) { 1231 } else { 1237 }),
+        DataType::Float64 => per_row::<Float64Array>(array, |a, i| long_hash_code(double_bits(a.value(i)))),
+        DataType::Float32 => per_row::<Float32Array>(array, |a, i| long_hash_code(real_bits(a.value(i)))),
+        DataType::Decimal128(precision, _) if *precision <= 18 => {
+            per_row::<Decimal128Array>(array, |a, i| {
+                long_hash_code(i64::try_from(a.value(i)).unwrap_or(0))
+            })
+        }
+        t if is_string(t) || matches!(t, DataType::Binary | DataType::LargeBinary | DataType::BinaryView) => {
+            hash_column(array)
+        }
+        DataType::List(_) | DataType::LargeList(_) => {
+            let list = cast(
+                array,
+                &DataType::List(Arc::new(Field::new_list_field(
+                    list_element(array.data_type()),
+                    true,
+                ))),
+            )?;
+            let list = downcast::<ListArray>(&list)?;
+            (0..list.len())
+                .map(|i| {
+                    if list.is_null(i) {
+                        return Ok(None);
+                    }
+                    Ok(Some(combine(0, &hash_codes(&list.value(i))?)))
+                })
+                .collect()
+        }
+        DataType::Struct(_) => struct_hash_codes(array),
+        other => Err(DataFusionError::Plan(format!(
+            "NOT_SUPPORTED: hashing values of type {other} inside a row is not supported"
+        ))),
+    }
+}
+
+fn struct_hash_codes(array: &ArrayRef) -> Result<Vec<Option<u64>>> {
+    let rows = downcast::<StructArray>(array)?;
+    let columns = rows
+        .columns()
+        .iter()
+        .map(hash_codes)
+        .collect::<Result<Vec<_>>>()?;
+    Ok((0..rows.len())
+        .map(|i| {
+            (!rows.is_null(i)).then(|| {
+                let fields: Vec<Option<u64>> = columns.iter().map(|c| c[i]).collect();
+                combine(1, &fields)
+            })
+        })
+        .collect())
+}
+
+/// Types `checksum` accepts: hashable values, arrays and rows of them.
+fn checksum_type(t: &DataType) -> bool {
+    match t {
+        DataType::List(f) | DataType::LargeList(f) => checksum_type(f.data_type()),
+        DataType::Struct(fields) => fields.iter().all(|f| checksum_type(f.data_type())),
+        t => hashable(t),
     }
 }
 
@@ -194,7 +324,7 @@ impl AggregateUDFImpl for Checksum {
 
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
         match arg_types {
-            [t] if hashable(t) => Ok(vec![if t.is_null() { DataType::Utf8 } else { t.clone() }]),
+            [t] if checksum_type(t) => Ok(vec![if t.is_null() { DataType::Utf8 } else { t.clone() }]),
             _ => Err(not_found("checksum", arg_types)),
         }
     }
@@ -351,6 +481,37 @@ struct ByAccumulator {
     max: bool,
 }
 
+/// Trino's identity for floats as keys (grouping, `DISTINCT`, maps):
+/// `-0.0` is `0.0` and every NaN is the same NaN.
+pub(crate) fn canonical_float(value: ScalarValue) -> ScalarValue {
+    match value {
+        ScalarValue::Float64(Some(v)) => ScalarValue::Float64(Some(if v.is_nan() {
+            f64::NAN
+        } else if v == 0.0 {
+            0.0
+        } else {
+            v
+        })),
+        ScalarValue::Float32(Some(v)) => ScalarValue::Float32(Some(if v.is_nan() {
+            f32::NAN
+        } else if v == 0.0 {
+            0.0
+        } else {
+            v
+        })),
+        other => other,
+    }
+}
+
+/// A float NaN.
+pub(crate) fn is_nan(value: &ScalarValue) -> bool {
+    match value {
+        ScalarValue::Float64(Some(v)) => v.is_nan(),
+        ScalarValue::Float32(Some(v)) => v.is_nan(),
+        _ => false,
+    }
+}
+
 /// Total order for the comparison value: NaN above every number.
 pub(crate) fn compare(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
     use std::cmp::Ordering;
@@ -368,6 +529,10 @@ impl ByAccumulator {
                 continue;
             }
             let y = ScalarValue::try_from_array(ys, i)?;
+            if is_nan(&y) {
+                // Trino never picks a NaN key (NaN compares false both ways).
+                continue;
+            }
             let better = self.best_y.is_null() || {
                 let order = compare(&y, &self.best_y);
                 if self.max { order.is_gt() } else { order.is_lt() }
@@ -601,11 +766,14 @@ impl AggregateUDFImpl for ApproxDistinct {
     }
 
     fn state_fields(&self, args: StateFieldsArgs<'_>) -> Result<Vec<FieldRef>> {
-        Ok(vec![state_field(
-            args.name,
-            "hashes",
-            DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true))),
-        )])
+        Ok(vec![
+            state_field(
+                args.name,
+                "hashes",
+                DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true))),
+            ),
+            state_field(args.name, "registers", DataType::Binary),
+        ])
     }
 
     fn accumulator(&self, _args: AccumulatorArgs<'_>) -> Result<Box<dyn Accumulator>> {
@@ -613,12 +781,11 @@ impl AggregateUDFImpl for ApproxDistinct {
     }
 }
 
-/// Exact set of value hashes. Trino's `HyperLogLog` is exact in its sparse
-/// range (a few thousand values); above it this stays exact, which is within
-/// Trino's error bound but not bit-identical to its estimate.
+/// Value hashes in a [`Hll`]: exact while few, `HyperLogLog` after (Trino's
+/// sparse and dense forms), so memory stays bounded.
 #[derive(Debug, Default)]
 struct DistinctAccumulator {
-    hashes: HashSet<u64>,
+    hll: Hll,
 }
 
 impl Accumulator for DistinctAccumulator {
@@ -636,46 +803,52 @@ impl Accumulator for DistinctAccumulator {
         let Some(values) = values.first() else {
             return Ok(());
         };
-        self.hashes.extend(hash_column(values)?.into_iter().flatten());
+        for hash in hash_column(values)?.into_iter().flatten() {
+            self.hll.insert(hash);
+        }
         Ok(())
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-        let Some(lists) = states.first() else {
-            return Ok(());
+        let [lists, registers] = states else {
+            return Err(DataFusionError::Internal("approx_distinct state".into()));
         };
         let lists = downcast::<ListArray>(lists)?;
+        let registers = downcast::<BinaryArray>(registers)?;
         for i in 0..lists.len() {
+            if !registers.is_null(i) {
+                self.hll.merge_registers(registers.value(i));
+            }
             if lists.is_null(i) {
                 continue;
             }
             let values = lists.value(i);
             let values = downcast::<Int64Array>(&values)?;
-            self.hashes.extend(values.iter().flatten().map(i64_bits));
+            for hash in values.iter().flatten() {
+                self.hll.insert(i64_bits(hash));
+            }
         }
         Ok(())
     }
 
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
         let values: Vec<ScalarValue> = self
-            .hashes
-            .iter()
-            .map(|h| ScalarValue::Int64(Some(u64_bits(*h))))
+            .hll
+            .hashes()
+            .map(|h| ScalarValue::Int64(Some(u64_bits(h))))
             .collect();
-        Ok(vec![ScalarValue::List(ScalarValue::new_list_nullable(
-            &values,
-            &DataType::Int64,
-        ))])
+        Ok(vec![
+            ScalarValue::List(ScalarValue::new_list_nullable(&values, &DataType::Int64)),
+            ScalarValue::Binary(self.hll.registers().map(<[u8]>::to_vec)),
+        ])
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
-        Ok(ScalarValue::Int64(Some(
-            i64::try_from(self.hashes.len()).unwrap_or(i64::MAX),
-        )))
+        Ok(ScalarValue::Int64(Some(self.hll.estimate())))
     }
 
     fn size(&self) -> usize {
-        size_of::<Self>() + self.hashes.capacity() * (size_of::<u64>() + 8)
+        size_of::<Self>() + self.hll.size()
     }
 }
 
@@ -751,7 +924,8 @@ impl AggregateUDFImpl for ApproxPercentile {
             .ok_or_else(|| DataFusionError::Internal("approx_percentile input".into()))?;
         let list = |t: DataType| DataType::List(Arc::new(Field::new_list_field(t, true)));
         Ok(vec![
-            state_field(args.name, "values", list(x)),
+            state_field(args.name, "values", list(x.clone())),
+            state_field(args.name, "ends", list(x)),
             state_field(args.name, "weights", list(DataType::Int64)),
             state_field(args.name, "percentiles", list(DataType::Float64)),
         ])
@@ -763,9 +937,13 @@ impl AggregateUDFImpl for ApproxPercentile {
             .first()
             .cloned()
             .ok_or_else(|| DataFusionError::Internal("no input".into()))?;
+        let values = if is_float(&x) {
+            Values::Float(QuantileSketch::default())
+        } else {
+            Values::Integer(QuantileSketch::default())
+        };
         Ok(Box::new(PercentileAccumulator {
-            values: Vec::new(),
-            weights: Vec::new(),
+            values,
             percentiles: None,
             value_type: x,
             array_result: matches!(types.last(), Some(DataType::List(_))),
@@ -774,11 +952,16 @@ impl AggregateUDFImpl for ApproxPercentile {
     }
 }
 
+/// Values of `approx_percentile`, by kind (`real` values are kept as `double`).
+#[derive(Debug)]
+enum Values {
+    Integer(QuantileSketch<i64>),
+    Float(QuantileSketch<f64>),
+}
+
 #[derive(Debug)]
 struct PercentileAccumulator {
-    /// Values as f64 bit-exact keys (`i64` inputs are kept exactly in `weights`' sibling).
-    values: Vec<ScalarValue>,
-    weights: Vec<i64>,
+    values: Values,
     percentiles: Option<Vec<f64>>,
     value_type: DataType,
     array_result: bool,
@@ -821,15 +1004,58 @@ impl PercentileAccumulator {
         }
     }
 
-    fn quantile(sorted: &[(ScalarValue, i64)], total: f64, p: f64) -> ScalarValue {
-        let mut sum = 0.0;
-        for (value, weight) in sorted {
-            sum += super::cast::i64_to_f64(*weight);
-            if sum > p * total {
-                return value.clone();
+    /// Adds the non-NULL values of `xs` (runs up to `ends` when merging
+    /// states) with their weights.
+    fn add(&mut self, xs: &ArrayRef, ends: Option<&ArrayRef>, weights: &[Option<i64>]) -> Result<()> {
+        match &mut self.values {
+            Values::Integer(sketch) => {
+                let los = longs(xs)?;
+                let his = ends.map(longs).transpose()?;
+                for (i, weight) in weights.iter().enumerate() {
+                    if let Some(weight) = weight
+                        && !los.is_null(i)
+                    {
+                        let lo = los.value(i);
+                        let hi = his.as_ref().map_or(lo, |h| h.value(i));
+                        sketch.add(Run {
+                            lo,
+                            hi,
+                            weight: *weight,
+                        });
+                    }
+                }
+            }
+            Values::Float(sketch) => {
+                let xs = cast(xs, &DataType::Float64)?;
+                let xs = downcast::<Float64Array>(&xs)?;
+                for (i, weight) in weights.iter().enumerate() {
+                    if let Some(weight) = weight
+                        && !xs.is_null(i)
+                    {
+                        let v = xs.value(i);
+                        if v.is_nan() {
+                            // Trino's quantile digest rejects NaN.
+                            return Err(DataFusionError::Execution(
+                                "GENERIC_INTERNAL_ERROR: value is NaN".into(),
+                            ));
+                        }
+                        sketch.add(Run {
+                            lo: v,
+                            hi: v,
+                            weight: *weight,
+                        });
+                    }
+                }
             }
         }
-        sorted.last().map_or(ScalarValue::Null, |(v, _)| v.clone())
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        match &self.values {
+            Values::Integer(sketch) => sketch.is_empty(),
+            Values::Float(sketch) => sketch.is_empty(),
+        }
     }
 }
 
@@ -841,37 +1067,36 @@ impl Accumulator for PercentileAccumulator {
         let percentile_column = values
             .last()
             .ok_or_else(|| DataFusionError::Internal("no percentile".into()))?;
-        let weights = if self.weighted {
-            Some(downcast::<Int64Array>(&values[1])?)
-        } else {
-            None
-        };
         for i in 0..xs.len() {
             if let Some(found) = read_percentiles(percentile_column, i)? {
                 self.set_percentiles(found)?;
             }
-            if xs.is_null(i) {
-                continue;
-            }
-            let weight = match weights {
-                Some(w) if w.is_null(i) => continue,
-                Some(w) => w.value(i),
-                None => 1,
-            };
-            if weight <= 0 {
-                return Err(invalid_argument("weight must be > 0"));
-            }
-            self.values.push(ScalarValue::try_from_array(xs, i)?);
-            self.weights.push(weight);
         }
-        Ok(())
+        let weights: Vec<Option<i64>> = if self.weighted {
+            let w = downcast::<Int64Array>(&values[1])?;
+            let mut out = Vec::with_capacity(w.len());
+            for i in 0..w.len() {
+                if w.is_null(i) || xs.is_null(i) {
+                    out.push(None);
+                } else if w.value(i) <= 0 {
+                    return Err(invalid_argument("weight must be > 0"));
+                } else {
+                    out.push(Some(w.value(i)));
+                }
+            }
+            out
+        } else {
+            vec![Some(1); xs.len()]
+        };
+        self.add(xs, None, &weights)
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-        let [values, weights, percentiles] = states else {
+        let [values, ends, weights, percentiles] = states else {
             return Err(DataFusionError::Internal("approx_percentile state".into()));
         };
         let values = downcast::<ListArray>(values)?;
+        let ends = downcast::<ListArray>(ends)?;
         let weights = downcast::<ListArray>(weights)?;
         for i in 0..values.len() {
             if let Some(found) = read_percentiles(percentiles, i)?.filter(|p| !p.is_empty()) {
@@ -881,22 +1106,32 @@ impl Accumulator for PercentileAccumulator {
                 continue;
             }
             let v = values.value(i);
+            let e = ends.value(i);
             let w = weights.value(i);
-            let w = downcast::<Int64Array>(&w)?;
-            for j in 0..v.len() {
-                self.values.push(ScalarValue::try_from_array(&v, j)?);
-                self.weights.push(w.value(j));
-            }
+            let w: Vec<Option<i64>> = downcast::<Int64Array>(&w)?.iter().collect();
+            self.add(&v, Some(&e), &w)?;
         }
         Ok(())
     }
 
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        let weights: Vec<ScalarValue> = self
-            .weights
-            .iter()
-            .map(|w| ScalarValue::Int64(Some(*w)))
-            .collect();
+        let (values, ends, weights): (ArrayRef, ArrayRef, Vec<i64>) = match &self.values {
+            Values::Integer(sketch) => (
+                Arc::new(Int64Array::from_iter_values(sketch.items().iter().map(|r| r.lo))),
+                Arc::new(Int64Array::from_iter_values(sketch.items().iter().map(|r| r.hi))),
+                sketch.items().iter().map(|r| r.weight).collect(),
+            ),
+            Values::Float(sketch) => (
+                Arc::new(Float64Array::from_iter_values(
+                    sketch.items().iter().map(|r| r.lo),
+                )),
+                Arc::new(Float64Array::from_iter_values(
+                    sketch.items().iter().map(|r| r.hi),
+                )),
+                sketch.items().iter().map(|r| r.weight).collect(),
+            ),
+        };
+        let (values, ends) = (cast(&values, &self.value_type)?, cast(&ends, &self.value_type)?);
         let percentiles: Vec<ScalarValue> = self
             .percentiles
             .iter()
@@ -904,46 +1139,51 @@ impl Accumulator for PercentileAccumulator {
             .map(|p| ScalarValue::Float64(Some(*p)))
             .collect();
         Ok(vec![
-            ScalarValue::List(ScalarValue::new_list_nullable(&self.values, &self.value_type)),
-            ScalarValue::List(ScalarValue::new_list_nullable(&weights, &DataType::Int64)),
+            ScalarValue::List(Arc::new(
+                datafusion::common::utils::SingleRowListArrayBuilder::new(values).build_list_array(),
+            )),
+            ScalarValue::List(Arc::new(
+                datafusion::common::utils::SingleRowListArrayBuilder::new(ends).build_list_array(),
+            )),
+            ScalarValue::List(Arc::new(
+                datafusion::common::utils::SingleRowListArrayBuilder::new(Arc::new(Int64Array::from(
+                    weights,
+                )))
+                .build_list_array(),
+            )),
             ScalarValue::List(ScalarValue::new_list_nullable(&percentiles, &DataType::Float64)),
         ])
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
         let null = ScalarValue::try_from(&self.value_type)?;
-        let Some(percentiles) = &self.percentiles else {
+        let list_type = DataType::List(Arc::new(Field::new_list_field(self.value_type.clone(), true)));
+        let Some(percentiles) = self.percentiles.clone() else {
             return Ok(if self.array_result {
-                ScalarValue::try_from(&DataType::List(Arc::new(Field::new_list_field(
-                    self.value_type.clone(),
-                    true,
-                ))))?
+                ScalarValue::try_from(&list_type)?
             } else {
                 null
             });
         };
-        if self.values.is_empty() {
+        if self.is_empty() {
             return Ok(if self.array_result {
-                ScalarValue::try_from(&DataType::List(Arc::new(Field::new_list_field(
-                    self.value_type.clone(),
-                    true,
-                ))))?
+                ScalarValue::try_from(&list_type)?
             } else {
                 null
             });
         }
-        let mut sorted: Vec<(ScalarValue, i64)> = self
-            .values
-            .iter()
-            .cloned()
-            .zip(self.weights.iter().copied())
-            .collect();
-        sorted.sort_by(|a, b| compare(&a.0, &b.0));
-        let total: f64 = self.weights.iter().map(|w| super::cast::i64_to_f64(*w)).sum();
-        let results: Vec<ScalarValue> = percentiles
-            .iter()
-            .map(|p| Self::quantile(&sorted, total, *p))
-            .collect();
+        let results = match &mut self.values {
+            Values::Integer(sketch) => sketch
+                .quantiles(&percentiles)
+                .into_iter()
+                .map(|v| ScalarValue::Int64(v).cast_to(&self.value_type))
+                .collect::<Result<Vec<_>>>()?,
+            Values::Float(sketch) => sketch
+                .quantiles(&percentiles)
+                .into_iter()
+                .map(|v| ScalarValue::Float64(v).cast_to(&self.value_type))
+                .collect::<Result<Vec<_>>>()?,
+        };
         if self.array_result {
             Ok(ScalarValue::List(ScalarValue::new_list_nullable(
                 &results,
@@ -956,8 +1196,10 @@ impl Accumulator for PercentileAccumulator {
 
     fn size(&self) -> usize {
         size_of::<Self>()
-            + self.values.iter().map(ScalarValue::size).sum::<usize>()
-            + self.weights.capacity() * size_of::<i64>()
+            + match &self.values {
+                Values::Integer(sketch) => sketch.size(),
+                Values::Float(sketch) => sketch.size(),
+            }
     }
 }
 
@@ -984,7 +1226,9 @@ impl AggregateUDFImpl for Avg {
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
         match arg_types {
             [t @ DataType::Decimal128(..)] => Ok(vec![t.clone()]),
-            // Integers and floats average as double (the engine's `avg` has a
+            // `avg(real)` is `real` (computed as `double`).
+            [DataType::Float32] => Ok(vec![DataType::Float32]),
+            // Integers and doubles average as double (the engine's `avg` has a
             // signature, not a coercion, so windows need this spelled out).
             [t] if is_integer(t) || is_float(t) || t.is_null() => Ok(vec![DataType::Float64]),
             [t @ (DataType::Duration(_) | DataType::Interval(_))] => Ok(vec![t.clone()]),
@@ -995,6 +1239,7 @@ impl AggregateUDFImpl for Avg {
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         match arg_types {
             [t @ DataType::Decimal128(..)] => Ok(t.clone()),
+            [DataType::Float32] => Ok(DataType::Float32),
             _ => builtin_avg().inner().return_type(arg_types),
         }
     }
@@ -1005,6 +1250,12 @@ impl AggregateUDFImpl for Avg {
                 state_field(args.name, "sum", DataType::Decimal128(38, *s)),
                 state_field(args.name, "count", DataType::Int64),
             ]),
+            Some(DataType::Float32) => {
+                let doubles = fields(args.name, &[DataType::Float64]);
+                builtin_avg()
+                    .inner()
+                    .state_fields(engine_state_args(&args, &doubles, &DataType::Float64))
+            }
             _ => builtin_avg().inner().state_fields(args),
         }
     }
@@ -1017,24 +1268,70 @@ impl AggregateUDFImpl for Avg {
                 precision: p,
                 scale: s,
             })),
+            Some(DataType::Float32) => {
+                let doubles = fields(args.name, &[DataType::Float64]);
+                let inner =
+                    builtin_avg()
+                        .inner()
+                        .accumulator(engine_args(&args, &doubles, &DataType::Float64))?;
+                Ok(Box::new(Retyped {
+                    inner,
+                    inputs: vec![DataType::Float64],
+                    finish: Some(to_real),
+                }))
+            }
             _ => builtin_avg().inner().accumulator(args),
         }
     }
 
     fn groups_accumulator_supported(&self, args: AccumulatorArgs<'_>) -> bool {
-        !matches!(
-            args.expr_fields.first().map(|f| f.data_type()),
-            Some(DataType::Decimal128(..))
-        ) && builtin_avg().inner().groups_accumulator_supported(args)
+        match args.expr_fields.first().map(|f| f.data_type()) {
+            Some(DataType::Decimal128(..)) => false,
+            Some(DataType::Float32) => {
+                let doubles = fields(args.name, &[DataType::Float64]);
+                builtin_avg().inner().groups_accumulator_supported(engine_args(
+                    &args,
+                    &doubles,
+                    &DataType::Float64,
+                ))
+            }
+            _ => builtin_avg().inner().groups_accumulator_supported(args),
+        }
     }
 
     fn create_groups_accumulator(&self, args: AccumulatorArgs<'_>) -> Result<Box<dyn GroupsAccumulator>> {
+        if args.expr_fields.first().map(|f| f.data_type()) == Some(&DataType::Float32) {
+            let doubles = fields(args.name, &[DataType::Float64]);
+            let inner = builtin_avg().inner().create_groups_accumulator(engine_args(
+                &args,
+                &doubles,
+                &DataType::Float64,
+            ))?;
+            return Ok(Box::new(RetypedGroups {
+                inner,
+                inputs: vec![DataType::Float64],
+                finish: Some(to_real_array),
+            }));
+        }
         builtin_avg().inner().create_groups_accumulator(args)
     }
 
     fn create_sliding_accumulator(&self, args: AccumulatorArgs<'_>) -> Result<Box<dyn Accumulator>> {
         match args.expr_fields.first().map(|f| f.data_type()) {
             Some(DataType::Decimal128(..)) => self.accumulator(args),
+            Some(DataType::Float32) => {
+                let doubles = fields(args.name, &[DataType::Float64]);
+                let inner = builtin_avg().inner().create_sliding_accumulator(engine_args(
+                    &args,
+                    &doubles,
+                    &DataType::Float64,
+                ))?;
+                Ok(Box::new(Retyped {
+                    inner,
+                    inputs: vec![DataType::Float64],
+                    finish: Some(to_real),
+                }))
+            }
             _ => builtin_avg().inner().create_sliding_accumulator(args),
         }
     }
@@ -1165,14 +1462,6 @@ pub(crate) fn udafs() -> Vec<AggregateUDF> {
             .as_ref()
             .clone()
             .with_aliases(["variance"]),
-        datafusion::functions_aggregate::bit_and_or_xor::bit_and_udaf()
-            .as_ref()
-            .clone()
-            .with_aliases(["bitwise_and_agg"]),
-        datafusion::functions_aggregate::bit_and_or_xor::bit_or_udaf()
-            .as_ref()
-            .clone()
-            .with_aliases(["bitwise_or_agg"]),
     ]
 }
 
@@ -1206,16 +1495,6 @@ mod tests {
         let mut merged = ChecksumAccumulator::default();
         merged.merge_batch(&state).unwrap();
         assert_eq!(merged.evaluate().unwrap(), y.evaluate().unwrap());
-    }
-
-    #[test]
-    fn percentile_picks_first_value_past_the_rank() {
-        let sorted: Vec<(ScalarValue, i64)> = (1..=4).map(|v| (ScalarValue::Int64(Some(v)), 1)).collect();
-        let q = |p| PercentileAccumulator::quantile(&sorted, 4.0, p);
-        assert_eq!(q(0.5), ScalarValue::Int64(Some(3)));
-        assert_eq!(q(0.25), ScalarValue::Int64(Some(2)));
-        assert_eq!(q(0.0), ScalarValue::Int64(Some(1)));
-        assert_eq!(q(1.0), ScalarValue::Int64(Some(4)));
     }
 
     #[test]
