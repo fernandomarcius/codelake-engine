@@ -138,6 +138,77 @@ impl Default for TelemetryConfig {
     }
 }
 
+/// Why `endpoint` cannot be an OTLP/HTTP base URL, if it cannot: the
+/// exporter must be able to use every value validation accepts, and
+/// `/v1/traces` is appended to it, so a query or fragment would swallow that
+/// path. Accepted: `http://host[:port][/path]`, host a DNS name, an IPv4
+/// address or a bracketed IPv6 address, port 1–65535, no credentials.
+fn check_otlp_endpoint(endpoint: &str) -> Result<(), String> {
+    let Some(rest) = endpoint.strip_prefix("http://") else {
+        return Err(if endpoint.starts_with("https://") {
+            "uses https: TLS to the collector is not supported; export to a collector agent \
+             over http:// on the node or in the pod"
+                .to_owned()
+        } else {
+            "must be an http:// URL (OTLP/HTTP, port 4318 by default)".to_owned()
+        });
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    if authority.is_empty() || rest.contains(|c: char| c.is_whitespace() || c.is_control()) {
+        return Err("has no host".to_owned());
+    }
+    if rest.contains(['?', '#']) {
+        return Err("must not have a query or fragment: `/v1/traces` is appended to it".to_owned());
+    }
+    if authority.contains('@') {
+        return Err("must not carry credentials".to_owned());
+    }
+    if !path.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err("has an invalid path".to_owned());
+    }
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(bracketed) => {
+            let (host, after) = bracketed.split_once(']').ok_or("has an invalid IPv6 host")?;
+            if host.parse::<std::net::Ipv6Addr>().is_err() {
+                return Err("has an invalid IPv6 host".to_owned());
+            }
+            match after {
+                "" => (host, None),
+                port => (host, Some(port.strip_prefix(':').ok_or("has an invalid port")?)),
+            }
+        }
+        None => match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        },
+    };
+    if host.is_empty() {
+        return Err("has no host".to_owned());
+    }
+    if !authority.starts_with('[') {
+        let label_ok = |label: &str| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        };
+        // URL parsers read a host whose last label is numeric as IPv4.
+        let numeric = host
+            .rsplit('.')
+            .next()
+            .is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()));
+        if !host.split('.').all(label_ok) || (numeric && host.parse::<std::net::Ipv4Addr>().is_err()) {
+            return Err(format!("has an invalid host `{host}`"));
+        }
+    }
+    if let Some(port) = port
+        && !(port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok_and(|p| p > 0))
+    {
+        return Err(format!("has an invalid port `{port}` (1-65535)"));
+    }
+    Ok(())
+}
+
 impl TelemetryConfig {
     /// `<endpoint>/v1/traces`, when tracing is enabled.
     pub fn traces_url(&self) -> Option<String> {
@@ -547,18 +618,16 @@ impl Config {
                 "telemetry.export_timeout_secs must be between 1 and {MAX_EXPORT_TIMEOUT_SECS}"
             ));
         }
-        if let Some(endpoint) = &telemetry.otlp_endpoint {
-            match endpoint.strip_prefix("http://") {
-                Some(rest) if !rest.is_empty() && !rest.starts_with('/') && !rest.contains(char::is_whitespace) => {}
-                Some(_) => errors.push(format!("telemetry.otlp_endpoint `{endpoint}` has no host")),
-                None if endpoint.starts_with("https://") => errors.push(format!(
-                    "telemetry.otlp_endpoint `{endpoint}`: TLS to the collector is not supported; \
-                     export to a collector agent over http:// on the node or in the pod"
-                )),
-                None => errors.push(format!(
-                    "telemetry.otlp_endpoint `{endpoint}` must be an http:// URL (OTLP/HTTP, port 4318 by default)"
-                )),
-            }
+        if let Some(endpoint) = &telemetry.otlp_endpoint
+            && let Err(problem) = check_otlp_endpoint(endpoint)
+        {
+            // Never echo what may be a password in the user-info part.
+            let shown = if endpoint.contains('@') {
+                "<hidden>"
+            } else {
+                endpoint
+            };
+            errors.push(format!("telemetry.otlp_endpoint `{shown}` {problem}"));
         }
     }
 
@@ -962,6 +1031,13 @@ mod tests {
             ),
             ("http://127.0.0.1:4318/", "http://127.0.0.1:4318/v1/traces"),
             ("http://c:4318/v1/traces", "http://c:4318/v1/traces"),
+            ("http://otel_agent/otlp", "http://otel_agent/otlp/v1/traces"),
+            ("http://[::1]:4318", "http://[::1]:4318/v1/traces"),
+            ("http://[fe80::1]", "http://[fe80::1]/v1/traces"),
+            (
+                "http://collector.local:65535/",
+                "http://collector.local:65535/v1/traces",
+            ),
         ] {
             let doc = format!(
                 "{VALID}\n[telemetry]\notlp_endpoint = \"{endpoint}\"\nservice_name = \"lake\"\nsampling_ratio = 0.0\nexport_timeout_secs = 300\n"
@@ -996,6 +1072,28 @@ mod tests {
             ("http://", "has no host"),
             ("http:///v1/traces", "has no host"),
             ("http://a b", "has no host"),
+            ("http://:4318", "has no host"),
+            ("http://collector:99999", "has an invalid port"),
+            ("http://collector:0", "has an invalid port"),
+            ("http://collector:", "has an invalid port"),
+            ("http://collector:43a8", "has an invalid port"),
+            ("http://collector:+4318", "has an invalid port"),
+            (
+                "http://127.0.0.1:4318?token=abc",
+                "must not have a query or fragment",
+            ),
+            (
+                "http://127.0.0.1:4318/otlp#frag",
+                "must not have a query or fragment",
+            ),
+            ("http://user:secret@collector:4318", "must not carry credentials"),
+            ("http://coll ector:4318", "has no host"),
+            ("http://collector..local:4318", "has an invalid host"),
+            ("http://999.0.0.1:4318", "has an invalid host"),
+            ("http://a:b:4318", "has an invalid port"),
+            ("http://[::1", "has an invalid IPv6 host"),
+            ("http://[zz]:4318", "has an invalid IPv6 host"),
+            ("http://[::1]4318", "has an invalid port"),
         ] {
             let doc = format!("{VALID}\n[telemetry]\notlp_endpoint = \"{endpoint}\"\n");
             let errors = errors_of(&doc, &full_env);
