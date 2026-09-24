@@ -1030,7 +1030,6 @@ async fn expect_error(sql: &str, name: &str) {
 /// second silently returns the first one's order. The reference pipelines build
 /// column signatures with `array_join(array_agg(… ORDER BY …))`.
 #[tokio::test]
-#[ignore = "DEFECT-1: array_agg with different ORDER BY in one query returns the same order"]
 async fn defect_01_array_agg_orderings_in_one_query() {
     expect_rows(
         "SELECT array_agg(x ORDER BY x)[1], array_agg(x ORDER BY x DESC)[1] FROM UNNEST(sequence(1, 5000)) AS t(x)",
@@ -1052,7 +1051,6 @@ async fn defect_01_array_agg_orderings_in_one_query() {
 /// `row_number() OVER (… ORDER BY x DESC) = 1` (134 uses in reference) then keeps
 /// the NULL row instead of the greatest one.
 #[tokio::test]
-#[ignore = "DEFECT-2: ORDER BY … DESC puts NULLs first (Trino: last) in queries, windows and array_agg"]
 async fn defect_02_desc_order_puts_nulls_last() {
     expect_rows(
         "SELECT x FROM (VALUES 3, NULL, 1) AS t(x) ORDER BY x DESC",
@@ -1079,7 +1077,6 @@ async fn defect_02_desc_order_puts_nulls_last() {
 /// join (or is a projection read only by such a filter): the value wraps and
 /// rows are silently dropped or kept. Trino fails the query.
 #[tokio::test]
-#[ignore = "DEFECT-3: integer overflow in WHERE over a join wraps silently instead of failing"]
 async fn defect_03_overflow_in_filter_over_join() {
     expect_error(
         &format!("SELECT count(*) FROM {FIFTY_THOUSAND} AS t WHERE CAST(x AS integer) * 50000 > 0"),
@@ -1097,7 +1094,6 @@ async fn defect_03_overflow_in_filter_over_join() {
 /// joins, `histogram`, `checksum` and `array_distinct`; the engine keeps
 /// them apart (a checksum comparison between two tables then differs).
 #[tokio::test]
-#[ignore = "DEFECT-4: -0.0 and 0.0 are different keys in GROUP BY/DISTINCT/join/histogram/checksum"]
 async fn defect_04_negative_zero_equals_zero() {
     expect_rows(
         "SELECT x, count(*) FROM (VALUES 0E0, -0E0, 1E0) AS t(x) GROUP BY x ORDER BY 1",
@@ -1141,7 +1137,6 @@ async fn defect_04_negative_zero_equals_zero() {
 /// A `decimal(38, s)` sum past 38 digits returns a 39-digit value in a
 /// `decimal(38,0)` column; Trino fails (`Decimal overflow`).
 #[tokio::test]
-#[ignore = "DEFECT-5: sum(decimal) overflowing 38 digits returns an out-of-range value"]
 async fn defect_05_decimal_sum_overflow() {
     expect_error(
         "SELECT sum(x) FROM (VALUES DECIMAL '99999999999999999999999999999999999999', DECIMAL '1') AS t(x)",
@@ -1152,7 +1147,6 @@ async fn defect_05_decimal_sum_overflow() {
 
 /// `abs(integer)` of the minimum value returns a `bigint` 2147483648.
 #[tokio::test]
-#[ignore = "DEFECT-6: abs(-2147483648) returns bigint 2147483648 instead of NUMERIC_VALUE_OUT_OF_RANGE"]
 async fn defect_06_abs_integer_minimum() {
     expect_error("SELECT abs(-2147483648)", "NUMERIC_VALUE_OUT_OF_RANGE").await;
     expect_rows(
@@ -1166,7 +1160,6 @@ async fn defect_06_abs_integer_minimum() {
 /// NaN: `max_by`/`min_by` never pick a NaN key, `array_max`/`array_min`
 /// skip NaN, and NaN is not equal to itself in `contains`/`array_position`.
 #[tokio::test]
-#[ignore = "DEFECT-7: NaN keys in max_by, array_max, contains, array_position differ from Trino"]
 async fn defect_07_nan_in_max_by_and_arrays() {
     expect_rows(
         "SELECT max_by(x, y), min_by(x, y) FROM (VALUES (1, nan()), (2, 1E0), (3, NULL)) AS t(x, y)",
@@ -1186,7 +1179,6 @@ async fn defect_07_nan_in_max_by_and_arrays() {
 /// `CAST(double AS json)` writes `NaN`/`Infinity` bare, which is not JSON;
 /// Trino writes them as strings.
 #[tokio::test]
-#[ignore = "DEFECT-8: CAST(array(double) AS json) emits invalid JSON for NaN/Infinity"]
 async fn defect_08_json_of_nan() {
     expect_rows(
         "SELECT CAST(ARRAY[1E0, nan(), infinity()] AS json)",
@@ -1204,7 +1196,6 @@ async fn defect_08_json_of_nan() {
 
 /// `listagg` over a group with only NULLs is NULL in Trino, `''` here.
 #[tokio::test]
-#[ignore = "DEFECT-9: listagg over only NULL values returns '' instead of NULL"]
 async fn defect_09_listagg_of_nulls() {
     expect_rows(
         "SELECT listagg(s, ',') WITHIN GROUP (ORDER BY s) FROM (VALUES CAST(NULL AS varchar), NULL) AS t(s)",
@@ -1224,7 +1215,6 @@ async fn defect_09_listagg_of_nulls() {
 /// `try(with_timezone(ts, 'constant zone'))` fails planning: the zone is a
 /// constant, but not once wrapped by `try`.
 #[tokio::test]
-#[ignore = "DEFECT-10: try(with_timezone(ts, constant zone)) fails with NOT_SUPPORTED"]
 async fn defect_10_try_with_timezone() {
     expect_rows(
         "SELECT try(with_timezone(TIMESTAMP '2018-11-04 00:30:00.000', 'America/Sao_Paulo'))",
@@ -1244,7 +1234,6 @@ async fn defect_10_try_with_timezone() {
 /// `VALUES ARRAY[1, 2], ARRAY[3]`: the `VALUES 1, 2` text rewrite splits
 /// rows at the commas inside the brackets.
 #[tokio::test]
-#[ignore = "DEFECT-11: VALUES rows holding ARRAY[a, b] without parentheses fail to parse"]
 async fn defect_11_values_rows_with_arrays() {
     expect_rows(
         "SELECT count(*) FROM (VALUES ARRAY[1, 2], ARRAY[3]) AS t(a)",
@@ -1263,7 +1252,6 @@ async fn defect_11_values_rows_with_arrays() {
 /// `CROSS JOIN UNNEST(column)` (the usual way to explode arrays in Trino)
 /// fails with an internal error in the federation optimizer rule.
 #[tokio::test]
-#[ignore = "DEFECT-12: CROSS JOIN UNNEST(column) fails with an internal optimizer error"]
 async fn defect_12_cross_join_unnest_column() {
     expect_rows(
         "SELECT g, x FROM (VALUES (1, ARRAY[10, 20]), (2, ARRAY[])) AS t(g, a) CROSS JOIN UNNEST(a) AS u(x) ORDER BY 1, 2",
@@ -1275,7 +1263,6 @@ async fn defect_12_cross_join_unnest_column() {
 
 /// `UNNEST(map)` yields key/value rows in Trino.
 #[tokio::test]
-#[ignore = "DEFECT-13: UNNEST(map) is rejected"]
 async fn defect_13_unnest_map() {
     expect_rows(
         "SELECT k, v FROM UNNEST(map(ARRAY['a', 'b'], ARRAY[1, 2])) AS t(k, v) ORDER BY 1",
@@ -1287,7 +1274,6 @@ async fn defect_13_unnest_map() {
 
 /// `varbinary || varbinary` (reference-style `X'0000' || …`) fails planning.
 #[tokio::test]
-#[ignore = "DEFECT-14: varbinary || varbinary fails planning"]
 async fn defect_14_varbinary_concat_operator() {
     expect_rows("SELECT to_hex(X'01' || X'02')", &["varchar"], json!([["0102"]])).await;
 }
@@ -1295,7 +1281,6 @@ async fn defect_14_varbinary_concat_operator() {
 /// Trino's regular expressions (Joni) support look-around and
 /// back-references; the engine rejects them.
 #[tokio::test]
-#[ignore = "DEFECT-15: regexp look-around and back-references are rejected"]
 async fn defect_15_regexp_lookaround_backreference() {
     expect_rows(
         r"SELECT regexp_like('abc', 'a(?=b)'), regexp_like('abab', '(ab)\1'), regexp_replace('aXbX', '(?<=a)X', '-')",
@@ -1308,7 +1293,6 @@ async fn defect_15_regexp_lookaround_backreference() {
 /// `from_iso8601_date` accepts ISO week dates, ordinal dates and reduced
 /// precision in Trino.
 #[tokio::test]
-#[ignore = "DEFECT-16: from_iso8601_date rejects week, ordinal and reduced-precision dates"]
 async fn defect_16_from_iso8601_date_forms() {
     expect_rows(
         "SELECT from_iso8601_date('2020-W10-3'), from_iso8601_date('2020-060'), from_iso8601_date('2020-02'), \
@@ -1321,7 +1305,6 @@ async fn defect_16_from_iso8601_date_forms() {
 
 /// Joda `z` (zone short name) in `format_datetime`.
 #[tokio::test]
-#[ignore = "DEFECT-17: format_datetime rejects the 'z' zone-name pattern"]
 async fn defect_17_format_datetime_zone_name() {
     expect_rows(
         "SELECT format_datetime(TIMESTAMP '2020-06-01 10:00:00 America/Sao_Paulo', 'z')",
@@ -1335,7 +1318,6 @@ async fn defect_17_format_datetime_zone_name() {
 /// `bitwise_or_agg` are `bigint`, `corr`/`covar_samp`/`regr_slope` of
 /// integers resolve to the `real` overloads.
 #[tokio::test]
-#[ignore = "DEFECT-18: avg(real), bitwise_*_agg(integer), corr/covar/regr(integer) result types differ"]
 async fn defect_18_aggregate_result_types() {
     expect_rows(
         "SELECT avg(x), typeof(avg(x)) FROM (VALUES REAL '1.5', REAL '2.25') AS t(x)",
@@ -1360,7 +1342,6 @@ async fn defect_18_aggregate_result_types() {
 /// `timestamp(0) ± INTERVAL` is `timestamp(3)` in Trino (interval
 /// precision is milliseconds).
 #[tokio::test]
-#[ignore = "DEFECT-19: timestamp(p < 3) plus/minus INTERVAL keeps precision p (Trino: 3)"]
 async fn defect_19_timestamp_interval_precision() {
     expect_rows(
         "SELECT TIMESTAMP '2020-01-01 00:00:00' - INTERVAL '1' SECOND, typeof(TIMESTAMP '2020-01-01 00:00:00' - INTERVAL '1' SECOND)",
@@ -1378,7 +1359,6 @@ async fn defect_19_timestamp_interval_precision() {
 
 /// A bare `VALUES` query names its column `_col0` in Trino.
 #[tokio::test]
-#[ignore = "DEFECT-20: VALUES 1, 2 names its column column1 (Trino: _col0)"]
 async fn defect_20_values_column_name() {
     let answer = defect_answer("VALUES 1, 2").await;
     let expected = Answer::Rows {
@@ -1391,7 +1371,6 @@ async fn defect_20_values_column_name() {
 /// Integer literals out of the `bigint` range are a syntax error in Trino;
 /// the engine turns them into a `double` or an Arrow `UInt64`.
 #[tokio::test]
-#[ignore = "DEFECT-21: integer literals beyond bigint are accepted as double/UInt64 instead of SYNTAX_ERROR"]
 async fn defect_21_integer_literal_out_of_range() {
     expect_error(
         "SELECT 12345678901234567890123456789012345678 * 10",
@@ -1403,7 +1382,6 @@ async fn defect_21_integer_literal_out_of_range() {
 
 /// `CAST(double AS integer)` out of range is `NUMERIC_VALUE_OUT_OF_RANGE`.
 #[tokio::test]
-#[ignore = "DEFECT-22: CAST(3E9 AS integer) reports INVALID_CAST_ARGUMENT (Trino: NUMERIC_VALUE_OUT_OF_RANGE)"]
 async fn defect_22_cast_double_out_of_range_error_name() {
     expect_error("SELECT CAST(3E9 AS integer)", "NUMERIC_VALUE_OUT_OF_RANGE").await;
 }
@@ -1411,7 +1389,6 @@ async fn defect_22_cast_double_out_of_range_error_name() {
 /// `approx_percentile` over a NaN input fails in Trino; the engine returns
 /// a value.
 #[tokio::test]
-#[ignore = "DEFECT-23: approx_percentile over NaN returns a value (Trino fails)"]
 async fn defect_23_approx_percentile_nan() {
     expect_error(
         "SELECT approx_percentile(x, 0.5) FROM (VALUES 1E0, nan(), 3E0) AS t(x)",
@@ -1422,7 +1399,6 @@ async fn defect_23_approx_percentile_nan() {
 
 /// Trino accepts blanks between the digits of a binary literal.
 #[tokio::test]
-#[ignore = "DEFECT-24: X'ED A0 80' (blanks inside a binary literal) is rejected"]
 async fn defect_24_binary_literal_with_blanks() {
     expect_rows("SELECT to_hex(X'ED A0 80')", &["varchar"], json!([["EDA080"]])).await;
 }
@@ -1430,7 +1406,6 @@ async fn defect_24_binary_literal_with_blanks() {
 /// `from_utf8` replaces one malformed sequence with one U+FFFD (a UTF-8
 /// encoded surrogate, an overlong form); the engine emits one per byte.
 #[tokio::test]
-#[ignore = "DEFECT-25: from_utf8 emits one replacement per byte of a malformed sequence"]
 async fn defect_25_from_utf8_malformed_sequences() {
     expect_rows(
         "SELECT from_utf8(X'EDA080'), from_utf8(X'C0AF'), length(from_utf8(X'EDA080'))",
@@ -1442,7 +1417,6 @@ async fn defect_25_from_utf8_malformed_sequences() {
 
 /// `checksum` accepts any comparable type in Trino (arrays, rows).
 #[tokio::test]
-#[ignore = "DEFECT-26: checksum(array) and checksum(row) are rejected"]
 async fn defect_26_checksum_of_containers() {
     expect_rows(
         "SELECT checksum(ARRAY[1, 2]), checksum(ROW(1, 'a'))",
@@ -1457,7 +1431,6 @@ async fn defect_26_checksum_of_containers() {
 /// key or a window-function argument wraps silently. Kept as a defect: the
 /// answer differs from Trino without any error.
 #[tokio::test]
-#[ignore = "DEFECT-27: NaN equi-join and overflow in ORDER BY keys / window arguments give silent wrong results"]
 async fn defect_27_documented_bounds_are_wrong_results() {
     expect_rows(
         "SELECT count(*) FROM (VALUES nan(), 1E0) AS a(x) JOIN (VALUES nan(), 1E0) AS b(y) ON x = y",
@@ -1482,7 +1455,6 @@ async fn defect_27_documented_bounds_are_wrong_results() {
 /// distinct count comes out exact), so a big input fails with a resource
 /// error where Trino answers.
 #[tokio::test]
-#[ignore = "DEFECT-28: approx_distinct/approx_percentile keep every value (memory grows with the input)"]
 async fn defect_28_approximate_aggregates_in_bounded_memory() {
     let spill = tempfile::tempdir().unwrap();
     let small = engine_with(spill.path(), ByteSize::mib(4), 8192, 4);
@@ -1505,7 +1477,6 @@ async fn defect_28_approximate_aggregates_in_bounded_memory() {
 /// n = 50 000 take about a minute (debug build) where a bounded heap needs
 /// well under a second.
 #[tokio::test]
-#[ignore = "DEFECT-29: max_by/min_by(x, y, n) take time proportional to rows x n"]
 async fn defect_29_max_by_n_is_not_quadratic() {
     let spill = tempfile::tempdir().unwrap();
     let engine = engine_with(spill.path(), ByteSize::gib(1), 8192, 4);
@@ -1523,7 +1494,6 @@ async fn defect_29_max_by_n_is_not_quadratic() {
 
 /// `TRIM(LEADING | TRAILING | BOTH FROM s)` without a character list.
 #[tokio::test]
-#[ignore = "DEFECT-30: TRIM(TRAILING FROM s) without characters fails to parse"]
 async fn defect_30_trim_side_without_characters() {
     expect_rows(
         "SELECT trim(TRAILING FROM '  a  '), trim(BOTH FROM '  a  ')",
@@ -1536,7 +1506,6 @@ async fn defect_30_trim_side_without_characters() {
 /// `greatest`/`least` over arrays compare element by element in Trino; the
 /// engine fails with an Arrow internal error.
 #[tokio::test]
-#[ignore = "DEFECT-31: greatest/least over arrays fail with an internal Arrow error"]
 async fn defect_31_greatest_of_arrays() {
     expect_rows(
         "SELECT greatest(ARRAY[1, 2], ARRAY[1, 3]), least(ARRAY['b'], ARRAY['a', 'z'])",
@@ -1549,7 +1518,6 @@ async fn defect_31_greatest_of_arrays() {
 /// `array_agg` over a sliding window frame (`ROWS BETWEEN 1 PRECEDING AND
 /// CURRENT ROW`) is rejected: the accumulator cannot retract.
 #[tokio::test]
-#[ignore = "DEFECT-32: array_agg over a sliding window frame is rejected"]
 async fn defect_32_array_agg_sliding_window() {
     expect_rows(
         "SELECT x, array_agg(x) OVER (PARTITION BY g ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
@@ -1564,7 +1532,6 @@ async fn defect_32_array_agg_sliding_window() {
 /// rejects, so `try_cast` returns a value where Trino returns NULL; and it
 /// rejects a zone suffix, which Trino drops (the wall clock is kept).
 #[tokio::test]
-#[ignore = "DEFECT-33: CAST(varchar AS timestamp) accepts 'T' and rejects a zone suffix (Trino: the reverse)"]
 async fn defect_33_cast_iso_t_separator_to_timestamp() {
     expect_error(
         "SELECT CAST('2020-01-01T10:00:00' AS timestamp)",
