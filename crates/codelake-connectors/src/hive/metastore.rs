@@ -11,9 +11,9 @@
 //! Unknown JSON fields are preserved on rewrite (`extra`), so metadata written
 //! by a newer Trino survives a round trip through `CodeLake`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures::TryStreamExt;
@@ -205,11 +205,32 @@ pub(crate) enum MetastoreError {
     Io(#[from] std::io::Error),
 }
 
+/// In-process coordination of one table's maintenance (ADR 0009).
+#[derive(Debug, Default)]
+pub(crate) struct TableLocks {
+    /// One `OPTIMIZE` at a time per table.
+    pub(crate) optimize: tokio::sync::Mutex<()>,
+    /// Held exclusively while `OPTIMIZE` swaps files; scans hold it shared
+    /// while listing, so they never list old and new files together.
+    pub(crate) commit: tokio::sync::RwLock<()>,
+}
+
+/// Held cross-process lock on one table's data files (ADR 0009); released
+/// when dropped. Empty when the warehouse is not a local file system.
+#[derive(Debug)]
+pub(crate) struct FileLock {
+    _file: Option<std::fs::File>,
+}
+
+/// Locks of every table touched so far, by `(schema, table)`.
+type LockMap = HashMap<(String, String), Arc<TableLocks>>;
+
 /// Metadata access for one catalog root.
 #[derive(Debug, Clone)]
 pub(crate) struct FileMetastore {
     store: Arc<dyn ObjectStore>,
     root: Path,
+    locks: Arc<Mutex<LockMap>>,
     /// Directory of `root` when the warehouse is a local file system. Object
     /// stores have no directories, but Trino on a local warehouse does: it
     /// refuses to create a table whose directory exists, even empty.
@@ -242,7 +263,61 @@ impl FileMetastore {
         Self {
             store,
             root,
+            locks: Arc::default(),
             local_dir: None,
+        }
+    }
+
+    pub(crate) fn table_locks(&self, schema: &str, table: &str) -> Arc<TableLocks> {
+        let mut locks = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(locks.entry((schema.to_owned(), table.to_owned())).or_default())
+    }
+
+    /// Cross-process lock of one table's data files: exclusive while
+    /// `OPTIMIZE` swaps them or recovers a swap, shared while a scan lists
+    /// them. The in-process [`TableLocks`] do not reach other processes (other
+    /// `CodeLake` nodes on the same warehouse); this advisory `flock` does, on
+    /// a local warehouse (`.codelake/locks/<schema>/<table>.lock` under the
+    /// root, hidden from Trino). The OS releases it when a process dies, so a
+    /// crash never leaves it held. Object stores have no such lock: `None`.
+    pub(crate) async fn table_file_lock(
+        &self,
+        schema: &str,
+        table: &str,
+        exclusive: bool,
+    ) -> MetastoreResult<FileLock> {
+        let Some(dir) = &self.local_dir else {
+            return Ok(FileLock { _file: None });
+        };
+        let path = dir
+            .join(".codelake")
+            .join("locks")
+            .join(schema)
+            .join(format!("{table}.lock"));
+        let file = tokio::task::spawn_blocking(move || {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        loop {
+            let attempt = if exclusive {
+                file.try_lock()
+            } else {
+                file.try_lock_shared()
+            };
+            match attempt {
+                Ok(()) => return Ok(FileLock { _file: Some(file) }),
+                Err(std::fs::TryLockError::WouldBlock) => tokio::time::sleep(Duration::from_millis(5)).await,
+                Err(std::fs::TryLockError::Error(err)) => return Err(err.into()),
+            }
         }
     }
 
@@ -721,6 +796,10 @@ mod tests {
             .insert("id".into(), serde_json::json!({"nullsCount": 0}));
         table.invalidate_statistics();
         assert!(!table.parameters.contains_key("numRows") && table.column_statistics.is_empty());
+        // Trino 431 cannot read table metadata without these keys, even empty.
+        let json: serde_json::Value = serde_json::to_value(&table).unwrap();
+        assert_eq!(json["serdeParameters"], serde_json::json!({}));
+        assert_eq!(json["columnStatistics"], serde_json::json!({}));
 
         metastore.write_table("raw", "t", &table).await.unwrap();
         metastore

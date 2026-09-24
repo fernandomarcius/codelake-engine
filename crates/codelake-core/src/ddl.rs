@@ -7,6 +7,11 @@
 //!
 //! Trino's `CREATE TABLE … WITH (format = 'PARQUET')` is accepted; any other
 //! table option is rejected rather than ignored.
+//!
+//! Trino's `ALTER TABLE <table> EXECUTE <procedure>[(args)] [WHERE …]` is not
+//! in `sqlparser`'s grammar: [`parse_table_execute`] recognizes it with
+//! `sqlparser`'s own tokenizer and expression parser, so quoting, comments,
+//! case and whitespace follow the dialect exactly.
 
 use datafusion::logical_expr::{DdlStatement, LogicalPlan};
 use datafusion::sql::TableReference;
@@ -15,6 +20,10 @@ use datafusion::sql::sqlparser::ast::{
     AlterTableOperation, CreateTableOptions, Expr as SqlExpr, ObjectName, ObjectNamePart, SqlOption,
     Statement, Value,
 };
+use datafusion::sql::sqlparser::dialect::Dialect;
+use datafusion::sql::sqlparser::keywords::Keyword;
+use datafusion::sql::sqlparser::parser::{Parser, ParserError};
+use datafusion::sql::sqlparser::tokenizer::Token;
 
 use datafusion::error::{DataFusionError, Result};
 
@@ -28,6 +37,85 @@ pub(crate) enum Prepared {
     },
     /// The view's query text, needed to persist the view.
     ViewSql(String),
+}
+
+/// `ALTER TABLE <table> EXECUTE <procedure>(<arguments>) [WHERE <filter>]`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TableExecute {
+    pub(crate) table: TableReference,
+    /// Trino's canonical name: upper-cased unless quoted (`"optimize"` stays
+    /// lower case and matches no procedure, as in Trino).
+    pub(crate) procedure: String,
+    /// `(name, expression)`; `name` is lower-cased, `None` when positional.
+    pub(crate) arguments: Vec<(Option<String>, SqlExpr)>,
+    pub(crate) filter: Option<SqlExpr>,
+}
+
+fn syntax(err: ParserError) -> DataFusionError {
+    DataFusionError::SQL(Box::new(err), None)
+}
+
+/// Recognizes Trino's `ALTER TABLE … EXECUTE`. Returns `None` for any other
+/// statement (including text that does not tokenize), which then goes
+/// through the regular parser and its error messages.
+pub(crate) fn parse_table_execute(sql: &str, dialect: &dyn Dialect) -> Result<Option<TableExecute>> {
+    let Ok(mut parser) = Parser::new(dialect).try_with_sql(sql) else {
+        return Ok(None);
+    };
+    if !parser.parse_keywords(&[Keyword::ALTER, Keyword::TABLE]) {
+        return Ok(None);
+    }
+    let Ok(name) = parser.parse_object_name(false) else {
+        return Ok(None);
+    };
+    if !parser.parse_keyword(Keyword::EXECUTE) {
+        return Ok(None);
+    }
+    let table = table_reference(&name)?;
+    let procedure = parser.parse_identifier().map_err(syntax)?;
+    let procedure = if procedure.quote_style.is_some() {
+        procedure.value
+    } else {
+        procedure.value.to_uppercase()
+    };
+    let mut arguments = Vec::new();
+    if parser.consume_token(&Token::LParen) && !parser.consume_token(&Token::RParen) {
+        loop {
+            let named = matches!(parser.peek_token().token, Token::Word(_))
+                && parser.peek_nth_token(1).token == Token::RArrow;
+            let argument_name = if named {
+                let ident = parser.parse_identifier().map_err(syntax)?;
+                parser.expect_token(&Token::RArrow).map_err(syntax)?;
+                Some(ident.value.to_lowercase())
+            } else {
+                None
+            };
+            arguments.push((argument_name, parser.parse_expr().map_err(syntax)?));
+            if !parser.consume_token(&Token::Comma) {
+                parser.expect_token(&Token::RParen).map_err(syntax)?;
+                break;
+            }
+        }
+    }
+    let filter = if parser.parse_keyword(Keyword::WHERE) {
+        Some(parser.parse_expr().map_err(syntax)?)
+    } else {
+        None
+    };
+    while parser.consume_token(&Token::SemiColon) {}
+    let rest = parser.peek_token();
+    if rest.token != Token::EOF {
+        return Err(syntax(ParserError::ParserError(format!(
+            "Expected: end of statement, found: {}",
+            rest.token
+        ))));
+    }
+    Ok(Some(TableExecute {
+        table,
+        procedure,
+        arguments,
+        filter,
+    }))
 }
 
 fn ident_value(part: &ObjectNamePart) -> Result<String> {
@@ -167,6 +255,87 @@ mod tests {
             prepare(&mut statement).unwrap(),
             Some(Prepared::ViewSql("SELECT id FROM hive.s.t WHERE id > 0".into()))
         );
+    }
+
+    fn execute(sql: &str) -> Result<Option<TableExecute>> {
+        parse_table_execute(sql, &datafusion::sql::sqlparser::dialect::GenericDialect {})
+    }
+
+    fn literal(expr: &SqlExpr) -> String {
+        expr.to_string()
+    }
+
+    #[test]
+    fn table_execute_is_recognized_robustly() {
+        let plain = execute("ALTER TABLE hive.raw.orders EXECUTE optimize")
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain.table, TableReference::full("hive", "raw", "orders"));
+        assert_eq!(plain.procedure, "OPTIMIZE");
+        assert!(plain.arguments.is_empty() && plain.filter.is_none());
+
+        let quoted = execute(
+            "  alter   table \"hive\".\"Raw\".\"Order Items\"\n  execute \"OPTIMIZE\" (\n file_size_threshold  =>  '10MB' ) ;",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(quoted.table, TableReference::full("hive", "Raw", "Order Items"));
+        assert_eq!(quoted.procedure, "OPTIMIZE");
+        assert_eq!(quoted.arguments.len(), 1);
+        assert_eq!(quoted.arguments[0].0.as_deref(), Some("file_size_threshold"));
+        assert_eq!(literal(&quoted.arguments[0].1), "'10MB'");
+
+        let partial = execute("ALTER TABLE Raw.T EXECUTE Optimize('1' || 'MB') -- trailing comment")
+            .unwrap()
+            .unwrap();
+        assert_eq!(partial.table, TableReference::partial("raw", "t"));
+        assert_eq!(partial.procedure, "OPTIMIZE");
+        let lower = execute("ALTER TABLE t EXECUTE \"optimize\"").unwrap().unwrap();
+        assert_eq!(lower.procedure, "optimize", "a quoted name is kept as written");
+        assert_eq!(partial.arguments[0].0, None);
+        assert_eq!(literal(&partial.arguments[0].1), "'1' || 'MB'");
+
+        let bare = execute("/* c */ ALTER TABLE t EXECUTE optimize() WHERE id = 1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(bare.table, TableReference::bare("t"));
+        assert!(bare.arguments.is_empty());
+        assert_eq!(bare.filter.map(|f| f.to_string()).as_deref(), Some("id = 1"));
+
+        let two = execute("ALTER TABLE t EXECUTE p(\"A\" => 1, b => CAST('x' AS varchar))")
+            .unwrap()
+            .unwrap();
+        assert_eq!(two.arguments[0].0.as_deref(), Some("a"));
+        assert_eq!(two.arguments[1].0.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn other_statements_are_left_to_the_regular_parser() {
+        for sql in [
+            "SELECT 1",
+            "ALTER TABLE t ADD COLUMN x int",
+            "ALTER VIEW v AS SELECT 1",
+            "ALTER TABLE",
+            "INSERT INTO t VALUES ('unterminated",
+            "",
+        ] {
+            assert_eq!(execute(sql).unwrap(), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn malformed_execute_is_a_syntax_error() {
+        for sql in [
+            "ALTER TABLE t EXECUTE",
+            "ALTER TABLE t EXECUTE optimize(",
+            "ALTER TABLE t EXECUTE optimize(1 2)",
+            "ALTER TABLE t EXECUTE optimize(x =>)",
+            "ALTER TABLE t EXECUTE optimize garbage",
+            "ALTER TABLE t EXECUTE optimize; SELECT 1",
+            "ALTER TABLE a.b.c.d EXECUTE optimize",
+        ] {
+            assert!(execute(sql).is_err(), "{sql}");
+        }
     }
 
     #[test]

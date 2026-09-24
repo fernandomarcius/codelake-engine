@@ -25,7 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use codelake_core::trace::{self, TARGET, field};
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::config::TableParquetOptions;
@@ -37,6 +37,7 @@ use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::execution::object_store::ObjectStoreUrl;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
@@ -48,8 +49,28 @@ use object_store::{ObjectMeta, ObjectStoreExt};
 use tracing::field::Empty;
 use tracing::{Instrument, Span};
 
-use super::metastore::FileMetastore;
+use super::columns::HiveColumns;
+use super::metastore::{FileMetastore, TableMetadata};
+use super::optimize::MARKER;
 use super::trino_parquet::{ROW_GROUP_ROWS, TrinoParquetWriter};
+use super::types::arrow_type;
+
+/// Casts `batch` to the declared column types of `schema`.
+pub(crate) fn conform(schema: &SchemaRef, batch: &RecordBatch) -> Result<RecordBatch> {
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| {
+            if column.data_type() == field.data_type() {
+                Ok(Arc::clone(column))
+            } else {
+                cast(column, field.data_type()).map_err(DataFusionError::from)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
+}
 
 /// File names listed on a `hive.scan` span; the count is always complete.
 const MAX_TRACED_FILE_NAMES: usize = 50;
@@ -91,6 +112,11 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 fn is_data_file(dir: &Path, meta: &ObjectMeta) -> bool {
+    // An empty file (a writer that died before its first byte) holds no rows
+    // and is no Parquet file: Trino skips it when reading and compacting.
+    if meta.size == 0 {
+        return false;
+    }
     let Some(relative) = meta.location.prefix_match(dir) else {
         return false;
     };
@@ -99,7 +125,7 @@ fn is_data_file(dir: &Path, meta: &ObjectMeta) -> bool {
     parts.len() == 1 && !parts[0].as_ref().starts_with(['.', '_'])
 }
 
-fn external(err: impl std::error::Error + Send + Sync + 'static) -> DataFusionError {
+pub(crate) fn external(err: impl std::error::Error + Send + Sync + 'static) -> DataFusionError {
     DataFusionError::External(Box::new(err))
 }
 
@@ -113,22 +139,159 @@ pub(crate) struct HiveTable {
 }
 
 impl HiveTable {
-    fn dir(&self) -> Path {
+    /// The table `schema.table` described by `metadata`.
+    pub(crate) fn from_metadata(
+        metastore: FileMetastore,
+        store_url: ObjectStoreUrl,
+        schema: &str,
+        table: &str,
+        metadata: &TableMetadata,
+    ) -> Result<Self> {
+        if metadata.storage_format.as_deref().is_some_and(|f| f != "PARQUET") {
+            return Err(DataFusionError::NotImplemented(format!(
+                "{schema}.{table}: only PARQUET hive tables are supported"
+            )));
+        }
+        if !metadata.partition_columns.is_empty() {
+            return Err(DataFusionError::NotImplemented(format!(
+                "{schema}.{table}: partitioned hive tables are not supported yet"
+            )));
+        }
+        let fields = metadata
+            .data_columns
+            .iter()
+            .map(|c| Ok(Field::new(&c.name, arrow_type(&c.hive_type)?, true)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            metastore,
+            store_url,
+            schema_name: schema.to_owned(),
+            table: table.to_owned(),
+            schema: Arc::new(Schema::new(fields)),
+        })
+    }
+
+    /// The same table as the metastore describes it now (its columns may
+    /// have changed since this handle was made).
+    pub(crate) async fn reload(&self) -> Result<Self> {
+        let metadata = self
+            .metastore
+            .table(&self.schema_name, &self.table)
+            .await
+            .map_err(external)?
+            .filter(|metadata| !metadata.is_view())
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "table {}.{} does not exist anymore",
+                    self.schema_name, self.table
+                ))
+            })?;
+        Self::from_metadata(
+            self.metastore.clone(),
+            self.store_url.clone(),
+            &self.schema_name,
+            &self.table,
+            &metadata,
+        )
+    }
+
+    pub(crate) fn dir(&self) -> Path {
         self.metastore.table_dir(&self.schema_name, &self.table)
     }
 
+    /// Data files as seen between two commits: an `OPTIMIZE` in this process
+    /// or in another one on the same local warehouse never swaps files while
+    /// the list is being taken.
+    async fn committed_data_files(&self) -> Result<Vec<ObjectMeta>> {
+        let locks = self.metastore.table_locks(&self.schema_name, &self.table);
+        let _between_commits = locks.commit.read().await;
+        // A warehouse this process cannot lock (read-only) has no swap of
+        // this process to wait for; other writers are then not excluded.
+        let _other_processes = match self
+            .metastore
+            .table_file_lock(&self.schema_name, &self.table, false)
+            .await
+        {
+            Ok(lock) => Some(lock),
+            Err(err) => {
+                tracing::debug!(table = %self.table, error = %err, "listing without the cross-process lock");
+                None
+            }
+        };
+        let (files, pending) = self.listing().await?;
+        if pending {
+            return Err(DataFusionError::Plan(format!(
+                "table {}.{} has an unfinished OPTIMIZE ({MARKER} in its directory): the next OPTIMIZE \
+                 of the table or opening the catalog again finishes it; if that fails, inspect the directory",
+                self.schema_name, self.table
+            )));
+        }
+        Ok(files)
+    }
+
+    /// A Parquet scan of `groups` in the table's schema: columns match by name
+    /// ignoring case, a column a file lacks (added later) reads as NULL, one
+    /// stored with a type the table's cannot hold is an error (`columns.rs`),
+    /// and `INT96` timestamps read at Trino's default precision, milliseconds.
+    pub(crate) fn scan_files(
+        &self,
+        runtime: &RuntimeEnv,
+        groups: Vec<Vec<PartitionedFile>>,
+        projection: Option<&Vec<usize>>,
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.scan_files_as(runtime, Arc::clone(&self.schema), "ms", groups, projection, limit)
+    }
+
+    /// [`HiveTable::scan_files`] into `schema` (the table's columns, possibly
+    /// at another timestamp precision), reading `INT96` timestamps in `int96`
+    /// units (`"ms"`, `"us"`).
+    pub(crate) fn scan_files_as(
+        &self,
+        runtime: &RuntimeEnv,
+        schema: SchemaRef,
+        int96: &str,
+        groups: Vec<Vec<PartitionedFile>>,
+        projection: Option<&Vec<usize>>,
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if runtime.object_store(&self.store_url).is_err() {
+            runtime.register_object_store(self.store_url.as_ref(), Arc::clone(self.metastore.store()));
+        }
+        let mut options = TableParquetOptions::default();
+        options.global.coerce_int96 = Some(int96.into());
+        let source = ParquetSource::new(schema).with_table_parquet_options(options);
+        let columns = HiveColumns {
+            table: format!("{}.{}", self.schema_name, self.table),
+        };
+        let config = FileScanConfigBuilder::new(self.store_url.clone(), Arc::new(source))
+            .with_file_groups(groups.into_iter().map(FileGroup::new).collect())
+            .with_projection_indices(projection.cloned())?
+            .with_limit(limit)
+            .with_expr_adapter(Some(Arc::new(columns)))
+            .build();
+        Ok(DataSourceExec::from_data_source(config))
+    }
+
     pub(crate) async fn data_files(&self) -> Result<Vec<ObjectMeta>> {
+        Ok(self.listing().await?.0)
+    }
+
+    /// Data files sorted by name, and whether an `OPTIMIZE` marker is present.
+    async fn listing(&self) -> Result<(Vec<ObjectMeta>, bool)> {
         let dir = self.dir();
-        let mut files: Vec<ObjectMeta> = self
+        let marker = dir.clone().join(MARKER);
+        let all: Vec<ObjectMeta> = self
             .metastore
             .store()
             .list(Some(&dir))
-            .try_filter(|meta| std::future::ready(is_data_file(&dir, meta)))
             .try_collect()
             .await
             .map_err(external)?;
+        let pending = all.iter().any(|meta| meta.location == marker);
+        let mut files: Vec<ObjectMeta> = all.into_iter().filter(|meta| is_data_file(&dir, meta)).collect();
         files.sort_by(|a, b| a.location.cmp(&b.location));
-        Ok(files)
+        Ok((files, pending))
     }
 
     fn register_store(&self, state: &dyn Session) {
@@ -165,7 +328,6 @@ impl TableProvider for HiveTable {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.register_store(state);
         let span = tracing::info_span!(
             target: TARGET,
             "hive.scan",
@@ -178,7 +340,7 @@ impl TableProvider for HiveTable {
             codelake.hive.file_names = Empty,
         );
         let files = self
-            .data_files()
+            .committed_data_files()
             .instrument(span.clone())
             .await
             .inspect_err(|err| trace::record_error(&span, err))?;
@@ -189,16 +351,7 @@ impl TableProvider for HiveTable {
         for (index, meta) in files.into_iter().enumerate() {
             groups[index % group_count].push(PartitionedFile::new_from_meta(meta));
         }
-        let mut options = TableParquetOptions::default();
-        // Trino writes Hive timestamps as INT96; read them at its default precision.
-        options.global.coerce_int96 = Some("ms".into());
-        let source = ParquetSource::new(Arc::clone(&self.schema)).with_table_parquet_options(options);
-        let config = FileScanConfigBuilder::new(self.store_url.clone(), Arc::new(source))
-            .with_file_groups(groups.into_iter().map(FileGroup::new).collect())
-            .with_projection_indices(projection.cloned())?
-            .with_limit(limit)
-            .build();
-        Ok(DataSourceExec::from_data_source(config))
+        self.scan_files(state.runtime_env(), groups, projection, limit)
     }
 
     async fn insert_into(
@@ -251,23 +404,6 @@ impl DisplayAs for HiveSink {
 }
 
 impl HiveSink {
-    fn conform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let schema = &self.table.schema;
-        let columns = batch
-            .columns()
-            .iter()
-            .zip(schema.fields())
-            .map(|(column, field)| {
-                if column.data_type() == field.data_type() {
-                    Ok(Arc::clone(column))
-                } else {
-                    cast(column, field.data_type()).map_err(DataFusionError::from)
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
-    }
-
     /// Streams `data` into `temporary`; returns the number of rows written.
     async fn write_file(
         &self,
@@ -289,7 +425,7 @@ impl HiveSink {
             if batch.num_rows() == 0 {
                 continue;
             }
-            writer.write(&self.conform(&batch)?).await?;
+            writer.write(&conform(&self.table.schema, &batch)?).await?;
             rows += batch.num_rows() as u64;
             // The encoder buffers the open row group: account for it.
             reservation.try_resize(writer.memory_size())?;
@@ -439,5 +575,13 @@ mod tests {
             &meta("pilot/t1/.trinoPermissions/user_trino")
         ));
         assert!(!is_data_file(&dir, &meta("pilot/t2/file")));
+        let empty = ObjectMeta {
+            size: 0,
+            ..meta("pilot/t1/20260923_235834_00004_h47gc_74f5")
+        };
+        assert!(
+            !is_data_file(&dir, &empty),
+            "zero-byte files are skipped, as in Trino"
+        );
     }
 }

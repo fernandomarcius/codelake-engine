@@ -13,8 +13,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use crate::ByteSize;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PropertyType {
     Boolean,
@@ -82,7 +80,7 @@ impl SessionProperty {
             }
             PropertyType::Integer => value.parse::<i64>().is_ok(),
             PropertyType::Duration => parse_duration(value).is_some(),
-            PropertyType::DataSize => value.parse::<ByteSize>().is_ok(),
+            PropertyType::DataSize => parse_data_size(value).is_ok(),
             PropertyType::Varchar => true,
             PropertyType::Enum(allowed) => {
                 let upper = value.to_ascii_uppercase();
@@ -117,6 +115,61 @@ pub fn parse_duration(text: &str) -> Option<Duration> {
         _ => return None,
     };
     Duration::try_from_secs_f64(number * seconds).ok()
+}
+
+/// airlift `DataSize`, as Trino parses session and procedure sizes: a decimal
+/// number and a case-sensitive unit (`B kB MB GB TB PB`), powers of 1024.
+/// `"100MB"` is 104 857 600 bytes. Errors carry airlift's messages.
+pub fn parse_data_size(text: &str) -> Result<u64, String> {
+    if text.is_empty() {
+        return Err("size is empty".into());
+    }
+    let invalid = || format!("size is not a valid data size string: {text}");
+    let trimmed = text.trim();
+    let split = trimmed
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .ok_or_else(invalid)?;
+    let (number, unit) = trimmed.split_at(split);
+    let unit = unit.trim_start();
+    let well_formed = !number.is_empty()
+        && !number.starts_with('.')
+        && !number.ends_with('.')
+        && number.matches('.').count() <= 1
+        && !unit.is_empty()
+        && unit.chars().all(|c| c.is_ascii_alphabetic());
+    if !well_formed {
+        return Err(invalid());
+    }
+    let exponent = match unit {
+        "B" => 0,
+        "kB" => 1,
+        "MB" => 2,
+        "GB" => 3,
+        "TB" => 4,
+        "PB" => 5,
+        other => return Err(format!("Unknown unit: {other}")),
+    };
+    // airlift keeps whole numbers exact and rounds a fraction to the nearest
+    // byte, half up (`374.5B` is 375 bytes). Digits past the 19th cannot move
+    // the result by a byte and are ignored.
+    let too_large = || format!("size is too large to be represented in bytes: {text}");
+    let multiplier = 1_u128 << (10 * exponent);
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    let whole: u128 = whole.parse().map_err(|_| too_large())?;
+    let mut bytes = whole.checked_mul(multiplier).ok_or_else(too_large)?;
+    if !fraction.is_empty() {
+        let kept = &fraction[..fraction.len().min(19)];
+        let digits = u32::try_from(kept.len()).map_err(|_| invalid())?;
+        let scale = 10_u128.pow(digits);
+        let numerator: u128 = kept.parse().map_err(|_| invalid())?;
+        let scaled = numerator * multiplier;
+        let rounded = scaled / scale + u128::from(2 * (scaled % scale) >= scale);
+        bytes = bytes.checked_add(rounded).ok_or_else(too_large)?;
+    }
+    if bytes > u128::from(i64::MAX.unsigned_abs()) {
+        return Err(too_large());
+    }
+    u64::try_from(bytes).map_err(|_| too_large())
 }
 
 pub const QUERY_MAX_RUN_TIME: &str = "query_max_run_time";
@@ -315,6 +368,24 @@ impl PropertyRegistry {
         })
     }
 
+    /// Effective values of `catalog`'s properties in `session`: the value the
+    /// client set, or the declared default.
+    pub fn catalog_session(&self, catalog: &str, session: &SessionProperties) -> CatalogSession {
+        let values = self
+            .catalogs
+            .get(catalog)
+            .into_iter()
+            .flatten()
+            .map(|property| {
+                let value = session
+                    .get(&format!("{catalog}.{}", property.name))
+                    .unwrap_or(&property.default);
+                (property.name.clone(), value.to_owned())
+            })
+            .collect();
+        CatalogSession { values }
+    }
+
     /// `(name, default, type, description)` rows, for `SHOW SESSION`.
     pub fn describe(&self) -> Vec<(String, &SessionProperty)> {
         let mut rows: Vec<_> = self.system.iter().map(|p| (p.name.clone(), p)).collect();
@@ -349,6 +420,28 @@ impl SessionProperties {
             .iter()
             .filter_map(|name| self.get(name).and_then(parse_duration))
             .min()
+    }
+}
+
+/// One catalog's session properties as seen by its connector, without the
+/// `<catalog>.` prefix and with defaults applied.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CatalogSession {
+    values: BTreeMap<String, String>,
+}
+
+impl CatalogSession {
+    pub fn new(values: BTreeMap<String, String>) -> Self {
+        Self { values }
+    }
+
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.values.get(name).map(String::as_str)
+    }
+
+    /// True when a boolean property is set to `true`.
+    pub fn is_enabled(&self, name: &str) -> bool {
+        self.get(name) == Some("true")
     }
 }
 
@@ -425,6 +518,65 @@ mod tests {
         assert_eq!(parse_duration("10 s"), Some(Duration::from_secs(10)));
         assert_eq!(parse_duration("h"), None);
         assert_eq!(parse_duration("5 years"), None);
+    }
+
+    #[test]
+    fn data_sizes_follow_airlift() {
+        assert_eq!(parse_data_size("100MB"), Ok(100 << 20));
+        assert_eq!(parse_data_size("1GB"), Ok(1 << 30));
+        assert_eq!(parse_data_size("10kB"), Ok(10 << 10));
+        assert_eq!(parse_data_size("10 MB"), Ok(10 << 20));
+        assert_eq!(parse_data_size(" 10MB "), Ok(10 << 20));
+        assert_eq!(parse_data_size("1.5MB"), Ok(1_572_864));
+        // Fractions round to the nearest byte, half up (Trino 431).
+        assert_eq!(parse_data_size("0.5B"), Ok(1));
+        assert_eq!(parse_data_size("374.5B"), Ok(375));
+        assert_eq!(parse_data_size("374.4B"), Ok(374));
+        assert_eq!(parse_data_size("0.36572265625kB"), Ok(375));
+        assert_eq!(parse_data_size("0B"), Ok(0));
+        assert_eq!(parse_data_size("1PB"), Ok(1 << 50));
+        assert_eq!(parse_data_size("10mb"), Err("Unknown unit: mb".into()));
+        assert_eq!(parse_data_size("10KB"), Err("Unknown unit: KB".into()));
+        assert_eq!(parse_data_size("1EB"), Err("Unknown unit: EB".into()));
+        for bad in ["abc", "100", "-1MB", ".5MB", "1.MB", "1.2.3MB", "10 M B"] {
+            assert_eq!(
+                parse_data_size(bad),
+                Err(format!("size is not a valid data size string: {bad}")),
+                "{bad}"
+            );
+        }
+        assert_eq!(parse_data_size(""), Err("size is empty".into()));
+        assert_eq!(
+            parse_data_size("99999999999PB"),
+            Err("size is too large to be represented in bytes: 99999999999PB".into())
+        );
+        assert_eq!(parse_data_size("8191PB"), Ok(8191 << 50));
+        assert!(parse_data_size("8192PB").is_err());
+        assert_eq!(
+            parse_data_size("1.99999999999999999999999999999999999PB"),
+            Ok(2 << 50)
+        );
+        assert_eq!(parse_data_size("0.001kB"), Ok(1));
+    }
+
+    #[test]
+    fn catalog_session_applies_defaults() {
+        let registry = registry();
+        let empty = registry.catalog_session("hive", &SessionProperties::default());
+        assert_eq!(empty.get("compression_codec"), Some("SNAPPY"));
+        let set = registry
+            .session(BTreeMap::from([(
+                "hive.compression_codec".to_owned(),
+                "zstd".to_owned(),
+            )]))
+            .unwrap();
+        let session = registry.catalog_session("hive", &set);
+        assert_eq!(session.get("compression_codec"), Some("ZSTD"));
+        assert_eq!(session.get("nope"), None);
+        assert!(!session.is_enabled("compression_codec"));
+        assert_eq!(registry.catalog_session("other", &set), CatalogSession::default());
+        let flags = CatalogSession::new(BTreeMap::from([("on".to_owned(), "true".to_owned())]));
+        assert!(flags.is_enabled("on") && !flags.is_enabled("off"));
     }
 
     #[test]

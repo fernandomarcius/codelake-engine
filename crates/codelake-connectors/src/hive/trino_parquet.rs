@@ -22,7 +22,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit, TimestampMillisecondType};
+use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit, TimestampMicrosecondType};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::parquet::arrow::ArrowSchemaConverter;
 use datafusion::parquet::arrow::arrow_writer::{
@@ -45,7 +45,7 @@ pub(crate) const ROW_GROUP_ROWS: usize = 128 * 1024;
 /// Close the open row group once its buffers hold this many bytes.
 const FLUSH_BYTES: usize = 64 * 1024 * 1024;
 const JULIAN_DAY_OF_EPOCH: i64 = 2_440_588;
-const MILLIS_PER_DAY: i64 = 86_400_000;
+const MICROS_PER_DAY: i64 = 86_400_000_000;
 const INT96_BYTES: usize = 12;
 
 fn is_int96(data_type: &DataType) -> bool {
@@ -105,14 +105,16 @@ pub(crate) fn trino_parquet_schema(schema: &Schema) -> Result<SchemaDescriptor> 
     Ok(SchemaDescriptor::new(Arc::new(root)))
 }
 
-/// Wall-clock milliseconds since the epoch as `INT96`.
-fn int96_from_millis(millis: i64) -> Result<Int96> {
-    let day = u32::try_from(millis.div_euclid(MILLIS_PER_DAY) + JULIAN_DAY_OF_EPOCH).map_err(|_| {
+/// Wall-clock microseconds since the epoch as `INT96`. Microseconds keep
+/// every value Trino writes at `MILLISECONDS` or `MICROSECONDS` precision,
+/// over the whole `0001`–`9999` range.
+fn int96_from_micros(micros: i64) -> Result<Int96> {
+    let day = u32::try_from(micros.div_euclid(MICROS_PER_DAY) + JULIAN_DAY_OF_EPOCH).map_err(|_| {
         DataFusionError::Execution(format!(
-            "timestamp {millis} ms since 1970 is outside the range Parquet INT96 stores"
+            "timestamp {micros} µs since 1970 is outside the range Parquet INT96 stores"
         ))
     })?;
-    let nanos = u64::try_from(millis.rem_euclid(MILLIS_PER_DAY) * 1_000_000).unwrap_or_default();
+    let nanos = u64::try_from(micros.rem_euclid(MICROS_PER_DAY) * 1_000).unwrap_or_default();
     // Less than 2^47: both halves fit.
     let low = u32::try_from(nanos & 0xFFFF_FFFF).unwrap_or_default();
     let high = u32::try_from(nanos >> 32).unwrap_or_default();
@@ -133,6 +135,14 @@ enum Column {
 }
 
 impl Column {
+    /// Estimated encoded size of what the open row group holds.
+    fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::Arrow(writer) => writer.get_estimated_total_bytes(),
+            Self::Int96 { values, .. } => values.len() * INT96_BYTES,
+        }
+    }
+
     fn memory_size(&self) -> usize {
         match self {
             Self::Arrow(writer) => writer.memory_size(),
@@ -150,15 +160,15 @@ impl Column {
                 }
             }
             Self::Int96 { values, definition } => {
-                let millis_type = DataType::Timestamp(TimeUnit::Millisecond, None);
-                let array = if array.data_type() == &millis_type {
+                let micros_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+                let array = if array.data_type() == &micros_type {
                     Arc::clone(array)
                 } else {
-                    cast(array, &millis_type)?
+                    cast(array, &micros_type)?
                 };
-                let millis = array.as_primitive::<TimestampMillisecondType>();
-                for row in 0..millis.len() {
-                    let present = millis.is_valid(row);
+                let micros = array.as_primitive::<TimestampMicrosecondType>();
+                for row in 0..micros.len() {
+                    let present = micros.is_valid(row);
                     match definition {
                         Some(levels) => levels.push(i16::from(present)),
                         None if !present => {
@@ -170,7 +180,7 @@ impl Column {
                         None => {}
                     }
                     if present {
-                        values.push(int96_from_millis(millis.value(row))?);
+                        values.push(int96_from_micros(micros.value(row))?);
                     }
                 }
             }
@@ -189,6 +199,8 @@ pub(crate) struct TrinoParquetWriter<W: AsyncFileWriter> {
     open: Option<Vec<Column>>,
     open_rows: usize,
     row_group_rows: usize,
+    /// Bytes handed to `output` so far.
+    written: usize,
 }
 
 impl<W: AsyncFileWriter> TrinoParquetWriter<W> {
@@ -226,7 +238,21 @@ impl<W: AsyncFileWriter> TrinoParquetWriter<W> {
             open: None,
             open_rows: 0,
             row_group_rows: row_group_rows.max(1),
+            written: 0,
         })
+    }
+
+    /// Bytes of closed row groups already handed to the output.
+    pub(crate) fn bytes_written(&self) -> usize {
+        self.written
+    }
+
+    /// Estimated encoded size of the open row group (not its buffers, which
+    /// can be much larger).
+    pub(crate) fn in_progress_size(&self) -> usize {
+        self.open
+            .as_ref()
+            .map_or(0, |columns| columns.iter().map(Column::estimated_bytes).sum())
     }
 
     /// Bytes buffered for the open row group.
@@ -310,18 +336,20 @@ impl<W: AsyncFileWriter> TrinoParquetWriter<W> {
         self.file.flush()?;
         let bytes = std::mem::take(self.file.inner_mut());
         if !bytes.is_empty() {
+            self.written += bytes.len();
             self.output.write(Bytes::from(bytes)).await?;
         }
         Ok(())
     }
 
-    /// Writes the footer and completes the output.
-    pub(crate) async fn close(mut self) -> Result<()> {
+    /// Writes the footer and completes the output; returns the number of
+    /// rows the footer records.
+    pub(crate) async fn close(mut self) -> Result<i64> {
         self.flush().await?;
-        self.file.finish()?;
+        let metadata = self.file.finish()?;
         self.drain().await?;
         self.output.complete().await?;
-        Ok(())
+        Ok(metadata.file_metadata().num_rows())
     }
 }
 
@@ -469,18 +497,19 @@ mod tests {
 
     #[test]
     fn int96_encoding() {
-        for millis in [
+        for micros in [
             0,
             1,
             -1,
-            1_767_261_600_123,
-            -2_203_891_200_000,
-            MILLIS_PER_DAY - 1,
+            1_767_261_600_123_999,
+            -2_203_891_200_000_000,
+            -46_388_476_799_999_999,
+            MICROS_PER_DAY - 1,
         ] {
-            assert_eq!(int96_from_millis(millis).unwrap().to_millis(), millis, "{millis}");
+            assert_eq!(int96_from_micros(micros).unwrap().to_micros(), micros, "{micros}");
         }
-        assert_eq!(int96_from_millis(0).unwrap().data(), &[0, 0, 2_440_588]);
-        assert!(int96_from_millis(i64::MIN).is_err());
+        assert_eq!(int96_from_micros(0).unwrap().data(), &[0, 0, 2_440_588]);
+        assert!(int96_from_micros(i64::MIN).is_err());
     }
 
     #[test]

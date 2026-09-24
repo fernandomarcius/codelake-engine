@@ -10,9 +10,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::catalog::CatalogProvider;
-use datafusion::error::Result as DfResult;
+use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::SendableRecordBatchStream;
+
+use crate::session_properties::CatalogSession;
+use crate::table_procedure::{ProcedureCall, TableProcedure, not_registered};
 
 /// Boxed error from a driver, kept opaque so connectors can wrap any client library.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -112,4 +115,36 @@ pub trait WritableCatalog: Send + Sync + Debug {
 
     async fn add_column(&self, schema: &str, table: &str, column: &str, data_type: &DataType)
     -> DfResult<()>;
+
+    /// Procedures this catalog runs with `ALTER TABLE … EXECUTE` (Trino's table
+    /// procedures, e.g. `OPTIMIZE`).
+    fn table_procedures(&self) -> Vec<TableProcedure> {
+        Vec::new()
+    }
+
+    /// Checks, before the statement's `WHERE` clause is looked at, that `call`
+    /// may run with `session` (Trino validates a procedure's session
+    /// properties when it resolves the table handle, before planning the
+    /// filter). The default accepts every call.
+    fn check_table_procedure(&self, call: &ProcedureCall, session: &CatalogSession) -> DfResult<()> {
+        let _ = (call, session);
+        Ok(())
+    }
+
+    /// Runs a procedure from [`WritableCatalog::table_procedures`] on an existing
+    /// table. The engine has already checked that the table exists and is not a
+    /// view, and bound `call`'s arguments (defaults applied). `session` holds
+    /// this catalog's session properties; `context` gives access to the memory
+    /// pool, which procedures that move data must reserve from.
+    async fn execute_table_procedure(
+        &self,
+        schema: &str,
+        table: &str,
+        call: &ProcedureCall,
+        session: &CatalogSession,
+        context: Arc<TaskContext>,
+    ) -> DfResult<()> {
+        let _ = (schema, table, session, context);
+        Err(DataFusionError::Plan(not_registered(&call.procedure)))
+    }
 }
