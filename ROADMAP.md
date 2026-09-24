@@ -80,9 +80,23 @@ Blocking items, in order:
 ## M3 — Lakehouse (Iceberg) and dbt merge
 
 - Iceberg write path: CTAS, append, **overwrite/row-delta (MERGE)** — upstream
-  contribution to `iceberg-rust` or a maintained fork.
+  contribution to [`apache/datafusion-iceberg`](https://github.com/apache/datafusion-iceberg),
+  which takes over the DataFusion integration that `iceberg-rust` removed from
+  `main` (0.11.x is its last release with `iceberg-datafusion`), or a maintained fork.
 - Ship the Iceberg connector: blocked on an `iceberg-rust` release with
-  `opendal ≥ 0.59` (clears RUSTSEC-2026-0194/0195 from `quick-xml`).
+  `opendal ≥ 0.58.1` (quick-xml ^0.41, clears RUSTSEC-2026-0194/0195). No such
+  release is published yet: 0.11.0 (DataFusion 54, opendal 0.58) is still at RC.
+- Dependency train (F11 survey, 2026-09-24): stay on DataFusion 53. Move to
+  DataFusion 54 in one train PR once `iceberg` 0.11.0 final is on crates.io, with
+  `datafusion-federation = "=0.5.5"`, the per-connector
+  `datafusion-table-providers` 0.13.1 crates and `datafusion-postgres` 0.18.0,
+  then the full `semantics` suite (string/number coercion, codepoint
+  `lpad`/`rpad`/`translate`, `approx_percentile` change in DataFusion 54).
+  Skip DataFusion 55 (no `datafusion-table-providers` or `datafusion-postgres`
+  for it).
+- `hive-s3` (S3/MinIO warehouses) waits for DataFusion 56: DataFusion 53–55 need
+  `object_store` ^0.13 (quick-xml ^0.39); DataFusion 56 moves to
+  `object_store` 0.14.2 (quick-xml ^0.41).
 - Persistent views in the catalog; `information_schema` completeness for dbt.
 - dbt incremental `merge` and `delete+insert` strategies.
 
@@ -94,7 +108,9 @@ A single node with 32–64 cores and NVMe spill handles hundreds of GB per query
 TB-scale joins need scale-out.
 
 - Evaluate Ballista vs `datafusion-distributed` (Arrow Flight shuffle) with TPC-H
-  SF100/SF1000; ADR with the numbers.
+  SF100/SF1000; ADR with the numbers. ADR 0011 (Proposed) makes
+  `datafusion-distributed` the candidate and Ballista the fallback, and sets the
+  benchmark plan and decision gates; nothing merges before the benchmark runs.
 - Coordinator/worker split; the core is already stateless per node.
 - Memory ceiling per worker plus a cluster-wide admission budget.
 
