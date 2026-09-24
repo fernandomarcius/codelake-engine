@@ -495,3 +495,5 @@ async fn info_reports_protocol_version() {
     assert_eq!(reply.body["nodeVersion"]["version"], "431");
     assert_eq!(reply.body["coordinator"], true);
 }
+
+mod redteam;
