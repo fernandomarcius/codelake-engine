@@ -83,7 +83,7 @@ async fn information_schema_lists_remote_tables() {
 
     let tables = common::query(
         &engine,
-        "SELECT table_name FROM information_schema.tables \
+        "SELECT table_name FROM erp.information_schema.tables \
          WHERE table_catalog = 'erp' AND table_schema = 'public' ORDER BY table_name",
     )
     .await;
