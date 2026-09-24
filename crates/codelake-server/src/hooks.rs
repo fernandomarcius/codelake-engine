@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use codelake_core::statement_policy;
 use codelake_core::trace::{self, TARGET, TraceParent};
 use datafusion::common::ParamValues;
 use datafusion::logical_expr::LogicalPlan;
@@ -17,7 +18,7 @@ use datafusion_postgres::hooks::transactions::TransactionStatementHook;
 use datafusion_postgres::hooks::{HookClient, QueryHook};
 use datafusion_postgres::pgwire::api::results::Response;
 use datafusion_postgres::pgwire::api::{ClientInfo, METADATA_USER};
-use datafusion_postgres::pgwire::error::PgWireResult;
+use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 pub(crate) const STATEMENTS_TOTAL: &str = "codelake_statements_total";
 
@@ -56,6 +57,68 @@ impl QueryHook for MetricsHook {
     ) -> Option<PgWireResult<Response>> {
         metrics::counter!(STATEMENTS_TOTAL, "protocol" => "extended").increment(1);
         None
+    }
+}
+
+/// Refuses, before any other hook or `DataFusion` sees them, the statements
+/// no client may run (`COPY`, `CREATE EXTERNAL TABLE`, runtime settings,
+/// `""`): the engine's statement policy
+/// ([`codelake_core::statement_policy`]), applied to the PostgreSQL wire
+/// protocol, which runs statements on the session directly.
+#[derive(Debug)]
+pub(crate) struct PolicyHook;
+
+fn refusal(err: &datafusion::error::DataFusionError) -> PgWireError {
+    let (code, message) = match err {
+        datafusion::error::DataFusionError::SQL(..) => ("42601", err.to_string()),
+        datafusion::error::DataFusionError::NotImplemented(message) => ("0A000", message.clone()),
+        other => ("42000", other.to_string()),
+    };
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        code.to_owned(),
+        message,
+    )))
+}
+
+fn check(statement: &Statement) -> PgWireResult<()> {
+    statement_policy::check_sql(&statement.to_string(), &PostgreSqlDialect {}).map_err(|err| refusal(&err))
+}
+
+#[async_trait]
+impl QueryHook for PolicyHook {
+    async fn handle_simple_query(
+        &self,
+        statement: &Statement,
+        _session_context: &SessionContext,
+        _client: &mut dyn HookClient,
+    ) -> Option<PgWireResult<Response>> {
+        check(statement).err().map(Err)
+    }
+
+    async fn handle_extended_parse_query(
+        &self,
+        statement: &Statement,
+        _session_context: &SessionContext,
+        _client: &(dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<LogicalPlan>> {
+        check(statement).err().map(Err)
+    }
+
+    async fn handle_extended_query(
+        &self,
+        statement: &Statement,
+        logical_plan: &LogicalPlan,
+        _params: &ParamValues,
+        _session_context: &SessionContext,
+        _client: &mut dyn HookClient,
+    ) -> Option<PgWireResult<Response>> {
+        if let Err(err) = check(statement) {
+            return Some(Err(err));
+        }
+        statement_policy::check_plan(logical_plan)
+            .err()
+            .map(|err| Err(refusal(&err)))
     }
 }
 
@@ -173,6 +236,25 @@ pub(crate) fn all(session_sampling: Option<f64>) -> Vec<Arc<dyn QueryHook>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::sql::sqlparser::parser::Parser;
+
+    fn statement(sql: &str) -> Statement {
+        Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap().remove(0)
+    }
+
+    #[test]
+    fn the_wire_protocol_refuses_statements_that_reach_server_files() {
+        for sql in [
+            "COPY (SELECT 1) TO '/tmp/x.csv'",
+            "SET datafusion.runtime.temp_directory = '/etc'",
+            "SELECT 1 AS \"\"",
+        ] {
+            assert!(check(&statement(sql)).is_err(), "{sql}");
+        }
+        for sql in ["SELECT 1", "SET datafusion.execution.batch_size = 10", "BEGIN"] {
+            assert!(check(&statement(sql)).is_ok(), "{sql}");
+        }
+    }
 
     #[test]
     fn tracing_hook_only_when_exporting() {

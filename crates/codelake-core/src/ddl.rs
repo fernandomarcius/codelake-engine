@@ -17,8 +17,8 @@ use datafusion::logical_expr::{DdlStatement, LogicalPlan};
 use datafusion::sql::TableReference;
 use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
-    AlterTableOperation, CreateTableOptions, Expr as SqlExpr, ObjectName, ObjectNamePart, SqlOption,
-    Statement, Value,
+    AlterTableOperation, ColumnDef, ColumnOption, CreateTableOptions, Expr as SqlExpr, ObjectName,
+    ObjectNamePart, ShowStatementFilter, ShowStatementFilterPosition, SqlOption, Statement, Value,
 };
 use datafusion::sql::sqlparser::dialect::Dialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
@@ -37,6 +37,60 @@ pub(crate) enum Prepared {
     },
     /// The view's query text, needed to persist the view.
     ViewSql(String),
+}
+
+/// A column as the DDL statement declared it: what a writable catalog may
+/// have to store or refuse, and Arrow types do not keep.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DeclaredColumn {
+    pub(crate) name: String,
+    /// The type as written (`VARCHAR(3)`, `TIMESTAMP(6)`).
+    pub(crate) sql_type: String,
+    pub(crate) comment: Option<String>,
+    pub(crate) not_null: bool,
+    /// Any other column option (`DEFAULT …`, `PRIMARY KEY`, …), as written.
+    pub(crate) other: Option<String>,
+}
+
+fn declared(column: &ColumnDef) -> DeclaredColumn {
+    let mut declared = DeclaredColumn {
+        name: column.name.value.clone(),
+        sql_type: column.data_type.to_string(),
+        ..DeclaredColumn::default()
+    };
+    for option in &column.options {
+        match &option.option {
+            ColumnOption::Null => {}
+            ColumnOption::NotNull => declared.not_null = true,
+            ColumnOption::Comment(comment) => declared.comment = Some(comment.clone()),
+            other => {
+                declared.other.get_or_insert_with(|| other.to_string());
+            }
+        }
+    }
+    declared
+}
+
+/// Columns declared by `CREATE TABLE t (…)` (in order) or by
+/// `ALTER TABLE … ADD COLUMN`; empty for any other statement, and for CTAS.
+pub(crate) fn declared_columns(statement: &DFStatement) -> Vec<DeclaredColumn> {
+    let DFStatement::Statement(inner) = statement else {
+        return Vec::new();
+    };
+    match inner.as_ref() {
+        Statement::CreateTable(create) if create.query.is_none() => {
+            create.columns.iter().map(declared).collect()
+        }
+        Statement::AlterTable(alter) => alter
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                AlterTableOperation::AddColumn { column_def, .. } => Some(declared(column_def)),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// `ALTER TABLE <table> EXECUTE <procedure>(<arguments>) [WHERE <filter>]`.
@@ -192,6 +246,65 @@ pub(crate) fn prepare(statement: &mut DFStatement) -> Result<Option<Prepared>> {
     }
 }
 
+/// Trino's `SHOW TABLES FROM|IN [catalog.]schema [LIKE pattern]`, which the
+/// SQL planner does not plan ("SHOW TABLES IN not supported"), as the query
+/// on the catalog's `information_schema` it means, with Trino's column name
+/// (`Table`). Any other statement is left as it is.
+pub(crate) fn rewrite_show_tables(statement: &mut DFStatement) -> Result<()> {
+    let DFStatement::Statement(inner) = statement else {
+        return Ok(());
+    };
+    let Statement::ShowTables {
+        terse: false,
+        history: false,
+        extended: false,
+        full: false,
+        external: false,
+        show_options,
+    } = inner.as_ref()
+    else {
+        return Ok(());
+    };
+    let Some(parent) = show_options
+        .show_in
+        .as_ref()
+        .and_then(|show_in| show_in.parent_name.as_ref())
+    else {
+        return Ok(());
+    };
+    let parts = parent.0.iter().map(ident_value).collect::<Result<Vec<_>>>()?;
+    let quoted = |text: &str| format!("'{}'", text.replace('\'', "''"));
+    let (listing, schema) = match parts.as_slice() {
+        [schema] => ("information_schema.tables".to_owned(), schema),
+        [catalog, schema] => (
+            format!("\"{}\".information_schema.tables", catalog.replace('"', "\"\"")),
+            schema,
+        ),
+        _ => return Err(DataFusionError::Plan(format!("invalid schema name {parent}"))),
+    };
+    let like = match &show_options.filter_position {
+        None => String::new(),
+        Some(
+            ShowStatementFilterPosition::Infix(ShowStatementFilter::Like(pattern))
+            | ShowStatementFilterPosition::Suffix(ShowStatementFilter::Like(pattern)),
+        ) => format!(" AND table_name LIKE {}", quoted(pattern)),
+        Some(_) => {
+            return Err(DataFusionError::NotImplemented(
+                "SHOW TABLES accepts only a LIKE filter".into(),
+            ));
+        }
+    };
+    let sql = format!(
+        "SELECT table_name AS \"Table\" FROM {listing} WHERE table_schema = {}{like} ORDER BY table_name",
+        quoted(schema)
+    );
+    let mut parsed = datafusion::sql::parser::DFParser::parse_sql(&sql)?;
+    if let Some(query) = parsed.pop_front() {
+        *statement = query;
+    }
+    Ok(())
+}
+
 /// DDL plans a writable catalog may take over.
 pub(crate) fn is_routable(plan: &LogicalPlan) -> bool {
     matches!(
@@ -246,6 +359,39 @@ mod tests {
         );
         let mut other = parsed("ALTER TABLE t DROP COLUMN x");
         assert!(prepare(&mut other).is_err());
+    }
+
+    #[test]
+    fn declared_columns_keep_types_comments_and_options() {
+        let create = parsed("CREATE TABLE t (a VARCHAR(3) COMMENT 'x', b TIMESTAMP(6) NOT NULL, c INT NULL)");
+        let columns = declared_columns(&create);
+        assert_eq!(columns.len(), 3);
+        assert_eq!(
+            (columns[0].sql_type.as_str(), columns[0].comment.as_deref()),
+            ("VARCHAR(3)", Some("x"))
+        );
+        assert!(columns[1].not_null && columns[1].sql_type == "TIMESTAMP(6)");
+        assert!(!columns[2].not_null && columns[2].other.is_none());
+        let add = parsed("ALTER TABLE t ADD COLUMN n INT DEFAULT 1");
+        assert_eq!(declared_columns(&add)[0].other.as_deref(), Some("DEFAULT 1"));
+        assert!(declared_columns(&parsed("CREATE TABLE t AS SELECT 1 AS a")).is_empty());
+    }
+
+    #[test]
+    fn show_tables_from_a_schema_lists_its_information_schema() {
+        let mut statement = parsed("SHOW TABLES FROM hive.S");
+        rewrite_show_tables(&mut statement).unwrap();
+        assert_eq!(
+            statement.to_string(),
+            "SELECT table_name AS \"Table\" FROM \"hive\".information_schema.tables WHERE table_schema = 's' \
+             ORDER BY table_name"
+        );
+        let mut like = parsed("SHOW TABLES IN raw LIKE 'o''k%'");
+        rewrite_show_tables(&mut like).unwrap();
+        assert!(like.to_string().contains("table_name LIKE 'o''k%'"), "{like}");
+        let mut plain = parsed("SHOW TABLES");
+        rewrite_show_tables(&mut plain).unwrap();
+        assert_eq!(plain.to_string(), "SHOW TABLES");
     }
 
     #[test]

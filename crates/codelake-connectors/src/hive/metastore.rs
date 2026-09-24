@@ -10,6 +10,21 @@
 //!
 //! Unknown JSON fields are preserved on rewrite (`extra`), so metadata written
 //! by a newer Trino survives a round trip through `CodeLake`.
+//!
+//! Checksums: when a metadata file has its Hadoop `.crc`, reads verify it, as
+//! Trino does ("Checksum error"): a file changed or cut short is an error,
+//! never columns read as NULL.
+//!
+//! Writers: every change of one table's metadata, and every commit of new
+//! files, runs under the table's metadata lock ([`FileMetastore::lock_metadata`]:
+//! a `tokio` mutex in this process, an advisory `flock` across processes on a
+//! local warehouse). New tables and new data files are written under
+//! `.codelake/staging/<id>/` at the warehouse root (hidden from Trino, the
+//! sink and scans) and published by a rename under that lock, after checking
+//! that the target is still what the statement expects. So two `CREATE
+//! TABLE` of one name never mix rows, an `ALTER TABLE ADD COLUMN` is never
+//! lost to a concurrent writer, and a statement that fails leaves nothing
+//! visible and removes only what it wrote.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -21,6 +36,9 @@ use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use serde::{Deserialize, Serialize};
 
+use codelake_core::config::HiveTimestampPrecision;
+use codelake_core::statement_policy::is_valid_object_name;
+
 use super::crc::{crc_name, hadoop_crc};
 
 pub(crate) const MANAGED_TABLE: &str = "MANAGED_TABLE";
@@ -28,8 +46,15 @@ pub(crate) const VIRTUAL_VIEW: &str = "VIRTUAL_VIEW";
 /// Data lives at `externalLocation`, owned by someone else: dropping the table
 /// removes only its metadata.
 const EXTERNAL_TABLE: &str = "EXTERNAL_TABLE";
-const METADATA_FILE: &str = ".trinoSchema";
+pub(crate) const METADATA_FILE: &str = ".trinoSchema";
 const PERMISSIONS_DIR: &str = ".trinoPermissions";
+/// Directory of `CodeLake`'s own files at the warehouse root: locks, staging
+/// of new tables and files, journals of table replacements. Trino lists
+/// schemas by their `.<schema>.trinoSchema` files and ignores it.
+const CODELAKE_DIR: &str = ".codelake";
+/// How many times a read retries a metadata file whose checksum does not
+/// match: a writer replaces the checksum first and the file right after.
+const CHECKSUM_RETRIES: u32 = 10;
 /// Trino's file metastore refuses metadata whose `writerVersion` is not its own
 /// version ("File metastore provides no compatibility for metadata written with
 /// a different version"). `CodeLake` shares the warehouse with Trino 431, so new
@@ -203,6 +228,10 @@ pub(crate) enum MetastoreError {
     NotFound(String),
     #[error("local warehouse: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Checksum error: {0} does not match its checksum file")]
+    Checksum(String),
+    #[error("{0}")]
+    Conflict(String),
 }
 
 /// In-process coordination of one table's maintenance (ADR 0009).
@@ -213,6 +242,34 @@ pub(crate) struct TableLocks {
     /// Held exclusively while `OPTIMIZE` swaps files; scans hold it shared
     /// while listing, so they never list old and new files together.
     pub(crate) commit: tokio::sync::RwLock<()>,
+    /// Held while the table's metadata changes or new files are published
+    /// (see the module documentation). Always taken last.
+    metadata: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Held metadata lock of one table (in-process and cross-process).
+#[derive(Debug)]
+pub(crate) struct MetadataLock {
+    _local: tokio::sync::OwnedMutexGuard<()>,
+    _file: FileLock,
+}
+
+/// A statement's private directory under `.codelake/staging/`.
+#[derive(Debug, Clone)]
+pub(crate) struct Staging {
+    pub(crate) dir: Path,
+}
+
+/// A table replacement in progress, recorded before the old table moves so
+/// a crash in the middle is undone when the catalog is opened again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Replacement {
+    schema: String,
+    table: String,
+    /// Local directory of the new table while it is being written.
+    staging: PathBuf,
+    /// Where the old table waits until the new one is in place.
+    previous: PathBuf,
 }
 
 /// Held cross-process lock on one table's data files (ADR 0009); released
@@ -235,6 +292,8 @@ pub(crate) struct FileMetastore {
     /// stores have no directories, but Trino on a local warehouse does: it
     /// refuses to create a table whose directory exists, even empty.
     local_dir: Option<PathBuf>,
+    /// The catalog's `hive.timestamp-precision`.
+    precision: HiveTimestampPrecision,
 }
 
 /// Removes a local directory tree; absent is fine. Retries briefly because an
@@ -258,6 +317,31 @@ async fn remove_local_dir(path: PathBuf) -> std::io::Result<()> {
     .map_err(std::io::Error::other)?
 }
 
+/// Directory of `path` (every part but the last).
+fn parent(path: &Path) -> Path {
+    Path::from_iter(path.parts().take(path.parts().count().saturating_sub(1)))
+}
+
+/// Names of the direct subdirectories of `dir` that hold a `.trinoSchema`,
+/// read from the local file system.
+fn local_tables(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let mut tables = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name.starts_with('.') || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if entry.path().join(METADATA_FILE).is_file() {
+            tables.push(name);
+        }
+    }
+    tables.sort();
+    Ok(tables)
+}
+
 impl FileMetastore {
     pub(crate) fn new(store: Arc<dyn ObjectStore>, root: Path) -> Self {
         Self {
@@ -265,7 +349,18 @@ impl FileMetastore {
             root,
             locks: Arc::default(),
             local_dir: None,
+            precision: HiveTimestampPrecision::default(),
         }
+    }
+
+    /// Sets the catalog's timestamp precision.
+    pub(crate) fn with_timestamp_precision(mut self, precision: HiveTimestampPrecision) -> Self {
+        self.precision = precision;
+        self
+    }
+
+    pub(crate) fn timestamp_precision(&self) -> HiveTimestampPrecision {
+        self.precision
     }
 
     pub(crate) fn table_locks(&self, schema: &str, table: &str) -> Arc<TableLocks> {
@@ -286,14 +381,33 @@ impl FileMetastore {
         table: &str,
         exclusive: bool,
     ) -> MetastoreResult<FileLock> {
+        self.lock_file(schema, &format!("{table}.lock"), exclusive).await
+    }
+
+    /// The table's metadata lock (see the module documentation). Taken after
+    /// any other lock of the table, never before.
+    pub(crate) async fn lock_metadata(&self, schema: &str, table: &str) -> MetastoreResult<MetadataLock> {
+        let mutex = Arc::clone(&self.table_locks(schema, table).metadata);
+        let local = mutex.lock_owned().await;
+        let file = self
+            .lock_file(schema, &format!("{table}.metadata.lock"), true)
+            .await?;
+        Ok(MetadataLock {
+            _local: local,
+            _file: file,
+        })
+    }
+
+    async fn lock_file(&self, schema: &str, file_name: &str, exclusive: bool) -> MetastoreResult<FileLock> {
         let Some(dir) = &self.local_dir else {
             return Ok(FileLock { _file: None });
         };
-        let path = dir
-            .join(".codelake")
-            .join("locks")
-            .join(schema)
-            .join(format!("{table}.lock"));
+        if !is_valid_object_name(schema) || !is_valid_object_name(file_name) {
+            return Err(MetastoreError::Conflict(format!(
+                "invalid name {schema}.{file_name}"
+            )));
+        }
+        let path = dir.join(CODELAKE_DIR).join("locks").join(schema).join(file_name);
         let file = tokio::task::spawn_blocking(move || {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -319,6 +433,11 @@ impl FileMetastore {
                 Err(std::fs::TryLockError::Error(err)) => return Err(err.into()),
             }
         }
+    }
+
+    /// Whether the warehouse is a local file system.
+    pub(crate) fn is_local(&self) -> bool {
+        self.local_dir.is_some()
     }
 
     /// Declares that `root` is the local directory `dir`.
@@ -350,27 +469,56 @@ impl FileMetastore {
         self.table_dir(schema, table).join(METADATA_FILE)
     }
 
-    async fn read_json<T: for<'de> Deserialize<'de>>(&self, path: &Path) -> MetastoreResult<Option<T>> {
+    async fn read_bytes(&self, path: &Path) -> MetastoreResult<Option<bytes::Bytes>> {
         match self.store.get(path).await {
-            Ok(result) => {
-                let bytes = result.bytes().await?;
-                serde_json::from_slice(&bytes)
-                    .map(Some)
-                    .map_err(|source| MetastoreError::Json {
-                        path: path.to_string(),
-                        source,
-                    })
-            }
+            Ok(result) => Ok(Some(result.bytes().await?)),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// Reads a metadata file and checks it against its `.crc`, when it has
+    /// one. A mismatch is read again a few times (a writer puts the checksum
+    /// first, the file right after), then is an error.
+    async fn read_verified(&self, path: &Path) -> MetastoreResult<Option<bytes::Bytes>> {
+        let name = path.filename().unwrap_or_default().to_owned();
+        let checksum = parent(path).join(crc_name(&name));
+        let mut attempt = 0;
+        loop {
+            let Some(bytes) = self.read_bytes(path).await? else {
+                return Ok(None);
+            };
+            match self.read_bytes(&checksum).await? {
+                None => return Ok(Some(bytes)),
+                Some(expected) if expected.as_ref() == hadoop_crc(&bytes).as_slice() => {
+                    return Ok(Some(bytes));
+                }
+                Some(_) if attempt < CHECKSUM_RETRIES => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Some(_) => return Err(MetastoreError::Checksum(path.to_string())),
+            }
+        }
+    }
+
+    async fn read_json<T: for<'de> Deserialize<'de>>(&self, path: &Path) -> MetastoreResult<Option<T>> {
+        let Some(bytes) = self.read_verified(path).await? else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|source| MetastoreError::Json {
+                path: path.to_string(),
+                source,
+            })
     }
 
     /// Writes `bytes` and its Hadoop checksum. The checksum goes first so a
     /// reader never sees new content with a stale checksum.
     async fn write_with_crc(&self, path: &Path, bytes: Vec<u8>) -> MetastoreResult<()> {
         let name = path.filename().unwrap_or_default().to_owned();
-        let parent = Path::from_iter(path.parts().take(path.parts().count().saturating_sub(1)));
+        let parent = parent(path);
         self.store
             .put(
                 &parent.join(crc_name(&name)),
@@ -433,6 +581,11 @@ impl FileMetastore {
     }
 
     pub(crate) async fn table(&self, schema: &str, table: &str) -> MetastoreResult<Option<TableMetadata>> {
+        // A name that is not its own directory names no table (an empty one
+        // would be the schema's directory).
+        if !is_valid_object_name(schema) || !is_valid_object_name(table) {
+            return Ok(None);
+        }
         self.read_json(&self.table_file(schema, table)).await
     }
 
@@ -471,6 +624,11 @@ impl FileMetastore {
         table: &str,
         owner: &str,
     ) -> MetastoreResult<()> {
+        self.write_owner_grants(&self.table_dir(schema, table), owner)
+            .await
+    }
+
+    async fn write_owner_grants(&self, dir: &Path, owner: &str) -> MetastoreResult<()> {
         let grants: Vec<TrinoGrant<'_>> = ["SELECT", "INSERT", "UPDATE", "DELETE"]
             .into_iter()
             .map(|permission| TrinoGrant {
@@ -482,15 +640,19 @@ impl FileMetastore {
                 },
             })
             .collect();
-        let path = self
-            .table_dir(schema, table)
-            .join(PERMISSIONS_DIR)
-            .join(format!("user_{owner}"));
+        let path = dir.clone().join(PERMISSIONS_DIR).join(format!("user_{owner}"));
         self.write_json(&path, &grants).await
     }
 
     /// Drops statistics after new data files were written, when any exist.
+    /// Takes the table's metadata lock.
     pub(crate) async fn invalidate_statistics(&self, schema: &str, table: &str) -> MetastoreResult<()> {
+        let _metadata = self.lock_metadata(schema, table).await?;
+        self.invalidate_statistics_locked(schema, table).await
+    }
+
+    /// [`FileMetastore::invalidate_statistics`] under a held metadata lock.
+    async fn invalidate_statistics_locked(&self, schema: &str, table: &str) -> MetastoreResult<()> {
         let Some(mut metadata) = self.table(schema, table).await? else {
             return Err(MetastoreError::NotFound(format!("table {schema}.{table}")));
         };
@@ -531,6 +693,310 @@ impl FileMetastore {
             remove_local_dir(path).await?;
         }
         Ok(())
+    }
+
+    /// Schemas listed from a local warehouse right now, without the object
+    /// store (synchronous: `DataFusion` lists names synchronously). `None`
+    /// on an object store.
+    pub(crate) fn local_schemas(&self) -> Option<Vec<String>> {
+        let dir = self.local_dir.as_ref()?;
+        let entries = std::fs::read_dir(dir).ok()?;
+        let mut schemas: Vec<String> = entries
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter_map(|file| {
+                file.strip_prefix('.')?
+                    .strip_suffix(METADATA_FILE)
+                    .map(str::to_owned)
+            })
+            .filter(|s| !s.is_empty() && !s.starts_with('.'))
+            .collect();
+        schemas.sort();
+        Some(schemas)
+    }
+
+    /// Tables and views of `schema` listed from a local warehouse right now
+    /// (see [`FileMetastore::local_schemas`]).
+    pub(crate) fn local_tables(&self, schema: &str) -> Option<Vec<String>> {
+        let dir = self.local_path(&self.root.clone().join(schema))?;
+        Some(local_tables(&dir).unwrap_or_default())
+    }
+
+    /// A new private directory for one statement's files.
+    pub(crate) fn staging(&self) -> Staging {
+        Staging {
+            dir: self
+                .root
+                .clone()
+                .join(CODELAKE_DIR)
+                .join("staging")
+                .join(uuid::Uuid::new_v4().simple().to_string()),
+        }
+    }
+
+    /// Removes a staging directory and everything in it; absent is fine.
+    pub(crate) async fn discard(&self, staging: &Staging) {
+        let removed = async {
+            self.delete_all(&staging.dir).await?;
+            if let Some(path) = self.local_path(&staging.dir) {
+                remove_local_dir(path).await?;
+            }
+            Ok::<_, MetastoreError>(())
+        }
+        .await;
+        if let Err(err) = removed {
+            tracing::warn!(staging = %staging.dir, error = %err, "could not remove a staging directory");
+        }
+    }
+
+    /// Writes a table's metadata and owner permissions into `staging`,
+    /// where [`FileMetastore::publish_table`] will find them.
+    pub(crate) async fn stage_table(
+        &self,
+        staging: &Staging,
+        metadata: &TableMetadata,
+        owner: &str,
+    ) -> MetastoreResult<()> {
+        self.write_json(&staging.dir.clone().join(METADATA_FILE), metadata)
+            .await?;
+        self.write_owner_grants(&staging.dir, owner).await
+    }
+
+    /// Makes the table staged in `staging` visible as `schema.table`, if no
+    /// table, view or directory took the name meanwhile. The caller holds the
+    /// table's metadata lock.
+    pub(crate) async fn publish_table(
+        &self,
+        staging: &Staging,
+        schema: &str,
+        table: &str,
+    ) -> MetastoreResult<()> {
+        if self.table(schema, table).await?.is_some() {
+            return Err(MetastoreError::AlreadyExists(format!("table {schema}.{table}")));
+        }
+        if self.table_location_exists(schema, table).await? {
+            return Err(MetastoreError::Conflict(format!(
+                "target directory for table {schema}.{table} already exists"
+            )));
+        }
+        let target = self.table_dir(schema, table);
+        if let (Some(from), Some(to)) = (self.local_path(&staging.dir), self.local_path(&target)) {
+            // One rename: the directory appears whole, metadata included.
+            tokio::task::spawn_blocking(move || {
+                if let Some(schema_dir) = to.parent() {
+                    std::fs::create_dir_all(schema_dir)?;
+                }
+                std::fs::rename(from, to)
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            return Ok(());
+        }
+        // Object store: files first, the metadata (the commit point) last.
+        let objects: Vec<_> = self.store.list(Some(&staging.dir)).try_collect().await?;
+        let mut metadata = Vec::new();
+        for object in objects {
+            let Some(relative) = object.location.prefix_match(&staging.dir) else {
+                continue;
+            };
+            let destination = relative.fold(target.clone(), Path::join);
+            if destination.filename() == Some(METADATA_FILE) {
+                metadata.push((object.location, destination));
+                continue;
+            }
+            self.store.rename(&object.location, &destination).await?;
+        }
+        for (from, to) in metadata {
+            self.store.rename(&from, &to).await?;
+        }
+        Ok(())
+    }
+
+    fn replacements_dir(&self) -> Option<PathBuf> {
+        Some(self.local_dir.as_ref()?.join(CODELAKE_DIR).join("replace"))
+    }
+
+    /// Puts the table staged in `staging` in place of `schema.table` (which
+    /// may not exist). Local warehouses only: the old directory is moved
+    /// aside, the new one renamed into place, then the old one removed. A
+    /// journal written first lets [`FileMetastore::recover_replacements`] put
+    /// the old table back if the process dies between the two renames. The
+    /// caller holds the table's commit and metadata locks.
+    pub(crate) async fn replace_table(
+        &self,
+        staging: &Staging,
+        schema: &str,
+        table: &str,
+    ) -> MetastoreResult<()> {
+        let target = self.table_dir(schema, table);
+        let (Some(from), Some(to), Some(journals)) = (
+            self.local_path(&staging.dir),
+            self.local_path(&target),
+            self.replacements_dir(),
+        ) else {
+            return Err(MetastoreError::Conflict(
+                "This connector does not support replacing tables".into(),
+            ));
+        };
+        if let Some(existing) = self.table(schema, table).await?
+            && existing.is_view()
+        {
+            return Err(MetastoreError::Conflict(format!("{schema}.{table} is a view")));
+        }
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let replacement = Replacement {
+            schema: schema.to_owned(),
+            table: table.to_owned(),
+            staging: from,
+            previous: journals.join(&id),
+        };
+        let journal = journals.join(format!("{id}.json"));
+        let body = serde_json::to_vec_pretty(&replacement).map_err(|source| MetastoreError::Json {
+            path: journal.display().to_string(),
+            source,
+        })?;
+        let replaced = replacement.clone();
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&journals)?;
+            std::fs::write(&journal, body)?;
+            let had_table = match std::fs::rename(&to, &replaced.previous) {
+                Ok(()) => true,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+                Err(err) => {
+                    let _ = std::fs::remove_file(&journal);
+                    return Err(err);
+                }
+            };
+            if let Err(err) = std::fs::rename(&replaced.staging, &to) {
+                // Put the old table back before reporting the failure.
+                if had_table {
+                    std::fs::rename(&replaced.previous, &to)?;
+                }
+                let _ = std::fs::remove_file(&journal);
+                return Err(err);
+            }
+            std::fs::remove_file(&journal)?;
+            Ok::<_, std::io::Error>(())
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        remove_local_dir(replacement.previous).await?;
+        Ok(())
+    }
+
+    /// Settles replacements interrupted by a crash: the old table goes back
+    /// where the new one never arrived; leftovers are removed. Returns how
+    /// many journals were found.
+    pub(crate) async fn recover_replacements(&self) -> MetastoreResult<usize> {
+        let Some(journals) = self.replacements_dir() else {
+            return Ok(0);
+        };
+        let mut found = Vec::new();
+        match std::fs::read_dir(&journals) {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = entry?.path();
+                    if path.extension().is_some_and(|e| e == "json") {
+                        found.push(path);
+                    }
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(err) => return Err(err.into()),
+        }
+        for journal in &found {
+            let replacement: Replacement =
+                serde_json::from_slice(&std::fs::read(journal)?).map_err(|source| MetastoreError::Json {
+                    path: journal.display().to_string(),
+                    source,
+                })?;
+            let _metadata = self
+                .lock_metadata(&replacement.schema, &replacement.table)
+                .await?;
+            let target = self.table_dir(&replacement.schema, &replacement.table);
+            if let Some(to) = self.local_path(&target)
+                && !to.exists()
+                && replacement.previous.exists()
+            {
+                tracing::warn!(
+                    schema = %replacement.schema,
+                    table = %replacement.table,
+                    "restoring a table whose replacement was interrupted"
+                );
+                std::fs::rename(&replacement.previous, &to)?;
+            }
+            remove_local_dir(replacement.previous.clone()).await?;
+            remove_local_dir(replacement.staging.clone()).await?;
+            std::fs::remove_file(journal)?;
+        }
+        Ok(found.len())
+    }
+
+    /// Commits the data file `staged` of an `INSERT` into `schema.table` as
+    /// `name`: under the table's metadata lock, checks that the table still
+    /// exists with the columns the file was written with (an `ADD COLUMN`
+    /// meanwhile only appends), marks its statistics unknown, then renames
+    /// the file into the table directory. The rename is the commit: any
+    /// failure before it leaves no row visible.
+    pub(crate) async fn commit_insert(
+        &self,
+        schema: &str,
+        table: &str,
+        written: &[ColumnMetadata],
+        staged: &Path,
+        name: &str,
+    ) -> MetastoreResult<()> {
+        let _metadata = self.lock_metadata(schema, table).await?;
+        let Some(metadata) = self.table(schema, table).await?.filter(|m| !m.is_view()) else {
+            return Err(MetastoreError::NotFound(format!("table {schema}.{table}")));
+        };
+        let same = |a: &ColumnMetadata, b: &ColumnMetadata| {
+            a.name.eq_ignore_ascii_case(&b.name) && a.hive_type.eq_ignore_ascii_case(&b.hive_type)
+        };
+        let unchanged = metadata.data_columns.len() >= written.len()
+            && written
+                .iter()
+                .zip(&metadata.data_columns)
+                .all(|(a, b)| same(a, b));
+        if !unchanged {
+            return Err(MetastoreError::Conflict(format!(
+                "table {schema}.{table} was replaced while the INSERT ran; nothing was written"
+            )));
+        }
+        self.invalidate_statistics_locked(schema, table).await?;
+        self.store
+            .rename(staged, &self.table_dir(schema, table).join(name))
+            .await?;
+        Ok(())
+    }
+
+    /// Adds a column: read, change and write the metadata under the table's
+    /// metadata lock, so no concurrent writer loses it.
+    pub(crate) async fn add_column(
+        &self,
+        schema: &str,
+        table: &str,
+        column: ColumnMetadata,
+    ) -> MetastoreResult<()> {
+        let _metadata = self.lock_metadata(schema, table).await?;
+        let Some(mut metadata) = self.table(schema, table).await? else {
+            return Err(MetastoreError::NotFound(format!("table {schema}.{table}")));
+        };
+        if metadata.is_view() {
+            return Err(MetastoreError::Conflict(format!("{schema}.{table} is a view")));
+        }
+        if metadata
+            .data_columns
+            .iter()
+            .chain(&metadata.partition_columns)
+            .any(|c| c.name.eq_ignore_ascii_case(&column.name))
+        {
+            return Err(MetastoreError::Conflict(format!(
+                "column {} already exists in {schema}.{table}",
+                column.name
+            )));
+        }
+        metadata.data_columns.push(column);
+        self.write_table(schema, table, &metadata).await
     }
 
     /// Drops a table or view: metadata first (it disappears atomically), then

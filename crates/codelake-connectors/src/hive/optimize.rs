@@ -49,6 +49,7 @@ use tracing::{info, warn};
 use super::metastore::MetastoreError;
 use super::table::{HiveTable, conform, data_file_name, external};
 use super::trino_parquet::{ROW_GROUP_ROWS, TrinoParquetWriter};
+use super::types::unsupported;
 
 pub(crate) const OPTIMIZE: &str = "OPTIMIZE";
 pub(crate) const FILE_SIZE_THRESHOLD: &str = "file_size_threshold";
@@ -184,6 +185,20 @@ pub(crate) async fn optimize(
     settings: Settings,
     context: &Arc<TaskContext>,
 ) -> Result<Outcome> {
+    // Compaction rewrites every column: one `CodeLake` cannot read is refused
+    // before anything is written.
+    if let Some(reason) = table
+        .schema
+        .fields()
+        .iter()
+        .filter(|field| field.data_type() == &DataType::Null)
+        .find_map(|field| unsupported(field))
+    {
+        return Err(DataFusionError::NotImplemented(format!(
+            "OPTIMIZE of {}.{}: {reason}",
+            table.schema_name, table.table
+        )));
+    }
     let locks = table.metastore.table_locks(&table.schema_name, &table.table);
     let _one_at_a_time = locks.optimize.lock().await;
     recover(table).await?;
@@ -327,16 +342,25 @@ impl Compactor<'_> {
     }
 }
 
-/// The table's columns with timestamps in microseconds.
+/// The table's columns with timestamps in microseconds, or in the catalog's
+/// unit when it is finer (`NANOSECONDS`): compaction never rounds away what
+/// the files hold.
 fn full_precision(schema: &SchemaRef) -> SchemaRef {
     let fields: Vec<Field> = schema
         .fields()
         .iter()
         .map(|field| match field.data_type() {
-            DataType::Timestamp(_, zone) => field
-                .as_ref()
-                .clone()
-                .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, zone.clone())),
+            DataType::Timestamp(unit, zone) => {
+                let unit = if *unit == TimeUnit::Nanosecond {
+                    TimeUnit::Nanosecond
+                } else {
+                    TimeUnit::Microsecond
+                };
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(DataType::Timestamp(unit, zone.clone()))
+            }
             _ => field.as_ref().clone(),
         })
         .collect();
@@ -364,7 +388,7 @@ pub(crate) async fn write_compacted(
     let plan = table.scan_files_as(
         context.runtime_env().as_ref(),
         Arc::clone(&schema),
-        "us",
+        true,
         vec![group],
         None,
         None,

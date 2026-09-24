@@ -350,6 +350,11 @@ pub enum SourceKind {
         secret_access_key_env: Option<String>,
         #[serde(default)]
         s3_path_style: bool,
+        /// Precision of the catalog's `timestamp` columns, Trino's
+        /// `hive.timestamp-precision`: reads round to it, writes round to it,
+        /// and DDL of another precision is refused, as in Trino.
+        #[serde(default)]
+        timestamp_precision: HiveTimestampPrecision,
     },
     Iceberg {
         /// Iceberg REST catalog URI.
@@ -449,6 +454,36 @@ fn default_mysql_sslmode() -> String {
 fn default_mssql_encrypt() -> String {
     "required".to_owned()
 }
+/// Trino's `hive.timestamp-precision` (default `MILLISECONDS`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HiveTimestampPrecision {
+    #[default]
+    Milliseconds,
+    Microseconds,
+    Nanoseconds,
+}
+
+impl HiveTimestampPrecision {
+    /// Fractional digits of the precision (3, 6, 9).
+    pub fn digits(self) -> u8 {
+        match self {
+            Self::Milliseconds => 3,
+            Self::Microseconds => 6,
+            Self::Nanoseconds => 9,
+        }
+    }
+
+    /// The name Trino prints in messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Milliseconds => "MILLISECONDS",
+            Self::Microseconds => "MICROSECONDS",
+            Self::Nanoseconds => "NANOSECONDS",
+        }
+    }
+}
+
 fn default_region() -> String {
     "us-east-1".to_owned()
 }
@@ -1113,6 +1148,37 @@ mod tests {
         );
         let cfg = parse(&doc);
         assert_eq!(cfg.sources.last().unwrap().kind.label(), "hive");
+    }
+
+    #[test]
+    fn hive_timestamp_precision_defaults_to_milliseconds_like_trino() {
+        let doc = format!(
+            "{VALID}\n[[source]]\nname = \"hive\"\nkind = \"hive\"\nwarehouse = \"/wh\"\n\
+             [[source]]\nname = \"hive_us\"\nkind = \"hive\"\nwarehouse = \"/wh\"\ntimestamp_precision = \"MICROSECONDS\"\n"
+        );
+        let precisions: Vec<HiveTimestampPrecision> = parse(&doc)
+            .sources
+            .iter()
+            .filter_map(|source| match &source.kind {
+                SourceKind::Hive {
+                    timestamp_precision, ..
+                } => Some(*timestamp_precision),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            precisions,
+            vec![
+                HiveTimestampPrecision::Milliseconds,
+                HiveTimestampPrecision::Microseconds
+            ]
+        );
+        assert_eq!(HiveTimestampPrecision::Microseconds.digits(), 6);
+        assert_eq!(HiveTimestampPrecision::Nanoseconds.name(), "NANOSECONDS");
+        let wrong = format!(
+            "{VALID}\n[[source]]\nname = \"hive\"\nkind = \"hive\"\nwarehouse = \"/wh\"\ntimestamp_precision = \"SECONDS\"\n"
+        );
+        assert!(toml::from_str::<Config>(&wrong).is_err());
     }
 
     #[test]

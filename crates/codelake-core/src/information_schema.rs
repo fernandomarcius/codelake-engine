@@ -12,13 +12,25 @@
 //! `information_schema` schema, `DataFusion`'s own provider restricted to that
 //! catalog. Statements that `DataFusion` plans over `information_schema`
 //! (`SHOW TABLES`, `SHOW COLUMNS`) resolve it in the session's catalog.
+//!
+//! A listing never fails because of one table: a table whose provider cannot
+//! be built (unreadable metadata, a layout the connector does not read) is
+//! listed without columns and logged; reading it still fails with its own
+//! error. Trino lists such tables too, and dbt lists a whole schema at once.
 
 use std::any::Any;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::catalog::information_schema::{INFORMATION_SCHEMA, InformationSchemaProvider};
-use datafusion::catalog::{CatalogProvider, CatalogProviderList, MemoryCatalogProviderList, SchemaProvider};
+use datafusion::catalog::{
+    CatalogProvider, CatalogProviderList, MemoryCatalogProviderList, SchemaProvider, Session, TableProvider,
+};
+use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::logical_expr::Expr;
+use datafusion::physical_plan::ExecutionPlan;
 
 /// Catalogs of the engine, each with its own `information_schema`.
 #[derive(Debug, Default)]
@@ -83,7 +95,10 @@ impl CatalogProvider for WithInformationSchema {
         if name.eq_ignore_ascii_case(INFORMATION_SCHEMA) {
             let only_this = Arc::new(SingleCatalog {
                 name: self.name.clone(),
-                catalog: Arc::clone(&self.catalog),
+                catalog: Arc::new(Tolerant {
+                    name: self.name.clone(),
+                    catalog: Arc::clone(&self.catalog),
+                }),
             });
             return Some(Arc::new(InformationSchemaProvider::new(only_this)));
         }
@@ -132,6 +147,107 @@ impl CatalogProviderList for SingleCatalog {
 
     fn catalog(&self, name: &str) -> Option<Arc<dyn CatalogProvider>> {
         (name == self.name).then(|| Arc::clone(&self.catalog))
+    }
+}
+
+/// The catalog as its `information_schema` sees it: a table whose provider
+/// fails is listed as [`Unreadable`] instead of failing the listing.
+#[derive(Debug)]
+struct Tolerant {
+    name: String,
+    catalog: Arc<dyn CatalogProvider>,
+}
+
+impl CatalogProvider for Tolerant {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema_names(&self) -> Vec<String> {
+        self.catalog.schema_names()
+    }
+
+    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        let schema = self.catalog.schema(name)?;
+        Some(Arc::new(TolerantSchema {
+            catalog: self.name.clone(),
+            name: name.to_owned(),
+            schema,
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct TolerantSchema {
+    catalog: String,
+    name: String,
+    schema: Arc<dyn SchemaProvider>,
+}
+
+#[async_trait]
+impl SchemaProvider for TolerantSchema {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn table_names(&self) -> Vec<String> {
+        self.schema.table_names()
+    }
+
+    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+        match self.schema.table(name).await {
+            Ok(table) => Ok(table),
+            Err(err) => {
+                tracing::warn!(
+                    catalog = %self.catalog,
+                    schema = %self.name,
+                    table = %name,
+                    error = %err,
+                    "table listed without columns: its definition cannot be read"
+                );
+                Ok(Some(Arc::new(Unreadable {
+                    reason: err.to_string(),
+                    schema: Arc::new(Schema::empty()),
+                })))
+            }
+        }
+    }
+
+    fn table_exist(&self, name: &str) -> bool {
+        self.schema.table_exist(name)
+    }
+}
+
+/// A listed table whose definition cannot be read: no columns, and reading
+/// it fails with the original error.
+#[derive(Debug)]
+struct Unreadable {
+    reason: String,
+    schema: SchemaRef,
+}
+
+#[async_trait]
+impl TableProvider for Unreadable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Err(DataFusionError::Plan(self.reason.clone()))
     }
 }
 
@@ -202,6 +318,59 @@ mod tests {
         );
         let columns = "SELECT count(*) FROM other.information_schema.columns WHERE table_name = 'b'";
         assert_eq!(count(&ctx, columns).await, 1);
+    }
+
+    #[derive(Debug)]
+    struct Broken;
+
+    #[async_trait]
+    impl SchemaProvider for Broken {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn table_names(&self) -> Vec<String> {
+            vec!["bad".into(), "good".into()]
+        }
+        async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+            if name == "bad" {
+                return Err(DataFusionError::NotImplemented(
+                    "hive type `array<int>` is not supported".into(),
+                ));
+            }
+            let schema = Arc::new(Schema::new(vec![datafusion::arrow::datatypes::Field::new(
+                "x",
+                datafusion::arrow::datatypes::DataType::Int64,
+                true,
+            )]));
+            Ok(Some(Arc::new(datafusion::datasource::empty::EmptyTable::new(
+                schema,
+            ))))
+        }
+        fn table_exist(&self, name: &str) -> bool {
+            name == "bad" || name == "good"
+        }
+    }
+
+    #[tokio::test]
+    async fn one_unreadable_table_does_not_break_the_listing() {
+        let ctx = ctx();
+        let lake = MemoryCatalogProvider::new();
+        lake.register_schema("s", Arc::new(Broken)).unwrap();
+        ctx.register_catalog("lake", Arc::new(lake));
+        let tables = "SELECT count(*) FROM lake.information_schema.tables WHERE table_schema = 's'";
+        assert_eq!(count(&ctx, tables).await, 2, "both tables are listed");
+        let columns = "SELECT count(*) FROM lake.information_schema.columns WHERE table_schema = 's'";
+        assert_eq!(count(&ctx, columns).await, 1, "the readable table's column");
+        let err = ctx
+            .sql("SELECT * FROM lake.s.bad")
+            .await
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("array<int>"),
+            "reading it keeps its own error: {err}"
+        );
     }
 
     #[tokio::test]

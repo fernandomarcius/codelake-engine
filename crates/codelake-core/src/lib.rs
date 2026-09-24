@@ -16,6 +16,7 @@ mod literals;
 pub mod overflow;
 pub mod runtime;
 pub mod session_properties;
+pub mod statement_policy;
 pub mod subquery;
 pub mod table_procedure;
 #[cfg(test)]
@@ -25,7 +26,9 @@ pub mod trino_functions;
 
 pub use bytes::ByteSize;
 pub use config::{Config, SourceConfig, SourceKind, TrinoProtocolConfig, ValidatedConfig};
-pub use connector::{BoxError, Connector, ConnectorError, ViewDefinition, WritableCatalog};
+pub use connector::{
+    BoxError, COLUMN_COMMENT, Connector, ConnectorError, DECLARED_TYPE, ViewDefinition, WritableCatalog,
+};
 pub use engine::{Attach, Engine, EngineError, Query, QueryOptions, SourceStatus};
 pub use runtime::MemoryStats;
 pub use session_properties::{

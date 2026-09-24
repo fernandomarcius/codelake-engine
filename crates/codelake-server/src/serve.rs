@@ -79,7 +79,7 @@ async fn serve(validated: ValidatedConfig, session_sampling: Option<f64>) -> Res
     let session = Arc::new(engine.context().clone());
 
     tokio::select! {
-        result = datafusion_postgres::serve_with_hooks(session, &options, hooks::all(session_sampling)) => {
+        result = datafusion_postgres::serve_with_hooks(session, &options, pg_hooks(session_sampling)) => {
             shutdown.cancel();
             let reason = result.err().map_or_else(|| "exited".to_owned(), |e| e.to_string());
             return Err(ServeError::PgListener(reason));
@@ -103,6 +103,14 @@ async fn serve(validated: ValidatedConfig, session_sampling: Option<f64>) -> Res
     }
     info!("shutdown complete");
     Ok(())
+}
+
+/// The PostgreSQL hooks: the statement policy first, so no other hook and
+/// no `DataFusion` path sees a refused statement.
+fn pg_hooks(session_sampling: Option<f64>) -> Vec<Arc<dyn datafusion_postgres::hooks::QueryHook>> {
+    let mut all: Vec<Arc<dyn datafusion_postgres::hooks::QueryHook>> = vec![Arc::new(hooks::PolicyHook)];
+    all.extend(hooks::all(session_sampling));
+    all
 }
 
 /// Starts the Trino protocol listener and its registry sweeper; exposes the

@@ -8,7 +8,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::arrow::datatypes::{Field, SchemaRef};
 use datafusion::catalog::CatalogProvider;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
@@ -66,6 +66,15 @@ pub trait Connector: Send + Sync + Debug {
     }
 }
 
+/// Field metadata key: the column type as the client declared it in DDL
+/// (`varchar(3)`, `timestamp(6)`, …), when the statement declared one. Arrow
+/// types lose what a catalog may have to store or enforce (a `varchar`'s
+/// length, a timestamp's precision); CTAS columns have no declared type.
+pub const DECLARED_TYPE: &str = "codelake.declared_type";
+
+/// Field metadata key: the column comment declared in DDL.
+pub const COLUMN_COMMENT: &str = "codelake.comment";
+
 /// A view to persist, as the client defined it.
 #[derive(Debug, Clone)]
 pub struct ViewDefinition {
@@ -88,7 +97,9 @@ pub trait WritableCatalog: Send + Sync + Debug {
     async fn create_schema(&self, schema: &str, if_not_exists: bool, owner: &str) -> DfResult<()>;
 
     /// Creates `schema.table` from a stream of rows. The table becomes visible
-    /// only after every row is durably written.
+    /// only after every row is durably written. Fields of the stream's schema
+    /// carry [`DECLARED_TYPE`] and [`COLUMN_COMMENT`] when the statement
+    /// declared its columns (`CREATE TABLE t (c varchar(3))`).
     async fn create_table_as(
         &self,
         schema: &str,
@@ -98,6 +109,24 @@ pub trait WritableCatalog: Send + Sync + Debug {
         rows: SendableRecordBatchStream,
         context: Arc<TaskContext>,
     ) -> DfResult<u64>;
+
+    /// `CREATE OR REPLACE TABLE … AS`: the new table is written next to the
+    /// old one and takes its place only once every row is written; a failure
+    /// leaves the old table as it was. The default refuses, as Trino's
+    /// connectors without replace support do.
+    async fn replace_table_as(
+        &self,
+        schema: &str,
+        table: &str,
+        owner: &str,
+        rows: SendableRecordBatchStream,
+        context: Arc<TaskContext>,
+    ) -> DfResult<u64> {
+        let _ = (schema, table, owner, rows, context);
+        Err(DataFusionError::NotImplemented(
+            "This connector does not support replacing tables".into(),
+        ))
+    }
 
     async fn drop_table(&self, schema: &str, table: &str, if_exists: bool) -> DfResult<()>;
 
@@ -113,8 +142,9 @@ pub trait WritableCatalog: Send + Sync + Debug {
 
     async fn drop_view(&self, schema: &str, view: &str, if_exists: bool) -> DfResult<()>;
 
-    async fn add_column(&self, schema: &str, table: &str, column: &str, data_type: &DataType)
-    -> DfResult<()>;
+    /// `ALTER TABLE … ADD COLUMN`. `column` carries its name, Arrow type and
+    /// the [`DECLARED_TYPE`] / [`COLUMN_COMMENT`] metadata of the statement.
+    async fn add_column(&self, schema: &str, table: &str, column: &Field) -> DfResult<()>;
 
     /// Procedures this catalog runs with `ALTER TABLE … EXECUTE` (Trino's table
     /// procedures, e.g. `OPTIMIZE`).

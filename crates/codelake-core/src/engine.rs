@@ -34,6 +34,7 @@ use crate::federation_guard::FederationFilterGuard;
 use crate::information_schema::CatalogList;
 use crate::runtime::{EngineRuntime, MemoryStats};
 use crate::session_properties::{PropertyRegistry, SessionProperties};
+use crate::statement_policy::{self, ObjectKind, check_object_name};
 use crate::table_procedure::{self, ArgumentValue, RawArgument};
 use crate::trace::{self, QueryTrace, TARGET, TracedStream};
 
@@ -235,7 +236,11 @@ fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
 /// does not know, or an ordinary statement with its DDL preparation.
 enum Parsed {
     TableExecute(Box<TableExecute>),
-    Statement(Box<datafusion::sql::parser::Statement>, Option<Prepared>),
+    Statement(
+        Box<datafusion::sql::parser::Statement>,
+        Option<Prepared>,
+        Vec<ddl::DeclaredColumn>,
+    ),
 }
 
 /// Phases of a query, one child span each.
@@ -316,6 +321,59 @@ fn query_span(query_id: &str, options: &QueryOptions, sql: &str) -> Span {
         &datafusion::sql::sqlparser::dialect::GenericDialect {},
     );
     span
+}
+
+/// `field` with the type and comment the DDL declared for it (see
+/// [`crate::DECLARED_TYPE`]).
+fn declared_field(field: Field, sql_type: &str, comment: Option<&str>) -> Field {
+    let mut metadata = field.metadata().clone();
+    metadata.insert(crate::connector::DECLARED_TYPE.to_owned(), sql_type.to_owned());
+    if let Some(comment) = comment {
+        metadata.insert(crate::connector::COLUMN_COMMENT.to_owned(), comment.to_owned());
+    }
+    field.with_metadata(metadata)
+}
+
+/// The rows of `CREATE TABLE t (<columns>)` with each column's declared type
+/// and comment in its field metadata, for the writable catalog to store.
+fn with_declared_columns(
+    rows: SendableRecordBatchStream,
+    declared: &[ddl::DeclaredColumn],
+) -> Result<SendableRecordBatchStream, DataFusionError> {
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::StreamExt;
+    if declared.is_empty() {
+        return Ok(rows);
+    }
+    let schema = rows.schema();
+    if schema.fields().len() != declared.len() {
+        return Err(DataFusionError::Internal(format!(
+            "CREATE TABLE declares {} columns but plans {}",
+            declared.len(),
+            schema.fields().len()
+        )));
+    }
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .zip(declared)
+        .map(|(field, column)| {
+            declared_field(
+                field.as_ref().clone(),
+                &column.sql_type,
+                column.comment.as_deref(),
+            )
+        })
+        .collect();
+    let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    let adapted = Arc::clone(&schema);
+    let batches = rows.map(move |batch| {
+        batch.and_then(|batch| {
+            RecordBatch::try_new(Arc::clone(&adapted), batch.columns().to_vec())
+                .map_err(DataFusionError::from)
+        })
+    });
+    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
 }
 
 /// Result of attaching one source at startup.
@@ -473,12 +531,16 @@ impl Engine {
                 // The parser's dialect is a `Box<dyn Dialect>` (not `Send`): it
                 // must be gone before any `.await`, or callers cannot spawn
                 // this future.
-                if let Some(parser_dialect) = dialect_from_str(dialect)
-                    && let Some(execute) = ddl::parse_table_execute(&sql, parser_dialect.as_ref())?
-                {
-                    return Ok(Parsed::TableExecute(Box::new(execute)));
+                if let Some(parser_dialect) = dialect_from_str(dialect) {
+                    statement_policy::check_tokens(&sql, parser_dialect.as_ref())?;
+                    if let Some(execute) = ddl::parse_table_execute(&sql, parser_dialect.as_ref())? {
+                        return Ok(Parsed::TableExecute(Box::new(execute)));
+                    }
                 }
                 let mut statement = state.sql_to_statement(&sql, &dialect)?;
+                statement_policy::check_statement(&statement)?;
+                ddl::rewrite_show_tables(&mut statement)?;
+                let declared = ddl::declared_columns(&statement);
                 let prepared = ddl::prepare(&mut statement)?;
                 // After `prepare`, which keeps a view's text as written. The
                 // function library's literal rewrites (precision of
@@ -487,15 +549,15 @@ impl Engine {
                 // `literals`.
                 crate::trino_functions::rewrite_statement(&mut statement)?;
                 crate::literals::rewrite_zoned_timestamps(&mut statement);
-                Ok::<_, DataFusionError>(Parsed::Statement(Box::new(statement), prepared))
+                Ok::<_, DataFusionError>(Parsed::Statement(Box::new(statement), prepared, declared))
             })
             .inspect_err(|err| trace::record_error(&parse, err))?;
         drop(parse);
-        let (statement, prepared) = match parsed {
+        let (statement, prepared, declared) = match parsed {
             Parsed::TableExecute(execute) => {
                 return traced(Phase::Execute, self.table_execute(ctx, options, *execute)).await;
             }
-            Parsed::Statement(statement, prepared) => (*statement, prepared),
+            Parsed::Statement(statement, prepared, declared) => (*statement, prepared, declared),
         };
         if let Some(Prepared::AddColumn {
             table,
@@ -503,11 +565,21 @@ impl Engine {
             sql_type,
         }) = &prepared
         {
-            return traced(Phase::Execute, self.add_column(ctx, table, column, sql_type)).await;
+            let declared = declared.into_iter().next().unwrap_or_default();
+            return traced(
+                Phase::Execute,
+                self.add_column(ctx, table, column, sql_type, &declared),
+            )
+            .await;
         }
         let plan = traced(Phase::Plan, state.statement_to_plan(statement)).await?;
+        statement_policy::check_plan(&plan)?;
         if ddl::is_routable(&plan)
-            && let Some(result) = traced(Phase::Execute, self.route_ddl(ctx, user, &plan, prepared)).await?
+            && let Some(result) = traced(
+                Phase::Execute,
+                self.route_ddl(ctx, user, &plan, prepared, &declared),
+            )
+            .await?
         {
             return Ok(result);
         }
@@ -603,15 +675,35 @@ impl Engine {
         table: &TableReference,
         column: &str,
         sql_type: &str,
+        declared: &ddl::DeclaredColumn,
     ) -> Result<DataFrame, DataFusionError> {
         let (catalog, schema, name) = Self::resolve(ctx, table);
         let writable = self.writable(&catalog).ok_or_else(|| {
             DataFusionError::Plan(format!("catalog {catalog} does not support ALTER TABLE"))
         })?;
+        check_object_name(ObjectKind::Schema, &schema)?;
+        check_object_name(ObjectKind::Table, &name)?;
+        check_object_name(ObjectKind::Column, column)?;
+        // No writable catalog enforces constraints: refused, never dropped.
+        if declared.not_null {
+            return Err(DataFusionError::NotImplemented(format!(
+                "Catalog '{catalog}' does not support NOT NULL for column '{column}'"
+            )));
+        }
+        if let Some(option) = &declared.other {
+            return Err(DataFusionError::NotImplemented(format!(
+                "Catalog '{catalog}' does not support column option {option} for column '{column}'"
+            )));
+        }
         // Let the SQL planner translate the type name exactly as it would in a cast.
         let probe = ctx.sql(&format!("SELECT CAST(NULL AS {sql_type}) AS t")).await?;
         let data_type = probe.schema().field(0).data_type().clone();
-        writable.add_column(&schema, &name, column, &data_type).await?;
+        let field = declared_field(
+            Field::new(column, data_type, true),
+            sql_type,
+            declared.comment.as_deref(),
+        );
+        writable.add_column(&schema, &name, &field).await?;
         Self::empty(ctx)
     }
 
@@ -627,6 +719,10 @@ impl Engine {
         execute: TableExecute,
     ) -> Result<DataFrame, DataFusionError> {
         let (catalog, schema, table) = Self::resolve(ctx, &execute.table);
+        if self.writable(&catalog).is_some() {
+            check_object_name(ObjectKind::Schema, &schema)?;
+            check_object_name(ObjectKind::Table, &table)?;
+        }
         let schema_provider = ctx.catalog(&catalog).and_then(|c| c.schema(&schema));
         let provider = match schema_provider {
             Some(provider) => provider.table(&table).await?,
@@ -717,40 +813,87 @@ impl Engine {
         })
     }
 
+    /// `CREATE [OR REPLACE] TABLE` in a writable catalog: names checked,
+    /// column options the catalog cannot keep refused, declared types handed
+    /// over with the rows.
+    async fn create_in(
+        &self,
+        ctx: &SessionContext,
+        writable: &Arc<dyn WritableCatalog>,
+        user: &str,
+        create: &datafusion::logical_expr::CreateMemoryTable,
+        declared: &[ddl::DeclaredColumn],
+    ) -> Result<DataFrame, DataFusionError> {
+        let (catalog, schema, table) = Self::resolve(ctx, &create.name);
+        check_object_name(ObjectKind::Schema, &schema)?;
+        check_object_name(ObjectKind::Table, &table)?;
+        if create.if_not_exists && create.or_replace {
+            return Err(DataFusionError::Execution(
+                "'IF NOT EXISTS' cannot coexist with 'REPLACE'".into(),
+            ));
+        }
+        for column in declared {
+            if column.not_null {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "Catalog '{catalog}' does not support non-null column for column name '{}'",
+                    column.name
+                )));
+            }
+            if let Some(option) = &column.other {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "Catalog '{catalog}' does not support column option {option} for column name '{}'",
+                    column.name
+                )));
+            }
+        }
+        let input =
+            crate::subquery::pre_evaluate_scalar_subqueries(ctx, create.input.as_ref().clone()).await?;
+        let input = crate::trino_functions::analyze(ctx, input)?;
+        for field in input.schema().fields() {
+            check_object_name(ObjectKind::Column, field.name())?;
+        }
+        let rows = ctx.execute_logical_plan(input).await?.execute_stream().await?;
+        let rows = with_declared_columns(rows, declared)?;
+        let written = if create.or_replace {
+            writable
+                .replace_table_as(&schema, &table, user, rows, ctx.task_ctx())
+                .await?
+        } else {
+            writable
+                .create_table_as(&schema, &table, create.if_not_exists, user, rows, ctx.task_ctx())
+                .await?
+        };
+        Self::row_count(ctx, written)
+    }
+
     async fn route_ddl(
         &self,
         ctx: &SessionContext,
         user: &str,
         plan: &LogicalPlan,
         prepared: Option<Prepared>,
+        declared: &[ddl::DeclaredColumn],
     ) -> Result<Option<DataFrame>, DataFusionError> {
         let LogicalPlan::Ddl(ddl) = plan else {
             return Ok(None);
         };
         match ddl {
             DdlStatement::CreateMemoryTable(create) => {
-                let (catalog, schema, table) = Self::resolve(ctx, &create.name);
+                let (catalog, _, _) = Self::resolve(ctx, &create.name);
                 let Some(writable) = self.writable(&catalog) else {
                     return Self::create_memory_table(ctx, create).await.map(Some);
                 };
-                if create.or_replace {
-                    writable.drop_table(&schema, &table, true).await?;
-                }
-                let input =
-                    crate::subquery::pre_evaluate_scalar_subqueries(ctx, create.input.as_ref().clone())
-                        .await?;
-                let input = crate::trino_functions::analyze(ctx, input)?;
-                let rows = ctx.execute_logical_plan(input).await?.execute_stream().await?;
-                let written = writable
-                    .create_table_as(&schema, &table, create.if_not_exists, user, rows, ctx.task_ctx())
-                    .await?;
-                Ok(Some(Self::row_count(ctx, written)?))
+                self.create_in(ctx, writable, user, create, declared)
+                    .await
+                    .map(Some)
             }
             DdlStatement::DropTable(drop) => {
                 let (catalog, schema, table) = Self::resolve(ctx, &drop.name);
                 let Some(writable) = self.writable(&catalog) else {
                     return Ok(None);
                 };
+                check_object_name(ObjectKind::Schema, &schema)?;
+                check_object_name(ObjectKind::Table, &table)?;
                 writable.drop_table(&schema, &table, drop.if_exists).await?;
                 Ok(Some(Self::empty(ctx)?))
             }
@@ -759,6 +902,11 @@ impl Engine {
                 let Some(writable) = self.writable(&catalog) else {
                     return Ok(None);
                 };
+                check_object_name(ObjectKind::Schema, &schema)?;
+                check_object_name(ObjectKind::View, &name)?;
+                for field in view.input.schema().fields() {
+                    check_object_name(ObjectKind::Column, field.name())?;
+                }
                 let Some(Prepared::ViewSql(sql)) = prepared else {
                     return Err(DataFusionError::Internal("view SQL was not captured".into()));
                 };
@@ -779,6 +927,8 @@ impl Engine {
                 let Some(writable) = self.writable(&catalog) else {
                     return Ok(None);
                 };
+                check_object_name(ObjectKind::Schema, &schema)?;
+                check_object_name(ObjectKind::View, &name)?;
                 writable.drop_view(&schema, &name, drop.if_exists).await?;
                 Ok(Some(Self::empty(ctx)?))
             }
@@ -792,6 +942,7 @@ impl Engine {
                 let Some(writable) = self.writable(catalog) else {
                     return Ok(None);
                 };
+                check_object_name(ObjectKind::Schema, schema)?;
                 writable.create_schema(schema, create.if_not_exists, user).await?;
                 Ok(Some(Self::empty(ctx)?))
             }
@@ -1005,6 +1156,43 @@ mod tests {
             "{answers:?}"
         );
         assert!(answers[2].is_err(), "{answers:?}");
+    }
+
+    /// Trino has neither statement: files are reached through catalogs only
+    /// (F2 red-team). Runtime settings belong to the server.
+    #[tokio::test]
+    async fn client_statements_never_reach_server_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        let target = dir.path().join("written.csv");
+        let file = target.display();
+        for sql in [
+            format!("COPY (SELECT 1 AS a) TO '{file}' STORED AS CSV"),
+            format!("COPY (SELECT 1 AS a) TO '{file}'"),
+            format!("EXPLAIN ANALYZE COPY (SELECT 1 AS a) TO '{file}'"),
+            "CREATE EXTERNAL TABLE leak (line VARCHAR) STORED AS CSV LOCATION '/etc/hostname'".to_owned(),
+            "SET datafusion.runtime.memory_limit = '100G'".to_owned(),
+            format!(
+                "SET datafusion.runtime.temp_directory = '{}'",
+                dir.path().display()
+            ),
+            "RESET datafusion.runtime.memory_limit".to_owned(),
+        ] {
+            let err = match engine.sql(&sql).await {
+                Ok(frame) => frame.collect().await.map(|_| ()).unwrap_err(),
+                Err(err) => err,
+            };
+            assert!(matches!(err, DataFusionError::NotImplemented(_)), "{sql}: {err}");
+        }
+        assert!(!target.exists(), "a client statement wrote a server file");
+        let err = engine.sql("SELECT 1 AS \"\"").await.unwrap_err();
+        assert!(matches!(err, DataFusionError::SQL(..)), "{err}");
+        assert!(
+            engine
+                .sql("SET datafusion.execution.batch_size = 1024")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -1291,7 +1479,7 @@ mod tests {
         async fn drop_view(&self, _: &str, _: &str, _: bool) -> datafusion::error::Result<()> {
             Ok(())
         }
-        async fn add_column(&self, _: &str, _: &str, _: &str, _: &DataType) -> datafusion::error::Result<()> {
+        async fn add_column(&self, _: &str, _: &str, _: &Field) -> datafusion::error::Result<()> {
             Ok(())
         }
         fn table_procedures(&self) -> Vec<crate::TableProcedure> {

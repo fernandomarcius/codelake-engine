@@ -5,6 +5,8 @@
 mod catalog;
 mod columns;
 mod crc;
+#[cfg(test)]
+mod f2_tests;
 mod metastore;
 mod optimize;
 #[cfg(test)]
@@ -16,6 +18,7 @@ mod types;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use codelake_core::config::HiveTimestampPrecision;
 use codelake_core::{BoxError, Connector, ConnectorError, SessionProperty, WritableCatalog};
 use datafusion::catalog::CatalogProvider;
 use object_store::ObjectStore;
@@ -72,6 +75,8 @@ fn parse_location(warehouse: &str) -> Result<Location, String> {
 pub struct HiveConnector {
     name: String,
     params: HiveParams,
+    /// Trino's `hive.timestamp-precision` for this catalog.
+    precision: HiveTimestampPrecision,
     catalog: OnceCell<Arc<HiveCatalog>>,
 }
 
@@ -89,8 +94,17 @@ impl HiveConnector {
         Self {
             name,
             params,
+            precision: HiveTimestampPrecision::default(),
             catalog: OnceCell::new(),
         }
+    }
+
+    /// Sets the precision of the catalog's timestamps (Trino's
+    /// `hive.timestamp-precision`, default `MILLISECONDS`).
+    #[must_use]
+    pub fn with_timestamp_precision(mut self, precision: HiveTimestampPrecision) -> Self {
+        self.precision = precision;
+        self
     }
 
     fn misconfigured(&self, reason: impl Into<String>) -> ConnectorError {
@@ -136,7 +150,7 @@ impl HiveConnector {
                 (Arc::new(store), Path::from(prefix), None)
             }
         };
-        let metastore = FileMetastore::new(store, root);
+        let metastore = FileMetastore::new(store, root).with_timestamp_precision(self.precision);
         Ok(match local {
             Some(dir) => metastore.with_local_dir(dir),
             None => metastore,
@@ -174,6 +188,14 @@ impl Connector for HiveConnector {
 
     async fn catalog(&self) -> Result<Arc<dyn CatalogProvider>, ConnectorError> {
         let hive = self.hive().await?;
+        // A `CREATE OR REPLACE TABLE` cut short puts the old table back.
+        hive.metastore()
+            .recover_replacements()
+            .await
+            .map_err(|e| ConnectorError::Metadata {
+                source_name: self.name.clone(),
+                cause: e.into(),
+            })?;
         hive.refresh().await.map_err(|e| self.unreachable(e))?;
         // A half-swapped OPTIMIZE would show duplicated rows: settle it first.
         hive.recover_interrupted_optimize()
