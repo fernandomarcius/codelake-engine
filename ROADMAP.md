@@ -43,7 +43,9 @@ Blocking items, in order:
    `INSERT INTO … SELECT` appending **one new file per insert**, `DROP TABLE`,
    `CREATE/DROP VIEW`, `ALTER TABLE ADD COLUMN`. Output readable by SQL Server 2022
    `OPENROWSET` (verified in an integration test).
-3. ✅ **Trino client protocol** (R10, F3): `POST /v1/statement`, `nextUri` paging
+3. 🔧 **Trino client protocol** (R10, F3) — implemented; independent verification against
+   Trino 431 found 40 defects (dbt-trino, prepared statements, JDBC metadata, cancel of
+   CPU-bound queries, value encoding), being fixed: `POST /v1/statement`, `nextUri` paging
    with idempotent retries, cancel, `X-Trino-*` session headers, `USE` / `SET
    SESSION` / `SHOW SESSION`, Trino error codes, `system.runtime.queries`, and a
    session-property registry that connectors extend (ADR 0012). Proven with the
