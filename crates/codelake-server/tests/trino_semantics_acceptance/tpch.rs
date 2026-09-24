@@ -175,10 +175,6 @@ async fn tpch_q01_q08_q14_match_trino() -> Res<()> {
 // ---------------------------------------------------------------- defects
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM2: TPC-H Q17 fails: a decimal product inside a correlated scalar subquery \
-    (0.2 * avg(l_quantity) ... WHERE l_partkey = p_partkey). Expected: decimal(38,2) NULL (Brand#23) \
-    and '3134.52' (Brand#11). Obtained: GENERIC_USER_ERROR 'codelake_decimal_multiply: \
-    Decimal128(1, 1) and Null are not exact numbers'"]
 async fn defect_sem2_tpch_q17() -> Res<()> {
     let pair = Pair::start().await?;
     load(&pair).await?;
@@ -186,8 +182,6 @@ async fn defect_sem2_tpch_q17() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM18: extract(YEAR FROM date) is bigint in Trino, so TPC-H Q08 answers \
-    another type. Expected: o_year bigint 1995, 1996. Obtained: integer"]
 async fn defect_sem18_tpch_q08_extract_is_bigint() -> Res<()> {
     let pair = Pair::start().await?;
     load(&pair).await?;

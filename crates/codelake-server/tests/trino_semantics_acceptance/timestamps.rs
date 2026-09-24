@@ -65,10 +65,6 @@ async fn session_zone_does_not_move_zoned_text() -> Res<()> {
 // ---------------------------------------------------------------- defects
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM3: CAST(timestamp with time zone AS timestamp) takes the local time in \
-    UTC, not in the value's zone. Expected: CAST(CAST('2026-01-01 10:00:00 America/Sao_Paulo' AS \
-    TIMESTAMP WITH TIME ZONE) AS TIMESTAMP) = 2026-01-01 10:00:00.000; the same from a column of \
-    Sao_Paulo and Tokyo rows = 10:00, 10:00. Obtained: 13:00:00.000; 01:00 and 13:00"]
 async fn defect_sem3_zoned_to_local_timestamp_uses_the_value_zone() -> Res<()> {
     expect_same(
         &[],
@@ -82,11 +78,6 @@ async fn defect_sem3_zoned_to_local_timestamp_uses_the_value_zone() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM4: the session time zone (X-Trino-Time-Zone) is ignored. Expected with \
-    session America/Sao_Paulo: CAST('2026-01-01 10:00:00' AS TIMESTAMP WITH TIME ZONE) = \
-    2026-01-01 10:00:00.000 America/Sao_Paulo (13:00 UTC); CAST(TIMESTAMP ... AS TIMESTAMP WITH \
-    TIME ZONE) and CAST(DATE ...) likewise. Obtained: 2026-01-01 10:00:00.000 UTC, an instant 3 \
-    hours off"]
 async fn defect_sem4_session_time_zone_applies_to_unzoned_values() -> Res<()> {
     expect_same(
         &[],
@@ -123,9 +114,6 @@ async fn defect_sem5_zoned_column_keeps_its_zone() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM8: text in a DST gap cast to timestamp(p): Trino resolves the local time in \
-    the named zone first. Expected: CAST('2018-11-04 00:30:00 America/Sao_Paulo' AS TIMESTAMP) = \
-    2018-11-04 01:30:00.000. Obtained: 2018-11-04 00:30:00.000"]
 async fn defect_sem8_dst_gap_text_to_timestamp() -> Res<()> {
     expect_same(
         &[],
@@ -149,9 +137,6 @@ async fn defect_sem9_column_cast_keeps_each_rows_zone() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM10: to_unixtime is double with the fraction of a second. Expected: \
-    to_unixtime(CAST('1969-12-31 23:59:59.999 UTC' AS TIMESTAMP WITH TIME ZONE)) = -0.001 (double). \
-    Obtained: bigint 0"]
 async fn defect_sem10_to_unixtime_keeps_milliseconds() -> Res<()> {
     expect_same(
         &[],
@@ -162,9 +147,6 @@ async fn defect_sem10_to_unixtime_keeps_milliseconds() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM11: CAST(timestamp with time zone AS varchar) uses RFC 3339. Expected: \
-    '2019-02-16 23:30:00.000 America/Sao_Paulo'. Obtained: '2019-02-16T23:30:00-02:00' (and \
-    '2026-01-01T10:00:00Z' for UTC)"]
 async fn defect_sem11_zoned_timestamp_to_varchar() -> Res<()> {
     expect_same(
         &[],
@@ -175,9 +157,6 @@ async fn defect_sem11_zoned_timestamp_to_varchar() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM12: only precisions 0, 3, 6 and 9 exist. Expected: CAST('2026-01-01 \
-    10:00:00.5' AS TIMESTAMP(1)) = timestamp(1) '2026-01-01 10:00:00.5' (also 2, 4, 5, 7, 8, with \
-    and without time zone). Obtained: NOT_SUPPORTED 'Unsupported SQL type TIMESTAMP(1)'"]
 async fn defect_sem12_every_timestamp_precision() -> Res<()> {
     expect_same(
         &[],
@@ -191,9 +170,6 @@ async fn defect_sem12_every_timestamp_precision() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM13: TRY_CAST(... AS TIMESTAMP WITH TIME ZONE) has no zone. Expected: \
-    timestamp(3) with time zone '2026-01-01 10:00:00.000 America/Sao_Paulo' and NULL. Obtained: \
-    timestamp(9) '2026-01-01 10:00:00.000000000' and NULL"]
 async fn defect_sem13_try_cast_with_time_zone() -> Res<()> {
     expect_same(
         &[],
@@ -204,9 +180,6 @@ async fn defect_sem13_try_cast_with_time_zone() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM14: AT TIME ZONE widens the precision. Expected: timestamp(3) with time \
-    zone '2019-02-17 01:30:00.000 UTC'. Obtained: timestamp(9) with time zone '2019-02-17 \
-    01:30:00.000000000 UTC'"]
 async fn defect_sem14_at_time_zone_keeps_precision() -> Res<()> {
     expect_same(
         &[],
@@ -217,9 +190,6 @@ async fn defect_sem14_at_time_zone_keeps_precision() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM15: a TIMESTAMP literal takes the precision of its digits. Expected: \
-    TIMESTAMP '2026-01-01 10:00:00.123' is timestamp(3) '2026-01-01 10:00:00.123'; without \
-    fraction timestamp(0). Obtained: timestamp(9) '2026-01-01 10:00:00.123000000'"]
 async fn defect_sem15_timestamp_literal_precision() -> Res<()> {
     expect_same(
         &[],

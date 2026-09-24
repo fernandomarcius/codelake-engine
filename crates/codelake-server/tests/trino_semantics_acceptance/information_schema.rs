@@ -81,9 +81,6 @@ async fn hive_catalog_information_schema_matches_trino() -> Res<()> {
 // ---------------------------------------------------------------- defects
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM7: varchar(n) is not enforced. Expected: CAST('abcdefgh' AS varchar(5)) is \
-    varchar(5) 'abcde' (also through a view); INSERT of 13 characters into varchar(10) fails with \
-    INVALID_CAST_ARGUMENT. Obtained: varchar 'abcdefgh'; the INSERT succeeds and stores all 13"]
 async fn defect_sem7_varchar_length_is_enforced() -> Res<()> {
     expect_same(
         &[
@@ -103,9 +100,6 @@ async fn defect_sem7_varchar_length_is_enforced() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM23: information_schema.columns.data_type loses varchar(n) and char(n) in the \
-    in-memory catalog, in hive and in view columns. Expected: 'varchar(10)', 'char(3)', \
-    'varchar(5)'. Obtained: 'varchar' for all three"]
 async fn defect_sem23_bounded_character_types_in_data_type() -> Res<()> {
     expect_same(
         &[
@@ -126,9 +120,6 @@ async fn defect_sem23_bounded_character_types_in_data_type() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM24: columns of an in-memory CTAS are NOT NULL. Expected: is_nullable 'YES' \
-    and data_type 'varchar(3)' for CREATE TABLE ... AS SELECT 1.5 AS x, CAST(1 AS INTEGER) AS y, \
-    'abc' AS z. Obtained: is_nullable 'NO' for every column, data_type 'varchar'"]
 async fn defect_sem24_ctas_columns_are_nullable() -> Res<()> {
     expect_same(
         &[
@@ -142,10 +133,6 @@ async fn defect_sem24_ctas_columns_are_nullable() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM25: an in-memory view reports other column types than its own query. \
-    Expected (dc decimal(12,3)): dc * 2 is decimal(22,3) and avg(dc) OVER () decimal(12,3) in \
-    information_schema.columns, DESCRIBE and SELECT. Obtained: information_schema decimal(33,3) \
-    and decimal(16,7); DESCRIBE and SELECT decimal(32, 3)"]
 async fn defect_sem25_memory_view_column_types() -> Res<()> {
     expect_same(
         &[
@@ -164,10 +151,6 @@ async fn defect_sem25_memory_view_column_types() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM26: views.view_definition is not Trino's formatted query. Expected: \
-    'SELECT\\n  id\\n, (dc * 2) dc2\\nFROM\\n  memory.sem_vd.t\\n' (hive the same). Obtained: \
-    in-memory 'CREATE VIEW datafusion.sem_vd.v AS SELECT id, dc * 2 AS dc2 FROM \
-    datafusion.sem_vd.t' (with the CREATE VIEW prefix); hive the stored SQL unformatted"]
 async fn defect_sem26_view_definition_is_the_formatted_query() -> Res<()> {
     expect_same(
         &[
@@ -188,10 +171,6 @@ async fn defect_sem26_view_definition_is_the_formatted_query() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM27: SHOW COLUMNS and DESCRIBE are not shaped like Trino's. Expected: \
-    columns Column, Type, Extra, Comment with '' for Extra/Comment and types without spaces \
-    ('decimal(12,3)'). Obtained: SHOW COLUMNS answers table_catalog, table_schema, table_name, \
-    column_name, data_type, is_nullable; DESCRIBE has NULL Extra/Comment and 'decimal(12, 3)'"]
 async fn defect_sem27_show_columns_and_describe() -> Res<()> {
     expect_same(
         &[
@@ -205,10 +184,6 @@ async fn defect_sem27_show_columns_and_describe() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM28: CREATE TABLE rejects Trino type names array(T), map(K,V), row(...) and \
-    varbinary. Expected: the tables are created and information_schema shows 'array(integer)', \
-    'map(varchar, bigint)', 'row(x integer, y varchar)', 'varbinary'. Obtained: SYNTAX_ERROR \
-    'Expected: <, found: (' and NOT_SUPPORTED 'Unsupported SQL type ...'"]
 async fn defect_sem28_create_table_with_trino_type_names() -> Res<()> {
     expect_same(
         &["CREATE SCHEMA {c}.sem_ty"],

@@ -205,11 +205,6 @@ async fn division_overflow_is_an_error_where_trino_431_returns_a_wrong_value() -
 // ---------------------------------------------------------------- defects
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM1: the supertype of double/real and decimal is decimal, not double/real. \
-    Expected (Trino): VALUES (1E-20), (1.5) is double [1.0E-20, 1.5]; CASE/COALESCE/NULLIF/UNION \
-    of a double and a decimal literal are double; VALUES (1E300), (1.5) is double. Obtained: \
-    decimal(30,15) [0.000000000000000, 1.500000000000000] (1E-20 becomes 0), real UNION 2.5 is \
-    decimal(14,7), 1E300 fails with 'Cannot cast to Decimal128(30, 15)'"]
 async fn defect_sem1_double_and_decimal_unify_to_double() -> Res<()> {
     expect_same(
         &[],
@@ -228,9 +223,6 @@ async fn defect_sem1_double_and_decimal_unify_to_double() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM6: CAST(double AS decimal) rounds the binary value, Trino rounds the \
-    shortest decimal text half up. Expected: CAST(1.005E0 AS DECIMAL(5,2)) = 1.01 (literal, \
-    column and real). Obtained: 1.00"]
 async fn defect_sem6_double_to_decimal_rounds_like_trino() -> Res<()> {
     expect_same(
         &[],
@@ -244,9 +236,6 @@ async fn defect_sem6_double_to_decimal_rounds_like_trino() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM16: round(decimal(p,s), n) keeps scale s in Trino. Expected: \
-    round(CAST(1.2345 AS DECIMAL(10,4)), 2) is decimal(11,4) '1.2300'; round(CAST(9.99 AS \
-    DECIMAL(3,2)), 1) is decimal(4,2) '10.00'. Obtained: decimal(10,2) '1.23' and decimal(3,1) '10.0'"]
 async fn defect_sem16_round_with_digits_keeps_the_scale() -> Res<()> {
     expect_same(
         &[],
@@ -257,8 +246,6 @@ async fn defect_sem16_round_with_digits_keeps_the_scale() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM17: row_number() and rank() are bigint in Trino. Expected: bigint 1. \
-    Obtained: decimal(20,0) '1' (the unsigned Arrow type)"]
 async fn defect_sem17_ranking_windows_are_bigint() -> Res<()> {
     expect_same(
         &[],
@@ -269,8 +256,6 @@ async fn defect_sem17_ranking_windows_are_bigint() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM19: an integer literal that fits 32 bits is integer in Trino. Expected: \
-    SELECT 1/2 is integer 0; VALUES (1), (2) is integer. Obtained: bigint"]
 async fn defect_sem19_small_integer_literals_are_integer() -> Res<()> {
     expect_same(
         &[],
@@ -284,8 +269,6 @@ async fn defect_sem19_small_integer_literals_are_integer() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM20: bigint joins a decimal supertype as decimal(19,0). Expected: VALUES \
-    (CAST(1 AS BIGINT)), (1.5) is decimal(20,1). Obtained: decimal(21,1)"]
 async fn defect_sem20_bigint_in_a_decimal_supertype_is_decimal_19() -> Res<()> {
     expect_same(
         &[],
@@ -299,9 +282,6 @@ async fn defect_sem20_bigint_in_a_decimal_supertype_is_decimal_19() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM21: a NULL literal in decimal arithmetic takes Trino's unknown-type rules. \
-    Expected: 0.2 * NULL is decimal(2,1), NULL * 1.5 decimal(3,1), 1.5 / NULL decimal(2,1). \
-    Obtained: decimal(3,2), decimal(5,2), decimal(7,5)"]
 async fn defect_sem21_null_literal_in_decimal_arithmetic() -> Res<()> {
     expect_same(
         &[],
@@ -312,10 +292,6 @@ async fn defect_sem21_null_literal_in_decimal_arithmetic() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM22: decimal errors carry other error names. Expected: decimal(p,s) * \
-    decimal(38,38) with s + 38 > 38 is INVALID_FUNCTION_ARGUMENT; x / decimal(38,38) is \
-    NUMERIC_VALUE_OUT_OF_RANGE (Decimal overflow); a narrowing CAST that does not fit is \
-    INVALID_CAST_ARGUMENT. Obtained: TYPE_MISMATCH, TYPE_MISMATCH and GENERIC_INTERNAL_ERROR"]
 async fn defect_sem22_decimal_error_names() -> Res<()> {
     expect_same(
         &[],
@@ -330,9 +306,6 @@ async fn defect_sem22_decimal_error_names() -> Res<()> {
 }
 
 #[tokio::test]
-#[ignore = "DEFECT-SEM29: text to decimal parses other inputs than Trino. Expected: CAST(' 12.5 ' \
-    AS DECIMAL(5,1)) fails with INVALID_CAST_ARGUMENT (Value is not a number); CAST('1e2' AS \
-    DECIMAL(5,1)) = '100.0'. Obtained: '12.5'; INVALID_CAST_ARGUMENT 'Cannot cast string '1e2''"]
 async fn defect_sem29_text_to_decimal_accepts_what_trino_accepts() -> Res<()> {
     expect_same(
         &[],
