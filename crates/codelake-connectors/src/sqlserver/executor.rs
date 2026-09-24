@@ -94,9 +94,22 @@ fn query_span(target: &Target, sql: &str) -> Span {
 }
 
 /// Records the SQL Server error number (`Msg 208`, …) on the current span.
+///
+/// A server error keeps SQL Server's own message, prefixed with its number:
+/// `sqlserver: error 245 (state 1, class 16): Conversion failed …`. tiberius'
+/// rendering wraps that message in quotes (`'…' on server …`), and the values
+/// the message itself quotes then no longer pair up, which leaves them
+/// outside every quoted segment of the error text.
 fn tds_error(err: tiberius::error::Error) -> DataFusionError {
     if let tiberius::error::Error::Server(token) = &err {
         Span::current().record("db.response.status_code", token.code());
+        return DataFusionError::Execution(format!(
+            "sqlserver: error {} (state {}, class {}): {}",
+            token.code(),
+            token.state(),
+            token.class(),
+            token.message()
+        ));
     }
     external(err)
 }
