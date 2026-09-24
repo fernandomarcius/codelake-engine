@@ -17,6 +17,7 @@ pub(crate) enum Code {
     InvalidCastArgument,
     NotSupported,
     InvalidSessionProperty,
+    NumericValueOutOfRange,
     CatalogNotFound,
     TableNotFound,
     ColumnNotFound,
@@ -37,6 +38,7 @@ impl Code {
             Self::InvalidCastArgument => (9, "INVALID_CAST_ARGUMENT", "USER_ERROR"),
             Self::NotSupported => (13, "NOT_SUPPORTED", "USER_ERROR"),
             Self::InvalidSessionProperty => (14, "INVALID_SESSION_PROPERTY", "USER_ERROR"),
+            Self::NumericValueOutOfRange => (19, "NUMERIC_VALUE_OUT_OF_RANGE", "USER_ERROR"),
             Self::CatalogNotFound => (44, "CATALOG_NOT_FOUND", "USER_ERROR"),
             Self::TableNotFound => (46, "TABLE_NOT_FOUND", "USER_ERROR"),
             Self::ColumnNotFound => (47, "COLUMN_NOT_FOUND", "USER_ERROR"),
@@ -148,6 +150,7 @@ fn code_of(error: &DataFusionError) -> Code {
         DataFusionError::ResourcesExhausted(_) => Code::ExceededLocalMemoryLimit,
         DataFusionError::ArrowError(arrow, _) => match arrow.as_ref() {
             ArrowError::DivideByZero => Code::DivisionByZero,
+            ArrowError::ArithmeticOverflow(_) => Code::NumericValueOutOfRange,
             ArrowError::CastError(_) | ArrowError::ParseError(_) => Code::InvalidCastArgument,
             _ => Code::GenericInternalError,
         },

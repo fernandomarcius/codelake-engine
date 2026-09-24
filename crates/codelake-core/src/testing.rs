@@ -153,6 +153,7 @@ pub(crate) fn federated_session() -> datafusion::prelude::SessionContext {
     rules.extend(PhysicalOptimizer::new().rules);
     let state = SessionStateBuilder::new()
         .with_default_features()
+        .with_analyzer_rules(crate::engine::analyzer_rules())
         .with_optimizer_rules(crate::engine::optimizer_rules())
         .with_query_planner(Arc::new(datafusion_federation::FederatedQueryPlanner::new()))
         .with_physical_optimizer_rules(rules)

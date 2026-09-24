@@ -67,12 +67,17 @@ impl QueryOptions {
 /// so a filter over a cross-source join never reaches its source. Federating
 /// after *all* rules instead lets `optimize_projections` create derived tables
 /// that the unparser renders as invalid SQL for PostgreSQL and SQL Server.
+///
+/// Checked arithmetic (see [`crate::overflow`]) is turned back into operators
+/// right before federation, so a federated sub-plan renders as plain SQL, and
+/// checked again right after it for what runs in the engine.
 pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>> {
     let mut rules = datafusion::optimizer::Optimizer::new().rules;
     let position = rules
         .iter()
         .position(|r| r.name() == "scalar_subquery_to_join")
         .map_or(rules.len(), |p| p + 1);
+    rules.insert(position, Arc::new(crate::overflow::CheckAfterFederation));
     rules.insert(
         position,
         Arc::new(datafusion_federation::FederationOptimizerRule::new()),
@@ -81,6 +86,15 @@ pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + S
         position,
         Arc::new(datafusion::optimizer::push_down_filter::PushDownFilter::new()),
     );
+    rules.insert(position, Arc::new(crate::overflow::UncheckBeforeFederation));
+    rules
+}
+
+/// `DataFusion`'s analyzer rules followed by checked arithmetic
+/// ([`crate::overflow`]), which needs the types that type coercion settles.
+pub fn analyzer_rules() -> Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Send + Sync>> {
+    let mut rules = datafusion::optimizer::Analyzer::new().rules;
+    rules.push(Arc::new(crate::overflow::CheckedArithmetic));
     rules
 }
 
@@ -144,6 +158,7 @@ impl Engine {
             .with_config(session)
             .with_runtime_env(runtime.env())
             .with_default_features()
+            .with_analyzer_rules(analyzer_rules())
             .with_optimizer_rules(optimizer_rules())
             .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
             .with_physical_optimizer_rules(physical_rules())

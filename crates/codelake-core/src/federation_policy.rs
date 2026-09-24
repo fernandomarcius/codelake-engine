@@ -87,7 +87,8 @@ fn split(
         .cloned()
         .map(|child| split(child, policy, planner))
         .collect::<Result<Vec<_>>>()?;
-    plan.with_new_exprs(plan.expressions(), children)
+    // Runs in the engine: its arithmetic is checked again (see `crate::overflow`).
+    crate::overflow::check_local_node(plan.with_new_exprs(plan.expressions(), children)?)
 }
 
 /// A rejected `Filter` whose predicate is a conjunction keeps its unsafe terms
@@ -124,7 +125,10 @@ fn lift_scan_filters(
     let bare = federate_prepared(LogicalPlan::TableScan(scan), policy, planner)?;
     // Never drop a predicate: if it cannot be rebuilt, planning fails.
     Ok(match conjunction(filters) {
-        Some(predicate) => LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(bare))?),
+        Some(predicate) => crate::overflow::check_local_node(LogicalPlan::Filter(Filter::try_new(
+            predicate,
+            Arc::new(bare),
+        )?))?,
         None => bare,
     })
 }
