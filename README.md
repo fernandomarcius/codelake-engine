@@ -35,7 +35,7 @@ Goal: replace Trino in production workloads at a fraction of the memory
  │ codelake-core   SQL → logical plan → federation        │
  │                 ─ sub-plans pushed down to each source │
  │                 ─ cross-source joins run here, inside  │
- │                   FairSpillPool(memory.limit) + spill  │
+ │                   CeilingPool(memory.limit) + spill    │
  ├───────────┬───────────┬────────────┬───────────────────┤
  │ sqlserver · postgres · mysql · mongodb · iceberg (exp.) │  codelake-connectors
  └───────────┴───────────┴────────────┴───────────────────┘

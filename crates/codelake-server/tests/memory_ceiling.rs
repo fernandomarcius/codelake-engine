@@ -274,7 +274,7 @@ fn assert_memory_error(error: &Value) {
 /// 4 read one page and cancel. Peak within the ADR 0003 budget; every page
 /// holds right rows or `EXCEEDED_LOCAL_MEMORY_LIMIT`; nothing stays reserved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-MEM8: Trino clients grow the process 187 MiB with memory.limit = 128 MiB: batches being produced and spilled are outside the pool (ADR 0003)"]
+#[ignore = "DEFECT-MEM8: Trino clients grow the process 187-206 MiB with memory.limit = 128 MiB: batches being produced and spilled are outside the pool (ADR 0003)"]
 async fn trino_slow_abandoned_and_canceled_clients_stay_under_the_ceiling() {
     let mut server = Server::start().await;
     let baseline = server.baseline().await;
@@ -416,7 +416,7 @@ fn wide_row(body: &[u8]) -> (i64, usize) {
 /// connection open. Peak within the ADR 0003 budget, right rows, and the
 /// memory is back once the connections close.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-MEM9: PostgreSQL clients grow the process 227 MiB with memory.limit = 128 MiB: batches being produced and spilled are outside the pool (ADR 0003)"]
+#[ignore = "DEFECT-MEM9: PostgreSQL clients grow the process 155-227 MiB with memory.limit = 128 MiB (over the budget in 1 of 2 runs): batches being produced and spilled are outside the pool (ADR 0003)"]
 async fn pg_wire_slow_and_stalled_clients_stay_under_the_ceiling() {
     let mut server = Server::start().await;
     let baseline = server.baseline().await;
@@ -580,7 +580,7 @@ async fn heavy_sort_spills_under_the_ceiling() {
 /// 1,000,000 groups of ~210 B keys, each seen twice, under 128 MiB: spills and
 /// counts right.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-MEM6: aggregation spills 1.36 GiB within the budget (168 MiB), then fails merging its spill files under its fair share (ADR 0003)"]
+#[ignore = "DEFECT-MEM6: aggregation spills ~1.4 GiB within the budget (168-170 MiB), then fails merging its spill files under its fair share (ADR 0003)"]
 async fn heavy_aggregation_spills_under_the_ceiling() {
     let (report, wrong) = heavy(
         "aggregation",

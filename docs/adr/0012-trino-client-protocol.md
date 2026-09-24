@@ -33,7 +33,11 @@ A separate listener (`[server.trino]`, off by default) serves:
   client's pace, and DML finishes without waiting for the client. The buffered
   batches are reserved in the engine's memory pool, and a query that fails
   (canceled, abandoned, timed out) drops them at once — only its record stays
-  in the history.
+  in the history. The rows of the page being built and the body kept for a
+  retry of the current token are reserved too (ADR 0003). A failed query
+  keeps that body only while requests for it are in flight, so they all get
+  the same bytes; a finished one does not keep its final page. A later retry
+  of those tokens is `410`.
 - **Cancellation stops the work.** Every operator of the physical plan is
   wrapped in `DataFusion`'s `CooperativeExec`, so it yields to the scheduler
   after a budget of batches. Without it an operator that emits many batches per
