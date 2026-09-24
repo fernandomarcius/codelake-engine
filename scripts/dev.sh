@@ -24,7 +24,10 @@ if [ -n "${CODELAKE_CACHE_DIR:-}" ]; then
   mkdir -p "$CODELAKE_CACHE_DIR/registry" "$CODELAKE_CACHE_DIR/target"
   CACHE_FLAGS=(-v "$CODELAKE_CACHE_DIR/registry":/usr/local/cargo/registry -v "$CODELAKE_CACHE_DIR/target":/work/target)
 else
-  CACHE_FLAGS=(-v codelake-cargo:/usr/local/cargo/registry -v codelake-target:/work/target)
+  # One target volume per checkout: cargo decides freshness by mtime, so two
+  # worktrees sharing a target (both mounted at /work) could reuse each other's
+  # binaries and test code that is not on disk.
+  CACHE_FLAGS=(-v codelake-cargo:/usr/local/cargo/registry -v "${CODELAKE_TARGET_VOLUME:-codelake-target}":/work/target)
 fi
 
 ENV_FLAGS=()
