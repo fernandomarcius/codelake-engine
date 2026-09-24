@@ -15,12 +15,15 @@
 //! or a marker from which [`recover`] finishes or undoes the swap, before the
 //! next `OPTIMIZE` of the table and when the catalog is opened.
 //!
-//! Before publishing the marker, the swap checks (under the table's commit
-//! lock) that the table and every file it compacted are still there with the
-//! same size. The marker is created with "create if absent", so a second
-//! process swapping the same table at that moment is refused. Concurrent
-//! `OPTIMIZE` of one table from several processes is otherwise not supported
-//! (as in Trino); see ADR 0009 for the residual window.
+//! The swap and every recovery hold the table's commit lock: in this process
+//! a `tokio` lock, across processes on a local warehouse an exclusive `flock`
+//! (`FileMetastore::table_file_lock`). So a recovery never inspects a swap
+//! that is still running (another node opening the catalog in the middle of
+//! a swap waits for it), and two swaps of one table never interleave. Before
+//! publishing the marker, the swap checks that the table and every file it
+//! compacted are still there with the same size. The marker is created with
+//! "create if absent" as a last guard. On an object store there is no
+//! cross-process lock; see ADR 0009.
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -369,11 +372,23 @@ async fn discard(table: &HiveTable, added: &[Added]) {
 /// Checks the snapshot still holds, publishes the marker and swaps the files.
 ///
 /// Once the marker exists the swap only moves forward (here or in
-/// [`recover`]): nothing that published a marker ever deletes the new files,
-/// so a recovery running concurrently in another process agrees with it.
+/// [`recover`]): nothing that published a marker ever deletes the new files.
+/// The whole swap holds the table's commit lock, in-process and across
+/// processes, so no recovery looks at it half done.
 pub(crate) async fn commit(table: &HiveTable, manifest: &Manifest) -> Result<()> {
     let locks = table.metastore.table_locks(&table.schema_name, &table.table);
     let _swap = locks.commit.write().await;
+    let _other_processes = match table
+        .metastore
+        .table_file_lock(&table.schema_name, &table.table, true)
+        .await
+    {
+        Ok(lock) => lock,
+        Err(err) => {
+            discard(table, &manifest.add).await;
+            return Err(external(err));
+        }
+    };
     if let Err(err) = verify(table, manifest).await {
         discard(table, &manifest.add).await;
         return Err(err);
@@ -483,6 +498,15 @@ async fn roll_back(table: &HiveTable, manifest: &Manifest) -> Result<()> {
 ///   it): undo, keeping the old files;
 /// - anything else was changed by someone else: stop and say so.
 pub(crate) async fn recover(table: &HiveTable) -> Result<bool> {
+    // Read and act on the marker only while no swap runs, here or in another
+    // process: a marker of a live swap is not a crash.
+    let locks = table.metastore.table_locks(&table.schema_name, &table.table);
+    let _swap = locks.commit.write().await;
+    let _other_processes = table
+        .metastore
+        .table_file_lock(&table.schema_name, &table.table, true)
+        .await
+        .map_err(external)?;
     let marker = file(table, MARKER);
     let bytes = match store(table).get(&marker).await {
         Ok(found) => found.bytes().await.map_err(external)?,
@@ -494,11 +518,11 @@ pub(crate) async fn recover(table: &HiveTable) -> Result<bool> {
             "OPTIMIZE marker {marker} is unreadable ({err}); inspect the table directory"
         ))
     })?;
-    let locks = table.metastore.table_locks(&table.schema_name, &table.table);
-    let _swap = locks.commit.write().await;
     let mut lost = false;
     for added in &manifest.add {
-        if !exists(table, &added.name).await? && !exists(table, &added.temporary).await? {
+        // Hidden name first: a rename between the two checks (a writer this
+        // lock does not reach) then finds the file under its final name.
+        if !exists(table, &added.temporary).await? && !exists(table, &added.name).await? {
             lost = true;
         }
     }

@@ -127,10 +127,24 @@ impl HiveTable {
     }
 
     /// Data files as seen between two commits: an `OPTIMIZE` in this process
-    /// never swaps files while the list is being taken.
+    /// or in another one on the same local warehouse never swaps files while
+    /// the list is being taken.
     async fn committed_data_files(&self) -> Result<Vec<ObjectMeta>> {
         let locks = self.metastore.table_locks(&self.schema_name, &self.table);
         let _between_commits = locks.commit.read().await;
+        // A warehouse this process cannot lock (read-only) has no swap of
+        // this process to wait for; other writers are then not excluded.
+        let _other_processes = match self
+            .metastore
+            .table_file_lock(&self.schema_name, &self.table, false)
+            .await
+        {
+            Ok(lock) => Some(lock),
+            Err(err) => {
+                tracing::debug!(table = %self.table, error = %err, "listing without the cross-process lock");
+                None
+            }
+        };
         self.data_files().await
     }
 
