@@ -32,6 +32,7 @@ use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::execution::object_store::ObjectStoreUrl;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
@@ -49,7 +50,32 @@ use super::metastore::FileMetastore;
 /// Rows per Parquet row group. Bounded so the writer's buffer stays small.
 const ROW_GROUP_ROWS: usize = 128 * 1024;
 /// Flush the in-progress row group once it holds this many bytes.
-const FLUSH_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const FLUSH_BYTES: usize = 64 * 1024 * 1024;
+
+/// Parquet settings shared by every file `CodeLake` writes into a hive table.
+pub(crate) fn writer_properties() -> WriterProperties {
+    WriterProperties::builder()
+        .set_max_row_group_row_count(Some(ROW_GROUP_ROWS))
+        .set_compression(Compression::SNAPPY)
+        .build()
+}
+
+/// Casts `batch` to the table's declared column types.
+pub(crate) fn conform(schema: &SchemaRef, batch: &RecordBatch) -> Result<RecordBatch> {
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| {
+            if column.data_type() == field.data_type() {
+                Ok(Arc::clone(column))
+            } else {
+                cast(column, field.data_type()).map_err(DataFusionError::from)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
+}
 
 static SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
@@ -96,7 +122,7 @@ fn is_data_file(dir: &Path, meta: &ObjectMeta) -> bool {
     parts.len() == 1 && !parts[0].as_ref().starts_with(['.', '_'])
 }
 
-fn external(err: impl std::error::Error + Send + Sync + 'static) -> DataFusionError {
+pub(crate) fn external(err: impl std::error::Error + Send + Sync + 'static) -> DataFusionError {
     DataFusionError::External(Box::new(err))
 }
 
@@ -110,8 +136,40 @@ pub(crate) struct HiveTable {
 }
 
 impl HiveTable {
-    fn dir(&self) -> Path {
+    pub(crate) fn dir(&self) -> Path {
         self.metastore.table_dir(&self.schema_name, &self.table)
+    }
+
+    /// Data files as seen between two commits: an `OPTIMIZE` in this process
+    /// never swaps files while the list is being taken.
+    async fn committed_data_files(&self) -> Result<Vec<ObjectMeta>> {
+        let locks = self.metastore.table_locks(&self.schema_name, &self.table);
+        let _between_commits = locks.commit.read().await;
+        self.data_files().await
+    }
+
+    /// A Parquet scan of `groups` in the table's schema: columns a file lacks
+    /// (added later) read as NULL, `INT96` timestamps as milliseconds.
+    pub(crate) fn scan_files(
+        &self,
+        runtime: &RuntimeEnv,
+        groups: Vec<Vec<PartitionedFile>>,
+        projection: Option<&Vec<usize>>,
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if runtime.object_store(&self.store_url).is_err() {
+            runtime.register_object_store(self.store_url.as_ref(), Arc::clone(self.metastore.store()));
+        }
+        let mut options = TableParquetOptions::default();
+        // Trino writes Hive timestamps as INT96; read them at its default precision.
+        options.global.coerce_int96 = Some("ms".into());
+        let source = ParquetSource::new(Arc::clone(&self.schema)).with_table_parquet_options(options);
+        let config = FileScanConfigBuilder::new(self.store_url.clone(), Arc::new(source))
+            .with_file_groups(groups.into_iter().map(FileGroup::new).collect())
+            .with_projection_indices(projection.cloned())?
+            .with_limit(limit)
+            .build();
+        Ok(DataSourceExec::from_data_source(config))
     }
 
     pub(crate) async fn data_files(&self) -> Result<Vec<ObjectMeta>> {
@@ -162,24 +220,14 @@ impl TableProvider for HiveTable {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.register_store(state);
-        let files = self.data_files().await?;
+        let files = self.committed_data_files().await?;
         let partitions = state.config().target_partitions().max(1);
         let mut groups: Vec<Vec<PartitionedFile>> = vec![Vec::new(); partitions.min(files.len().max(1))];
         let group_count = groups.len();
         for (index, meta) in files.into_iter().enumerate() {
             groups[index % group_count].push(PartitionedFile::new_from_meta(meta));
         }
-        let mut options = TableParquetOptions::default();
-        // Trino writes Hive timestamps as INT96; read them at its default precision.
-        options.global.coerce_int96 = Some("ms".into());
-        let source = ParquetSource::new(Arc::clone(&self.schema)).with_table_parquet_options(options);
-        let config = FileScanConfigBuilder::new(self.store_url.clone(), Arc::new(source))
-            .with_file_groups(groups.into_iter().map(FileGroup::new).collect())
-            .with_projection_indices(projection.cloned())?
-            .with_limit(limit)
-            .build();
-        Ok(DataSourceExec::from_data_source(config))
+        self.scan_files(state.runtime_env(), groups, projection, limit)
     }
 
     async fn insert_into(
@@ -215,23 +263,6 @@ impl DisplayAs for HiveSink {
 }
 
 impl HiveSink {
-    fn conform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let schema = &self.table.schema;
-        let columns = batch
-            .columns()
-            .iter()
-            .zip(schema.fields())
-            .map(|(column, field)| {
-                if column.data_type() == field.data_type() {
-                    Ok(Arc::clone(column))
-                } else {
-                    cast(column, field.data_type()).map_err(DataFusionError::from)
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
-    }
-
     /// Streams `data` into `temporary`; returns the number of rows written.
     async fn write_file(
         &self,
@@ -240,14 +271,10 @@ impl HiveSink {
         temporary: &Path,
     ) -> Result<u64> {
         let store = Arc::clone(self.table.metastore.store());
-        let properties = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(ROW_GROUP_ROWS))
-            .set_compression(Compression::SNAPPY)
-            .build();
         let mut writer = AsyncArrowWriter::try_new(
             ParquetObjectWriter::new(store, temporary.clone()),
             Arc::clone(&self.table.schema),
-            Some(properties),
+            Some(writer_properties()),
         )?;
         let reservation =
             MemoryConsumer::new(format!("HiveSink[{}]", self.table.table)).register(context.memory_pool());
@@ -257,7 +284,7 @@ impl HiveSink {
             if batch.num_rows() == 0 {
                 continue;
             }
-            writer.write(&self.conform(&batch)?).await?;
+            writer.write(&conform(&self.table.schema, &batch)?).await?;
             rows += batch.num_rows() as u64;
             if writer.in_progress_size() >= FLUSH_BYTES {
                 writer.flush().await?;

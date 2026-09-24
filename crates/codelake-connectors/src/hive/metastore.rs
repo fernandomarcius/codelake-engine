@@ -11,8 +11,8 @@
 //! Unknown JSON fields are preserved on rewrite (`extra`), so metadata written
 //! by a newer Trino survives a round trip through `CodeLake`.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use futures::TryStreamExt;
 use object_store::path::Path;
@@ -161,16 +161,39 @@ pub(crate) enum MetastoreError {
     NotFound(String),
 }
 
+/// In-process coordination of one table's maintenance (ADR 0009).
+#[derive(Debug, Default)]
+pub(crate) struct TableLocks {
+    /// One `OPTIMIZE` at a time per table.
+    pub(crate) optimize: tokio::sync::Mutex<()>,
+    /// Held exclusively while `OPTIMIZE` swaps files; scans hold it shared
+    /// while listing, so they never list old and new files together.
+    pub(crate) commit: tokio::sync::RwLock<()>,
+}
+
+/// Locks of every table touched so far, by `(schema, table)`.
+type LockMap = HashMap<(String, String), Arc<TableLocks>>;
+
 /// Metadata access for one catalog root.
 #[derive(Debug, Clone)]
 pub(crate) struct FileMetastore {
     store: Arc<dyn ObjectStore>,
     root: Path,
+    locks: Arc<Mutex<LockMap>>,
 }
 
 impl FileMetastore {
     pub(crate) fn new(store: Arc<dyn ObjectStore>, root: Path) -> Self {
-        Self { store, root }
+        Self {
+            store,
+            root,
+            locks: Arc::default(),
+        }
+    }
+
+    pub(crate) fn table_locks(&self, schema: &str, table: &str) -> Arc<TableLocks> {
+        let mut locks = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(locks.entry((schema.to_owned(), table.to_owned())).or_default())
     }
 
     pub(crate) fn store(&self) -> &Arc<dyn ObjectStore> {

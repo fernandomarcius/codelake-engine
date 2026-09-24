@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use codelake_core::WritableCatalog;
+use codelake_core::{CatalogSession, ProcedureCall, TableProcedure, WritableCatalog};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::{CatalogProvider, SchemaProvider, Session, TableProvider};
 use datafusion::datasource::TableType;
@@ -22,9 +22,11 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder, cast, col};
 use datafusion::physical_plan::ExecutionPlan;
+use object_store::ObjectStoreExt;
 use serde::{Deserialize, Serialize};
 
 use super::metastore::{ColumnMetadata, FileMetastore, MetastoreError, TableMetadata, VIRTUAL_VIEW};
+use super::optimize::{self, OPTIMIZE, Settings};
 use super::table::{HiveSink, HiveTable};
 use super::types::{arrow_type, hive_type};
 
@@ -264,7 +266,12 @@ impl HiveCatalog {
         Ok(Some(Arc::new(self.table_provider(schema, table, &metadata)?)))
     }
 
-    fn table_provider(&self, schema: &str, table: &str, metadata: &TableMetadata) -> Result<HiveTable> {
+    pub(crate) fn table_provider(
+        &self,
+        schema: &str,
+        table: &str,
+        metadata: &TableMetadata,
+    ) -> Result<HiveTable> {
         if metadata.storage_format.as_deref().is_some_and(|f| f != "PARQUET") {
             return Err(DataFusionError::NotImplemented(format!(
                 "{schema}.{table}: only PARQUET hive tables are supported"
@@ -287,6 +294,46 @@ impl HiveCatalog {
             table: table.to_owned(),
             schema: Arc::new(Schema::new(fields)),
         })
+    }
+
+    /// Finishes or undoes `OPTIMIZE` runs interrupted by a crash, in every
+    /// table. Called when the catalog is opened, before any query can list a
+    /// table whose files were half swapped.
+    pub(crate) async fn recover_interrupted_optimize(&self) -> Result<usize> {
+        let tables: Vec<(String, String)> = self
+            .listing
+            .read()
+            .map(|l| {
+                l.tables
+                    .iter()
+                    .flat_map(|(schema, tables)| tables.iter().map(move |t| (schema.clone(), t.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut recovered = 0;
+        for (schema, table) in tables {
+            let marker = self.metastore.table_dir(&schema, &table).join(optimize::MARKER);
+            match self.metastore.store().head(&marker).await {
+                Ok(_) => {}
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(err) => return Err(DataFusionError::External(Box::new(err))),
+            }
+            let Some(metadata) = self
+                .metastore
+                .table(&schema, &table)
+                .await
+                .map_err(metastore_error)?
+            else {
+                continue;
+            };
+            let hive = self.table_provider(&schema, &table, &metadata)?;
+            let locks = self.metastore.table_locks(&schema, &table);
+            let _one_at_a_time = locks.optimize.lock().await;
+            if optimize::recover(&hive).await? {
+                recovered += 1;
+            }
+        }
+        Ok(recovered)
     }
 
     async fn require_schema(&self, schema: &str) -> Result<()> {
@@ -451,6 +498,9 @@ impl WritableCatalog for HiveCatalog {
             }
             Some(_) => {}
         }
+        // Never in the middle of an OPTIMIZE swap of this table.
+        let locks = self.metastore.table_locks(schema, table);
+        let _swap = locks.commit.write().await;
         self.metastore
             .drop_table(schema, table)
             .await
@@ -576,6 +626,51 @@ impl WritableCatalog for HiveCatalog {
             .write_table(schema, table, &metadata)
             .await
             .map_err(metastore_error)
+    }
+
+    fn table_procedures(&self) -> Vec<TableProcedure> {
+        optimize::procedures()
+    }
+
+    async fn execute_table_procedure(
+        &self,
+        schema: &str,
+        table: &str,
+        call: &ProcedureCall,
+        session: &CatalogSession,
+        context: Arc<TaskContext>,
+    ) -> Result<()> {
+        if !call.procedure.eq_ignore_ascii_case(OPTIMIZE) {
+            return Err(DataFusionError::Plan(
+                codelake_core::table_procedure::not_registered(&call.procedure),
+            ));
+        }
+        let settings = Settings::new(call, session)?;
+        let metadata = self
+            .metastore
+            .table(schema, table)
+            .await
+            .map_err(metastore_error)?
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!("Table '{}.{schema}.{table}' does not exist", self.name))
+            })?;
+        if metadata.is_view() {
+            return Err(DataFusionError::Plan(
+                "ALTER TABLE EXECUTE is not supported for views".into(),
+            ));
+        }
+        let hive = self.table_provider(schema, table, &metadata)?;
+        let outcome = optimize::optimize(&hive, settings, &context).await?;
+        tracing::info!(
+            catalog = %self.name,
+            schema,
+            table,
+            files_removed = outcome.files_removed,
+            files_written = outcome.files_written,
+            rows = outcome.rows,
+            "OPTIMIZE finished"
+        );
+        Ok(())
     }
 }
 

@@ -5,13 +5,16 @@
 mod catalog;
 mod crc;
 mod metastore;
+mod optimize;
+#[cfg(test)]
+mod optimize_tests;
 mod table;
 mod types;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use codelake_core::{BoxError, Connector, ConnectorError, WritableCatalog};
+use codelake_core::{BoxError, Connector, ConnectorError, SessionProperty, WritableCatalog};
 use datafusion::catalog::CatalogProvider;
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
@@ -164,6 +167,13 @@ impl Connector for HiveConnector {
     async fn catalog(&self) -> Result<Arc<dyn CatalogProvider>, ConnectorError> {
         let hive = self.hive().await?;
         hive.refresh().await.map_err(|e| self.unreachable(e))?;
+        // A half-swapped OPTIMIZE would show duplicated rows: settle it first.
+        hive.recover_interrupted_optimize()
+            .await
+            .map_err(|e| ConnectorError::Metadata {
+                source_name: self.name.clone(),
+                cause: e.into(),
+            })?;
         Ok(Arc::new(HiveCatalogProvider(hive)))
     }
 
@@ -180,6 +190,10 @@ impl Connector for HiveConnector {
         self.catalog
             .get()
             .map(|c| Arc::clone(c) as Arc<dyn WritableCatalog>)
+    }
+
+    fn session_properties(&self) -> Vec<SessionProperty> {
+        optimize::session_properties()
     }
 }
 
