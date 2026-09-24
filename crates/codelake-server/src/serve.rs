@@ -3,14 +3,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use codelake_core::{Engine, EngineError, ValidatedConfig};
+use codelake_core::{Engine, EngineError, TrinoProtocolConfig, ValidatedConfig};
 use datafusion_postgres::ServerOptions;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::{hooks, ops};
+use crate::{hooks, ops, trino};
+
+/// How often abandoned Trino queries are canceled and old ones forgotten.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ServeError {
@@ -58,6 +61,11 @@ async fn serve(validated: ValidatedConfig) -> Result<(), ServeError> {
             .into_future(),
     );
 
+    let trino = match &config.server.trino {
+        Some(settings) => Some(start_trino(&engine, settings, &shutdown).await?),
+        None => None,
+    };
+
     let server = &config.server;
     let tls = server.tls.as_ref();
     let options = ServerOptions::new()
@@ -81,6 +89,9 @@ async fn serve(validated: ValidatedConfig) -> Result<(), ServeError> {
     // above), fail readiness so the load balancer drains us, and give in-flight
     // queries the grace period to finish.
     state.start_draining();
+    if let Some(trino) = &trino {
+        trino.start_draining();
+    }
     let grace = Duration::from_secs(server.shutdown_grace_secs);
     warn!(?grace, "shutdown requested, draining");
     tokio::time::sleep(grace).await;
@@ -90,6 +101,44 @@ async fn serve(validated: ValidatedConfig) -> Result<(), ServeError> {
     }
     info!("shutdown complete");
     Ok(())
+}
+
+/// Starts the Trino protocol listener and its registry sweeper; exposes the
+/// registry as `system.runtime.queries`.
+async fn start_trino(
+    engine: &Arc<Engine>,
+    settings: &TrinoProtocolConfig,
+    shutdown: &CancellationToken,
+) -> Result<Arc<trino::TrinoState>, ServeError> {
+    let limits = trino::Limits {
+        max_active: settings.max_active_queries,
+        client_timeout: Duration::from_secs(settings.client_timeout_secs),
+        history_retention: Duration::from_secs(settings.history_retention_secs),
+        history_size: settings.history_size,
+    };
+    let state = trino::TrinoState::new(Arc::clone(engine), limits, settings.listen);
+    engine
+        .context()
+        .register_catalog("system", state.system_catalog().map_err(EngineError::from)?);
+    let listener = TcpListener::bind(settings.listen).await?;
+    info!(addr = %settings.listen, "Trino protocol listening");
+    tokio::spawn(
+        axum::serve(listener, trino::router(Arc::clone(&state)))
+            .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+            .into_future(),
+    );
+    let sweeper = Arc::clone(&state);
+    let stop = shutdown.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(SWEEP_INTERVAL);
+        loop {
+            tokio::select! {
+                () = stop.cancelled() => return,
+                _ = tick.tick() => sweeper.sweep(),
+            }
+        }
+    });
+    Ok(state)
 }
 
 async fn shutdown_signal() {

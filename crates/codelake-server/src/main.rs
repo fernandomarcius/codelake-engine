@@ -14,6 +14,7 @@ mod hooks;
 mod ops;
 mod serve;
 mod telemetry;
+mod trino;
 
 #[derive(Debug, Parser)]
 #[command(

@@ -1,8 +1,15 @@
 # Roadmap
 
-The target is concrete: **replace Trino in the two production pipelines documented in
-[docs/requirements/trino-replacement.md](docs/requirements/trino-replacement.md)**
-(`reference-dbt-project` and `reference-streaming-pipeline`), then scale out.
+The target: **a drop-in replacement for Trino** — same client protocol, SQL
+dialect, functions, session properties, error codes and table formats — with a
+hard memory ceiling instead of a JVM heap, then scale-out.
+
+CodeLake is a general-purpose engine. The two production pipelines described in
+[docs/requirements/trino-replacement.md](docs/requirements/trino-replacement.md)
+are **acceptance cases**: CodeLake must run them unchanged, but they are a floor,
+not the specification. Features follow Trino's contract, with registries that
+connectors extend (catalogs, session properties, functions), never shapes
+hard-coded for one user.
 
 Every milestone ends with an executable Definition of Done. A milestone is done
 when its DoD commands pass in CI, not when the code "looks finished".
@@ -20,7 +27,7 @@ when its DoD commands pass in CI, not when the code "looks finished".
 
 **DoD:** `scripts/dev.sh scripts/gates.sh fast` and `… integration` pass.
 
-## M1 — Drop-in for the reference pipelines (read + write)
+## M1 — Trino drop-in: read, write, clients
 
 Blocking items, in order:
 
@@ -36,14 +43,16 @@ Blocking items, in order:
    `INSERT INTO … SELECT` appending **one new file per insert**, `DROP TABLE`,
    `CREATE/DROP VIEW`, `ALTER TABLE ADD COLUMN`. Output readable by SQL Server 2022
    `OPENROWSET` (verified in an integration test).
-3. **Trino client protocol** (R10): `POST /v1/statement`, `nextUri` paging,
-   `DELETE` cancel, `X-Trino-User/Catalog/Schema` headers, `system.runtime.queries`.
-   This keeps dbt-trino, the curl/urllib scripts and the .NET API unchanged.
-4. **Trino function pack** (R-SQL): UDFs for every function in the inventory
-   (`date_add('unit', n, ts)`, `date_diff`, `date_format`, `format_datetime`,
-   `from_big_endian_64`, `X'..'` varbinary literals, `checksum`, `uuid`, `max_by`,
-   `approx_percentile`, `with_timezone`, `to_hex`, `array_join`, …), each with a
-   golden test comparing the result with Trino 431.
+3. ✅ **Trino client protocol** (R10, F3): `POST /v1/statement`, `nextUri` paging
+   with idempotent retries, cancel, `X-Trino-*` session headers, `USE` / `SET
+   SESSION` / `SHOW SESSION`, Trino error codes, `system.runtime.queries`, and a
+   session-property registry that connectors extend (ADR 0012). Proven with the
+   Trino 431 CLI and the Python `trino` client (dbt-trino's DB-API).
+   Follow-up: prepared statements (`EXECUTE IMMEDIATE`), TLS on the listener.
+4. **Trino function library** (R-SQL): Trino 431's functions by category
+   (date/time, string, binary, math, conditional, aggregate, array/map, JSON,
+   URL) with Trino semantics, each with a golden test against Trino 431. Every
+   function the acceptance pipelines use is the minimum, not the scope.
 5. **Client authentication** on both listeners (SCRAM-SHA-256 for PostgreSQL wire,
    password/JWT for the Trino protocol) and table ownership semantics (R11).
 6. **Query governance** (R12): per-query timeout, admission queue, per-user limits.
