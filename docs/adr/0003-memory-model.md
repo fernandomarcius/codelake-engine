@@ -116,7 +116,9 @@
     and cannot refuse (DataFusion 54.1 `sort_merge_join/materializing_stream.rs`).
     That memory grows with the number of rows sharing a key: 1M rows of one
     100-byte key hold ~100 MB outside the pool's say. `SortMergeWithinCeiling`
-    wraps each rewritten join in a pool that watches that growth; once the
+    wraps each rewritten join in a pool that holds its buffered rows within
+    the budget of one input (past it they spill, while the pool still has
+    room for their keys) and watches the unchecked growth; once the
     engine's pool holds more than its limit, the join and its inputs fail
     with `Resources exhausted` at their next batch, one batch's keys over the
     limit at most. A key repeated past the pool fails, as the hash join did;

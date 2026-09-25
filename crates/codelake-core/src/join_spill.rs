@@ -84,10 +84,12 @@ limitations under the License.
 //! memory, and reads a spilled batch back to emit it, with growth the pool
 //! records and cannot refuse (`MemoryReservation::grow`). A key repeated on
 //! enough rows would take the pool past its limit that way.
-//! [`SortMergeWithinCeiling`] watches that growth: once the pool holds more
-//! than its limit, the join and its inputs fail with a resources error at
-//! their next batch, as the hash join failed, one batch's keys over the limit
-//! at most.
+//! [`SortMergeWithinCeiling`] holds the join's buffered rows within the same
+//! budget as one of its inputs, so that it spills them while the pool still
+//! has room for their keys, and watches the unchecked growth: once the pool
+//! holds more than its limit, the join and its inputs fail with a resources
+//! error at their next batch, as the hash join failed, one batch's keys over
+//! the limit at most.
 //!
 //! The estimate ([`build_estimate`]) is rows × bytes per row × 5/2 (the hash
 //! table and the batches it concatenates). A row count the source knows
@@ -477,8 +479,8 @@ fn sort_merge(join: &HashJoinExec, side_budget: usize) -> Result<Option<Arc<dyn 
     ) else {
         return Ok(None);
     };
-    let merge: Arc<dyn ExecutionPlan> =
-        Arc::new(SortMergeWithinCeiling::new(Arc::new(SortMergeJoinExec::try_new(
+    let merge: Arc<dyn ExecutionPlan> = Arc::new(SortMergeWithinCeiling::new(
+        Arc::new(SortMergeJoinExec::try_new(
             left,
             right,
             join.on().to_vec(),
@@ -486,7 +488,9 @@ fn sort_merge(join: &HashJoinExec, side_budget: usize) -> Result<Option<Arc<dyn 
             *join.join_type(),
             vec![SortOptions::default(); join.on().len()],
             join.null_equality(),
-        )?)));
+        )?),
+        side_budget,
+    ));
     let Some(output) = same_output(merge, join)? else {
         return Ok(None);
     };
@@ -790,12 +794,40 @@ impl CeilingWatch {
     }
 }
 
+/// Consumer name of the sort-merge join's buffered rows.
+const SORT_MERGE_ROWS: &str = "SMJStream[";
+
 /// Memory pool of a rewritten join: forwards everything to the pool it
-/// runs over and tells the [`CeilingWatch`] after every unchecked growth.
+/// runs over, tells the [`CeilingWatch`] after every unchecked growth, and
+/// refuses what would take the join's buffered rows past `budget`: the join
+/// then spills them, and the rest of the pool keeps room for the keys of
+/// what it spilled.
 #[derive(Debug)]
 struct WatchedPool {
     inner: Arc<dyn MemoryPool>,
     watch: Arc<CeilingWatch>,
+    budget: usize,
+    used: Mutex<usize>,
+}
+
+impl WatchedPool {
+    fn new(inner: Arc<dyn MemoryPool>, watch: Arc<CeilingWatch>, budget: usize) -> Self {
+        Self {
+            inner,
+            watch,
+            budget,
+            used: Mutex::new(0),
+        }
+    }
+
+    fn used(&self) -> MutexGuard<'_, usize> {
+        // A plain counter: a panic elsewhere leaves it consistent.
+        self.used.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+fn join_rows(reservation: &MemoryReservation) -> bool {
+    reservation.consumer().name().starts_with(SORT_MERGE_ROWS)
 }
 
 impl fmt::Display for WatchedPool {
@@ -819,15 +851,38 @@ impl MemoryPool for WatchedPool {
 
     fn grow(&self, reservation: &MemoryReservation, additional: usize) {
         self.inner.grow(reservation, additional);
+        if join_rows(reservation) {
+            *self.used() += additional;
+        }
         self.watch.observe();
     }
 
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
         self.inner.shrink(reservation, shrink);
+        if join_rows(reservation) {
+            let mut used = self.used();
+            *used = used.saturating_sub(shrink);
+        }
     }
 
     fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
-        self.inner.try_grow(reservation, additional)
+        if !join_rows(reservation) {
+            return self.inner.try_grow(reservation, additional);
+        }
+        let mut used = self.used();
+        let room = self.budget.saturating_sub(*used);
+        if additional > room {
+            return Err(resources_datafusion_err!(
+                "Failed to allocate additional {} for {} with {} already allocated for this reservation - {} remain available for this join",
+                human_readable_size(additional),
+                reservation.consumer().name(),
+                human_readable_size(reservation.size()),
+                human_readable_size(room)
+            ));
+        }
+        self.inner.try_grow(reservation, additional)?;
+        *used += additional;
+        Ok(())
     }
 
     fn reserved(&self) -> usize {
@@ -890,25 +945,32 @@ impl RecordBatchStream for Watched {
 }
 
 /// Runs its input (the sort-merge join of a rewritten hash join) over a
-/// pool that reports its unchecked growth to a watch of the engine's pool, and fails
-/// with a resources error, it and its inputs, once that growth took the
-/// engine's pool past its limit (see the module documentation).
+/// pool that holds the join's buffered rows within `budget` bytes (past it
+/// the join spills them) and reports unchecked growth to a watch of the
+/// engine's pool; it and its inputs fail with a resources error once that
+/// growth took the engine's pool past its limit (see the module
+/// documentation).
 #[derive(Debug)]
 pub struct SortMergeWithinCeiling {
     input: Arc<dyn ExecutionPlan>,
+    budget: usize,
     properties: Arc<PlanProperties>,
 }
 
 impl SortMergeWithinCeiling {
-    pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
+    pub fn new(input: Arc<dyn ExecutionPlan>, budget: usize) -> Self {
         let properties = Arc::clone(input.properties());
-        Self { input, properties }
+        Self {
+            input,
+            budget,
+            properties,
+        }
     }
 }
 
 impl DisplayAs for SortMergeWithinCeiling {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SortMergeWithinCeiling")
+        write!(f, "SortMergeWithinCeiling: bytes={}", self.budget)
     }
 }
 
@@ -943,7 +1005,7 @@ impl ExecutionPlan for SortMergeWithinCeiling {
                 children.len()
             ))
         })?;
-        Ok(Arc::new(Self::new(input)))
+        Ok(Arc::new(Self::new(input, self.budget)))
     }
 
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
@@ -954,10 +1016,11 @@ impl ExecutionPlan for SortMergeWithinCeiling {
             .session_config()
             .get_extension::<CeilingWatch>()
             .unwrap_or_else(|| Arc::new(CeilingWatch::new(Arc::clone(&runtime.memory_pool))));
-        let pool: Arc<dyn MemoryPool> = Arc::new(WatchedPool {
-            inner: Arc::clone(&runtime.memory_pool),
-            watch: Arc::clone(&watch),
-        });
+        let pool: Arc<dyn MemoryPool> = Arc::new(WatchedPool::new(
+            Arc::clone(&runtime.memory_pool),
+            Arc::clone(&watch),
+            self.budget,
+        ));
         let watched = RuntimeEnvBuilder::from_runtime_env(&runtime)
             .with_memory_pool(pool)
             .build_arc()?;
@@ -1032,13 +1095,22 @@ impl PhysicalOptimizerRule for SortMergeOversizedJoins {
         }
         let floor = config.execution.sort_spill_reservation_bytes.saturating_mul(2);
         let shared = shared_side_budget(pool_bytes, joins, floor);
-        plan.transform_up(|node| match node.downcast_ref::<JoinSideBudget>() {
-            Some(side) if side.budget != shared => {
-                Ok(Transformed::yes(
-                    Arc::new(JoinSideBudget::new(Arc::clone(&side.input), shared)) as Arc<dyn ExecutionPlan>,
-                ))
+        plan.transform_up(|node| {
+            if let Some(side) = node.downcast_ref::<JoinSideBudget>()
+                && side.budget != shared
+            {
+                let side: Arc<dyn ExecutionPlan> =
+                    Arc::new(JoinSideBudget::new(Arc::clone(&side.input), shared));
+                return Ok(Transformed::yes(side));
             }
-            _ => Ok(Transformed::no(node)),
+            if let Some(join) = node.downcast_ref::<SortMergeWithinCeiling>()
+                && join.budget != shared
+            {
+                let join: Arc<dyn ExecutionPlan> =
+                    Arc::new(SortMergeWithinCeiling::new(Arc::clone(&join.input), shared));
+                return Ok(Transformed::yes(join));
+            }
+            Ok(Transformed::no(node))
         })
         .data()
     }
@@ -1683,6 +1755,8 @@ mod tests {
         let shared = format!("JoinSideBudget: bytes={}", side_budget(pool) / 2);
         assert_eq!(text.matches(&shared).count(), 4, "{text}");
         assert_eq!(text.matches("JoinSideBudget").count(), 4, "{text}");
+        let joins = format!("SortMergeWithinCeiling: bytes={}", side_budget(pool) / 2);
+        assert_eq!(text.matches(&joins).count(), 2, "{text}");
         assert_eq!(rows(&small, two).await, rows(&large, two).await);
     }
 
@@ -1875,12 +1949,16 @@ mod tests {
     fn the_watch_fails_once_growth_passed_the_limit() {
         let engine: Arc<dyn MemoryPool> = Arc::new(crate::pool::CeilingPool::new(MIB));
         let watch = Arc::new(CeilingWatch::new(Arc::clone(&engine)));
-        let pool: Arc<dyn MemoryPool> = Arc::new(WatchedPool {
-            inner: Arc::clone(&engine),
-            watch: Arc::clone(&watch),
-        });
+        let pool: Arc<dyn MemoryPool> =
+            Arc::new(WatchedPool::new(Arc::clone(&engine), Arc::clone(&watch), MIB));
         let keys = MemoryConsumer::new("SMJStream[0]").register(&pool);
         keys.try_grow(MIB / 2).unwrap();
+        // The join's rows stay within its budget: past it they spill.
+        let error = keys.try_grow(MIB).unwrap_err().to_string();
+        assert!(error.contains("remain available for this join"), "{error}");
+        let other = MemoryConsumer::new("ExternalSorter[0]").register(&pool);
+        other.try_grow(MIB / 4).unwrap();
+        drop(other);
         keys.grow(MIB / 2);
         assert!(watch.check().is_ok(), "at the limit, not past it");
         assert!(keys.try_grow(1).is_err());
