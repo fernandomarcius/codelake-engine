@@ -60,7 +60,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tempfile.workspace = true
 tokio-postgres = "0.7"
-mysql_async = { version = "0.36", default-features = false, features = ["minimal"] }
+mysql_async = { version = "0.37", default-features = false, features = ["minimal"] }
 mongodb = "3.6"
 tiberius = { workspace = true }
 tokio-util = { workspace = true, features = ["compat"] }
