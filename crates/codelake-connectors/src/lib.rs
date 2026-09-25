@@ -139,6 +139,13 @@ pub fn build(source: &SourceConfig, secrets: &Secrets) -> Result<Arc<dyn Connect
                 .with_timestamp_precision(*timestamp_precision),
             ))
         }
+        // No Iceberg integration is published for the DataFusion train (ADR 0013).
+        SourceKind::Iceberg { .. } => Err(ConnectorError::Misconfigured {
+            source_name: name.clone(),
+            reason: "connector `iceberg` is not compiled into this build: no Iceberg integration is \
+                     published for its DataFusion version (ADR 0013)"
+                .to_owned(),
+        }),
         #[allow(
             unreachable_patterns,
             reason = "reachable only when a connector feature is disabled"
@@ -150,5 +157,42 @@ pub fn build(source: &SourceConfig, secrets: &Secrets) -> Result<Arc<dyn Connect
                 other.label()
             ),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use codelake_core::config::{Secrets, SourceConfig};
+    use codelake_core::{ConnectorError, SourceKind};
+
+    #[test]
+    fn an_iceberg_source_names_why_it_is_missing() {
+        let source = SourceConfig {
+            name: "lake".to_owned(),
+            required: true,
+            kind: SourceKind::Iceberg {
+                catalog_uri: "http://iceberg-rest:8181".to_owned(),
+                warehouse: None,
+                s3_endpoint: None,
+                s3_region: "us-east-1".to_owned(),
+                access_key_id_env: None,
+                secret_access_key_env: None,
+                s3_path_style: false,
+            },
+        };
+        let Err(ConnectorError::Misconfigured { source_name, reason }) =
+            super::build(&source, &Secrets::default())
+        else {
+            panic!("an iceberg source must not build");
+        };
+        assert_eq!(source_name, "lake");
+        assert!(
+            reason.starts_with("connector `iceberg` is not compiled into this build"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("ADR 0013") && !reason.contains("Cargo feature"),
+            "{reason}"
+        );
     }
 }
