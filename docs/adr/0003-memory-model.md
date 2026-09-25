@@ -216,10 +216,16 @@ cannot size fails cleanly (220 MiB `generate_series` build under 128 MiB:
   tables of 200 000 and 250 000 rows of ~210 bytes, pool 24 MiB): the hash
   join is refused; inner, left, right, full, semi and anti joins (integer
   and text keys, NULLs on both sides) return Trino's rows, both sorts spill,
-  the pool peaks at 11-16 MB. The guarded shapes stay hash joins with the
+  the pool peaks at 11-16 MB. Inner, right semi and right anti joins whose
+  buffered side repeats a key on 75 000 rows (`hive.hj.hot`) return Trino's
+  rows; the inner one spills rows of that key. The guarded shapes stay hash joins with the
   same rows (`join_spill::tests::guarded_joins_stay_hash_joins`). One key on
   400 000 rows (~40 MB of keys) under 16 MiB
   (`join_spill::tests::a_key_repeated_past_the_pool_fails_instead_of_passing_the_ceiling`)
   took the pool past its limit (17.0 MB reserved at the first growth past
   it) and completed without the watch; with it the query fails with
-  `Resources exhausted` and the pool returns to zero.
+  `Resources exhausted` and the pool returns to zero. Keys repeated on 100 000 rows (~9 MB per key) under 16 MiB
+  (`join_spill::tests::repeated_keys_spill_the_buffered_side_and_keep_the_hash_join_rows`):
+  inner, left, right, full, semi, right semi and right anti joins answer
+  the hash join's rows with the pool under its limit; the inner join spills
+  rows of its buffered side and reads them back.

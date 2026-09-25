@@ -1944,6 +1944,122 @@ mod tests {
         assert!(engine.memory_peak() <= limit.as_u64());
     }
 
+    /// The rows of `sql`, in memory, as one partition.
+    async fn table_of(sql: &str) -> Arc<dyn datafusion::catalog::TableProvider> {
+        let frame = SessionContext::new().sql(sql).await.unwrap();
+        let schema = Arc::new(frame.schema().as_arrow().clone());
+        let batches = frame.collect().await.unwrap();
+        Arc::new(datafusion::datasource::MemTable::try_new(schema, vec![batches]).unwrap())
+    }
+
+    /// The sort-merge joins of `plan` spilled their buffered side.
+    fn buffered_side_spilled(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        let own = plan.downcast_ref::<SortMergeJoinExec>().is_some_and(|join| {
+            join.metrics()
+                .and_then(|metrics| metrics.spill_count())
+                .is_some_and(|count| count > 0)
+        });
+        own || plan.children().into_iter().any(buffered_side_spilled)
+    }
+
+    /// Repeated keys under the engine's 16 MiB pool: `big.k` holds every key
+    /// twice, `hot.k` three keys on 100 000 rows each (~9 MB per key; `kt`
+    /// is the same key as 70 characters of text), so
+    /// the sort-merge join spills the rows of one key of its buffered side
+    /// and reads them back. Every join type the rule rewrites, the right
+    /// semi and anti joins included, answers the hash join's rows (computed
+    /// under a pool that fits it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repeated_keys_spill_the_buffered_side_and_keep_the_hash_join_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = engine(dir.path(), crate::ByteSize::mib(16));
+        let large = engine(dir.path(), crate::ByteSize::gib(2));
+        let big = table_of(
+            "SELECT value % 100000 AS k, lpad(CAST(value AS VARCHAR), 70, 'x') AS s, \
+                    lpad(CAST(value % 100000 AS VARCHAR), 70, '#') AS kt \
+             FROM generate_series(1, 200000)",
+        )
+        .await;
+        let hot = table_of(
+            "SELECT value % 3 AS k, lpad(CAST(value AS VARCHAR), 70, 'y') AS s, \
+                    lpad(CAST(value % 3 AS VARCHAR), 70, '#') AS kt \
+             FROM generate_series(1, 300000)",
+        )
+        .await;
+        for engine in [&small, &large] {
+            engine.context().register_table("big", Arc::clone(&big)).unwrap();
+            engine.context().register_table("hot", Arc::clone(&hot)).unwrap();
+        }
+        let cases = [
+            (
+                "join_type=Inner",
+                "SELECT count(*), sum(big.k), sum(length(big.s) + length(hot.s)) \
+                 FROM big JOIN hot ON big.k = hot.k",
+            ),
+            (
+                "join_type=Left",
+                "SELECT count(*), count(hot.k), sum(length(big.s)), sum(length(hot.s)) \
+                 FROM big LEFT JOIN hot ON big.k = hot.k",
+            ),
+            (
+                "join_type=Right",
+                "SELECT count(*), count(big.k), sum(length(hot.s)), sum(length(big.s)) \
+                 FROM big RIGHT JOIN hot ON big.k = hot.k",
+            ),
+            (
+                "join_type=Full",
+                "SELECT count(*), count(big.k), count(hot.k), sum(length(big.s)), sum(length(hot.s)) \
+                 FROM big FULL JOIN hot ON big.k = hot.k",
+            ),
+            (
+                "join_type=RightSemi",
+                "SELECT count(*), sum(length(s)) FROM hot WHERE kt IN (SELECT kt FROM big)",
+            ),
+            (
+                "join_type=RightAnti",
+                "SELECT count(*), sum(length(s)) FROM hot WHERE NOT EXISTS (SELECT 1 FROM big WHERE big.kt = hot.kt)",
+            ),
+            (
+                "Semi,",
+                "SELECT count(*), sum(length(s)) FROM big WHERE EXISTS (SELECT 1 FROM hot WHERE hot.kt = big.kt)",
+            ),
+        ];
+        let on = options(&small, "true");
+        for (join_type, sql) in cases {
+            let frame = small.sql_with(&on, sql).await.unwrap();
+            let plan = frame.clone().create_physical_plan().await.unwrap();
+            let text = displayable(plan.as_ref()).indent(true).to_string();
+            assert!(
+                text.lines()
+                    .any(|line| line.contains("SortMergeJoinExec: ") && line.contains(join_type))
+                    && !text.contains("HashJoinExec"),
+                "{sql}\n{text}"
+            );
+            small.reset_memory_peak();
+            let got = datafusion::physical_plan::collect(Arc::clone(&plan), Arc::new(frame.task_ctx()))
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert!(small.memory_peak() <= crate::ByteSize::mib(16).as_u64(), "{sql}");
+            let spilled = buffered_side_spilled(&plan);
+            assert!(
+                spilled || join_type != "join_type=Inner",
+                "vacuous: the inner join did not spill its buffered side"
+            );
+            let reference = large.sql_with(&options(&large, "true"), sql).await.unwrap();
+            let text = displayable(reference.clone().create_physical_plan().await.unwrap().as_ref())
+                .indent(true)
+                .to_string();
+            assert!(text.contains("HashJoinExec"), "{sql}\n{text}");
+            let expected = reference.collect().await.unwrap();
+            let show = |batches: &[RecordBatch]| {
+                datafusion::arrow::util::pretty::pretty_format_batches(batches)
+                    .unwrap()
+                    .to_string()
+            };
+            assert_eq!(show(&got), show(&expected), "{sql} (spilled: {spilled})");
+        }
+    }
+
     /// The watch: growth past the limit fails the streams it guards.
     #[test]
     fn the_watch_fails_once_growth_passed_the_limit() {
