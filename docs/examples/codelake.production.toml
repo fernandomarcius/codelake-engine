@@ -26,7 +26,9 @@ client_timeout_secs = 300
 # ~75% of the 8 GiB container (docs/operations/sizing.md).
 limit = "6GiB"
 spill_dir = "/var/lib/codelake/spill"
-spill_limit = "80GiB"
+# Below the spill volume: the base Kubernetes emptyDir sizeLimit is 50Gi, or
+# the free space of the host directory on Compose. Raise both together.
+spill_limit = "40GiB"
 metadata_cache_limit = "256MiB"
 
 [execution]
@@ -34,9 +36,12 @@ batch_size = 8192
 target_partitions = 8
 source_startup_timeout_secs = 60
 
-# Traces to a collector agent on the node or in the pod (ADR 0010).
+# Traces to a collector agent (ADR 0010). 127.0.0.1 is the container itself:
+# it reaches a sidecar in the same pod, but not an agent on the host of a
+# Compose bridge network or on a Kubernetes node. Use the agent's address
+# (a service name, or the node/host address the agent listens on).
 [telemetry]
-otlp_endpoint = "http://127.0.0.1:4318"
+otlp_endpoint = "http://otel-agent.example.internal:4318"
 service_name = "codelake"
 sampling_ratio = 0.1
 
