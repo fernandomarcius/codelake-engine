@@ -540,7 +540,9 @@ run_check() {
 write_textfile() {
   local results="$1" run_ok="$2" ts="$3" tmp
   tmp="$TEXTFILE.$$.tmp"
-  {
+  # Positive form on purpose: bash 3.2's `!` does not negate a failed
+  # redirection of a group.
+  if {
     printf '# HELP codelake_canary_check_ok 1 when the check passed in the last run.\n'
     printf '# TYPE codelake_canary_check_ok gauge\n'
     jq -r --arg canary "$NAME" '"codelake_canary_check_ok{canary=\"\($canary)\",check=\"\(.name)\",status=\"\(.status)\"} \(if .status == "ok" then 1 else 0 end)"' "$results"
@@ -556,7 +558,11 @@ write_textfile() {
     printf '# HELP codelake_canary_last_run_timestamp_seconds When the last run finished.\n'
     printf '# TYPE codelake_canary_last_run_timestamp_seconds gauge\n'
     printf 'codelake_canary_last_run_timestamp_seconds{canary="%s"} %s\n' "$NAME" "$((ts / 1000))"
-  } >"$tmp" && mv "$tmp" "$TEXTFILE" || log "cannot write $TEXTFILE"
+  } >"$tmp" && mv "$tmp" "$TEXTFILE"; then
+    return 0
+  fi
+  log "cannot write $TEXTFILE"
+  rm -f "$tmp"
 }
 
 RUN=0

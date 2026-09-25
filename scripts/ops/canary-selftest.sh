@@ -130,8 +130,8 @@ config "$WORK/drift.json" '[{"name": "drift", "sql": "SELECT drift", "expect": {
 expect_run "divergence from the reference fails" 1 "$WORK/drift.json"
 expect_jq "divergence reported as mismatch" '.checks[0].status == "mismatch" and (.checks[0].message | test("differs from the reference"))'
 
-"$CANARY" --config "$WORK/ok.json" --interval 1 --max-runs 2 >"$WORK/out" 2>"$WORK/err"
-if [ "$?" = 0 ] && [ "$(wc -l <"$WORK/out" | tr -d ' ')" = 2 ] && [ "$(jq -s '[.[].run] == [1, 2]' "$WORK/out")" = true ]; then
+if "$CANARY" --config "$WORK/ok.json" --interval 1 --max-runs 2 >"$WORK/out" 2>"$WORK/err" \
+  && [ "$(wc -l <"$WORK/out" | tr -d ' ')" = 2 ] && [ "$(jq -s '[.[].run] == [1, 2]' "$WORK/out")" = true ]; then
   pass "periodic mode: one line per run"
 else
   fail "periodic mode: one line per run" "$(cat "$WORK/out" "$WORK/err")"
