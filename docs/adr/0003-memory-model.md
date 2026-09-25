@@ -101,6 +101,18 @@
   the pool has room for and left the other sort without a batch), and the
   output spread again over the hash join's partitioning. The join trades
   parallelism for a plan that fits.
+  - Rows of one key value: the sort-merge join holds the rows of the current
+    key value of its buffered side and spills them past what the pool
+    grants, but keeps their key columns in memory, and reads a spilled batch
+    back to emit it, with `MemoryReservation::grow`, which the pool records
+    and cannot refuse (DataFusion 54.1 `sort_merge_join/materializing_stream.rs`).
+    That memory grows with the number of rows sharing a key: 1M rows of one
+    100-byte key hold ~100 MB outside the pool's say. `SortMergeWithinCeiling`
+    wraps each rewritten join in a pool that watches that growth; once the
+    engine's pool holds more than its limit, the join and its inputs fail
+    with `Resources exhausted` at their next batch, one batch's keys over the
+    limit at most. A key repeated past the pool fails, as the hash join did;
+    it never holds more than the ceiling in silence.
   - Statistics: an exact row count is used as it is; an estimate (`Inexact`:
     a filter's selectivity, the hive metastore or footers) must exceed the
     slice twice over; a build side of unknown size (no statistics: a
@@ -195,4 +207,9 @@ cannot size fails cleanly (220 MiB `generate_series` build under 128 MiB:
   join is refused; inner, left, right, full, semi and anti joins (integer
   and text keys, NULLs on both sides) return Trino's rows, both sorts spill,
   the pool peaks at 11-16 MB. The guarded shapes stay hash joins with the
-  same rows (`join_spill::tests::guarded_joins_stay_hash_joins`).
+  same rows (`join_spill::tests::guarded_joins_stay_hash_joins`). One key on
+  400 000 rows (~40 MB of keys) under 16 MiB
+  (`join_spill::tests::a_key_repeated_past_the_pool_fails_instead_of_passing_the_ceiling`)
+  took the pool past its limit (17.0 MB reserved at the first growth past
+  it) and completed without the watch; with it the query fails with
+  `Resources exhausted` and the pool returns to zero.

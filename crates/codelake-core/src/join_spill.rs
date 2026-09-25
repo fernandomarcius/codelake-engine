@@ -77,6 +77,16 @@ limitations under the License.
 //! - a limit pushed into the join, or an output ordering (a parent may rely
 //!   on it).
 //!
+//! The sort-merge join holds the rows of one key value of its buffered side;
+//! past what the pool grants it spills them, but keeps their key columns in
+//! memory, and reads a spilled batch back to emit it, with growth the pool
+//! records and cannot refuse (`MemoryReservation::grow`). A key repeated on
+//! enough rows would take the pool past its limit that way.
+//! [`SortMergeWithinCeiling`] watches that growth: once the pool holds more
+//! than its limit, the join and its inputs fail with a resources error at
+//! their next batch, as the hash join failed, one batch's keys over the limit
+//! at most.
+//!
 //! The estimate ([`build_estimate`]) is rows × bytes per row × 5/2 (the hash
 //! table and the batches it concatenates). A row count the source knows
 //! exactly is used as it is; an estimate (`Inexact`: a filter's selectivity,
@@ -86,10 +96,14 @@ limitations under the License.
 //! same rows.
 
 use std::fmt;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll};
 
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::compute::SortOptions;
-use datafusion::arrow::datatypes::{DataType, IntervalUnit, Schema};
+use datafusion::arrow::datatypes::{DataType, IntervalUnit, Schema, SchemaRef};
 use datafusion::common::config::{ConfigExtension, ConfigOptions};
 use datafusion::common::extensions_options;
 use datafusion::common::stats::Precision;
@@ -99,7 +113,7 @@ use datafusion::common::{human_readable_size, resources_datafusion_err};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
@@ -111,6 +125,8 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning, PlanProperties,
 };
+
+use futures::{Stream, StreamExt};
 
 use crate::pool::{BUFFERS_DIVISOR, is_exchange_buffer};
 
@@ -442,15 +458,16 @@ fn sort_merge(join: &HashJoinExec, side_budget: usize) -> Result<Option<Arc<dyn 
     ) else {
         return Ok(None);
     };
-    let merge: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
-        left,
-        right,
-        join.on().to_vec(),
-        None,
-        *join.join_type(),
-        vec![SortOptions::default(); join.on().len()],
-        join.null_equality(),
-    )?);
+    let merge: Arc<dyn ExecutionPlan> =
+        Arc::new(SortMergeWithinCeiling::new(Arc::new(SortMergeJoinExec::try_new(
+            left,
+            right,
+            join.on().to_vec(),
+            None,
+            *join.join_type(),
+            vec![SortOptions::default(); join.on().len()],
+            join.null_equality(),
+        )?)));
     let Some(output) = same_output(merge, join)? else {
         return Ok(None);
     };
@@ -677,7 +694,250 @@ impl ExecutionPlan for JoinSideBudget {
             context.window_functions().clone(),
             budgeted,
         ));
-        self.input.execute(partition, context)
+        let stream = self.input.execute(partition, Arc::clone(&context))?;
+        Ok(match context.session_config().get_extension::<CeilingWatch>() {
+            Some(watch) => Box::pin(Watched::new(stream, watch)),
+            None => stream,
+        })
+    }
+}
+
+/// The pool a rewritten join runs over, and whether unchecked growth took
+/// it past its limit: shared by the join, its inputs and the rewritten
+/// joins below them.
+#[derive(Debug)]
+struct CeilingWatch {
+    ceiling: Arc<dyn MemoryPool>,
+    /// Bytes the pool held when growth first took it past its limit; 0
+    /// while it has not.
+    passed_at: AtomicUsize,
+}
+
+impl CeilingWatch {
+    fn new(ceiling: Arc<dyn MemoryPool>) -> Self {
+        Self {
+            ceiling,
+            passed_at: AtomicUsize::new(0),
+        }
+    }
+
+    /// Records whether the pool holds more than its limit now.
+    fn observe(&self) {
+        if let MemoryLimit::Finite(limit) = self.ceiling.memory_limit() {
+            let reserved = self.ceiling.reserved();
+            if reserved > limit {
+                let _ = self
+                    .passed_at
+                    .compare_exchange(0, reserved, Ordering::Relaxed, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// A resources error once growth took the pool past its limit.
+    fn check(&self) -> Result<()> {
+        let reserved = self.passed_at.load(Ordering::Relaxed);
+        if reserved == 0 {
+            return Ok(());
+        }
+        let limit = match self.ceiling.memory_limit() {
+            MemoryLimit::Finite(limit) => human_readable_size(limit),
+            _ => "its limit".to_owned(),
+        };
+        Err(DataFusionError::ResourcesExhausted(format!(
+            "a sort-merge join held {} in a pool of {limit}: the rows of one key value, whose keys stay \
+             in memory when they spill, do not fit",
+            human_readable_size(reserved)
+        )))
+    }
+}
+
+/// Memory pool of a rewritten join: forwards everything to the pool it
+/// runs over and tells the [`CeilingWatch`] after every unchecked growth.
+#[derive(Debug)]
+struct WatchedPool {
+    inner: Arc<dyn MemoryPool>,
+    watch: Arc<CeilingWatch>,
+}
+
+impl fmt::Display for WatchedPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.inner)
+    }
+}
+
+impl MemoryPool for WatchedPool {
+    fn name(&self) -> &'static str {
+        "sort_merge_within_ceiling"
+    }
+
+    fn register(&self, consumer: &MemoryConsumer) {
+        self.inner.register(consumer);
+    }
+
+    fn unregister(&self, consumer: &MemoryConsumer) {
+        self.inner.unregister(consumer);
+    }
+
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.inner.grow(reservation, additional);
+        self.watch.observe();
+    }
+
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.inner.shrink(reservation, shrink);
+    }
+
+    fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
+        self.inner.try_grow(reservation, additional)
+    }
+
+    fn reserved(&self) -> usize {
+        self.inner.reserved()
+    }
+
+    fn memory_limit(&self) -> MemoryLimit {
+        self.inner.memory_limit()
+    }
+}
+
+/// A stream that fails once its [`CeilingWatch`] saw the pool past its
+/// limit: before it asks its input for a batch and before it hands one on.
+struct Watched {
+    input: SendableRecordBatchStream,
+    watch: Arc<CeilingWatch>,
+    failed: bool,
+}
+
+impl Watched {
+    fn new(input: SendableRecordBatchStream, watch: Arc<CeilingWatch>) -> Self {
+        Self {
+            input,
+            watch,
+            failed: false,
+        }
+    }
+
+    fn fail(&mut self) -> Option<Poll<Option<Result<RecordBatch>>>> {
+        if self.failed {
+            return Some(Poll::Ready(None));
+        }
+        let error = self.watch.check().err()?;
+        self.failed = true;
+        Some(Poll::Ready(Some(Err(error))))
+    }
+}
+
+impl Stream for Watched {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(poll) = self.fail() {
+            return poll;
+        }
+        let poll = self.input.poll_next_unpin(cx);
+        if poll.is_ready()
+            && let Some(failed) = self.fail()
+        {
+            return failed;
+        }
+        poll
+    }
+}
+
+impl RecordBatchStream for Watched {
+    fn schema(&self) -> SchemaRef {
+        self.input.schema()
+    }
+}
+
+/// Runs its input (the sort-merge join of a rewritten hash join) over a
+/// pool that reports its unchecked growth to a watch of the engine's pool, and fails
+/// with a resources error, it and its inputs, once that growth took the
+/// engine's pool past its limit (see the module documentation).
+#[derive(Debug)]
+pub struct SortMergeWithinCeiling {
+    input: Arc<dyn ExecutionPlan>,
+    properties: Arc<PlanProperties>,
+}
+
+impl SortMergeWithinCeiling {
+    pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
+        let properties = Arc::clone(input.properties());
+        Self { input, properties }
+    }
+}
+
+impl DisplayAs for SortMergeWithinCeiling {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SortMergeWithinCeiling")
+    }
+}
+
+impl ExecutionPlan for SortMergeWithinCeiling {
+    fn name(&self) -> &'static str {
+        "SortMergeWithinCeiling"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let [input] = <[_; 1]>::try_from(children).map_err(|children| {
+            DataFusionError::Internal(format!(
+                "SortMergeWithinCeiling expects one child, got {}",
+                children.len()
+            ))
+        })?;
+        Ok(Arc::new(Self::new(input)))
+    }
+
+    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
+        let runtime = context.runtime_env();
+        // A join inside a side of another rewritten join watches the same
+        // pool with the same flag.
+        let watch = context
+            .session_config()
+            .get_extension::<CeilingWatch>()
+            .unwrap_or_else(|| Arc::new(CeilingWatch::new(Arc::clone(&runtime.memory_pool))));
+        let pool: Arc<dyn MemoryPool> = Arc::new(WatchedPool {
+            inner: Arc::clone(&runtime.memory_pool),
+            watch: Arc::clone(&watch),
+        });
+        let watched = RuntimeEnvBuilder::from_runtime_env(&runtime)
+            .with_memory_pool(pool)
+            .build_arc()?;
+        let config = context
+            .session_config()
+            .clone()
+            .with_extension(Arc::clone(&watch));
+        let context = Arc::new(TaskContext::new(
+            context.task_id(),
+            context.session_id(),
+            config,
+            context.scalar_functions().clone(),
+            context.higher_order_functions().clone(),
+            context.aggregate_functions().clone(),
+            context.window_functions().clone(),
+            watched,
+        ));
+        let stream = self.input.execute(partition, context)?;
+        Ok(Box::pin(Watched::new(stream, watch)))
     }
 }
 
@@ -1406,6 +1666,88 @@ mod tests {
         let schema = Arc::new(frame.schema().as_arrow().clone());
         let batches = frame.collect().await.unwrap();
         Arc::new(datafusion::datasource::MemTable::try_new(schema, vec![batches]).unwrap())
+    }
+
+    /// `rows` rows whose text key is one value of 100 bytes.
+    async fn one_key_table(rows: usize) -> Arc<dyn datafusion::catalog::TableProvider> {
+        let sql = format!("SELECT lpad('', 100, 'a') AS s FROM generate_series(1, {rows})");
+        let frame = SessionContext::new().sql(&sql).await.unwrap();
+        let schema = Arc::new(frame.schema().as_arrow().clone());
+        let batches = frame.collect().await.unwrap();
+        Arc::new(
+            datafusion::datasource::MemTable::try_new(schema, batches.into_iter().map(|b| vec![b]).collect())
+                .unwrap(),
+        )
+    }
+
+    /// One key value on 400 000 rows of the buffered side (~40 MB of keys)
+    /// under a 16 MiB pool: the sort-merge join spills them but keeps their
+    /// keys with growth the pool cannot refuse. It fails with a resources
+    /// error, as the hash join did, instead of holding more than the pool;
+    /// the pool goes back to zero.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_key_repeated_past_the_pool_fails_instead_of_passing_the_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let limit = crate::ByteSize::mib(16);
+        let engine = engine(dir.path(), limit);
+        let context = engine.context();
+        context
+            .register_table("l", keyed_table(200_000, 'x').await)
+            .unwrap();
+        context
+            .register_table("hot", one_key_table(400_000).await)
+            .unwrap();
+        // `l` holds the hot key once, so the join needs the whole group.
+        let sql = "SELECT count(*) FROM (SELECT s FROM l UNION ALL SELECT lpad('', 100, 'a')) l \
+                   JOIN hot ON l.s = hot.s";
+        let frame = engine.sql_with(&options(&engine, "true"), sql).await.unwrap();
+        let plan = frame.clone().create_physical_plan().await.unwrap();
+        let text = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(
+            text.contains("SortMergeWithinCeiling") && text.contains("SortMergeJoinExec"),
+            "{text}"
+        );
+        engine.reset_memory_peak();
+        let error = frame.collect().await.unwrap_err();
+        assert!(
+            matches!(error.find_root(), DataFusionError::ResourcesExhausted(m) if m.contains("sort-merge join held")),
+            "{error}"
+        );
+        // Over the limit by at most about one batch of keys.
+        let peak = engine.memory_peak();
+        assert!(peak <= limit.as_u64() + (2 << 20), "pool peak {peak}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while engine.memory().reserved_bytes != 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(engine.memory().reserved_bytes, 0);
+    }
+
+    /// The watch: growth past the limit fails the streams it guards.
+    #[test]
+    fn the_watch_fails_once_growth_passed_the_limit() {
+        let engine: Arc<dyn MemoryPool> = Arc::new(crate::pool::CeilingPool::new(MIB));
+        let watch = Arc::new(CeilingWatch::new(Arc::clone(&engine)));
+        let pool: Arc<dyn MemoryPool> = Arc::new(WatchedPool {
+            inner: Arc::clone(&engine),
+            watch: Arc::clone(&watch),
+        });
+        let keys = MemoryConsumer::new("SMJStream[0]").register(&pool);
+        keys.try_grow(MIB / 2).unwrap();
+        keys.grow(MIB / 2);
+        assert!(watch.check().is_ok(), "at the limit, not past it");
+        assert!(keys.try_grow(1).is_err());
+        keys.grow(1);
+        let error = watch.check().unwrap_err();
+        assert!(matches!(error, DataFusionError::ResourcesExhausted(_)), "{error}");
+        assert!(error.to_string().contains("in a pool of 1024.0 KB"), "{error}");
+        // Giving memory back does not undo the failure.
+        keys.shrink(MIB);
+        assert!(watch.check().is_err());
+        assert_eq!((pool.reserved(), engine.reserved()), (1, 1));
+        assert!(matches!(pool.memory_limit(), MemoryLimit::Finite(MIB)));
+        drop(keys);
+        assert_eq!(engine.reserved(), 0);
     }
 
     fn options(engine: &crate::Engine, value: &str) -> crate::QueryOptions {

@@ -30,7 +30,10 @@ versioning: [SemVer](https://semver.org/).
 - A hash join whose estimated build side does not fit its slice of the memory pool
   runs as a sort-merge join, which spills, instead of failing with
   `EXCEEDED_LOCAL_MEMORY_LIMIT` (ADR 0003; session property `sort_merge_oversized_joins`,
-  default on). Derived from Spice.ai's rule (Apache-2.0, NOTICE).
+  default on). Derived from Spice.ai's rule (Apache-2.0, NOTICE). A key value repeated on
+  more rows than the pool holds still fails with `EXCEEDED_LOCAL_MEMORY_LIMIT`: the
+  sort-merge join keeps the keys of its spilled rows in memory, and fails once they take
+  the pool past its limit.
 - DataFusion 54.1 train: `datafusion-federation` 0.5.5, per-connector
   `datafusion-table-providers` 0.13.1 crates, `datafusion-postgres` 0.18.0 (ADR 0002).
 

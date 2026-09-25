@@ -29,7 +29,10 @@
 //! bitmaps and the one batch it accepts to make progress when refused (in
 //! its spill fallback, which the engine keeps off: `crate::join_guard`), and
 //! the sort-merge join's key arrays of a spilled batch and the spilled batch
-//! it reads back to emit.
+//! it reads back to emit. The key arrays are not memory already held: they
+//! add up over every row of one key value, without bound, and can take the
+//! total past the limit; `crate::join_spill::SortMergeWithinCeiling` fails
+//! the join once they do (one batch's keys over the limit at most).
 
 use std::fmt;
 use std::sync::{Mutex, MutexGuard, PoisonError};
