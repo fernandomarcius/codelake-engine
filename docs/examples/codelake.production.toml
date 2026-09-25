@@ -1,0 +1,71 @@
+# Example production configuration for one node (8 CPUs, 8 GiB container).
+# Every name, host and path is a placeholder: each installation has its own.
+# Secrets are never written here; each source names the environment variable
+# that holds its secret. Runbooks: docs/operations/.
+#
+#   codelake check-config --config codelake.production.toml
+
+[server]
+# Inside a container the listeners bind 0.0.0.0 and the network layer keeps
+# them private (Compose publishes on the host's 127.0.0.1; Kubernetes has a
+# NetworkPolicy). There is no client authentication yet: never expose these
+# ports beyond the clients' network.
+pg_listen = "0.0.0.0:5432"
+http_listen = "0.0.0.0:8080"
+allow_unauthenticated_network = true
+max_connections = 128
+shutdown_grace_secs = 30
+
+# Client HTTP protocol (/v1/statement) for dbt, JDBC, the CLI and scripts.
+[server.trino]
+listen = "0.0.0.0:8081"
+max_active_queries = 100
+client_timeout_secs = 300
+
+[memory]
+# ~75% of the 8 GiB container (docs/operations/sizing.md).
+limit = "6GiB"
+spill_dir = "/var/lib/codelake/spill"
+spill_limit = "80GiB"
+metadata_cache_limit = "256MiB"
+
+[execution]
+batch_size = 8192
+target_partitions = 8
+source_startup_timeout_secs = 60
+
+# Traces to a collector agent on the node or in the pod (ADR 0010).
+[telemetry]
+otlp_endpoint = "http://127.0.0.1:4318"
+service_name = "codelake"
+sampling_ratio = 0.1
+
+# Parquet warehouse in the file-metastore layout, shared with the previous
+# engine during a migration (docs/operations/migration.md).
+[[source]]
+name = "lake"
+kind = "hive"
+warehouse = "/data/warehouse"
+timestamp_precision = "MILLISECONDS"
+
+# Federated SQL Server, read-only account.
+[[source]]
+name = "erp"
+kind = "sqlserver"
+host = "sqlserver.example.internal"
+database = "erp"
+user = "codelake_reader"
+password_env = "ERP_SQLSERVER_PASSWORD"
+encrypt = "required"
+pool_size = 10
+
+# A source the service can live without: skipped at startup when down.
+[[source]]
+name = "crm"
+kind = "postgres"
+required = false
+host = "postgres.example.internal"
+database = "crm"
+user = "codelake_reader"
+password_env = "CRM_PG_PASSWORD"
+sslmode = "verify-full"
