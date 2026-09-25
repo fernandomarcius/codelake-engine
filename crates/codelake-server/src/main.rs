@@ -3,6 +3,7 @@
 //! ```text
 //! codelake check-config --config codelake.toml   # validate and exit (CI / deploy gate)
 //! codelake serve --config codelake.toml          # run the server
+//! codelake config import --from catalog/ --out codelake.toml --env-out codelake.env
 //! ```
 
 use std::io::Write as _;
@@ -21,6 +22,7 @@ use codelake_server::telemetry;
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod hooks;
+mod import;
 mod ops;
 mod serve;
 mod trino;
@@ -48,14 +50,41 @@ enum Command {
         #[arg(long, env = "CODELAKE_CONFIG")]
         config: PathBuf,
     },
+    /// Configuration tools.
+    #[command(subcommand)]
+    Config(ConfigCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Generate `[[source]]` entries from a directory of catalog-properties
+    /// files (`connector.name=...`). Secrets go to an env file (mode 0600),
+    /// never to the TOML file or the terminal.
+    Import(import::ImportArgs),
 }
 
 /// Exit code for configuration errors, distinct from runtime failures (1).
 const EXIT_CONFIG: u8 = 2;
+/// `config import` wrote its files but skipped at least one catalog.
+const EXIT_PARTIAL: u8 = 3;
+
+fn config_import(args: &import::ImportArgs) -> ExitCode {
+    match import::run(args, &mut std::io::stdout().lock()) {
+        Ok(outcome) if outcome.skipped == 0 => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::from(EXIT_PARTIAL),
+        Err(err) => {
+            let _ = writeln!(std::io::stderr(), "codelake config import: {err}");
+            ExitCode::from(EXIT_CONFIG)
+        }
+    }
+}
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let (Command::CheckConfig { config } | Command::Serve { config }) = &cli.command;
+    let config = match &cli.command {
+        Command::CheckConfig { config } | Command::Serve { config } => config,
+        Command::Config(ConfigCommand::Import(args)) => return config_import(args),
+    };
     // Load first: the exporter is configured by the file. Errors are logged
     // once the subscriber exists.
     let loaded = codelake_core::Config::load(config);
@@ -79,6 +108,8 @@ fn main() -> ExitCode {
         }
     };
     let code = match cli.command {
+        // Handled before the configuration is loaded.
+        Command::Config(_) => ExitCode::SUCCESS,
         Command::CheckConfig { .. } => {
             tracing::info!(sources = validated.config.sources.len(), "configuration is valid");
             ExitCode::SUCCESS

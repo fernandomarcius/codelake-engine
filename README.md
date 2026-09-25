@@ -62,8 +62,10 @@ docker compose -f deploy/compose/docker-compose.yml up -d
 ```
 
 Configuration is a TOML file plus environment variables for secrets
-([examples/codelake.toml](examples/codelake.toml)). Validate it without starting
-anything; every problem is reported at once:
+([examples/codelake.toml](examples/codelake.toml)); any string value may also
+reference `${ENV:NAME}`, resolved at load. `codelake config import` generates
+sources from catalog `.properties` files ([docs/shadow-run.md](docs/shadow-run.md)).
+Validate it without starting anything; every problem is reported at once:
 
 ```bash
 scripts/dev.sh cargo run -p codelake-server -- check-config --config examples/codelake.toml
