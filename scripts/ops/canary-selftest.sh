@@ -96,6 +96,25 @@ config "$WORK/incomplete.json" '[{"name": "empty", "sql": "SELECT empty"}, {"nam
 expect_run "a result that never finished fails" 1 "$WORK/incomplete.json"
 expect_jq "incomplete results reported as errors" '.checks_total == 2 and ([.checks[] | .status == "error" and (.message | test("not FINISHED"))] | all)'
 
+# A stand-in psql: prints 1, or hangs like a statement that never answers.
+mkdir -p "$WORK/bin"
+cat >"$WORK/bin/psql" <<'EOF'
+#!/usr/bin/env bash
+while [ $# -gt 0 ]; do [ "$1" = -c ] && sql="$2"; shift; done
+[ "${sql:-}" = "SELECT hang" ] && exec sleep 30
+printf '1\n'
+EOF
+chmod +x "$WORK/bin/psql"
+jq -n '{pg: {url: "postgresql://canary@127.0.0.1:1/db"}, defaults: {max_latency_ms: 5000},
+  checks: [{name: "pg_ok", sql: "SELECT 1", expect: {value: "1"}},
+           {name: "pg_hang", sql: "SELECT hang", timeout_secs: 1}]}' >"$WORK/pg.json"
+started="$(date +%s)"
+PATH="$WORK/bin:$PATH" expect_run "a PostgreSQL statement past its timeout fails" 1 "$WORK/pg.json"
+expect_jq "PostgreSQL timeout enforced without coreutils timeout" \
+  '.checks[0].status == "ok" and .checks[1].status == "error" and (.checks[1].message | test("^timeout after 1s"))'
+if [ $(($(date +%s) - started)) -lt 10 ]; then pass "PostgreSQL watchdog does not wait for the statement"; else
+  fail "PostgreSQL watchdog does not wait for the statement" "took $(($(date +%s) - started))s"; fi
+
 config "$WORK/drift.json" '[{"name": "drift", "sql": "SELECT drift", "expect": {"reference": true}}]' \
   "$(jq -nc --arg ref "$URL/ref" '{reference: {url: $ref}}')"
 expect_run "divergence from the reference fails" 1 "$WORK/drift.json"

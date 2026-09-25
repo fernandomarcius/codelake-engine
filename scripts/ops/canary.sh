@@ -354,19 +354,29 @@ PG_ERROR=""
 # Runs $1 against the PostgreSQL wire and writes its rows to $2 in the same
 # canonical text as http_canonical (unaligned, tab-separated, NULL as \N; a
 # value holding a tab or a newline is not escaped by psql). $3: timeout in
-# seconds, enforced with coreutils `timeout` when it is installed (closing the
-# connection is the only way to stop a statement on this listener).
+# seconds, enforced by a watchdog that terminates psql (closing the connection
+# is the only way to stop a statement on this listener); no coreutils
+# `timeout` needed, so it holds on macOS too.
 run_pg() {
-  local sql="$1" out="$2" t="$3" status
-  local -a limit=()
+  local sql="$1" out="$2" t="$3" status pid dog fired="$WORK/psql.timeout"
   PG_ERROR=""
-  command -v timeout >/dev/null 2>&1 && limit=(timeout "$t")
-  PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}" ${limit[@]+"${limit[@]}"} \
+  rm -f "$fired"
+  PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}" \
     psql "$PG_URL" -X -q -A -t -F "$(printf '\t')" -P 'null=\N' -v ON_ERROR_STOP=1 \
-    -c "$sql" >"$out" 2>"$WORK/psql.err" </dev/null
+    -c "$sql" >"$out" 2>"$WORK/psql.err" </dev/null &
+  pid=$!
+  (
+    trap 'kill "$nap" 2>/dev/null; exit 0' TERM
+    sleep "$t" & nap=$!
+    wait "$nap" && : >"$fired" && kill -TERM "$pid" 2>/dev/null
+  ) &
+  dog=$!
+  wait "$pid"
   status=$?
-  [ "$status" -eq 0 ] && return 0
-  if [ "$status" -eq 124 ] && [ "${#limit[@]}" -gt 0 ]; then
+  kill -TERM "$dog" 2>/dev/null
+  wait "$dog" 2>/dev/null
+  [ "$status" -eq 0 ] && [ ! -e "$fired" ] && return 0
+  if [ -e "$fired" ]; then
     PG_ERROR="timeout after ${t}s; connection closed"
   else
     PG_ERROR="$(tr '\n' ' ' <"$WORK/psql.err" | head -c 500)"
