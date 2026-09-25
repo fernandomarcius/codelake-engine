@@ -327,8 +327,10 @@ async fn w1_optimize_racing_inserts_keeps_every_row_once() {
 }
 
 /// `CREATE OR REPLACE TABLE … AS SELECT … FROM` the same table, racing an
-/// `OPTIMIZE` of it on another node: the result is the old table or the new
-/// one, never a mix, and nothing of either statement stays behind.
+/// `OPTIMIZE` of it on another node. The hive catalog refuses `OR REPLACE`
+/// as Trino 431 does (W1-1): each round the replace must be refused, the
+/// compaction must succeed, the table must hold its old rows, and nothing of
+/// either statement stays behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w1_or_replace_racing_optimize_is_old_or_new_never_mixed() {
     let l = Local::new().await;
@@ -348,12 +350,10 @@ async fn w1_or_replace_racing_optimize_is_old_or_new_never_mixed() {
             (&compacted, &replaced, &got),
         );
         let old = vec![vec!["40000".to_owned(), triangle(40_000)]];
-        let new = vec![vec![
-            "40000".to_owned(),
-            (i128::from(40_000) * 40_001 / 2 * 10).to_string(),
-        ]];
-        let expected = if replaced.is_ok() { new } else { old };
-        if got.as_ref() != Ok(&expected) {
+        let refused = replaced
+            .as_ref()
+            .is_err_and(|e| e.contains("does not support replacing tables"));
+        if !refused || compacted.is_err() || got.as_ref() != Ok(&old) {
             bad.push((round, compacted, replaced, got));
         }
     }
@@ -494,16 +494,13 @@ async fn w1_nanosecond_catalog_never_reads_a_wrong_instant() {
     let q = "SELECT id, CAST(ts AS varchar) FROM hive.s.far ORDER BY id";
     let got = cl_try(&nanos, q).await;
     note("w1_nanosecond_catalog", "NANOSECONDS read", &got);
-    if let Ok(got) = &got {
-        for row in got {
-            let expected = match row[0].as_str() {
-                "1" => "1500-06-01 00:00:00.000000000",
-                "2" => "9999-12-31 23:59:59.999000000",
-                _ => "2026-01-01 10:00:00.123000000",
-            };
-            assert_eq!(row[1], expected, "wrong instant: {got:?}");
-        }
-    }
+    // 1500-06-01 and 9999-12-31 are outside what timestamp(9) holds: the
+    // read fails naming the value, never answers another instant.
+    let err = got.expect_err("instants outside timestamp(9) must not read");
+    assert!(
+        err.contains("is outside the range of timestamp(9)") && err.contains("in column ts"),
+        "{err}"
+    );
 }
 
 /// A NANOSECONDS catalog reads a table two ways and pairs the reads row by
@@ -610,9 +607,11 @@ async fn w1_char_comparisons_above_the_scan_never_drop_rows() {
         let got = cl_try(&l.engine, q).await;
         note("w1_char_comparisons", q, &got);
         // Trino 431 answers [[1]] to each; refusing is acceptable.
-        if let Ok(r) = &got
-            && *r != rows(&[&["1"]])
-        {
+        let right = match &got {
+            Ok(r) => *r == rows(&[&["1"]]),
+            Err(e) => e.contains("comparing the char column ch is not supported yet"),
+        };
+        if !right {
             wrong.push((q, got));
         }
     }
@@ -660,9 +659,11 @@ async fn w1_in_memory_tables_never_escape_the_pool() {
         (&created, &held, &other_user),
     );
     assert!(
-        created.is_err() || held.is_err(),
-        "120000 rows of ~1 KB live in a 48 MiB engine: {held:?}; visible to another user: {other_user:?}"
+        created.as_ref().is_err_and(|e| e.contains("Resources exhausted")),
+        "120000 rows of ~1 KB live in a 48 MiB engine: {created:?} {held:?}; visible to another user: \
+         {other_user:?}"
     );
+    assert!(held.is_err(), "a failed CREATE registered its table: {held:?}");
 }
 
 /// Files outside the catalogs stay out of reach, whatever the spelling.
@@ -1028,17 +1029,33 @@ impl Checks {
         }
     }
 
-    /// Same rows, or both errors.
+    /// Same rows. Two errors are a difference too: a check that expects
+    /// both engines to refuse says so with [`Checks::both_refuse`].
     fn same(&mut self, id: &str, what: &str, codelake: &Result<Rows, String>, trino: &Result<Rows, String>) {
         note(self.probe, &format!("{id} {what}"), (codelake, trino));
-        let same = match (codelake, trino) {
-            (Ok(a), Ok(b)) => a == b,
-            (Err(_), Err(_)) => true,
-            _ => false,
-        };
+        let same = matches!((codelake, trino), (Ok(a), Ok(b)) if a == b);
         if !same {
             self.diffs
                 .push(format!("{id} {what}: CodeLake {codelake:?} / Trino {trino:?}"));
+        }
+    }
+
+    /// Both engines refuse, `CodeLake` with an error containing `codelake`
+    /// and Trino with one containing `trino`.
+    fn both_refuse(
+        &mut self,
+        id: &str,
+        what: &str,
+        (got, codelake): (&Result<Rows, String>, &str),
+        (reference, trino): (&Result<Rows, String>, &str),
+    ) {
+        note(self.probe, &format!("{id} {what}"), (got, reference));
+        let refused =
+            matches!((got, reference), (Err(a), Err(b)) if a.contains(codelake) && b.contains(trino));
+        if !refused {
+            self.diffs.push(format!(
+                "{id} {what}: expected both to refuse ({codelake:?} / {trino:?}): CodeLake {got:?} / Trino {reference:?}"
+            ));
         }
     }
 
@@ -1133,12 +1150,14 @@ async fn finding_8(s: &Shared, checks: &mut Checks) {
             &format!("INSERT INTO hive.s.by_codelake VALUES {values}"),
         )
         .await;
-        checks.same(
-            "F8",
-            &format!("INSERT {values}"),
-            &c.map(|_| Vec::new()),
-            &t.map(|_| Vec::new()),
-        );
+        let (c, t) = (c.map(|_| Vec::new()), t.map(|_| Vec::new()));
+        let what = format!("INSERT {values}");
+        if t.is_err() {
+            let too_long = "Cannot truncate non-space characters when casting from varchar(";
+            checks.both_refuse("F8", &what, (&c, too_long), (&t, too_long));
+        } else {
+            checks.same("F8", &what, &c, &t);
+        }
     }
     let read = "SELECT id, c, CAST(ch AS varchar), length(ch) FROM hive.s.{t} ORDER BY id";
     checks.same(
@@ -1255,11 +1274,17 @@ async fn findings_10_11(s: &Shared, checks: &mut Checks) {
         .unwrap()
         .replace("\"aa\"", "\"zz\"");
     std::fs::write(&file, text).unwrap();
-    checks.same(
+    checks.both_refuse(
         "F10",
         "metadata that does not match its .crc",
-        &cl_try(&s.engine, "SELECT * FROM hive.s.crc").await,
-        &s.trino.sql("SELECT * FROM hive.s.crc").await,
+        (
+            &cl_try(&s.engine, "SELECT * FROM hive.s.crc").await,
+            "does not match its checksum file",
+        ),
+        (
+            &s.trino.sql("SELECT * FROM hive.s.crc").await,
+            "Could not read table schema",
+        ),
     );
     s.trino
         .ok("CREATE TABLE hive.s.upper (id bigint) WITH (format = 'PARQUET')")
@@ -1336,34 +1361,59 @@ async fn findings_18_20_21(s: &Shared, checks: &mut Checks) {
         "CREATE TABLE hive.s.alt_cl AS SELECT CAST(1 AS BIGINT) AS id",
     )
     .await;
-    checks.same(
+    let not_null = "Catalog 'hive' does not support NOT NULL for column 'n'";
+    checks.both_refuse(
         "F18",
         "ADD COLUMN NOT NULL",
-        &cl_try(&s.engine, "ALTER TABLE hive.s.alt_cl ADD COLUMN n INT NOT NULL").await,
-        &s.trino
-            .sql("ALTER TABLE hive.s.alt_trino ADD COLUMN n INT NOT NULL")
-            .await,
+        (
+            &cl_try(&s.engine, "ALTER TABLE hive.s.alt_cl ADD COLUMN n INT NOT NULL").await,
+            not_null,
+        ),
+        (
+            &s.trino
+                .sql("ALTER TABLE hive.s.alt_trino ADD COLUMN n INT NOT NULL")
+                .await,
+            not_null,
+        ),
     );
-    checks.same(
+    let create_refused = "Catalog 'hive' does not support non-null column for column name 'n'";
+    checks.both_refuse(
         "F18",
         "CREATE TABLE with NOT NULL",
-        &cl_try(&s.engine, "CREATE TABLE hive.s.nn_cl (n INT NOT NULL)").await,
-        &s.trino.sql("CREATE TABLE hive.s.nn_trino (n INT NOT NULL)").await,
+        (
+            &cl_try(&s.engine, "CREATE TABLE hive.s.nn_cl (n INT NOT NULL)").await,
+            create_refused,
+        ),
+        (
+            &s.trino.sql("CREATE TABLE hive.s.nn_trino (n INT NOT NULL)").await,
+            create_refused,
+        ),
     );
-    checks.same(
+    let precision =
+        "Incorrect timestamp precision for timestamp(6); the configured precision is MILLISECONDS";
+    checks.both_refuse(
         "F20",
         "CREATE TABLE timestamp(6)",
-        &cl_try(&s.engine, "CREATE TABLE hive.s.t6_cl (ts timestamp(6))").await,
-        &s.trino
-            .sql("CREATE TABLE hive.s.t6_trino (ts timestamp(6))")
-            .await,
+        (
+            &cl_try(&s.engine, "CREATE TABLE hive.s.t6_cl (ts timestamp(6))").await,
+            precision,
+        ),
+        (
+            &s.trino
+                .sql("CREATE TABLE hive.s.t6_trino (ts timestamp(6))")
+                .await,
+            precision,
+        ),
     );
     let ctas = "CREATE TABLE hive.s.{t} AS SELECT TIMESTAMP '2026-01-01 00:00:00.9996' AS ts";
-    checks.same(
+    // The engine carries the literal in microseconds and names timestamp(6)
+    // where Trino names timestamp(4); both refuse the precision.
+    let refused = "the configured precision is MILLISECONDS; column name: ts";
+    checks.both_refuse(
         "F20",
         "CTAS of a timestamp(4) literal",
-        &cl_try(&s.engine, &ctas.replace("{t}", "c4_cl")).await,
-        &s.trino.sql(&ctas.replace("{t}", "c4_trino")).await,
+        (&cl_try(&s.engine, &ctas.replace("{t}", "c4_cl")).await, refused),
+        (&s.trino.sql(&ctas.replace("{t}", "c4_trino")).await, refused),
     );
     let far = "CREATE TABLE hive.s.{t} AS SELECT id, ts FROM (VALUES \
                (BIGINT '1', TIMESTAMP '1582-10-10 12:00:00.000'), (2, TIMESTAMP '0001-01-01 00:00:00.000'), \
