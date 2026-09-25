@@ -33,7 +33,7 @@ use crate::connector::{Connector, ConnectorError, ViewDefinition, WritableCatalo
 use crate::ddl::{self, Prepared, RelationKind, Rewrite, TableExecute, ViewSecurity};
 use crate::federation_guard::FederationFilterGuard;
 use crate::information_schema::CatalogList;
-use crate::join_guard::{JoinQueryPlanner, NullAwareAntiJoinGuard};
+use crate::join_guard::{JoinQueryPlanner, NestedLoopJoinSpillGuard, NullAwareAntiJoinGuard};
 use crate::output::AccountedOutput;
 use crate::plain_views::PlainViews;
 use crate::runtime::{EngineRuntime, MemoryStats};
@@ -253,7 +253,8 @@ fn trino_literal(value: &ScalarValue) -> String {
 /// [`crate::statistics_guard`]), and followed by
 /// [`PlainViews`], which keeps string views out of operators that retain rows
 /// (ADR 0003), [`ComputedBatches`], which sizes the batches of computed values
-/// in bytes, and [`AccountedOutput`], which keeps the buffers between the plan
+/// in bytes, the nested loop join spill guard ([`crate::join_guard`]), and
+/// [`AccountedOutput`], which keeps the buffers between the plan
 /// and the client inside the memory pool.
 pub(crate) fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> =
@@ -263,6 +264,7 @@ pub(crate) fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Syn
     rules.extend(crate::trino_functions::physical_rules());
     rules.push(Arc::new(PlainViews));
     rules.push(Arc::new(ComputedBatches));
+    rules.push(Arc::new(NestedLoopJoinSpillGuard));
     rules.push(Arc::new(AccountedOutput));
     rules
 }

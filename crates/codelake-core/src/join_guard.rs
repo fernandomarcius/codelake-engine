@@ -34,6 +34,19 @@
 //!    `NOT EXISTS (SELECT … WHERE <correlation> AND (x = y OR x IS NULL OR
 //!    y IS NULL))`, which is `x NOT IN (…)` wherever UNKNOWN filters a row
 //!    out (a conjunct of a `WHERE`).
+//! 4. **Nested loop joins do not fall back to spilling.** Over the memory
+//!    limit, `DataFusion` 54's `NestedLoopJoinExec` spills its build side and
+//!    runs in chunks. The fallback emits a `LEFT`/`LEFT ANTI` join's unmatched
+//!    rows once per probe partition (apache/datafusion#24675), drops the
+//!    unmatched probe rows of a `RIGHT`/`RIGHT ANTI` join
+//!    (apache/datafusion#24746) and executes the build side a second time
+//!    (apache/datafusion#24677): a file scan hands the second execution only
+//!    the files the first one left unopened, an exchange panics. The fallback
+//!    only starts when the runtime can write temporary files;
+//!    [`NestedLoopJoinWithoutFallback`] runs the join with a runtime that
+//!    cannot and gives its inputs the engine's runtime back
+//!    ([`JoinInputRuntime`]). Over the limit the join fails with a resources
+//!    error, as in `DataFusion` 53.
 //!
 //! Remove a guard only when a `DataFusion` release carries the upstream fix
 //! **and** the matching test of
@@ -49,6 +62,8 @@ use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, Tr
 use datafusion::common::{Column, DFSchema, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::QueryPlanner;
+use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
 use datafusion::logical_expr::expr::{Exists, InSubquery};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
@@ -56,11 +71,15 @@ use datafusion::logical_expr::{Expr, Filter, Join, LogicalPlan, LogicalPlanBuild
 use datafusion::optimizer::extract_equijoin_predicate::ExtractEquijoinPredicate;
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec};
+use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 
 /// Name of [`NullAwareAntiJoinGuard`].
 pub const NULL_AWARE_ANTI_JOIN_GUARD: &str = "codelake_null_aware_anti_join_guard";
+
+/// Name of [`NestedLoopJoinSpillGuard`].
+pub const NESTED_LOOP_JOIN_SPILL_GUARD: &str = "codelake_nested_loop_join_spill_guard";
 
 fn one_child(name: &str, children: Vec<Arc<dyn ExecutionPlan>>) -> Result<Arc<dyn ExecutionPlan>> {
     let [child] = <[_; 1]>::try_from(children).map_err(|children| {
@@ -435,17 +454,217 @@ pub fn with_null_safe_not_in(
     rules
 }
 
+// ---------------------------------------------------------------------------
+// 4. Nested loop joins run without the spill fallback.
+// ---------------------------------------------------------------------------
+
+/// The engine's runtime, carried in the session config of a nested loop
+/// join's task so that its inputs get it back.
+#[derive(Debug)]
+struct EngineRuntime(Arc<RuntimeEnv>);
+
+/// `context` with `runtime` and `config`.
+fn task_context(
+    context: &TaskContext,
+    config: datafusion::execution::config::SessionConfig,
+    runtime: Arc<RuntimeEnv>,
+) -> Arc<TaskContext> {
+    Arc::new(TaskContext::new(
+        context.task_id(),
+        context.session_id(),
+        config,
+        context.scalar_functions().clone(),
+        context.higher_order_functions().clone(),
+        context.aggregate_functions().clone(),
+        context.window_functions().clone(),
+        runtime,
+    ))
+}
+
+/// Physical rule, after every rule that rebuilds joins: wraps each
+/// `NestedLoopJoinExec` in [`NestedLoopJoinWithoutFallback`] and each of its
+/// inputs in [`JoinInputRuntime`].
+#[derive(Debug, Default)]
+pub struct NestedLoopJoinSpillGuard;
+
+impl PhysicalOptimizerRule for NestedLoopJoinSpillGuard {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        plan.transform_up(|node| {
+            // A join guarded already (a view planned on its own) has guarded
+            // inputs.
+            if !node.is::<NestedLoopJoinExec>() || node.children().iter().all(|c| c.is::<JoinInputRuntime>())
+            {
+                return Ok(Transformed::no(node));
+            }
+            let inputs = node
+                .children()
+                .into_iter()
+                .map(|child| Arc::new(JoinInputRuntime::new(Arc::clone(child))) as Arc<dyn ExecutionPlan>)
+                .collect();
+            let join = Arc::clone(&node).with_new_children(inputs)?;
+            let guarded: Arc<dyn ExecutionPlan> = Arc::new(NestedLoopJoinWithoutFallback::new(join));
+            Ok(Transformed::yes(guarded))
+        })
+        .data()
+    }
+
+    fn name(&self) -> &'static str {
+        NESTED_LOOP_JOIN_SPILL_GUARD
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+/// Runs its input (a nested loop join) with a runtime that cannot write
+/// temporary files, which keeps the join off its spill fallback. The memory
+/// pool, caches and object stores are the engine's.
+#[derive(Debug)]
+pub struct NestedLoopJoinWithoutFallback {
+    input: Arc<dyn ExecutionPlan>,
+    properties: Arc<PlanProperties>,
+}
+
+impl NestedLoopJoinWithoutFallback {
+    pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
+        let properties = Arc::clone(input.properties());
+        Self { input, properties }
+    }
+}
+
+impl DisplayAs for NestedLoopJoinWithoutFallback {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "NestedLoopJoinWithoutFallback")
+    }
+}
+
+impl ExecutionPlan for NestedLoopJoinWithoutFallback {
+    fn name(&self) -> &'static str {
+        "NestedLoopJoinWithoutFallback"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self::new(one_child(self.name(), children)?)))
+    }
+
+    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
+        let runtime = context.runtime_env();
+        let without_disk = RuntimeEnvBuilder::from_runtime_env(&runtime)
+            .with_disk_manager_builder(DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled))
+            .build_arc()?;
+        let config = context
+            .session_config()
+            .clone()
+            .with_extension(Arc::new(EngineRuntime(runtime)));
+        self.input
+            .execute(partition, task_context(&context, config, without_disk))
+    }
+}
+
+/// Input of a guarded nested loop join: runs with the engine's runtime again,
+/// so sorts and aggregations below the join still spill.
+#[derive(Debug)]
+pub struct JoinInputRuntime {
+    input: Arc<dyn ExecutionPlan>,
+    properties: Arc<PlanProperties>,
+}
+
+impl JoinInputRuntime {
+    pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
+        let properties = Arc::clone(input.properties());
+        Self { input, properties }
+    }
+}
+
+impl DisplayAs for JoinInputRuntime {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "JoinInputRuntime")
+    }
+}
+
+impl ExecutionPlan for JoinInputRuntime {
+    fn name(&self) -> &'static str {
+        "JoinInputRuntime"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self::new(one_child(self.name(), children)?)))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        None
+    }
+
+    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
+        match context.session_config().get_extension::<EngineRuntime>() {
+            Some(engine) => {
+                let config = context.session_config().clone();
+                let restored = task_context(&context, config, Arc::clone(&engine.0));
+                self.input.execute(partition, restored)
+            }
+            None => self.input.execute(partition, context),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Array, Int64Array, RecordBatch};
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use crate::bytes::ByteSize;
+    use crate::config::MemoryConfig;
+    use crate::runtime::EngineRuntime as NodeRuntime;
+    use datafusion::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::datasource::MemTable;
     use datafusion::execution::SessionStateBuilder;
     use datafusion::execution::config::SessionConfig;
-    use datafusion::execution::runtime_env::RuntimeEnv;
     use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::prelude::{ParquetReadOptions, SessionContext};
+    use std::sync::Mutex;
 
     /// A session with the engine's physical rules and query planner
     /// (`guarded`), or `DataFusion`'s.
@@ -708,5 +927,213 @@ mod tests {
             count(&ctx, NOT_IN_MEMORY).await > 0,
             "upstream behaviour changed: see the module documentation before removing the guard"
         );
+    }
+
+    // -- 3. Nested loop join spill fallback ----------------------------------
+
+    fn wide_table(prefix: &str, rows: i64, modulo: i64, partitions: usize) -> Arc<MemTable> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+            Field::new("pad", DataType::Utf8, false),
+        ]));
+        let per = usize::try_from(rows).unwrap().div_ceil(partitions);
+        let ids: Vec<i64> = (1..=rows).collect();
+        let batches = ids
+            .chunks(per)
+            .map(|part| {
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(part.to_vec())),
+                        Arc::new(Int64Array::from(
+                            part.iter().map(|id| id % modulo).collect::<Vec<_>>(),
+                        )),
+                        Arc::new(StringArray::from(
+                            part.iter()
+                                .map(|id| format!("{prefix}{id:0>4000}"))
+                                .collect::<Vec<_>>(),
+                        )),
+                    ],
+                )
+                .unwrap();
+                vec![batch]
+            })
+            .collect();
+        Arc::new(MemTable::try_new(schema, batches).unwrap())
+    }
+
+    /// `s` (about 5 MB) builds a `LEFT` nested loop join probed by the four
+    /// partitions of `b`; the pool holds 4 MiB.
+    fn nested_loop_session(dir: &std::path::Path, limit: ByteSize, guarded: bool) -> SessionContext {
+        let runtime = NodeRuntime::new(&MemoryConfig {
+            limit,
+            spill_dir: dir.to_owned(),
+            spill_limit: ByteSize::mib(512),
+            metadata_cache_limit: ByteSize::mib(1),
+        })
+        .unwrap()
+        .env();
+        let config = SessionConfig::new().with_target_partitions(4).with_batch_size(64);
+        let ctx = session(config, Some(runtime), guarded);
+        ctx.register_table("s", wide_table("s", 1200, 97, 1)).unwrap();
+        ctx.register_table("b", wide_table("b", 2000, 101, 4)).unwrap();
+        ctx
+    }
+
+    const LEFT_JOIN: &str = "SELECT count(*), count(b.id), sum(length(s.pad)), sum(length(b.pad)) FROM s LEFT JOIN b ON s.v > b.v + 90";
+
+    #[tokio::test]
+    async fn a_nested_loop_join_over_the_limit_fails_instead_of_spilling() {
+        let dir = tempfile::tempdir().unwrap();
+        let roomy = nested_loop_session(dir.path(), ByteSize::gib(1), true);
+        let expected = rows(&roomy, LEFT_JOIN).await.unwrap();
+        let tight = nested_loop_session(dir.path(), ByteSize::mib(4), true);
+        let plan = tight
+            .sql(&format!("EXPLAIN {LEFT_JOIN}"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let text = datafusion::arrow::util::pretty::pretty_format_batches(&plan)
+            .unwrap()
+            .to_string();
+        assert!(text.contains("NestedLoopJoinWithoutFallback"), "{text}");
+        assert!(text.contains("NestedLoopJoinExec: join_type="), "{text}");
+        let error = rows(&tight, LEFT_JOIN).await.unwrap_err();
+        assert!(
+            matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{error}"
+        );
+        assert!(error.to_string().contains("NestedLoopJoinLoad"), "{error}");
+        assert_eq!(rows(&roomy, LEFT_JOIN).await.unwrap(), expected);
+    }
+
+    /// Documents apache/datafusion#24675 (see
+    /// `upstream_still_prunes_the_null_of_the_subquery`): without the guard the
+    /// join spills and emits unmatched rows once per probe partition.
+    #[tokio::test]
+    async fn upstream_nested_loop_fallback_still_repeats_unmatched_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = rows(
+            &nested_loop_session(dir.path(), ByteSize::gib(1), true),
+            LEFT_JOIN,
+        )
+        .await
+        .unwrap();
+        let unguarded = nested_loop_session(dir.path(), ByteSize::mib(4), false);
+        let answer = rows(&unguarded, LEFT_JOIN).await;
+        assert!(
+            answer.as_ref().is_ok_and(|answer| *answer != expected),
+            "upstream behaviour changed ({answer:?} vs {expected:?}): see the module documentation \
+             before removing the guard"
+        );
+    }
+
+    /// Records whether the runtime it runs with can write temporary files.
+    #[derive(Debug)]
+    struct SeesDisk {
+        properties: Arc<PlanProperties>,
+        seen: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl SeesDisk {
+        fn new(seen: Arc<Mutex<Vec<bool>>>) -> Self {
+            let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+            Self {
+                properties: Arc::clone(EmptyExec::new(schema).properties()),
+                seen,
+            }
+        }
+    }
+
+    impl DisplayAs for SeesDisk {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "SeesDisk")
+        }
+    }
+
+    impl ExecutionPlan for SeesDisk {
+        fn name(&self) -> &'static str {
+            "SeesDisk"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(&self, _partition: usize, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(context.runtime_env().disk_manager.tmp_files_enabled());
+            let schema = self.schema();
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::empty(),
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_join_runs_without_disk_and_its_inputs_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = NodeRuntime::new(&MemoryConfig {
+            limit: ByteSize::mib(64),
+            spill_dir: dir.path().to_owned(),
+            spill_limit: ByteSize::mib(64),
+            metadata_cache_limit: ByteSize::mib(1),
+        })
+        .unwrap()
+        .env();
+        let context = Arc::new(TaskContext::default().with_runtime(Arc::clone(&runtime)));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let join_itself = NestedLoopJoinWithoutFallback::new(Arc::new(SeesDisk::new(Arc::clone(&seen))));
+        join_itself.execute(0, Arc::clone(&context)).unwrap();
+        let input = NestedLoopJoinWithoutFallback::new(Arc::new(JoinInputRuntime::new(Arc::new(
+            SeesDisk::new(Arc::clone(&seen)),
+        ))));
+        input.execute(0, Arc::clone(&context)).unwrap();
+        // Outside a guarded join the input keeps its context.
+        JoinInputRuntime::new(Arc::new(SeesDisk::new(Arc::clone(&seen))))
+            .execute(0, context)
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![false, true, true]);
+    }
+
+    #[test]
+    fn the_spill_guard_wraps_each_join_once() {
+        use datafusion::physical_plan::joins::NestedLoopJoinExec;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let side = || Arc::new(EmptyExec::new(Arc::clone(&schema))) as Arc<dyn ExecutionPlan>;
+        let join: Arc<dyn ExecutionPlan> = Arc::new(
+            NestedLoopJoinExec::try_new(side(), side(), None, &datafusion::common::JoinType::Inner, None)
+                .unwrap(),
+        );
+        let once = NestedLoopJoinSpillGuard
+            .optimize(join, &ConfigOptions::default())
+            .unwrap();
+        let twice = NestedLoopJoinSpillGuard
+            .optimize(Arc::clone(&once), &ConfigOptions::default())
+            .unwrap();
+        for plan in [&once, &twice] {
+            assert_eq!(plan.name(), "NestedLoopJoinWithoutFallback");
+            let join = plan.children()[0];
+            assert_eq!(join.name(), "NestedLoopJoinExec");
+            assert!(join.children().iter().all(|c| c.name() == "JoinInputRuntime"));
+            assert!(
+                join.children()
+                    .iter()
+                    .all(|c| c.children()[0].name() == "EmptyExec")
+            );
+        }
     }
 }

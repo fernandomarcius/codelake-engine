@@ -26,7 +26,8 @@
 //! Unchecked growth (`MemoryReservation::grow`) is recorded but not refused, as
 //! in every `DataFusion` pool. `DataFusion` 54 uses it only for memory an
 //! operator already holds and must keep: the nested loop join's visited
-//! bitmaps and the one batch it accepts to make progress when refused, and
+//! bitmaps and the one batch it accepts to make progress when refused (in
+//! its spill fallback, which the engine keeps off: `crate::join_guard`), and
 //! the sort-merge join's key arrays of a spilled batch and the spilled batch
 //! it reads back to emit.
 
