@@ -120,6 +120,14 @@ if grep -q 'name must match' "$WORK/err" && grep -q 'sql is required' "$WORK/err
 else
   fail "every configuration problem reported, password not echoed" "$(cat "$WORK/err")"
 fi
+for pg_url in 'postgresql://u@h/db?password=secret' 'postgresql:///db?host=h&password=secret' \
+  'postgres://u@h/db?sslmode=require&PASSWORD=secret'; do
+  jq -n --arg url "$pg_url" '{pg: {url: $url}, checks: [{name: "x", sql: "SELECT 1", protocol: "pg"}]}' >"$WORK/pgpw.json"
+  expect_run "password in the pg.url query refused" 2 "$WORK/pgpw.json" --check-config
+  if ! grep -q 'must not carry a password' "$WORK/err" || grep -q 'secret' "$WORK/err"; then
+    fail "password in the pg.url query reported, not echoed" "$(cat "$WORK/err")"
+  fi
+done
 expect_run "--check-config on a valid file" 0 "$WORK/ok.json" --check-config
 printf 'not json' >"$WORK/garbage.json"
 expect_run "configuration that is not JSON" 2 "$WORK/garbage.json"

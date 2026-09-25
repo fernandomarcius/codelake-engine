@@ -142,7 +142,7 @@ PROBLEMS="$(jq -r '
        else empty end),
       (if has("pg") then
          (if (.pg.url | pg_ok) then empty else "pg.url must be a postgresql:// URL" end),
-         (if (.pg.url // "" | tostring | test("^postgres(ql)?://[^/@]*:[^/@]*@")) then
+         (if (.pg.url // "" | tostring | test("^postgres(ql)?://[^/@]*:[^/@]*@|[?&]password="; "i")) then
             "pg.url must not carry a password; use PGPASSWORD or a pgpass file" else empty end)
        else empty end),
       (if has("reference") then

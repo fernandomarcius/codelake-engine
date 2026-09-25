@@ -31,7 +31,7 @@ A JSON file; example: [docs/examples/canary.json](../examples/canary.json).
 | `http.url`, `http.catalog`, `http.schema`, `http.time_zone` | client HTTP protocol endpoint and session |
 | `http.password_env` | variable holding a password, once the engine authenticates (sent through curl's stdin, never on the command line) |
 | `http.header_prefix` | protocol header prefix (default the reference engine's) |
-| `pg.url` | `postgresql://user@host:port/db`, **without** password (use `PGPASSWORD` or a pgpass file; a URL with a password is refused) |
+| `pg.url` | `postgresql://user@host:port/db`, **without** password (use `PGPASSWORD` or a pgpass file; a URL with a password, as `user:pw@` or a `password=` parameter, is refused) |
 | `reference.url`, `.user`, `.catalog`, `.schema`, `.password_env` | a second HTTP endpoint (the reference engine, or the previous CodeLake) for `expect.reference` |
 | `defaults.protocol` | `http` or `pg` (default: `http` when configured) |
 | `defaults.max_latency_ms` | latency objective per check (default 300000) |
