@@ -855,9 +855,12 @@ mod tests {
         ctx.sql("SHOW ALL").await.unwrap().collect().await.unwrap();
         let catalog = ctx.catalog("other").unwrap();
         assert!(catalog.schema_names().contains(&"information_schema".to_owned()));
-        // DataFusion 54 downcasts to the concrete type: a wrapper can no
-        // longer answer as the catalog it wraps.
-        assert!(catalog.is::<WithInformationSchema>());
+        // DataFusion 54 downcasts to the concrete type, so the wrapper no
+        // longer answers as the catalog it wraps (nothing in the engine
+        // downcasts a catalog); it still serves the wrapped catalog's schemas.
+        assert!(catalog.schema_names().contains(&"public".to_owned()));
+        assert!(catalog.schema("public").is_some());
+        assert!(catalog.schema("nope").is_none());
         assert!(
             catalog
                 .register_schema("information_schema", Arc::new(MemorySchemaProvider::new()))
