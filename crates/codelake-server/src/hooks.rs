@@ -1,24 +1,32 @@
 //! PostgreSQL wire protocol hooks. The metrics and tracing hooks only observe
-//! statements; they never answer them, so the default behaviour of
-//! `datafusion-postgres` is kept.
+//! statements; they never answer them. The policy hook refuses statements,
+//! and the last hook runs the simple-protocol statements no other hook
+//! answered as `datafusion-postgres` would, planning each once
+//! ([`SimpleRunHook`]).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use codelake_core::trace::{self, TARGET, TraceParent};
 use codelake_core::{operand_checks, statement_policy};
 use datafusion::common::ParamValues;
+use datafusion::dataframe::DataFrame;
+use datafusion::execution::context::SQLOptions;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::Statement;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+use datafusion_postgres::arrow_pg::datatypes::df::encode_dataframe;
 use datafusion_postgres::hooks::cursor::CursorStatementHook;
 use datafusion_postgres::hooks::set_show::SetShowHook;
 use datafusion_postgres::hooks::transactions::TransactionStatementHook;
 use datafusion_postgres::hooks::{HookClient, QueryHook};
-use datafusion_postgres::pgwire::api::results::Response;
+use datafusion_postgres::pgwire::api::portal::Format;
+use datafusion_postgres::pgwire::api::results::{Response, Tag};
 use datafusion_postgres::pgwire::api::{ClientInfo, METADATA_USER};
 use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use datafusion_postgres::pgwire::types::format::FormatOptions;
 
 pub(crate) const STATEMENTS_TOTAL: &str = "codelake_statements_total";
 
@@ -64,10 +72,11 @@ impl QueryHook for MetricsHook {
 /// no client may run (`COPY`, `CREATE EXTERNAL TABLE`, runtime settings,
 /// `""`): the engine's statement policy
 /// ([`codelake_core::statement_policy`]), applied to the PostgreSQL wire
-/// protocol, which runs statements on the session directly. It also refuses
-/// the operand types the engine does not combine (text against a number,
-/// `time ± interval`; ADR 0014), with PostgreSQL's typing rules and errors
-/// ([`codelake_core::operand_checks::postgres_refusal`]).
+/// protocol, which runs statements on the session directly. On the extended
+/// protocol it also refuses the operand types the engine does not combine
+/// (text against a number, `time ± interval`; ADR 0014), with PostgreSQL's
+/// typing rules and errors ([`codelake_core::operand_checks::postgres_refusal`]);
+/// on the simple protocol [`SimpleRunHook`] refuses them on the plan it runs.
 #[derive(Debug)]
 pub(crate) struct PolicyHook;
 
@@ -103,35 +112,15 @@ fn check_operands(plan: &LogicalPlan) -> PgWireResult<()> {
     }
 }
 
-/// A simple-protocol statement arrives unplanned: it is planned here to
-/// check its operands. A statement that does not plan (a command answered by
-/// a later hook, a syntax `DataFusion` rejects) is left to what runs it,
-/// which reports its own error.
-async fn check_simple(statement: &Statement, session_context: &SessionContext) -> PgWireResult<()> {
-    let planned = session_context
-        .state()
-        .statement_to_plan(datafusion::sql::parser::Statement::Statement(Box::new(
-            statement.clone(),
-        )))
-        .await;
-    match planned {
-        Ok(plan) => check_operands(&plan),
-        Err(_) => Ok(()),
-    }
-}
-
 #[async_trait]
 impl QueryHook for PolicyHook {
     async fn handle_simple_query(
         &self,
         statement: &Statement,
-        session_context: &SessionContext,
+        _session_context: &SessionContext,
         _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
-        if let Err(err) = check(statement) {
-            return Some(Err(err));
-        }
-        check_simple(statement, session_context).await.err().map(Err)
+        check(statement).err().map(Err)
     }
 
     async fn handle_extended_parse_query(
@@ -158,6 +147,129 @@ impl QueryHook for PolicyHook {
             return Some(Err(refusal(&err)));
         }
         check_operands(logical_plan).err().map(Err)
+    }
+}
+
+/// Runs the simple-protocol statements no earlier hook answered, as
+/// `datafusion-postgres` does after its hooks (`SimpleQueryHandler::do_query`
+/// in 0.18: the statement's text planned by `SessionContext::sql`, under the
+/// session's `statement_timeout`, an `INSERT` answered with its row count),
+/// except that the plan is refused when its operands are ones the engine does
+/// not combine ([`check_operands`]) before it runs. The operands are checked
+/// on the very plan that runs, and the statement is planned once. It must be
+/// the last hook: it answers every statement that reaches it.
+///
+/// A statement that does not plan gets the planner's error, as it would from
+/// `datafusion-postgres`.
+#[derive(Debug)]
+pub(crate) struct SimpleRunHook;
+
+/// Client metadata key where `datafusion-postgres` keeps the session's
+/// `SET statement_timeout`, in milliseconds (its accessor is crate-private;
+/// a test pins the key against `SET`).
+const STATEMENT_TIMEOUT: &str = "statement_timeout_ms";
+
+fn statement_timeout<C: ClientInfo + ?Sized>(client: &C) -> Option<Duration> {
+    client
+        .metadata()
+        .get(STATEMENT_TIMEOUT)
+        .and_then(|millis| millis.parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
+fn api_error(err: datafusion::error::DataFusionError) -> PgWireError {
+    PgWireError::ApiError(Box::new(err))
+}
+
+/// What `SessionContext::sql` does, with the operand check between planning
+/// and running.
+async fn plan_checked(session_context: &SessionContext, sql: &str) -> PgWireResult<DataFrame> {
+    let plan = session_context
+        .state()
+        .create_logical_plan(sql)
+        .await
+        .map_err(api_error)?;
+    SQLOptions::new().verify_plan(&plan).map_err(api_error)?;
+    check_operands(&plan)?;
+    session_context
+        .execute_logical_plan(plan)
+        .await
+        .map_err(api_error)
+}
+
+async fn run_simple(
+    statement: &Statement,
+    session_context: &SessionContext,
+    client: &mut dyn HookClient,
+) -> PgWireResult<Response> {
+    let sql = statement.to_string();
+    let planned = plan_checked(session_context, &sql);
+    let df = match statement_timeout(client) {
+        Some(limit) => tokio::time::timeout(limit, planned).await.map_err(|_| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "57014".to_owned(),
+                "canceling statement due to statement timeout".to_owned(),
+            )))
+        })??,
+        None => planned.await?,
+    };
+    if matches!(statement, Statement::Insert(_)) {
+        return rows_inserted(df).await;
+    }
+    let options = Arc::new(FormatOptions::from_client_metadata(client.metadata()));
+    let response = encode_dataframe(df, &Format::UnifiedText, Some(options)).await?;
+    Ok(Response::Query(response))
+}
+
+/// Runs an `INSERT` and answers `INSERT 0 <rows>`, the count `DataFusion`
+/// reports in the `count` column.
+async fn rows_inserted(df: DataFrame) -> PgWireResult<Response> {
+    let batches = df.collect().await.map_err(api_error)?;
+    let rows = batches
+        .first()
+        .and_then(|batch| batch.column_by_name("count"))
+        .and_then(|column| {
+            column
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+        })
+        .map_or(0, |counts| counts.value(0));
+    let rows = usize::try_from(rows).unwrap_or(usize::MAX);
+    Ok(Response::Execution(
+        Tag::new("INSERT").with_oid(0).with_rows(rows),
+    ))
+}
+
+#[async_trait]
+impl QueryHook for SimpleRunHook {
+    async fn handle_simple_query(
+        &self,
+        statement: &Statement,
+        session_context: &SessionContext,
+        client: &mut dyn HookClient,
+    ) -> Option<PgWireResult<Response>> {
+        Some(run_simple(statement, session_context, client).await)
+    }
+
+    async fn handle_extended_parse_query(
+        &self,
+        _statement: &Statement,
+        _session_context: &SessionContext,
+        _client: &(dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<LogicalPlan>> {
+        None
+    }
+
+    async fn handle_extended_query(
+        &self,
+        _statement: &Statement,
+        _logical_plan: &LogicalPlan,
+        _params: &ParamValues,
+        _session_context: &SessionContext,
+        _client: &mut dyn HookClient,
+    ) -> Option<PgWireResult<Response>> {
+        None
     }
 }
 
@@ -254,14 +366,18 @@ impl QueryHook for TracingHook {
     }
 }
 
-/// Default hooks of `datafusion-postgres` plus ours. Passing a custom list
-/// replaces the defaults, so they are re-added explicitly here. The tracing
-/// observer goes first so statements answered by a default hook (`SET`,
-/// `BEGIN`, cursors) are traced too.
+/// The PostgreSQL hooks, in order: the statement policy first, so no other
+/// hook and no `DataFusion` path sees a refused statement; the default hooks
+/// of `datafusion-postgres` (passing a custom list replaces them, so they are
+/// re-added here), after the tracing observer so statements answered by a
+/// default hook (`SET`, `BEGIN`, cursors) are traced too; the metrics
+/// counter; and last [`SimpleRunHook`], which runs every simple-protocol
+/// statement that got that far.
 ///
 /// `session_sampling` is `None` when traces are not exported: no tracing hook.
 pub(crate) fn all(session_sampling: Option<f64>) -> Vec<Arc<dyn QueryHook>> {
-    let mut hooks: Vec<Arc<dyn QueryHook>> = Vec::with_capacity(5);
+    let mut hooks: Vec<Arc<dyn QueryHook>> = Vec::with_capacity(7);
+    hooks.push(Arc::new(PolicyHook));
     if let Some(ratio) = session_sampling {
         hooks.push(Arc::new(TracingHook { ratio }));
     }
@@ -269,6 +385,7 @@ pub(crate) fn all(session_sampling: Option<f64>) -> Vec<Arc<dyn QueryHook>> {
     hooks.push(Arc::new(SetShowHook));
     hooks.push(Arc::new(TransactionStatementHook));
     hooks.push(Arc::new(MetricsHook));
+    hooks.push(Arc::new(SimpleRunHook));
     hooks
 }
 
@@ -295,9 +412,187 @@ mod tests {
         }
     }
 
+    /// A schema that counts how often the planner looks its tables up: once
+    /// per planning of a statement that reads one table.
+    #[derive(Debug, Default)]
+    struct CountingSchema {
+        inner: datafusion::catalog::MemorySchemaProvider,
+        lookups: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl datafusion::catalog::SchemaProvider for CountingSchema {
+        fn table_names(&self) -> Vec<String> {
+            self.inner.table_names()
+        }
+
+        async fn table(
+            &self,
+            name: &str,
+        ) -> datafusion::error::Result<Option<Arc<dyn datafusion::catalog::TableProvider>>> {
+            self.lookups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.table(name).await
+        }
+
+        fn table_exist(&self, name: &str) -> bool {
+            self.inner.table_exist(name)
+        }
+    }
+
+    impl CountingSchema {
+        fn lookups(&self) -> usize {
+            self.lookups.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// The simple-protocol handler of `datafusion-postgres` with our hooks,
+    /// over a session holding `counted.ops (s varchar, n int)`.
+    fn simple_service() -> (datafusion_postgres::DfSessionService, Arc<CountingSchema>) {
+        use datafusion::arrow::array::{Int32Array, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::catalog::SchemaProvider as _;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("n", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["10", "9", "a"])),
+                Arc::new(Int32Array::from(vec![5, 100, 1])),
+            ],
+        )
+        .unwrap();
+        let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        let counted = Arc::new(CountingSchema::default());
+        counted
+            .inner
+            .register_table("ops".to_owned(), Arc::new(table))
+            .unwrap();
+        let ctx = SessionContext::new();
+        ctx.catalog("datafusion")
+            .unwrap()
+            .register_schema("counted", Arc::clone(&counted) as _)
+            .unwrap();
+        let service = datafusion_postgres::DfSessionService::new_with_hooks(Arc::new(ctx), all(None));
+        (service, counted)
+    }
+
+    async fn simple_query(
+        service: &datafusion_postgres::DfSessionService,
+        client: &mut datafusion_postgres::testing::MockClient,
+        sql: &str,
+    ) -> PgWireResult<Vec<Response>> {
+        use datafusion_postgres::pgwire::api::query::SimpleQueryHandler as _;
+        service.do_query(client, sql).await
+    }
+
+    async fn row_count(response: Response) -> usize {
+        use futures::StreamExt as _;
+        let Response::Query(mut query) = response else {
+            panic!("not a query response: {response:?}");
+        };
+        query.data_rows().count().await
+    }
+
+    #[tokio::test]
+    async fn a_simple_statement_is_planned_once() {
+        let (service, counted) = simple_service();
+        let mut client = datafusion_postgres::testing::MockClient::new();
+        let mut responses = simple_query(&service, &mut client, "SELECT n FROM counted.ops WHERE n > 1")
+            .await
+            .unwrap();
+        assert_eq!(row_count(responses.remove(0)).await, 2);
+        assert_eq!(counted.lookups(), 1, "planned more than once");
+    }
+
+    fn user_error(err: PgWireError) -> (String, String) {
+        match err {
+            PgWireError::UserError(info) => (info.code.clone(), info.message.clone()),
+            other => panic!("not a user error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_simple_statement_keeps_the_operand_refusals() {
+        let (service, counted) = simple_service();
+        let mut client = datafusion_postgres::testing::MockClient::new();
+        for (sql, code, message) in [
+            (
+                "SELECT n FROM counted.ops WHERE s > 9",
+                "42883",
+                "operator does not exist: text > integer",
+            ),
+            (
+                "SELECT n FROM counted.ops WHERE s BETWEEN 1 AND 9",
+                "42883",
+                "operator does not exist: text >= integer",
+            ),
+            (
+                "SELECT TIME '10:00:00' + INTERVAL '1 hour'",
+                "0A000",
+                "time without time zone + interval is not supported",
+            ),
+        ] {
+            let err = simple_query(&service, &mut client, sql).await.unwrap_err();
+            assert_eq!(user_error(err), (code.to_owned(), message.to_owned()), "{sql}");
+        }
+        assert_eq!(counted.lookups(), 2, "each refused statement planned once");
+        // The statement policy still refuses before anything plans.
+        let err = simple_query(
+            &service,
+            &mut client,
+            "COPY (SELECT n FROM counted.ops) TO '/tmp/x.csv'",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(user_error(err).0, "0A000");
+        assert_eq!(counted.lookups(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_simple_statement_that_does_not_plan_gets_the_planner_error() {
+        let (service, _) = simple_service();
+        let mut client = datafusion_postgres::testing::MockClient::new();
+        let err = simple_query(&service, &mut client, "SELECT * FROM counted.missing")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PgWireError::ApiError(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_simple_insert_answers_the_rows_it_added() {
+        let (service, counted) = simple_service();
+        let mut client = datafusion_postgres::testing::MockClient::new();
+        let mut responses = simple_query(&service, &mut client, "INSERT INTO counted.ops VALUES ('b', 7)")
+            .await
+            .unwrap();
+        match responses.remove(0) {
+            Response::Execution(tag) => assert_eq!(tag, Tag::new("INSERT").with_oid(0).with_rows(1)),
+            other => panic!("{other:?}"),
+        }
+        let mut responses = simple_query(&service, &mut client, "SELECT n FROM counted.ops")
+            .await
+            .unwrap();
+        assert_eq!(row_count(responses.remove(0)).await, 4);
+        assert_eq!(counted.lookups(), 2, "each statement planned once");
+    }
+
+    #[tokio::test]
+    async fn statement_timeout_is_read_where_set_statement_timeout_writes_it() {
+        let (service, _) = simple_service();
+        let mut client = datafusion_postgres::testing::MockClient::new();
+        simple_query(&service, &mut client, "SET statement_timeout TO '5000ms'")
+            .await
+            .unwrap();
+        assert_eq!(statement_timeout(&client), Some(Duration::from_millis(5000)));
+    }
+
     #[test]
     fn tracing_hook_only_when_exporting() {
-        assert_eq!(all(Some(1.0)).len(), 5);
-        assert_eq!(all(None).len(), 4, "no tracing hook when traces are not exported");
+        assert_eq!(all(Some(1.0)).len(), 7);
+        assert_eq!(all(None).len(), 6, "no tracing hook when traces are not exported");
     }
 }
