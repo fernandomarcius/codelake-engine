@@ -51,12 +51,14 @@ kind = "mongodb"
 required = false
 connection_string_env = "EVENTS_MONGO_URI"
 
-[[source]]
-name = "lake"
-kind = "iceberg"
-catalog_uri = "http://iceberg-rest:8181"
-warehouse = "s3://lake"
-s3_endpoint = "http://minio:9000"
-s3_path_style = true
-access_key_id_env = "LAKE_ACCESS_KEY_ID"
-secret_access_key_env = "LAKE_SECRET_ACCESS_KEY"
+# Iceberg is not compiled into this build (ADR 0013): a required `iceberg`
+# source stops the server at startup. Uncomment once the connector returns.
+# [[source]]
+# name = "lake"
+# kind = "iceberg"
+# catalog_uri = "http://iceberg-rest:8181"
+# warehouse = "s3://lake"
+# s3_endpoint = "http://minio:9000"
+# s3_path_style = true
+# access_key_id_env = "LAKE_ACCESS_KEY_ID"
+# secret_access_key_env = "LAKE_SECRET_ACCESS_KEY"

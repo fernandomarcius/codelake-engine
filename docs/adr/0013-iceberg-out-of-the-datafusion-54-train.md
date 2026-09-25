@@ -53,8 +53,10 @@ rows against a REST catalog.
 ## Consequences
 
 - No build on this train can read Iceberg. No shipped build could before.
-- `deploy/` and `examples/` configurations that declare an `iceberg` source
-  behave as they did with any shipped build, which never compiled the kind.
+- A configuration that declares a required `iceberg` source stops the server
+  at startup, as it did with any shipped build, which never compiled the kind.
+  The `iceberg` sources of `deploy/k8s/codelake.toml` and
+  `examples/codelake.toml` are commented out until the connector returns.
 - The parked file drifts from the engine's APIs while it waits. The return PR
   pays that cost once, against whichever integration crate is published.
 - M3 (lakehouse) still depends on this return.
