@@ -50,7 +50,9 @@ versioning: [SemVer](https://semver.org/).
   (ADR 0007, red-team W1-4). So do char values as join keys (`USING`, `NATURAL`,
   `INTERSECT`, `EXCEPT`), in a `UNION` (with or without `ALL`) and as arguments of
   `nullif`, `greatest` and `least` (DEFECT-W1T-2), and in a `VALUES` list that puts
-  them with other text; `TRY_CAST(x AS char(n))` fails with `NOT_SUPPORTED`.
+  them with other text; `TRY_CAST(x AS char(n))` fails with `NOT_SUPPORTED`. A value
+  computed from a char value (`max(ch)`, `lag(ch)`, `coalesce(ch, …)`, `upper(ch)`,
+  `ch || 'x'`) counts as one.
 - **Breaking:** text compared with a number (`varchar_col > 9`, `x IN ('1.0')`) fails with
   `TYPE_MISMATCH` on the engine's client protocols, as on Trino; cast explicitly
   (ADR 0014). It answered rows before, through DataFusion's coercion.
@@ -77,6 +79,11 @@ versioning: [SemVer](https://semver.org/).
 - `TRY_CAST('ab' AS char(5)) = 'ab '` answered false and `VALUES ('ab '),
   (CAST('ab' AS char(5)))` held two distinct values (the reference: true, one value):
   the engine held the char value as unpadded text. Both are refused (see Changed).
+- A char value passed through an aggregate, a window function, a function, a `CASE` or
+  `||` (`max(ch)`, `lag(ch)`, `coalesce(ch, …)`, `upper(ch)`) was compared as plain text:
+  `SELECT max(ch) FROM t UNION SELECT s FROM v` held two rows where the reference holds
+  one. Such values are followed through the plan and refused like the column (see
+  Changed).
 - Tables of the in-memory catalog (`CREATE TABLE datafusion.…`) kept their rows outside
   the memory pool; they are reserved in it for as long as the table exists. `UPDATE` and
   `DELETE` of such a table run when the plan executes (they changed the rows while

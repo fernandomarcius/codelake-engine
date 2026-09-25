@@ -25,27 +25,31 @@
 //!   `GROUP BY` then compares.
 //!
 //! The rule runs before type coercion, so every cast it sees is one the
-//! statement wrote. An operand is a char value when its field declares
-//! `char(n)` after its aliases are removed, or when it is a
-//! `CAST … AS char(n)` (planned as `codelake_trino_type`, which declares it;
-//! `TRY_CAST … AS char(n)` is refused before planning); an explicit
-//! `CAST(ch AS varchar)` is text, compared as text (the padded value), and
-//! is allowed, as are
-//! `IS [NOT] NULL`, `ORDER BY` and `GROUP BY`, which compare no char value
-//! with other text. Not seen: a char value passed through a function or an
-//! aggregate whose result does not declare the type (`max(ch)`,
-//! `coalesce(ch, …)`).
+//! statement wrote. A char value is a field that declares `char(n)` where the
+//! rows come from (a scan), a `CAST … AS char(n)` (planned as
+//! `codelake_trino_type`, which declares it; `TRY_CAST … AS char(n)` is
+//! refused before planning), and whatever is computed from one, followed
+//! through the plan: a column of a subquery, a `UNION`, a join, an aggregate
+//! (`max(ch)`, `min(ch)`), a window function (`lag(ch)`), and text a function,
+//! a `CASE` or `||` computes from a char value (`coalesce(ch, …)`,
+//! `upper(ch)`), since the reference types those as `char(n)` too. An
+//! explicit `CAST(ch AS varchar)` is text, compared as text (the padded
+//! value), and is allowed, as are `IS [NOT] NULL`, `ORDER BY` and `GROUP BY`,
+//! which compare no char value with other text.
 
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::DataType;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, Result, ScalarValue};
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::expr::{
-    Alias, Between, Case, Cast, InList, InSubquery, Like, ScalarFunction, SetComparison,
+    AggregateFunction, Alias, Between, Case, Cast, InList, InSubquery, Like, ScalarFunction, SetComparison,
+    WindowFunction,
 };
-use datafusion::logical_expr::{BinaryExpr, Expr, ExprSchemable, LogicalPlan, Operator};
+use datafusion::logical_expr::utils::grouping_set_to_exprlist;
+use datafusion::logical_expr::{BinaryExpr, Distinct, Expr, ExprSchemable, LogicalPlan, Operator};
 use datafusion::optimizer::AnalyzerRule;
 
 use crate::trino_types::{Declared, declared};
@@ -57,11 +61,11 @@ pub struct RefuseCharComparisons;
 impl AnalyzerRule for RefuseCharComparisons {
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         plan.apply_with_subqueries(|node| {
-            let schema = input_schema(node);
+            let scope = Scope::of(node);
             for expr in node.expressions() {
-                check(&expr, &schema)?;
+                check(&expr, &scope)?;
             }
-            if let Some(name) = compared_by_node(node, &schema) {
+            if let Some(name) = compared_by_node(node, &scope) {
                 return Err(refusal(&name));
             }
             Ok(TreeNodeRecursion::Continue)
@@ -74,41 +78,62 @@ impl AnalyzerRule for RefuseCharComparisons {
     }
 }
 
-/// The columns a node's expressions can refer to: its inputs' together (a
-/// join's condition refers to both sides), or its own for a leaf.
-fn input_schema(node: &LogicalPlan) -> Arc<DFSchema> {
-    let inputs = node.inputs();
-    let Some((first, rest)) = inputs.split_first() else {
-        return Arc::clone(node.schema());
-    };
-    if rest.is_empty() {
-        return Arc::clone(first.schema());
+/// What a node's expressions refer to: its inputs, and their columns
+/// together (a join's condition refers to both sides), or, for a leaf, its
+/// own columns.
+struct Scope<'a> {
+    inputs: Vec<&'a LogicalPlan>,
+    schema: Arc<DFSchema>,
+}
+
+impl<'a> Scope<'a> {
+    fn of(node: &'a LogicalPlan) -> Self {
+        let inputs = node.inputs();
+        let schema = match inputs.split_first() {
+            None => Arc::clone(node.schema()),
+            Some((first, [])) => Arc::clone(first.schema()),
+            Some((first, rest)) => {
+                let mut merged = first.schema().as_ref().clone();
+                for input in rest {
+                    merged.merge(input.schema());
+                }
+                Arc::new(merged)
+            }
+        };
+        Self { inputs, schema }
     }
-    let mut merged = first.schema().as_ref().clone();
-    for input in rest {
-        merged.merge(input.schema());
+
+    /// The scope of the expressions of a node whose only input is `input`.
+    fn over(input: &'a LogicalPlan) -> Self {
+        Self {
+            inputs: vec![input],
+            schema: Arc::clone(input.schema()),
+        }
     }
-    Arc::new(merged)
 }
 
 /// A char column `node` compares without a comparison expression: a join
 /// key, a column of a `UNION`, or a column of a `VALUES` list that puts char
 /// values and other text together.
-fn compared_by_node(node: &LogicalPlan, schema: &DFSchema) -> Option<String> {
+fn compared_by_node(node: &LogicalPlan, scope: &Scope<'_>) -> Option<String> {
     match node {
         LogicalPlan::Join(join) => join
             .on
             .iter()
             .flat_map(|(left, right)| [left, right])
-            .find_map(|key| char_operand(key, schema)),
-        LogicalPlan::Union(union) => union.inputs.iter().find_map(|input| char_column(input)),
+            .find_map(|key| char_value(key, scope)),
+        LogicalPlan::Union(union) => (0..union.schema.fields().len())
+            .find_map(|index| union.inputs.iter().find_map(|input| char_column(input, index))),
         LogicalPlan::Values(values) if values.values.len() > 1 => {
-            let empty = DFSchema::empty();
+            let empty = Scope {
+                inputs: Vec::new(),
+                schema: Arc::new(DFSchema::empty()),
+            };
             (0..values.schema.fields().len()).find_map(|index| {
                 let cells = values.values.iter().filter_map(|row| row.get(index));
                 let mut names = cells
                     .filter(|cell| !is_null(cell))
-                    .map(|cell| char_operand(cell, &empty));
+                    .map(|cell| char_value(cell, &empty));
                 let first = names.next()?;
                 let mut mixed = None;
                 for name in names {
@@ -139,20 +164,79 @@ fn is_null(cell: &Expr) -> bool {
     }
 }
 
-/// A char column of `plan`'s output: a projection's expression that is a
-/// char value (an explicit cast is not), or a field that declares `char(n)`.
-fn char_column(plan: &LogicalPlan) -> Option<String> {
+/// The char value column `index` of `plan`'s output holds, if it holds one:
+/// a field that declares `char(n)`, or a column computed from a char value
+/// (see [`char_value`]), followed through the plan.
+fn char_column(plan: &LogicalPlan, index: usize) -> Option<String> {
+    // A computed column is what its expression is: `CAST(ch AS varchar)`
+    // keeps the field metadata of `ch`, and is text.
     match plan {
-        LogicalPlan::Projection(projection) => projection
-            .expr
-            .iter()
-            .find_map(|expr| char_operand(expr, projection.input.schema())),
-        _ => plan
-            .schema()
-            .fields()
-            .iter()
-            .find(|field| matches!(declared(field), Some(Declared::Char(_))))
-            .map(|field| field.name().clone()),
+        LogicalPlan::Projection(projection) => {
+            char_value(projection.expr.get(index)?, &Scope::over(&projection.input))
+        }
+        LogicalPlan::Aggregate(aggregate) => {
+            let groups = grouping_set_to_exprlist(&aggregate.group_expr).ok()?;
+            let grouping_id = usize::from(matches!(aggregate.group_expr.as_slice(), [Expr::GroupingSet(_)]));
+            let expr = if index < groups.len() {
+                groups[index]
+            } else {
+                aggregate
+                    .aggr_expr
+                    .get(index.checked_sub(groups.len() + grouping_id)?)?
+            };
+            char_value(expr, &Scope::over(&aggregate.input))
+        }
+        LogicalPlan::Window(window) => {
+            let columns = window.input.schema().fields().len();
+            match index.checked_sub(columns) {
+                None => char_column(&window.input, index),
+                Some(at) => char_value(window.window_expr.get(at)?, &Scope::over(&window.input)),
+            }
+        }
+        LogicalPlan::Union(union) => union.inputs.iter().find_map(|input| char_column(input, index)),
+        LogicalPlan::Values(values) => {
+            let empty = Scope {
+                inputs: Vec::new(),
+                schema: Arc::new(DFSchema::empty()),
+            };
+            values
+                .values
+                .iter()
+                .find_map(|row| char_value(row.get(index)?, &empty))
+        }
+        // A source's column is what its field declares.
+        _ if plan.inputs().is_empty() => declared_char(plan, index),
+        _ => passed_through(plan, index),
+    }
+}
+
+/// The name of column `index` of `plan`, if its field declares `char(n)`.
+fn declared_char(plan: &LogicalPlan, index: usize) -> Option<String> {
+    let field = plan.schema().fields().get(index)?;
+    matches!(declared(field), Some(Declared::Char(_))).then(|| field.name().clone())
+}
+
+/// [`char_column`] of the input column that column `index` of `plan` passes
+/// through.
+fn passed_through(plan: &LogicalPlan, index: usize) -> Option<String> {
+    match plan {
+        // Same columns as the one input, other names.
+        LogicalPlan::SubqueryAlias(alias) => char_column(&alias.input, index),
+        LogicalPlan::Distinct(Distinct::All(input)) => char_column(input, index),
+        LogicalPlan::Distinct(Distinct::On(_)) => None,
+        // The input's columns, found by name (a join's are both sides').
+        other => {
+            let (qualifier, field) = other.schema().qualified_field(index);
+            let column = datafusion::common::Column::from((qualifier, field));
+            let inputs = other.inputs();
+            match inputs
+                .iter()
+                .find_map(|input| Some((*input, input.schema().index_of_column(&column).ok()?)))
+            {
+                Some((input, at)) => char_column(input, at),
+                None => declared_char(other, index),
+            }
+        }
     }
 }
 
@@ -163,12 +247,12 @@ fn refusal(name: &str) -> DataFusionError {
     ))
 }
 
-fn check(expr: &Expr, schema: &DFSchema) -> Result<()> {
+fn check(expr: &Expr, scope: &Scope<'_>) -> Result<()> {
     let mut refused = None;
     expr.apply(|e| {
         refused = operands(e)
             .into_iter()
-            .find_map(|operand| char_operand(operand, schema));
+            .find_map(|operand| char_value(operand, scope));
         Ok(if refused.is_some() {
             TreeNodeRecursion::Stop
         } else {
@@ -180,7 +264,6 @@ fn check(expr: &Expr, schema: &DFSchema) -> Result<()> {
         Some(name) => Err(refusal(&name)),
     }
 }
-
 /// The values `expr` compares with each other, if it compares values.
 fn operands(expr: &Expr) -> Vec<&Expr> {
     match expr {
@@ -231,10 +314,14 @@ fn compares(op: Operator) -> bool {
     )
 }
 
-/// The name of the char field `operand` is, if it is one (see the module
-/// documentation). An operand whose type cannot be settled here (an outer
-/// reference) is left to the rest of planning.
-fn char_operand(operand: &Expr, schema: &DFSchema) -> Option<String> {
+/// The name of the char value `operand` is, if it is one (see the module
+/// documentation): a field that declares `char(n)` once its aliases are
+/// removed, a `CAST … AS char(n)`, a column computed from a char value, or
+/// text computed from one (an aggregate such as `max`, a window function, a
+/// function such as `coalesce` or `upper`, a `CASE`, `||`). An explicit
+/// `CAST` to text is text. An operand whose type cannot be settled here (an
+/// outer reference) is left to the rest of planning.
+fn char_value(operand: &Expr, scope: &Scope<'_>) -> Option<String> {
     let mut operand = operand;
     while let Expr::Alias(Alias { expr, .. }) = operand {
         operand = expr;
@@ -242,11 +329,52 @@ fn char_operand(operand: &Expr, schema: &DFSchema) -> Option<String> {
     if let Some(declared) = declared_cast(operand) {
         return matches!(declared, Declared::Char(_)).then(|| operand.schema_name().to_string());
     }
-    if matches!(operand, Expr::Cast(_) | Expr::TryCast(_)) {
+    let (_, field) = match operand {
+        Expr::Cast(_) | Expr::TryCast(_) => return None,
+        Expr::Column(column) => {
+            return scope.inputs.iter().find_map(|input| {
+                let index = input.schema().index_of_column(column).ok()?;
+                char_column(input, index)
+            });
+        }
+        other => other.to_field(&scope.schema).ok()?,
+    };
+    if matches!(declared(&field), Some(Declared::Char(_))) {
+        return Some(field.name().clone());
+    }
+    if !matches!(
+        field.data_type(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    ) {
         return None;
     }
-    let (_, field) = operand.to_field(schema).ok()?;
-    matches!(declared(&field), Some(Declared::Char(_))).then(|| field.name().clone())
+    // Text computed from its arguments: char when one of them is.
+    let arguments: Vec<&Expr> = match operand {
+        Expr::ScalarFunction(ScalarFunction { args, .. }) => args.iter().collect(),
+        Expr::AggregateFunction(AggregateFunction { params, .. }) => params.args.iter().collect(),
+        Expr::WindowFunction(window) => {
+            let WindowFunction { params, .. } = window.as_ref();
+            params.args.iter().collect()
+        }
+        Expr::Case(Case {
+            when_then_expr,
+            else_expr,
+            ..
+        }) => when_then_expr
+            .iter()
+            .map(|(_, then)| then.as_ref())
+            .chain(else_expr.as_deref())
+            .collect(),
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::StringConcat,
+            right,
+        }) => vec![left, right],
+        _ => Vec::new(),
+    };
+    arguments
+        .into_iter()
+        .find_map(|argument| char_value(argument, scope))
 }
 
 /// The type `codelake_trino_type(x, '<type>')` (a `CAST … AS char(n)`,
@@ -343,6 +471,17 @@ mod tests {
             "SELECT id FROM t WHERE nullif(ch, 'ab') IS NULL",
             "SELECT greatest(ch, 'b') FROM t",
             "SELECT least('a', ch) FROM t",
+            // Values computed from a char value.
+            "SELECT max(ch) FROM t UNION SELECT s FROM v",
+            "SELECT id FROM (SELECT id, max(ch) AS m FROM t GROUP BY id) x WHERE m = 'ab'",
+            "SELECT coalesce(ch, 'x') FROM t UNION SELECT s FROM v",
+            "SELECT id FROM t WHERE upper(ch) = 'AB'",
+            "SELECT id FROM t WHERE ch || 'x' = 'abx'",
+            "SELECT CASE WHEN id = 1 THEN ch END FROM t UNION SELECT s FROM v",
+            "SELECT id FROM (SELECT id, lag(ch) OVER (ORDER BY id) AS p FROM t) x WHERE p = 'ab'",
+            "SELECT m FROM (SELECT min(ch) AS m FROM t) x INTERSECT SELECT s FROM v",
+            "SELECT c FROM (SELECT ch AS c FROM t) x UNION SELECT s FROM v",
+            "SELECT count(*) FROM (SELECT max(ch) AS m FROM t) x JOIN v ON x.m = v.s",
         ] {
             let err = error(&ctx, sql).await;
             assert!(
@@ -368,6 +507,12 @@ mod tests {
             "SELECT CAST(ch AS varchar) FROM t UNION SELECT s FROM v",
             "SELECT id FROM t UNION ALL SELECT 2",
             "SELECT nullif(CAST(ch AS varchar), 'ab   ') FROM t",
+            "SELECT max(ch) FROM t",
+            "SELECT id FROM (SELECT id, max(ch) AS m FROM t GROUP BY id) x WHERE m IS NULL",
+            "SELECT max(CAST(ch AS varchar)) FROM t UNION SELECT s FROM v",
+            "SELECT c FROM (SELECT CAST(ch AS varchar) AS c FROM t) x UNION SELECT s FROM v",
+            "SELECT id FROM t WHERE length(upper(ch)) = 5",
+            "SELECT id FROM t WHERE upper(CAST(ch AS varchar)) = 'AB   '",
         ] {
             assert_eq!(error(&ctx, sql).await, None, "{sql}");
         }
