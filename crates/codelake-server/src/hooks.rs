@@ -301,6 +301,9 @@ impl TracingHook {
             otel.kind = "server",
             codelake.protocol = protocol,
             codelake.session_id = pid,
+            // The id `system.runtime.queries` lists; absent for statements
+            // the session answers itself.
+            codelake.query_id = client.metadata().get(crate::pg::QUERY_ID).map(String::as_str),
             codelake.trace_id = tracing::field::Empty,
             enduser.id = client.metadata().get(METADATA_USER).map(String::as_str),
             client.address = %client.socket_addr().ip(),

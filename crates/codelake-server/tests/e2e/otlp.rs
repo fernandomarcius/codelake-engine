@@ -586,6 +586,14 @@ async fn postgres_wire_statements_of_one_session_share_a_trace() {
     assert_eq!(sessions.len(), 1, "{statements:#?}");
     let parents: BTreeSet<Option<&str>> = statements.iter().map(|s| s.parent.as_deref()).collect();
     assert_eq!(parents.len(), 1, "same synthetic session parent: {statements:#?}");
+    // Each statement carries its own id of the query registry
+    // (`system.runtime.queries`).
+    let ids: BTreeSet<&str> = statements
+        .iter()
+        .filter_map(|s| s.tag("codelake.query_id"))
+        .collect();
+    assert_eq!(ids.len(), 2, "{statements:#?}");
+    assert!(ids.iter().all(|id| id.split('_').count() == 4), "{ids:?}");
     for statement in &statements {
         assert_eq!(statement.tag("enduser.id"), Some("codelake"));
         assert_eq!(statement.tag("codelake.protocol"), Some("postgresql.simple"));
