@@ -80,6 +80,14 @@ Blocking items, in order:
   runs with `dbt build` through dbt-trino against CodeLake, and every output table
   matches the Trino run (row count + `checksum` per table), three consecutive days.
 - Peak RSS of CodeLake during the hourly full run ≤ 50% of Trino's on the same host.
+- 🔧 Tooling for both (F8, ADR 0015, [docs/shadow-run.md](docs/shadow-run.md)):
+  `codelake config import` (catalog `.properties` → `codelake.toml`, secrets to a
+  0600 env file), `${ENV:NAME}` references in `codelake.toml`, and the harness
+  `scripts/shadow-run.sh` (same cutoff on both sides, DuckDB checksums per table
+  and column, peak RSS per side, reports per cycle and cumulative). Evidence:
+  `tools/shadow/selftest.sh` (SQL Server 2022 CDC, Trino 431, CodeLake) — two
+  cycles without divergence, every injected mutation detected. Pending: the run
+  itself in homologation (a person, three days).
 
 ## M2 — Production cut-over
 

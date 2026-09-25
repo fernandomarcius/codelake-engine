@@ -41,6 +41,20 @@ versioning: [SemVer](https://semver.org/).
 - `deploy/compose/codelake.yml` (the engine alone on one host, ports on loopback) and a generic
   production configuration example (`docs/examples/codelake.production.toml`).
 
+- `${ENV:NAME}` references in any string value of `codelake.toml`, resolved when the file is
+  loaded; missing variables are named with their keys, all at once, and resolved values never
+  appear in errors (ADR 0015). Secrets keep their `*_env` keys.
+- `codelake config import --from <dir> --out codelake.toml --env-out codelake.env`: catalog
+  `.properties` files (`sqlserver`, `postgresql`, `hive` with a file metastore) become sources;
+  secrets go to an env file with mode 0600, never to the TOML or the terminal; other catalogs
+  are skipped with a reason (exit 3) (ADR 0015).
+- Shadow-run harness (`scripts/shadow-run.sh`, `tools/shadow`): runs a dbt project against a
+  reference and a candidate engine with the same cutoff, compares every output table with
+  DuckDB (row count, order-insensitive checksum, per-column checksums, differing rows by hash),
+  samples peak RSS per side, and writes JSON and Markdown reports per cycle and cumulative;
+  self-test with SQL Server CDC and mutation scenarios (`tools/shadow/selftest.sh`,
+  docs/shadow-run.md).
+
 ### Changed
 - A hash join whose estimated build side does not fit its slice of the memory pool
   runs as a sort-merge join, which spills, instead of failing with
