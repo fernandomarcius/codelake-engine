@@ -78,6 +78,12 @@ versioning: [SemVer](https://semver.org/).
   `DELETE` of such a table run when the plan executes (they changed the rows while
   planning, `EXPLAIN` included), and an `UPDATE` the pool cannot hold fails with the rows
   unchanged instead of growing the table past the ceiling (DEFECT-W1T-3).
+- `UPDATE` and `DELETE` changed every row of the table when their `WHERE` held a
+  subquery (`id IN (SELECT 2)`, `EXISTS`, a correlated value) or was false
+  (`WHERE 1 = 0`, `id = 1 AND id = 2`): DataFusion 54.1 passes the table only the
+  conditions it finds on filters. Every condition now reaches the table; a `WHERE`
+  with a subquery or a join fails with `NOT_SUPPORTED` before a row changes, and a
+  false one changes no row.
 - `OPTIMIZE` in a catalog whose `parquet_time_zone` is not UTC rewrote `INT64`
   timestamps of other writers (Spark, pandas) as `INT96` without converting them: they
   read shifted by the zone offset afterwards. They are now kept; a wall-clock time the

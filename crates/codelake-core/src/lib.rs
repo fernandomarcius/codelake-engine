@@ -12,6 +12,7 @@ pub mod config;
 pub mod connector;
 mod ddl;
 mod declared;
+mod dml_guard;
 pub mod engine;
 pub mod federation_guard;
 pub mod federation_policy;

@@ -276,9 +276,13 @@ pub(crate) fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Syn
 }
 
 /// The engine's query planner: the federation planner, with null-aware anti
-/// joins kept on hash joins ([`crate::join_guard`]).
+/// joins kept on hash joins ([`crate::join_guard`]), after the check that an
+/// `UPDATE` / `DELETE` hands its table every condition of its `WHERE`
+/// (`crate::dml_guard`).
 pub(crate) fn query_planner() -> Arc<dyn datafusion::execution::context::QueryPlanner + Send + Sync> {
-    Arc::new(JoinQueryPlanner::new(Arc::new(FederatedQueryPlanner::new())))
+    Arc::new(crate::dml_guard::DmlQueryPlanner::new(Arc::new(
+        JoinQueryPlanner::new(Arc::new(FederatedQueryPlanner::new())),
+    )))
 }
 
 /// Output schema of `plan` once analyzed: the analyzer settles some types

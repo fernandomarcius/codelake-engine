@@ -11,7 +11,10 @@
 //! the whole table at once: `UPDATE` reserves the values it computes before
 //! the table changes, so one the pool cannot hold fails with the rows as
 //! they were; then the reservation is resized to what the table holds.
-//! Dropping or replacing the table frees it.
+//! Dropping or replacing the table frees it. The conditions `DELETE` and
+//! `UPDATE` receive are the whole `WHERE`: a statement whose rows they would
+//! not select (a subquery, a join) is refused before it reaches the table
+//! (`crate::dml_guard`).
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -554,5 +557,107 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("No field named nope"), "{err}");
+    }
+
+    /// `t(id, s)` holding `(1, a), (2, b), (3, c)` and `u(id, s)` holding
+    /// `(2, B)`, created again.
+    async fn fresh(engine: &Engine) {
+        for sql in [
+            "DROP TABLE IF EXISTS datafusion.public.t",
+            "DROP TABLE IF EXISTS datafusion.public.u",
+            "CREATE TABLE datafusion.public.t AS SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) AS v(id, s)",
+            "CREATE TABLE datafusion.public.u AS SELECT * FROM (VALUES (2, 'B')) AS v(id, s)",
+        ] {
+            run(engine, sql).await.unwrap();
+        }
+    }
+
+    fn rows(rows: &[(i32, &str)]) -> String {
+        use std::fmt::Write as _;
+        let mut table = String::from("+----+---+\n| id | s |\n+----+---+\n");
+        for (id, s) in rows {
+            writeln!(table, "| {id}  | {s} |").unwrap();
+        }
+        table.push_str("+----+---+");
+        table
+    }
+
+    fn count(n: u64) -> String {
+        format!("+-------+\n| count |\n+-------+\n| {n:<5} |\n+-------+")
+    }
+
+    #[tokio::test]
+    async fn update_and_delete_change_exactly_the_rows_their_where_selects() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(48));
+        let all = "SELECT id, s FROM datafusion.public.t ORDER BY id";
+        let before = rows(&[(1, "a"), (2, "b"), (3, "c")]);
+        // A subquery or a join the table would not see: refused, nothing changed.
+        for sql in [
+            "UPDATE datafusion.public.t SET s = 'z' WHERE id IN (SELECT 2)",
+            "DELETE FROM datafusion.public.t WHERE id IN (SELECT 2)",
+            "UPDATE datafusion.public.t SET s = 'z' WHERE id NOT IN (SELECT id FROM datafusion.public.u)",
+            "DELETE FROM datafusion.public.t WHERE EXISTS (SELECT 1 FROM datafusion.public.u WHERE u.id = t.id)",
+            "DELETE FROM datafusion.public.t WHERE id = 2 OR id IN (SELECT 3)",
+            "UPDATE datafusion.public.t SET s = (SELECT u.s FROM datafusion.public.u WHERE u.id = t.id)",
+            "DELETE FROM datafusion.public.t WHERE id = (SELECT max(u.id) FROM datafusion.public.u WHERE u.s = t.s)",
+        ] {
+            fresh(&engine).await;
+            let err = run(&engine, sql).await.unwrap_err();
+            assert!(
+                err.contains("is not supported yet: the rows to change can only be selected by conditions on the columns of"),
+                "{sql}: {err}"
+            );
+            assert_eq!(run(&engine, all).await.unwrap(), before, "{sql} changed the rows");
+        }
+        // Exactly the rows the WHERE selects.
+        for (sql, changed, after) in [
+            ("DELETE FROM datafusion.public.t WHERE 1 = 0", 0, before.clone()),
+            ("DELETE FROM datafusion.public.t WHERE false", 0, before.clone()),
+            (
+                "DELETE FROM datafusion.public.t WHERE id = 1 AND id = 2",
+                0,
+                before.clone(),
+            ),
+            (
+                "UPDATE datafusion.public.t SET s = 'z' WHERE 1 = 0",
+                0,
+                before.clone(),
+            ),
+            (
+                "UPDATE datafusion.public.t SET s = 'z' WHERE id = (SELECT max(id) FROM datafusion.public.u)",
+                1,
+                rows(&[(1, "a"), (2, "z"), (3, "c")]),
+            ),
+            (
+                "UPDATE datafusion.public.t AS x SET s = 'w' WHERE x.id = 3",
+                1,
+                rows(&[(1, "a"), (2, "b"), (3, "w")]),
+            ),
+            (
+                "DELETE FROM datafusion.public.t WHERE id + 1 > 2 AND id + 1 < 4",
+                1,
+                rows(&[(1, "a"), (3, "c")]),
+            ),
+            (
+                "DELETE FROM datafusion.public.t WHERE id IN (1, 3)",
+                2,
+                rows(&[(2, "b")]),
+            ),
+            (
+                "UPDATE datafusion.public.t SET s = 'q'",
+                3,
+                rows(&[(1, "q"), (2, "q"), (3, "q")]),
+            ),
+            (
+                "UPDATE datafusion.public.t SET id = id * 2 + 1 WHERE id * 2 + 1 > 3",
+                2,
+                rows(&[(1, "a"), (5, "b"), (7, "c")]),
+            ),
+        ] {
+            fresh(&engine).await;
+            assert_eq!(run(&engine, sql).await.unwrap(), count(changed), "{sql}");
+            assert_eq!(run(&engine, all).await.unwrap(), after, "{sql}");
+        }
     }
 }
