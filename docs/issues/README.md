@@ -19,8 +19,19 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-007](ISS-007-sort-merge-join-hot-keys.md) | Sort-merge join with hot keys fails at the ceiling instead of avoiding the rewrite | memory limit | 2026-09-25 | open |
 | [ISS-008](ISS-008-breaking-commit-without-bang.md) | Commit 9ef792e not marked breaking in its header | history | 2026-09-25 | open |
 | [ISS-009](ISS-009-flaky-tests-rewritten.md) | Two unstable tests fixed to match their ADRs, not loosened | test change | 2026-09-25 | closed |
-| [ISS-010](ISS-010-red-team-decisions.md) | Ten red-team/semantics decisions applied by recommendation | behavior | 2026-09-24 | awaiting-confirmation |
+| [ISS-010](ISS-010-red-team-decisions.md) | Ten red-team/semantics decisions applied by recommendation | behavior | 2026-09-24 | open |
 | [ISS-011](ISS-011-configurable-compat-names.md) | Compatibility names configurable, CodeLake names by default | compatibility | 2026-09-24 | open |
 | [ISS-012](ISS-012-spice-code-reuse.md) | Code copied from Spice.ai under Apache-2.0 | licensing | 2026-09-24 | open |
 | [ISS-013](ISS-013-reference-engine-credentials-in-git.md) | Reference engine catalog credentials committed in an external repository | security (external) | 2026-09-24 | open |
-| [ISS-014](ISS-014-w1-corrections-by-recommendation.md) | W1 corrections: choices applied by recommendation | behavior | 2026-09-25 | awaiting-confirmation |
+| [ISS-014](ISS-014-w1-corrections-by-recommendation.md) | W1 corrections: choices applied by recommendation | behavior | 2026-09-25 | open |
+| [ISS-015](ISS-015-bench-harness-sub-millisecond.md) | Bench harness measures sub-millisecond cases in bursts | measurement | 2026-09-25 | open |
+| [ISS-016](ISS-016-erp-network-shadow-run.md) | Access to the source network authorized for the F8 shadow run | security | 2026-09-25 | open |
+| [ISS-017](ISS-017-create-or-replace-atomic.md) | CREATE OR REPLACE on hive tables, atomic | removed limitation | 2026-09-25 | open |
+| [ISS-018](ISS-018-case-preserving-names.md) | Case-preserving names, case-insensitive resolution | removed limitation | 2026-09-25 | open |
+| [ISS-019](ISS-019-ctas-literal-unbounded-varchar.md) | CTAS of a literal infers unbounded varchar | removed limitation | 2026-09-25 | open |
+| [ISS-020](ISS-020-datasize-iec-units.md) | Data sizes accept MiB/GiB | removed limitation | 2026-09-25 | open |
+| [ISS-021](ISS-021-arrow-flight-sql.md) | New front: Arrow Flight SQL | scope | 2026-09-25 | open |
+| [ISS-022](ISS-022-keep-dbt-trino-adapter.md) | Keep the existing dbt adapter until a native one is validated | dependency | 2026-09-25 | open |
+| [ISS-023](ISS-023-drop-view-keeps-files.md) | DROP VIEW never deletes data files | deliberate divergence | 2026-09-25 | open |
+| [ISS-024](ISS-024-char-semantics.md) | char(n) semantics instead of refusals | removed limitation | 2026-09-25 | open |
+| [ISS-025](ISS-025-char-wrong-results-merged.md) | Known char(n) wrong results merged into main | known defect | 2026-09-25 | open |

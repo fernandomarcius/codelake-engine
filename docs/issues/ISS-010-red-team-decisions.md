@@ -1,6 +1,6 @@
 # ISS-010 — Ten red-team/semantics decisions applied by recommendation
 
-- Kind: behavior · Applied: 2026-09-24 · Status: awaiting-confirmation (no explicit human answer; each is reversible)
+- Kind: behavior · Applied: 2026-09-24 · Status: open (confirmed by Fernando Farias, 2026-09-25)
 1. Test SQL hashes text as `lower(to_hex(md5(to_utf8(...))))`, valid on the reference engine.
 2. A test divides with `1.0E0/3` (double) to match the reference engine.
 3. `to_timestamp_millis` replaced by reference-engine functions in test SQL.

@@ -1,6 +1,6 @@
 # ISS-014 — W1 corrections: choices applied by recommendation
 
-- Kind: behavior · Applied: 2026-09-25 · Status: awaiting-confirmation (no explicit human answer; each is reversible)
+- Kind: behavior · Applied: 2026-09-25 · Status: open (confirmed by Fernando Farias, 2026-09-25)
 1. A NANOSECONDS hive catalog fails, naming the value and column, on an `INT96` instant outside 1677-09-21 … 2262-04-11 (what Arrow nanoseconds hold); the reference engine answers it. Before, it answered another instant (W1-2). The alternative, answering those values, needs a timestamp type wider than Arrow's.
 2. Tables of the in-memory catalog (`CREATE TABLE datafusion.…`) stay allowed, with their rows reserved in the memory pool; the red-team's first hint was to refuse that DDL, which the reference engine does not have. They remain visible to every user until F5 (R11). A client can fill the pool with them: other queries then fail at the ceiling instead of the server running out of memory.
 3. Every comparison of a `char(n)` value is refused (breaking), not only those pushed to a hive scan, until the engine compares char values padded (W1-4, with ISS-010 item 6).
