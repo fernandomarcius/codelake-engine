@@ -9,7 +9,17 @@
 //! unpadded after a `CAST … AS char(n)`) and drop or keep other rows, without
 //! an error. Until char values compare padded, such a comparison is refused,
 //! whether a filter above a `LIMIT` or a window, a join condition, a `CASE`
-//! or a projection holds it; a catalog's scan cannot see those.
+//! or a projection holds it; a catalog's scan cannot see those. So are the
+//! comparisons a plan makes without a comparison expression:
+//!
+//! - the keys of a join (`USING`, `NATURAL`, and `INTERSECT` and `EXCEPT`,
+//!   which are joins on every column);
+//! - a `UNION` (with or without `ALL`) holding a char column: it puts values
+//!   of other sources in one column (a varchar, or a `CAST … AS char(n)`
+//!   the engine holds unpadded), which a `DISTINCT`, a `GROUP BY` or the
+//!   `UNION` itself then compares;
+//! - the functions that compare their arguments (`nullif`, `greatest`,
+//!   `least`).
 //!
 //! The rule runs before type coercion, so every cast it sees is one the
 //! statement wrote. An operand is a char value when its field declares
@@ -26,7 +36,9 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, Result};
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::expr::{Alias, Between, Case, InList, InSubquery, Like, SetComparison};
+use datafusion::logical_expr::expr::{
+    Alias, Between, Case, InList, InSubquery, Like, ScalarFunction, SetComparison,
+};
 use datafusion::logical_expr::{BinaryExpr, Expr, ExprSchemable, LogicalPlan, Operator};
 use datafusion::optimizer::AnalyzerRule;
 
@@ -42,6 +54,9 @@ impl AnalyzerRule for RefuseCharComparisons {
             let schema = input_schema(node);
             for expr in node.expressions() {
                 check(&expr, &schema)?;
+            }
+            if let Some(name) = compared_by_node(node, &schema) {
+                return Err(refusal(&name));
             }
             Ok(TreeNodeRecursion::Continue)
         })?;
@@ -70,6 +85,44 @@ fn input_schema(node: &LogicalPlan) -> Arc<DFSchema> {
     Arc::new(merged)
 }
 
+/// A char column `node` compares without a comparison expression: a join
+/// key, or a column of a `UNION`.
+fn compared_by_node(node: &LogicalPlan, schema: &DFSchema) -> Option<String> {
+    match node {
+        LogicalPlan::Join(join) => join
+            .on
+            .iter()
+            .flat_map(|(left, right)| [left, right])
+            .find_map(|key| char_operand(key, schema)),
+        LogicalPlan::Union(union) => union.inputs.iter().find_map(|input| char_column(input)),
+        _ => None,
+    }
+}
+
+/// A char column of `plan`'s output: a projection's expression that is a
+/// char value (an explicit cast is not), or a field that declares `char(n)`.
+fn char_column(plan: &LogicalPlan) -> Option<String> {
+    match plan {
+        LogicalPlan::Projection(projection) => projection
+            .expr
+            .iter()
+            .find_map(|expr| char_operand(expr, projection.input.schema())),
+        _ => plan
+            .schema()
+            .fields()
+            .iter()
+            .find(|field| matches!(declared(field), Some(Declared::Char(_))))
+            .map(|field| field.name().clone()),
+    }
+}
+
+fn refusal(name: &str) -> DataFusionError {
+    DataFusionError::NotImplemented(format!(
+        "comparing the char column {name} is not supported yet: char values compare padded with \
+         spaces; compare CAST({name} AS varchar) with the padded value instead"
+    ))
+}
+
 fn check(expr: &Expr, schema: &DFSchema) -> Result<()> {
     let mut refused = None;
     expr.apply(|e| {
@@ -84,10 +137,7 @@ fn check(expr: &Expr, schema: &DFSchema) -> Result<()> {
     })?;
     match refused {
         None => Ok(()),
-        Some(name) => Err(DataFusionError::NotImplemented(format!(
-            "comparing the char column {name} is not supported yet: char values compare padded with \
-             spaces; compare CAST({name} AS varchar) with the padded value instead"
-        ))),
+        Some(name) => Err(refusal(&name)),
     }
 }
 
@@ -102,6 +152,11 @@ fn operands(expr: &Expr) -> Vec<&Expr> {
         Expr::Between(Between { expr, low, high, .. }) => vec![expr, low, high],
         Expr::InSubquery(InSubquery { expr, .. }) | Expr::SetComparison(SetComparison { expr, .. }) => {
             vec![expr]
+        }
+        Expr::ScalarFunction(ScalarFunction { func, args })
+            if matches!(func.name(), "nullif" | "greatest" | "least") =>
+        {
+            args.iter().collect()
         }
         Expr::Case(Case {
             expr: Some(base),
@@ -220,11 +275,22 @@ mod tests {
             "SELECT id FROM t JOIN v ON t.ch = v.s",
             "SELECT id FROM t WHERE id IN (SELECT 1 FROM v WHERE v.s = 'x') AND ch <> 'x'",
             "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t AS u WHERE u.ch = 'ab')",
+            "SELECT count(*) FROM t JOIN (SELECT s AS ch FROM v) w USING (ch)",
+            "SELECT count(*) FROM t NATURAL JOIN (SELECT s AS ch FROM v) w",
+            "SELECT ch FROM t INTERSECT SELECT s FROM v",
+            "SELECT ch FROM t EXCEPT SELECT s FROM v",
+            "SELECT s FROM v EXCEPT ALL SELECT ch FROM t",
+            "SELECT ch FROM t UNION SELECT s FROM v",
+            "SELECT count(DISTINCT c) FROM (SELECT ch AS c FROM t UNION ALL SELECT s FROM v)",
+            "SELECT id FROM t WHERE nullif(ch, 'ab') IS NULL",
+            "SELECT greatest(ch, 'b') FROM t",
+            "SELECT least('a', ch) FROM t",
         ] {
             let err = error(&ctx, sql).await;
             assert!(
-                err.as_deref()
-                    .is_some_and(|e| e.contains("comparing the char column ch is not supported")),
+                err.as_deref().is_some_and(|e| {
+                    e.contains("comparing the char column ") && e.contains(" is not supported yet")
+                }),
                 "{sql}: {err:?}"
             );
         }
@@ -240,6 +306,10 @@ mod tests {
             "SELECT id FROM t WHERE length(ch) = 5",
             "SELECT id FROM t WHERE CAST(ch AS varchar) = 'ab   '",
             "SELECT id FROM v, t WHERE v.s = 'ab'",
+            "SELECT count(*) FROM t JOIN v ON CAST(t.ch AS varchar) = v.s",
+            "SELECT CAST(ch AS varchar) FROM t UNION SELECT s FROM v",
+            "SELECT id FROM t UNION ALL SELECT 2",
+            "SELECT nullif(CAST(ch AS varchar), 'ab   ') FROM t",
         ] {
             assert_eq!(error(&ctx, sql).await, None, "{sql}");
         }

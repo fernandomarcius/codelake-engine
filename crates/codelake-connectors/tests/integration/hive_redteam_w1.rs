@@ -2105,7 +2105,6 @@ fn same_or_refused(
 /// operations, `USING` joins and functions that compare, over tables Trino
 /// 431 wrote. Each answer must be Trino's, or a refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-W1T-2: INTERSECT, EXCEPT, UNION, DISTINCT and nullif compare char(n) values unpadded and answer other rows than Trino"]
 async fn w1t_char_values_compared_outside_predicates_like_trino_431() {
     let s = Shared::new("codelake-w1t-trino-char").await;
     let mut checks = Checks::new("w1t_char_trino");

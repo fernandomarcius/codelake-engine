@@ -214,6 +214,13 @@ its correction and passes after it (2026-09-25).
   projections, subqueries), until the engine has a char type; an explicit
   `CAST(ch AS varchar)` compares text (owner decision: char(n) as
   implemented) (`w1_char_comparisons_above_the_scan_never_drop_rows`).
+  The comparisons a plan makes without a comparison expression are refused
+  too (DEFECT-W1T-2, which answered other counts than Trino 431): join keys
+  (`USING`, `NATURAL`, `INTERSECT`, `EXCEPT`), a `UNION` holding a char
+  column (it mixes padded values with unpadded ones, a varchar or a
+  `CAST … AS char(n)`, which `DISTINCT` and `GROUP BY` then compare), and
+  `nullif`, `greatest` and `least`
+  (`w1t_char_values_compared_outside_predicates_like_trino_431`).
 - **W1-5 tables of the in-memory catalog** (`CREATE TABLE datafusion.…`)
   held their rows outside the memory pool. Their rows are reserved in the
   pool for as long as the table exists (`codelake_core::memory_tables`):
