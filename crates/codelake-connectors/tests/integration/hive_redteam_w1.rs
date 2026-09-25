@@ -531,7 +531,6 @@ async fn w1_nanosecond_optimize_never_rewrites_other_instants() {
 /// the scan; a comparison the optimizer keeps above the scan (volatile
 /// predicate, `LIMIT` or window below it) must not answer differently.
 #[tokio::test]
-#[ignore = "DEFECT-W1-4: char(n) comparisons that are not pushed to the scan compare unpadded and drop rows Trino returns"]
 async fn w1_char_comparisons_above_the_scan_never_drop_rows() {
     let l = Local::new().await;
     cl(&l.engine, "CREATE SCHEMA hive.s").await;

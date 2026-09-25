@@ -204,11 +204,13 @@ pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + S
     crate::join_guard::guard_filter_pushdown(crate::join_guard::with_null_safe_not_in(rules))
 }
 
-/// `DataFusion`'s analyzer rules with the engine's: Trino's decimal types and
-/// common types (module `coercion`) right before type coercion (which then
-/// recomputes every schema), then
-/// checked arithmetic ([`crate::overflow`]) and the one-row rule of scalar
-/// subqueries ([`crate::subquery`]), which need the types coercion settles.
+/// `DataFusion`'s analyzer rules with the engine's: the refusal of `char(n)`
+/// comparisons ([`crate::char_comparisons`], which must see only the casts
+/// the statement wrote), then Trino's decimal types and common types (module
+/// `coercion`) right before type coercion (which then recomputes every
+/// schema), then checked arithmetic ([`crate::overflow`]) and the one-row
+/// rule of scalar subqueries ([`crate::subquery`]), which need the types
+/// coercion settles.
 pub fn analyzer_rules() -> Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Send + Sync>> {
     let mut rules = datafusion::optimizer::Analyzer::new().rules;
     let coercion = rules
@@ -217,6 +219,7 @@ pub fn analyzer_rules() -> Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Sen
         .unwrap_or(rules.len());
     rules.insert(coercion, Arc::new(crate::coercion::TrinoCommonTypes));
     rules.insert(coercion, Arc::new(crate::overflow::TrinoDecimalTypes));
+    rules.insert(coercion, Arc::new(crate::char_comparisons::RefuseCharComparisons));
     rules.push(Arc::new(crate::overflow::CheckedArithmetic));
     rules.push(Arc::new(crate::subquery::EnforceScalarSubqueryRows));
     rules

@@ -5,6 +5,7 @@
 pub mod bytes;
 mod casts;
 pub mod catalog;
+pub mod char_comparisons;
 mod coercion;
 pub mod computed_batches;
 pub mod config;
