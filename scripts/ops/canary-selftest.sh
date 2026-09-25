@@ -92,6 +92,10 @@ expect_jq "timeout inside a page reported" '.checks[2].status == "error" and (.c
 if [ "$(wc -l <"$WORK/cancels" 2>/dev/null | tr -d ' ')" = 2 ]; then pass "timed-out queries canceled on the server"; else
   fail "timed-out queries canceled on the server" "$(cat "$WORK/cancels" 2>/dev/null)"; fi
 
+config "$WORK/incomplete.json" '[{"name": "empty", "sql": "SELECT empty"}, {"name": "cut", "sql": "SELECT cut"}]'
+expect_run "a result that never finished fails" 1 "$WORK/incomplete.json"
+expect_jq "incomplete results reported as errors" '.checks_total == 2 and ([.checks[] | .status == "error" and (.message | test("not FINISHED"))] | all)'
+
 config "$WORK/drift.json" '[{"name": "drift", "sql": "SELECT drift", "expect": {"reference": true}}]' \
   "$(jq -nc --arg ref "$URL/ref" '{reference: {url: $ref}}')"
 expect_run "divergence from the reference fails" 1 "$WORK/drift.json"

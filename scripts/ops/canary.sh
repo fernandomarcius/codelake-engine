@@ -301,7 +301,15 @@ http_query() {
     fi
     jq -c '.data // [] | .[]' "$body" >>"$rows"
     next="$(jq -r '.nextUri // empty' "$body")"
-    [ -z "$next" ] && return 0
+    if [ -z "$next" ]; then
+      # The last page must say the query finished: a page without nextUri
+      # from anything else (a proxy's empty 200, a truncated stream) is not
+      # a complete result.
+      local state
+      state="$(jq -r '.stats.state // "none"' "$body")"
+      [ "$state" = FINISHED ] && return 0
+      HTTP_ERROR="result ended without nextUri in state $(shorten "$state"), not FINISHED"; return 1
+    fi
     now="$(now_ms)"
     if [ "$now" -ge "$deadline" ]; then
       curl_with_auth "$pw_var" "$user" -sS -o /dev/null --max-time 10 -X DELETE "${headers[@]}" "$next" 2>/dev/null
@@ -525,16 +533,30 @@ write_textfile() {
 RUN=0
 run_once() {
   RUN=$((RUN + 1))
-  local results="$WORK/results.jsonl" start end failed i
+  local results="$WORK/results.jsonl" start end failed total before i
   : >"$results"
   start="$(now_ms)"
   i=0
   while [ "$i" -lt "$CHECK_COUNT" ]; do
+    before="$(awk 'END { print NR }' "$results")"
     run_check "$i" "$results"
+    # Every check reports exactly one line; one that did not is a failure,
+    # never a silently shorter run.
+    if [ "$(awk 'END { print NR }' "$results")" -ne $((before + 1)) ]; then
+      jq -cn --arg name "$(jq -r ".checks[$i].name" "$CFG")" \
+        '{name: $name, status: "error", message: "the check did not report exactly one result"}' >>"$results"
+    fi
     i=$((i + 1))
   done
   end="$(now_ms)"
-  failed="$(jq -s '[.[] | select(.status != "ok")] | length' "$results")"
+  failed="$(jq -s '[.[] | select(.status != "ok")] | length' "$results")" || failed=""
+  total="$(jq -s 'length' "$results")" || total=""
+  # Unreadable results or a count that does not match the configuration fail
+  # the run as a whole.
+  if [ -z "$failed" ] || [ "$total" != "$CHECK_COUNT" ]; then
+    log "run $RUN: $total results for $CHECK_COUNT checks"
+    failed="$CHECK_COUNT"
+  fi
   jq -cs --arg canary "$NAME" --argjson run "$RUN" --argjson duration "$((end - start))" \
     --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson failed "$failed" '
     {time: $time, canary: $canary, run: $run,

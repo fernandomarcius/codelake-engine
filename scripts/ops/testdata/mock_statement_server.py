@@ -45,6 +45,8 @@ def answer(sql, reference):
         return one, None, None, 0
     if sql == "SELECT stall":  # a page that takes longer than the client waits
         return one, None, None, 5
+    if sql == "SELECT cut":  # the stream stops after one page, still RUNNING
+        return one, [[[1]]], None, 0
     if sql == "SELECT drift":
         return one, [[[7 if reference else 8]]], None, 0
     return None, [], {"errorName": "SYNTAX_ERROR", "message": "unknown statement"}, 0
@@ -76,10 +78,12 @@ class Handler(BaseHTTPRequestHandler):
         sql = self.rfile.read(length).decode()
         if not self.headers.get(PREFIX + "User"):
             return self.send_json(401, {"message": "missing user"})
+        if sql == "SELECT empty":  # an empty 200 from something in the way
+            return self.send_json(200, {})
         with LOCK:
             COUNTER[0] += 1
             qid = f"q{COUNTER[0]}"
-            QUERIES[qid] = answer(sql, reference)
+            QUERIES[qid] = answer(sql, reference) + (sql,)
         body = {"id": qid, "stats": {"state": "QUEUED"},
                 "nextUri": f"{self.base(reference)}/v1/statement/executing/{qid}/x/0"}
         self.send_json(200, body)
@@ -88,7 +92,7 @@ class Handler(BaseHTTPRequestHandler):
         reference = self.path.startswith("/ref/")
         parts = self.path.split("/")
         qid, token = parts[-3], int(parts[-1])
-        columns, pages, error, delay = QUERIES[qid]
+        columns, pages, error, delay, sql = QUERIES[qid]
         time.sleep(delay)
         body = {"id": qid}
         if error is not None:
@@ -107,7 +111,7 @@ class Handler(BaseHTTPRequestHandler):
             body["nextUri"] = f"{self.base(reference)}/v1/statement/executing/{qid}/x/{token + 1}"
             body["stats"] = {"state": "RUNNING"}
         else:
-            body["stats"] = {"state": "FINISHED"}
+            body["stats"] = {"state": "RUNNING" if sql == "SELECT cut" else "FINISHED"}
         self.send_json(200, body)
 
     def do_DELETE(self):

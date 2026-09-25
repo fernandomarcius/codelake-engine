@@ -127,7 +127,10 @@ Output of one run (one line, shown indented):
 
 Check statuses: `ok`, `mismatch` (wrong result), `slow` (latency above the
 objective), `stale` (freshness above the objective), `error` (query failed,
-timed out, endpoint unreachable; `message` has the engine's error name).
+timed out, endpoint unreachable, or an HTTP result that ended without the
+`FINISHED` state; `message` has the engine's error name). A check that
+reports no result counts as failed, so a run is never "ok" with fewer
+checks than the configuration has.
 `latency_ms` is measured by the canary around the query and includes the
 client's own overhead (tens of milliseconds).
 
