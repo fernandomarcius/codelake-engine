@@ -25,7 +25,8 @@ without evidence is not done.
       `DOCKER-USER`; never `0.0.0.0`) because there is no client
       authentication yet; ops listener reachable by monitoring only.
       **Proven by a negative test**: a connection from outside the client
-      network is refused ([install.md](install.md)).
+      network is refused ([install.md](install.md)); on Kubernetes this also
+      proves the CNI enforces the `NetworkPolicy`.
 - [ ] `memory.limit` ≈ 75% of the container limit; spill on a dedicated
       volume larger than `spill_limit` ([sizing.md](sizing.md)).
 - [ ] Client time limits (`query_max_run_time`) set in the pipelines'

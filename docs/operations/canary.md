@@ -163,8 +163,11 @@ Where to run it:
   log pipeline ships; alert on `status != "ok"` or on the exit code.
 - **Long-running** (`--interval`) under a supervisor, with `--textfile` for
   node_exporter; alert rules in [observability.md](observability.md).
-- **Kubernetes CronJob** in a client namespace (the NetworkPolicy admits it),
-  configuration from a ConfigMap, image with bash, curl and jq.
+- **Kubernetes CronJob** in a client namespace (labelled
+  `codelake.io/client=true`), configuration from a ConfigMap, image with
+  bash, curl and jq. The base `NetworkPolicy` admits only the PostgreSQL port
+  `5432`; checks over the client HTTP protocol need the overlay's rule for
+  its port ([install.md](install.md#kubernetes)).
 
 Self-test of the script (no engine needed):
 `scripts/ops/canary-selftest.sh`.

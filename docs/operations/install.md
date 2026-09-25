@@ -137,7 +137,8 @@ The base manifests: `Deployment` (2 replicas, probes on `/livez` and
 `/readyz`, `terminationGracePeriodSeconds` 45 > `shutdown_grace_secs` 30,
 spill `emptyDir` with `sizeLimit`), `Service`, `PodDisruptionBudget` and a
 `NetworkPolicy` that admits the PostgreSQL port only from namespaces labelled
-`codelake.io/client=true` and the ops port only from `monitoring`.
+`codelake.io/client=true` and the ops port only from `monitoring` (only
+when the cluster's CNI enforces NetworkPolicy: prove it in step 5).
 
 1. Create an overlay per environment instead of editing the base:
 
@@ -206,6 +207,22 @@ spill `emptyDir` with `sizeLimit`), `Service`, `PodDisruptionBudget` and a
    ```
 
    Then run the [canary](canary.md) from a pod in a client namespace.
+
+   **Prove the NetworkPolicy is enforced.** A `NetworkPolicy` is only an
+   object until the cluster's CNI enforces it (some CNIs, and some managed
+   clusters without the network policy option, accept it and do nothing).
+   From a namespace **without** the `codelake.io/client=true` label, the
+   connection must fail; from a labelled one, it must succeed:
+
+   ```bash
+   kubectl create namespace codelake-probe     # not labelled
+   kubectl -n codelake-probe run probe --rm -i --restart=Never --image=<image with nc> -- \
+     nc -vz -w 5 codelake.<ns>.svc 5432 ; echo "exit=$?"   # must fail (timeout)
+   kubectl delete namespace codelake-probe
+   ```
+
+   Repeat it for the client HTTP port if the overlay added one, and after a
+   CNI or cluster upgrade.
 
 6. Undo: `kubectl -n <ns> scale deploy/codelake --replicas=0` stops serving
    and keeps everything else. Deleting the overlay's resources deletes a
