@@ -18,6 +18,7 @@ pub mod functions;
 pub mod information_schema;
 pub mod join_guard;
 mod literals;
+mod operand_checks;
 pub mod output;
 pub mod overflow;
 pub mod plain_views;

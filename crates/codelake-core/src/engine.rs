@@ -841,6 +841,7 @@ impl Engine {
         }
         let plan = traced(Phase::Plan, state.statement_to_plan(statement)).await?;
         statement_policy::check_plan(&plan)?;
+        crate::operand_checks::check_plan(&plan)?;
         if ddl::is_routable(&plan)
             && let Some(result) = traced(Phase::Execute, async {
                 let columns = NewColumns {

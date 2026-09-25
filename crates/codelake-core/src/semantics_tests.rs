@@ -583,6 +583,108 @@ async fn second_suite_session_zone_and_errors_follow_trino() {
     .await;
 }
 
+/// Text and numbers are not comparable: each of these fails on Trino 431
+/// ("Cannot apply operator: integer < varchar(2)", …). `DataFusion` 53
+/// compared them as text and 54 as numbers, each answering rows.
+#[tokio::test]
+async fn text_and_numbers_are_not_comparable() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    for (sql, message) in [
+        (
+            "SELECT x FROM (VALUES 1, 5, 100) t(x) WHERE x > '20' ORDER BY x",
+            "Cannot apply operator: ",
+        ),
+        (
+            "SELECT CAST(5.0 AS double) = '5'",
+            "Cannot apply operator: double = varchar",
+        ),
+        (
+            "SELECT CAST('7' AS varchar) = 7",
+            "Cannot apply operator: varchar = ",
+        ),
+        (
+            "SELECT x FROM (VALUES '10', '9') t(x) WHERE x > 9 ORDER BY x",
+            "Cannot apply operator: varchar > ",
+        ),
+        (
+            "SELECT x FROM (VALUES 1, 2) t(x) WHERE x = 'a'",
+            "Cannot apply operator",
+        ),
+        (
+            "SELECT x FROM (VALUES 10, 9) t(x) WHERE x > '9.5'",
+            "Cannot apply operator",
+        ),
+        (
+            "SELECT x FROM (VALUES 1.0e0, 2.0e0) t(x) WHERE x IN ('1.0')",
+            "Cannot find common type between double and varchar",
+        ),
+        (
+            "SELECT 'a' IN ('a', 1)",
+            "Cannot find common type between varchar and ",
+        ),
+        (
+            "SELECT CASE 'x' WHEN 1.0 THEN 'a' ELSE 'b' END",
+            "CASE operand type does not match WHEN clause operand type",
+        ),
+        ("SELECT 5 BETWEEN '1' AND 9", "is BETWEEN"),
+        (
+            "SELECT x FROM (VALUES 1, 2) t(x) WHERE x IN (SELECT y FROM (VALUES '1') u(y))",
+            "must be of the same type",
+        ),
+        (
+            "SELECT x FROM (VALUES 1, 2) t(x) WHERE EXISTS (SELECT 1 FROM (VALUES '1') u(y) WHERE y = t.x)",
+            "Cannot apply operator: varchar = ",
+        ),
+    ] {
+        assert_error(&engine, sql, "TYPE_MISMATCH").await;
+        assert_error(&engine, sql, message).await;
+    }
+    // Same-kind comparisons, NULLs and explicit casts still answer.
+    assert_same(
+        &engine,
+        &[
+            (
+                "SELECT 1 = 1.0, 'a' < 'b', 1 = NULL",
+                answer(&["boolean", "boolean", "boolean"], &[&["true", "true", "NULL"]]),
+            ),
+            (
+                "SELECT x FROM (VALUES 1, 5, 100) t(x) WHERE CAST(x AS varchar) > '20' ORDER BY x",
+                answer(&["integer"], &[&["5"]]),
+            ),
+            (
+                "SELECT x FROM (VALUES 1, 5, 100) t(x) WHERE x > CAST('20' AS integer) ORDER BY x",
+                answer(&["integer"], &[&["100"]]),
+            ),
+        ],
+    )
+    .await;
+}
+
+/// `time ± interval` is refused: `DataFusion` 54 answers an interval
+/// (`24 hours 30 mins`) where Trino 431 answers the time `00:30:00`.
+#[tokio::test]
+async fn time_plus_interval_is_refused_instead_of_answering_an_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    for sql in [
+        "SELECT TIME '23:30:00' + INTERVAL '1' HOUR",
+        "SELECT TIME '00:30:00' - INTERVAL '1' HOUR",
+        "SELECT INTERVAL '1' HOUR + TIME '23:30:00'",
+    ] {
+        assert_error(&engine, sql, "NOT_SUPPORTED").await;
+    }
+    // Dates and timestamps keep their arithmetic.
+    assert_same(
+        &engine,
+        &[(
+            "SELECT DATE '2024-01-31' + INTERVAL '1' DAY",
+            answer(&["date"], &[&["2024-02-01"]]),
+        )],
+    )
+    .await;
+}
+
 /// `NOT IN` with a NULL in the subquery (or a NULL value) is UNKNOWN: the
 /// row is filtered out. Every answer below is Trino 431's; `DataFusion`
 /// answered the constant and correlated forms without the NULL semantics.
