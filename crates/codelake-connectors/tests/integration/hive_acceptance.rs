@@ -38,6 +38,8 @@ use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(240);
+/// How long a query waits for Trino to register its worker again.
+const NODES_BACK: Duration = Duration::from_secs(120);
 const SA_PASSWORD: &str = "Acceptance-Only-1";
 /// Where the dev container mounts the build cache (see `scripts/dev.sh`).
 const SHARED_MOUNT: &str = "/work/target";
@@ -202,7 +204,7 @@ impl Trino {
     async fn wait_until_it_runs_queries(&self) {
         let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
         loop {
-            match self.try_sql_in(None, "SELECT 1").await {
+            match self.run_once(None, "SELECT 1").await {
                 Ok(_) => return,
                 Err(error) if std::time::Instant::now() < deadline => {
                     assert!(
@@ -216,7 +218,26 @@ impl Trino {
         }
     }
 
+    /// [`Trino::run_once`], sent again while the coordinator has no worker
+    /// registered: under a loaded Docker VM the coordinator can miss its own
+    /// worker's heartbeat and drop it for a moment, well after it started.
+    /// Such a query failed before running anything, so sending it again
+    /// cannot apply a statement twice.
     async fn try_sql_in(&self, schema: Option<&str>, sql: &str) -> Result<Rows, String> {
+        let deadline = std::time::Instant::now() + NODES_BACK;
+        loop {
+            match self.run_once(schema, sql).await {
+                Err(error)
+                    if error.contains("No nodes available") && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn run_once(&self, schema: Option<&str>, sql: &str) -> Result<Rows, String> {
         // `--debug` prints the Java cause chain of a failure.
         let mut args = vec!["trino", "--debug", "--output-format", "TSV", "--catalog", "hive"];
         if let Some(schema) = schema {
