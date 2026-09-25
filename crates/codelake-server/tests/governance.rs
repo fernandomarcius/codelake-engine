@@ -218,6 +218,10 @@ async fn governance_with_real_clients_on_both_protocols() {
     postgres_timeout_stops_the_query_and_frees_the_pool(&server).await;
     postgres_per_user_limit_queues_and_refuses(&server).await;
     postgres_timeout_reaches_a_client_that_stopped_reading(&server).await;
+    postgres_cancel_request_stops_the_query_and_frees_the_pool(&server).await;
+    kill_query_stops_a_postgres_query(&server).await;
+    kill_query_stops_an_http_query(&server).await;
+    delete_cancels_a_postgres_query(&server).await;
     http_client_limits_and_timeout(&server).await;
     registry_lists_both_protocols(&server).await;
     server.slots_free().await;
@@ -342,6 +346,214 @@ async fn postgres_timeout_reaches_a_client_that_stopped_reading(server: &Server)
     )
     .await;
     assert_eq!(listed, [["FAILED", "EXCEEDED_TIME_LIMIT"]]);
+}
+
+/// Waits (at most 15 s) until the pool holds more than 1 MiB: the query
+/// under test is executing and holds memory.
+async fn pool_fills(server: &Server) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let reserved = server.reserved().await;
+        if reserved > 1 << 20 {
+            return reserved;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the query never held memory ({reserved} bytes)"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// `state` and `error_code` of `user`'s queries, oldest first.
+async fn states_of(client: &Client, user: &str) -> Vec<Vec<String>> {
+    text_rows(
+        client,
+        &format!(
+            "SELECT state, coalesce(error_code, '-') FROM system.runtime.queries \
+             WHERE \"user\" = '{user}' ORDER BY created, query_id"
+        ),
+    )
+    .await
+}
+
+/// A PostgreSQL cancel request (what `psql`'s Ctrl-C and JDBC's
+/// `Statement.cancel` send) stops a statement that is executing: SQLSTATE
+/// 57014, the pool back at zero, the connection still usable.
+async fn postgres_cancel_request_stops_the_query_and_frees_the_pool(server: &Server) {
+    let client = server.connect("carl").await;
+    let token = client.cancel_token();
+    let running = tokio::spawn(async move {
+        let outcome = client.simple_query(HOLDS_MEMORY).await.map(|_| ());
+        (client, outcome)
+    });
+    let held = pool_fills(server).await;
+    token.cancel_query(NoTls).await.unwrap();
+    let (client, outcome) = tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the canceled statement ended")
+        .unwrap();
+    let error = outcome.unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::QUERY_CANCELED), "{error:?}");
+    assert_eq!(
+        error.as_db_error().unwrap().message(),
+        "canceling statement due to user request"
+    );
+    assert_eq!(server.pool_drains().await, 0, "reservations left (held {held})");
+    assert_eq!(text_rows(&client, "SELECT 6 * 7").await, [["42"]]);
+    let observer = server.connect("observer").await;
+    assert_eq!(
+        states_of(&observer, "carl").await,
+        [["FAILED", "USER_CANCELED"], ["FINISHED", "-"]]
+    );
+}
+
+/// The id of `user`'s running join (`HOLDS_MEMORY`), read by another user:
+/// `user` has no free running slot.
+async fn running_join_of(server: &Server, user: &str) -> String {
+    let observer = server.connect("observer").await;
+    let ids = text_rows(
+        &observer,
+        &format!(
+            "SELECT query_id FROM system.runtime.queries \
+             WHERE \"user\" = '{user}' AND state = 'RUNNING' AND query LIKE '%3000000000%'"
+        ),
+    )
+    .await;
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    ids[0][0].clone()
+}
+
+/// `CALL system.runtime.kill_query` from another connection of the owner
+/// stops a PostgreSQL query; another user is refused. The call needs no
+/// slot (the owner has none free). Memory returns to the pool.
+async fn kill_query_stops_a_postgres_query(server: &Server) {
+    let client = server.connect("kim").await;
+    let running = tokio::spawn(async move { client.simple_query(HOLDS_MEMORY).await.map(|_| ()) });
+    pool_fills(server).await;
+    let id = running_join_of(server, "kim").await;
+    let stranger = server.connect("lee").await;
+    let error = stranger
+        .simple_query(&format!("CALL system.runtime.kill_query('{id}')"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE), "{error:?}");
+    assert_eq!(
+        error.as_db_error().unwrap().message(),
+        "Access Denied: Cannot kill query owned by kim"
+    );
+    let owner = server.connect("kim").await;
+    owner
+        .simple_query(&format!(
+            "CALL system.runtime.kill_query(query_id => '{id}', message => 'runbook')"
+        ))
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the killed statement ended")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::QUERY_CANCELED), "{error:?}");
+    assert_eq!(
+        error.as_db_error().unwrap().message(),
+        "Query killed. Message: runbook"
+    );
+    assert_eq!(
+        server.pool_drains().await,
+        0,
+        "reservations left after kill_query"
+    );
+    // Killing it again (extended protocol): it is no longer running.
+    let error = owner
+        .execute(&format!("CALL system.runtime.kill_query('{id}')"), &[])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code(),
+        Some(&SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE),
+        "{error:?}"
+    );
+}
+
+/// An HTTP query (its client does not page), killed from a PostgreSQL
+/// connection of its owner over the extended protocol.
+async fn kill_query_stops_an_http_query(server: &Server) {
+    let http = reqwest::Client::new();
+    let submitted = json(
+        http.post(format!("http://127.0.0.1:{}/v1/statement", server.statement))
+            .header("X-Trino-User", "kim")
+            .body(HOLDS_MEMORY)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    let id = submitted["id"].as_str().unwrap().to_owned();
+    let mut page = json(
+        http.get(submitted["nextUri"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    pool_fills(server).await;
+    let owner = server.connect("kim").await;
+    let call = format!("CALL system.runtime.kill_query('{id}', 'from psql')");
+    assert_eq!(owner.execute(&call, &[]).await.unwrap(), 0);
+    while let Some(next) = page["nextUri"].as_str().map(str::to_owned) {
+        page = json(http.get(next).send().await.unwrap()).await;
+    }
+    assert_eq!(page["error"]["errorName"], "ADMINISTRATIVELY_KILLED", "{page}");
+    assert_eq!(
+        page["error"]["message"], "Query killed. Message: from psql",
+        "{page}"
+    );
+    assert_eq!(
+        server.pool_drains().await,
+        0,
+        "reservations left after the HTTP kill"
+    );
+}
+
+/// A PostgreSQL query canceled over HTTP by id (`DELETE /v1/query/{id}`), by
+/// its owner only.
+async fn delete_cancels_a_postgres_query(server: &Server) {
+    let client = server.connect("kim").await;
+    let running = tokio::spawn(async move { client.simple_query(HOLDS_MEMORY).await.map(|_| ()) });
+    pool_fills(server).await;
+    let id = running_join_of(server, "kim").await;
+    let http = reqwest::Client::new();
+    let delete = |user: &'static str| {
+        http.delete(format!("http://127.0.0.1:{}/v1/query/{id}", server.statement))
+            .header("X-Trino-User", user)
+            .send()
+    };
+    assert_eq!(delete("lee").await.unwrap().status(), 403);
+    assert_eq!(delete("kim").await.unwrap().status(), 204);
+    let error = tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the canceled statement ended")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::QUERY_CANCELED), "{error:?}");
+    assert_eq!(server.pool_drains().await, 0, "reservations left after DELETE");
+    let observer = server.connect("observer").await;
+    let states = states_of(&observer, "kim").await;
+    let codes: Vec<&str> = states
+        .iter()
+        .filter(|row| row[0] == "FAILED")
+        .map(|row| row[1].as_str())
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            "ADMINISTRATIVELY_KILLED",
+            "ADMINISTRATIVELY_KILLED",
+            "USER_CANCELED"
+        ],
+        "{states:?}"
+    );
 }
 
 /// This container's id (Docker sets the hostname to it).

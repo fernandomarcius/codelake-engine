@@ -32,7 +32,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use codelake_core::governance::{self, Permit, Protocol, Ticket, TimeLimits};
+use codelake_core::governance::{self, KillError, Permit, Protocol, Ticket, TimeLimits};
 use codelake_core::output::ReservedOutputExec;
 use codelake_core::session_properties::{format_duration, parse_duration};
 use codelake_core::trace::QueryTrace;
@@ -990,6 +990,13 @@ fn start(
         }
         None => sql,
     };
+    // Killing a query answers at once, without a slot: it works on a full node.
+    if let Some(request) = governance::kill_request_sql(sql) {
+        request
+            .and_then(|request| state.engine.governance().kill(&request, &session.user))
+            .map_err(|error| QueryError::from_kill(&error))?;
+        return Ok(answered(query, "CALL", Vec::new()));
+    }
     if let Some(control) = session::control(sql, &session, state.engine.session_properties(), &names)? {
         return Ok(answered(
             query,
@@ -1415,19 +1422,26 @@ async fn cancel_statement(
     }
 }
 
-/// `DELETE /v1/query/{id}`: only the query's owner may cancel it by id.
+/// `DELETE /v1/query/{id}`: only the query's owner may cancel it by id. The
+/// query may run on another protocol (the PostgreSQL wire): it is then
+/// canceled in the engine's registry, and its protocol stops it.
 async fn kill_query(
     State(state): State<Arc<TrinoState>>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> StatusCode {
-    let Some(query) = state.queries.get(&id) else {
-        return StatusCode::NOT_FOUND;
-    };
     let user = headers
         .get(session::USER)
         .and_then(|v| v.to_str().ok())
         .map(str::trim);
+    let Some(query) = state.queries.get(&id) else {
+        return match state.engine.governance().cancel(&id, user.unwrap_or_default()) {
+            // As for this protocol's queries: canceling a finished one is a no-op.
+            Ok(()) | Err(KillError::NotRunning(_)) => StatusCode::NO_CONTENT,
+            Err(KillError::NotOwner(_)) => StatusCode::FORBIDDEN,
+            Err(_) => StatusCode::NOT_FOUND,
+        };
+    };
     if user != Some(query.snapshot().user.as_str()) {
         return StatusCode::FORBIDDEN;
     }

@@ -18,7 +18,20 @@
 //! The slot is held until the statement's rows are all sent (or its stream
 //! dropped). Statements the session answers itself (`SET`, `SHOW`,
 //! transaction control) neither register nor take a slot.
+//!
+//! Stopping a statement from outside, which also frees its slot and memory:
+//!
+//! - a cancel request (`psql`'s Ctrl-C, JDBC `Statement.cancel`,
+//!   `tokio-postgres`' `cancel_query`), which names the connection by its
+//!   process id and secret key: every governed statement of that connection
+//!   fails with `57014`, whether it waits in the queue, is planned, or sends
+//!   rows;
+//! - `CALL system.runtime.kill_query(query_id => '…', message => '…')` from
+//!   a connection of the query's owner, for a query of any protocol (its id
+//!   is listed in `system.runtime.queries`); it answers without taking a
+//!   slot, so it works on a full node.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,20 +42,23 @@ use std::time::Duration;
 use async_trait::async_trait;
 use codelake_core::Engine;
 use codelake_core::governance::{
-    EXCEEDED_TIME_LIMIT, Failure, GovernanceError, Permit, Protocol, QUERY_QUEUE_FULL, QueryRecord,
-    QueryState, USER_CANCELED,
+    ADMINISTRATIVELY_KILLED, EXCEEDED_TIME_LIMIT, Failure, GovernanceError, KillError, KillRequest, Permit,
+    Protocol, QUERY_QUEUE_FULL, QueryRecord, QueryState, USER_CANCELED, kill_request, kill_request_sql,
 };
+use datafusion::common::{DFSchema, ParamValues};
 use datafusion::error::DataFusionError;
+use datafusion::logical_expr::{EmptyRelation, LogicalPlan};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::Statement;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::Parser;
+use datafusion_postgres::hooks::HookClient;
 use datafusion_postgres::pgwire::api::auth::noop::NoopStartupHandler;
-use datafusion_postgres::pgwire::api::cancel::DefaultCancelHandler;
+use datafusion_postgres::pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
 use datafusion_postgres::pgwire::api::portal::Portal;
 use datafusion_postgres::pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use datafusion_postgres::pgwire::api::results::{
-    DescribePortalResponse, DescribeStatementResponse, Response, SendableRowStream,
+    DescribePortalResponse, DescribeStatementResponse, Response, SendableRowStream, Tag,
 };
 use datafusion_postgres::pgwire::api::stmt::StoredStatement;
 use datafusion_postgres::pgwire::api::store::PortalStore;
@@ -52,6 +68,7 @@ use datafusion_postgres::pgwire::api::{
 };
 use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
+use datafusion_postgres::pgwire::messages::cancel::CancelRequest;
 use datafusion_postgres::pgwire::messages::data::DataRow;
 use datafusion_postgres::{DfSessionService, QueryHook};
 use futures::{Sink, Stream};
@@ -64,6 +81,11 @@ use crate::trino::{Everything, QueryError};
 const STATEMENT_TIMEOUT: &str = "statement_timeout_ms";
 /// User of a connection whose startup message named none.
 const UNKNOWN_USER: &str = "unknown";
+/// `PostgreSQL`'s message for a statement stopped by a cancel request.
+const CANCELED: &str = "canceling statement due to user request";
+/// Client metadata key holding the registry id of the statement being run,
+/// for the tracing hook ([`crate::hooks`]).
+pub(crate) const QUERY_ID: &str = "codelake.query_id";
 
 type DfStatement = <DfSessionService as ExtendedQueryHandler>::Statement;
 
@@ -71,7 +93,7 @@ type DfStatement = <DfSessionService as ExtendedQueryHandler>::Statement;
 pub(crate) struct Handlers {
     service: Arc<Governed>,
     startup: Arc<Startup>,
-    cancel: Arc<DefaultCancelHandler>,
+    cancel: Arc<CancelRequests>,
 }
 
 impl Debug for Handlers {
@@ -81,21 +103,30 @@ impl Debug for Handlers {
 }
 
 impl Handlers {
+    /// `hooks` run after the one that plans `kill_query` calls on the
+    /// extended protocol ([`KillCallHook`]).
     pub(crate) fn new(
         engine: Arc<Engine>,
         session: Arc<SessionContext>,
         hooks: Vec<Arc<dyn QueryHook>>,
     ) -> Self {
         let manager = Arc::new(ConnectionManager::new());
+        let connections = Arc::new(Connections::default());
+        let mut all: Vec<Arc<dyn QueryHook>> = vec![Arc::new(KillCallHook)];
+        all.extend(hooks);
         Self {
             service: Arc::new(Governed {
-                inner: Arc::new(DfSessionService::new_with_hooks(session, hooks)),
+                inner: Arc::new(DfSessionService::new_with_hooks(session, all)),
                 engine,
+                connections: Arc::clone(&connections),
             }),
             startup: Arc::new(Startup {
                 manager: Arc::clone(&manager),
             }),
-            cancel: Arc::new(DefaultCancelHandler::new(manager)),
+            cancel: Arc::new(CancelRequests {
+                connections,
+                inner: DefaultCancelHandler::new(manager),
+            }),
         }
     }
 }
@@ -117,7 +148,7 @@ impl PgWireServerHandlers for Handlers {
         Arc::new(LogErrors)
     }
 
-    fn cancel_handler(&self) -> Arc<impl datafusion_postgres::pgwire::api::cancel::CancelHandler> {
+    fn cancel_handler(&self) -> Arc<impl CancelHandler> {
         Arc::clone(&self.cancel)
     }
 }
@@ -146,9 +177,139 @@ impl ErrorHandler for LogErrors {
     }
 }
 
+/// A connection as cancel requests name it: its process id and secret key.
+type ConnectionKey = (i32, Vec<u8>);
+
+fn connection_key(client: &(impl ClientInfo + ?Sized)) -> ConnectionKey {
+    let (pid, secret) = client.pid_and_secret_key();
+    (pid, secret.to_bytes().to_vec())
+}
+
+/// The governed statements alive on each connection, so a cancel request
+/// (which names a connection, not a statement) reaches them.
+#[derive(Default)]
+struct Connections {
+    live: Mutex<HashMap<ConnectionKey, Vec<Weak<QueryRecord>>>>,
+}
+
+impl Connections {
+    fn add(&self, key: &ConnectionKey, record: &Arc<QueryRecord>) {
+        lock(&self.live)
+            .entry(key.clone())
+            .or_default()
+            .push(Arc::downgrade(record));
+    }
+
+    fn remove(&self, key: &ConnectionKey, record: &QueryRecord) {
+        let mut live = lock(&self.live);
+        if let Some(records) = live.get_mut(key) {
+            records.retain(|r| r.strong_count() > 0 && !std::ptr::eq(r.as_ptr(), record));
+            if records.is_empty() {
+                live.remove(key);
+            }
+        }
+    }
+
+    fn records(&self, key: &ConnectionKey) -> Vec<Arc<QueryRecord>> {
+        lock(&self.live)
+            .get(key)
+            .map(|records| records.iter().filter_map(Weak::upgrade).collect())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        lock(&self.live).len()
+    }
+}
+
+/// Cancel requests: fail the connection's governed statements (their
+/// watchers then drop their streams), then let `datafusion-postgres` stop
+/// what it is planning.
+struct CancelRequests {
+    connections: Arc<Connections>,
+    inner: DefaultCancelHandler,
+}
+
+impl CancelRequests {
+    fn cancel(&self, key: &ConnectionKey) -> usize {
+        let records = self.connections.records(key);
+        for record in &records {
+            record.fail(Failure::new(USER_CANCELED, "USER_ERROR", CANCELED));
+        }
+        records.len()
+    }
+}
+
+#[async_trait]
+impl CancelHandler for CancelRequests {
+    async fn on_cancel_request(&self, request: CancelRequest) {
+        let key = (request.pid, request.secret_key.to_bytes().to_vec());
+        let canceled = self.cancel(&key);
+        tracing::debug!(pid = request.pid, canceled, "PostgreSQL cancel request");
+        self.inner.on_cancel_request(request).await;
+    }
+}
+
+/// Plans `CALL system.runtime.kill_query(…)` on the extended protocol as an
+/// empty statement, which `DataFusion` could not plan; [`Governed`] runs it.
+#[derive(Debug)]
+pub(crate) struct KillCallHook;
+
+#[async_trait]
+impl QueryHook for KillCallHook {
+    async fn handle_simple_query(
+        &self,
+        _statement: &Statement,
+        _session_context: &SessionContext,
+        _client: &mut dyn HookClient,
+    ) -> Option<PgWireResult<Response>> {
+        None
+    }
+
+    async fn handle_extended_parse_query(
+        &self,
+        statement: &Statement,
+        _session_context: &SessionContext,
+        _client: &(dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<LogicalPlan>> {
+        // Bad arguments too: the call answers them when it runs.
+        kill_request(statement).map(|_| {
+            Ok(LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row: false,
+                schema: Arc::new(DFSchema::empty()),
+            }))
+        })
+    }
+
+    async fn handle_extended_query(
+        &self,
+        _statement: &Statement,
+        _logical_plan: &LogicalPlan,
+        _params: &ParamValues,
+        _session_context: &SessionContext,
+        _client: &mut dyn HookClient,
+    ) -> Option<PgWireResult<Response>> {
+        None
+    }
+}
+
+/// The client's error for a failed `kill_query` call.
+fn kill_error(error: &KillError) -> PgWireError {
+    let code = match error {
+        KillError::InvalidArguments(_) | KillError::NullQueryId => "22023",
+        KillError::NotText(_) => "42804",
+        KillError::NotFound(_) => "42704",
+        KillError::NotRunning(_) => "55000",
+        KillError::NotOwner(_) => "42501",
+    };
+    user_error(code, error.to_string())
+}
+
 struct Governed {
     inner: Arc<DfSessionService>,
     engine: Arc<Engine>,
+    connections: Arc<Connections>,
 }
 
 /// Statements the session answers without executing a query.
@@ -199,7 +360,7 @@ fn user_error(code: &str, message: impl Into<String>) -> PgWireError {
 fn pg_error(failure: &Failure) -> PgWireError {
     let code = match failure.name.as_str() {
         QUERY_QUEUE_FULL => "53400",
-        EXCEEDED_TIME_LIMIT | USER_CANCELED => "57014",
+        EXCEEDED_TIME_LIMIT | USER_CANCELED | ADMINISTRATIVELY_KILLED => "57014",
         _ => "XX000",
     };
     user_error(code, failure.message.clone())
@@ -244,6 +405,9 @@ struct Execution {
     permit: Mutex<Option<Permit>>,
     ran: AtomicBool,
     done: Arc<Notify>,
+    /// Where cancel requests find the statement.
+    connection: ConnectionKey,
+    connections: Arc<Connections>,
 }
 
 impl Drop for Execution {
@@ -251,12 +415,10 @@ impl Drop for Execution {
         if self.ran.load(Ordering::SeqCst) {
             self.record.finish();
         } else {
-            self.record.fail(Failure::new(
-                USER_CANCELED,
-                "USER_ERROR",
-                "canceling statement due to user request",
-            ));
+            self.record
+                .fail(Failure::new(USER_CANCELED, "USER_ERROR", CANCELED));
         }
+        self.connections.remove(&self.connection, &self.record);
         lock(&self.permit).take();
         self.done.notify_one();
     }
@@ -341,13 +503,10 @@ impl Stream for GovernedRows {
         };
         match polled {
             None => {
-                let failure = execution.record.failure().unwrap_or_else(|| {
-                    Failure::new(
-                        USER_CANCELED,
-                        "USER_ERROR",
-                        "canceling statement due to user request",
-                    )
-                });
+                let failure = execution
+                    .record
+                    .failure()
+                    .unwrap_or_else(|| Failure::new(USER_CANCELED, "USER_ERROR", CANCELED));
                 this.end();
                 Poll::Ready(Some(Err(pg_error(&failure))))
             }
@@ -379,17 +538,25 @@ struct Admitted {
 
 impl Governed {
     /// Registers the statement and waits for its admission slot.
-    async fn admit(&self, client: &(impl ClientInfo + ?Sized), sql: &str) -> PgWireResult<Admitted> {
+    async fn admit(&self, client: &mut (impl ClientInfo + ?Sized), sql: &str) -> PgWireResult<Admitted> {
         let governance = self.engine.governance();
         let user = metadata(client, METADATA_USER).unwrap_or(UNKNOWN_USER);
         let source = metadata(client, METADATA_APPLICATION_NAME).filter(|s| !s.is_empty());
         let record = governance.register(Protocol::Postgres, user, source, sql);
+        let connection = connection_key(client);
+        self.connections.add(&connection, &record);
         let execution = Arc::new(Execution {
             record: Arc::clone(&record),
             permit: Mutex::new(None),
             ran: AtomicBool::new(false),
             done: Arc::new(Notify::new()),
+            connection,
+            connections: Arc::clone(&self.connections),
         });
+        // The statement's span (tracing hook) carries the registry's id.
+        client
+            .metadata_mut()
+            .insert(QUERY_ID.to_owned(), record.id().to_owned());
         let limits = governance.limits(statement_timeout(client), None);
         let ticket = governance.enter(&record).map_err(|e| pg_error(&e.failure()))?;
         let permit = governance
@@ -420,6 +587,40 @@ impl Governed {
     fn failed(admitted: &Admitted, error: PgWireError, sql: &str) -> PgWireError {
         admitted.execution.record.fail(failure_of(&error, sql));
         error
+    }
+
+    /// Runs `work` (planning) until the statement's deadline, or until it is
+    /// canceled or killed.
+    async fn bounded<T>(
+        &self,
+        admitted: &Admitted,
+        sql: &str,
+        work: impl Future<Output = PgWireResult<T>>,
+    ) -> PgWireResult<T> {
+        let record = &admitted.execution.record;
+        let stopped = record.cancellation();
+        tokio::select! {
+            biased;
+            () = stopped.cancelled() => {
+                let failure = record.failure().unwrap_or_else(|| GovernanceError::Canceled.failure());
+                Err(pg_error(&failure))
+            }
+            () = tokio::time::sleep_until(admitted.deadline) => Err(self.timed_out(admitted)),
+            outcome = work => outcome.map_err(|error| Self::failed(admitted, error, sql)),
+        }
+    }
+
+    /// `CALL system.runtime.kill_query(…)`, as the connection's user.
+    fn kill(
+        &self,
+        client: &(impl ClientInfo + ?Sized),
+        request: Result<KillRequest, KillError>,
+    ) -> PgWireResult<Response> {
+        let user = metadata(client, METADATA_USER).unwrap_or(UNKNOWN_USER);
+        request
+            .and_then(|request| self.engine.governance().kill(&request, user))
+            .map(|()| Response::Execution(Tag::new("CALL")))
+            .map_err(|error| kill_error(&error))
     }
 
     /// Wraps the result streams and watches the deadline until they end.
@@ -506,20 +707,22 @@ impl SimpleQueryHandler for Governed {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if let Some(request) = kill_request_sql(query) {
+            return Ok(vec![self.kill(client, request)?]);
+        }
+        client.metadata_mut().remove(QUERY_ID);
         if !governed_text(query) {
             return SimpleQueryHandler::do_query(&*self.inner, client, query).await;
         }
         let admitted = self.admit(client, query).await?;
-        let outcome = tokio::time::timeout_at(
-            admitted.deadline,
-            SimpleQueryHandler::do_query(&*self.inner, client, query),
-        )
-        .await;
-        match outcome {
-            Err(_) => Err(self.timed_out(&admitted)),
-            Ok(Err(error)) => Err(Self::failed(&admitted, error, query)),
-            Ok(Ok(responses)) => Ok(self.run(admitted, responses)),
-        }
+        let responses = self
+            .bounded(
+                &admitted,
+                query,
+                SimpleQueryHandler::do_query(&*self.inner, client, query),
+            )
+            .await?;
+        Ok(self.run(admitted, responses))
     }
 }
 
@@ -573,6 +776,10 @@ impl ExtendedQueryHandler for Governed {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let (sql, parsed) = &portal.statement.statement;
+        if let Some(request) = parsed.as_ref().and_then(|(statement, _)| kill_request(statement)) {
+            return self.kill(client, request);
+        }
+        client.metadata_mut().remove(QUERY_ID);
         let governed = parsed
             .as_ref()
             .is_some_and(|(statement, _)| !answered_by_the_session(statement));
@@ -580,19 +787,17 @@ impl ExtendedQueryHandler for Governed {
             return ExtendedQueryHandler::do_query(&*self.inner, client, portal, max_rows).await;
         }
         let admitted = self.admit(client, sql).await?;
-        let outcome = tokio::time::timeout_at(
-            admitted.deadline,
-            ExtendedQueryHandler::do_query(&*self.inner, client, portal, max_rows),
-        )
-        .await;
-        match outcome {
-            Err(_) => Err(self.timed_out(&admitted)),
-            Ok(Err(error)) => Err(Self::failed(&admitted, error, sql)),
-            Ok(Ok(response)) => Ok(self
-                .run(admitted, vec![response])
-                .pop()
-                .unwrap_or(Response::EmptyQuery)),
-        }
+        let response = self
+            .bounded(
+                &admitted,
+                sql,
+                ExtendedQueryHandler::do_query(&*self.inner, client, portal, max_rows),
+            )
+            .await?;
+        Ok(self
+            .run(admitted, vec![response])
+            .pop()
+            .unwrap_or(Response::EmptyQuery))
     }
 }
 
@@ -641,6 +846,53 @@ mod tests {
             "57014"
         );
         assert_eq!(code(GovernanceError::Canceled.failure()).0, "57014");
+    }
+
+    #[test]
+    fn kill_errors_map_to_postgres_states() {
+        let code = |error: KillError| match kill_error(&error) {
+            PgWireError::UserError(info) => (info.code.clone(), info.message.clone()),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            code(KillError::NotFound("q".into())),
+            ("42704".to_owned(), "Target query not found: q".to_owned())
+        );
+        assert_eq!(code(KillError::NotOwner("ana".into())).0, "42501");
+        assert_eq!(code(KillError::NotRunning("q".into())).0, "55000");
+        assert_eq!(code(KillError::InvalidArguments("x".into())).0, "22023");
+        assert_eq!(code(KillError::NullQueryId).0, "22023");
+        assert_eq!(code(KillError::NotText("x".into())).0, "42804");
+        let killed = Failure::new(
+            ADMINISTRATIVELY_KILLED,
+            "USER_ERROR",
+            "Query killed. No message provided.",
+        );
+        assert!(matches!(pg_error(&killed), PgWireError::UserError(info) if info.code == "57014"));
+    }
+
+    #[test]
+    fn cancel_requests_reach_only_their_connection() {
+        let connections = Arc::new(Connections::default());
+        let requests = CancelRequests {
+            connections: Arc::clone(&connections),
+            inner: DefaultCancelHandler::new(Arc::new(ConnectionManager::new())),
+        };
+        let mine = QueryRecord::detached("q1", Protocol::Postgres, "u", "SELECT 1");
+        let other = QueryRecord::detached("q2", Protocol::Postgres, "u", "SELECT 2");
+        let key = (7, vec![1, 2, 3, 4]);
+        let other_key = (7, vec![9, 9, 9, 9]);
+        connections.add(&key, &mine);
+        connections.add(&other_key, &other);
+        // Same process id, another secret key: nothing is canceled.
+        assert_eq!(requests.cancel(&(7, vec![0, 0, 0, 0])), 0);
+        assert_eq!(requests.cancel(&key), 1);
+        assert_eq!(mine.failure().map(|f| f.message), Some(CANCELED.to_owned()));
+        assert!(mine.cancellation().is_cancelled());
+        assert!(other.failure().is_none());
+        connections.remove(&key, &mine);
+        connections.remove(&other_key, &other);
+        assert_eq!(connections.len(), 0, "entries go away with their statements");
     }
 
     #[test]

@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use codelake_core::governance::{Failure, GovernanceError};
+use codelake_core::governance::{Failure, GovernanceError, KillError};
 use codelake_core::subquery::SubqueryMultipleRows;
 use codelake_core::trino_functions::trino_error_name;
 use datafusion::arrow::error::ArrowError;
@@ -30,6 +30,7 @@ pub(crate) enum Code {
     SyntaxError,
     AbandonedQuery,
     UserCanceled,
+    PermissionDenied,
     NotFound,
     FunctionNotFound,
     InvalidFunctionArgument,
@@ -52,6 +53,9 @@ pub(crate) enum Code {
     InvalidLiteral,
     AmbiguousName,
     InvalidParameterUsage,
+    AdministrativelyKilled,
+    InvalidProcedureArgument,
+    InvalidArguments,
     QueryQueueFull,
     ExceededTimeLimit,
     ExceededLocalMemoryLimit,
@@ -65,6 +69,7 @@ impl Code {
             Self::SyntaxError => (1, "SYNTAX_ERROR", "USER_ERROR"),
             Self::AbandonedQuery => (2, "ABANDONED_QUERY", "USER_ERROR"),
             Self::UserCanceled => (3, "USER_CANCELED", "USER_ERROR"),
+            Self::PermissionDenied => (4, "PERMISSION_DENIED", "USER_ERROR"),
             Self::NotFound => (5, "NOT_FOUND", "USER_ERROR"),
             Self::FunctionNotFound => (6, "FUNCTION_NOT_FOUND", "USER_ERROR"),
             Self::InvalidFunctionArgument => (7, "INVALID_FUNCTION_ARGUMENT", "USER_ERROR"),
@@ -87,6 +92,9 @@ impl Code {
             Self::InvalidLiteral => (59, "INVALID_LITERAL", "USER_ERROR"),
             Self::AmbiguousName => (62, "AMBIGUOUS_NAME", "USER_ERROR"),
             Self::InvalidParameterUsage => (80, "INVALID_PARAMETER_USAGE", "USER_ERROR"),
+            Self::InvalidProcedureArgument => (30, "INVALID_PROCEDURE_ARGUMENT", "USER_ERROR"),
+            Self::InvalidArguments => (76, "INVALID_ARGUMENTS", "USER_ERROR"),
+            Self::AdministrativelyKilled => (38, "ADMINISTRATIVELY_KILLED", "USER_ERROR"),
             Self::GenericInternalError => (65_536, "GENERIC_INTERNAL_ERROR", "INTERNAL_ERROR"),
             Self::QueryQueueFull => (131_074, "QUERY_QUEUE_FULL", "INSUFFICIENT_RESOURCES"),
             Self::ExceededTimeLimit => (131_075, "EXCEEDED_TIME_LIMIT", "INSUFFICIENT_RESOURCES"),
@@ -179,6 +187,7 @@ impl QueryError {
             "QUERY_QUEUE_FULL" => Code::QueryQueueFull,
             "EXCEEDED_TIME_LIMIT" => Code::ExceededTimeLimit,
             "USER_CANCELED" => Code::UserCanceled,
+            "ADMINISTRATIVELY_KILLED" => Code::AdministrativelyKilled,
             "ABANDONED_QUERY" => Code::AbandonedQuery,
             name => named(name).unwrap_or(if failure.kind == "USER_ERROR" {
                 Code::GenericUserError
@@ -191,6 +200,19 @@ impl QueryError {
 
     pub(crate) fn from_governance(error: &GovernanceError) -> Self {
         Self::from_failure(&error.failure())
+    }
+
+    /// A `kill_query` call that failed.
+    pub(crate) fn from_kill(error: &KillError) -> Self {
+        let code = match error {
+            KillError::InvalidArguments(_) => Code::InvalidArguments,
+            KillError::NullQueryId => Code::InvalidProcedureArgument,
+            KillError::NotText(_) => Code::TypeMismatch,
+            KillError::NotFound(_) => Code::NotFound,
+            KillError::NotRunning(_) => Code::NotSupported,
+            KillError::NotOwner(_) => Code::PermissionDenied,
+        };
+        Self::new(code, error.to_string())
     }
 
     #[cfg(test)]
@@ -512,6 +534,48 @@ impl From<&DataFusionError> for QueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Codes and names of the reference engine's `kill_query` (431).
+    #[test]
+    fn kill_errors_use_the_reference_codes() {
+        let wire = |error: KillError| {
+            let value = serde_json::to_value(QueryError::from_kill(&error)).unwrap();
+            (
+                value["errorCode"].as_i64().unwrap(),
+                value["errorName"].as_str().unwrap().to_owned(),
+                value["message"].as_str().unwrap().to_owned(),
+            )
+        };
+        assert_eq!(
+            wire(KillError::NotFound("q".into())),
+            (5, "NOT_FOUND".into(), "Target query not found: q".into())
+        );
+        assert_eq!(
+            wire(KillError::NotRunning("q".into())),
+            (
+                13,
+                "NOT_SUPPORTED".into(),
+                "Target query is not running: q".into()
+            )
+        );
+        assert_eq!(
+            wire(KillError::NullQueryId),
+            (
+                30,
+                "INVALID_PROCEDURE_ARGUMENT".into(),
+                "query_id cannot be null".into()
+            )
+        );
+        assert_eq!(wire(KillError::InvalidArguments("x".into())).0, 76);
+        assert_eq!(wire(KillError::NotText("x".into())).1, "TYPE_MISMATCH");
+        assert_eq!(wire(KillError::NotOwner("ana".into())).0, 4);
+        let killed = QueryError::from_failure(&Failure::new("ADMINISTRATIVELY_KILLED", "USER_ERROR", "m"));
+        let killed = serde_json::to_value(killed).unwrap();
+        assert_eq!(
+            (killed["errorCode"].as_i64(), killed["errorType"].as_str()),
+            (Some(38), Some("USER_ERROR"))
+        );
+    }
 
     #[test]
     fn failures_round_trip_through_the_registry() {

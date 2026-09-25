@@ -11,12 +11,17 @@
 //!   streams at the deadline, which stops its operators and returns their
 //!   memory to the pool.
 //!
+//! - Killing a query by id from any protocol
+//!   (`CALL system.runtime.kill_query(…)`, [`Governance::kill`]) or canceling
+//!   it as its owner ([`Governance::cancel`]).
+//!
 //! A protocol registers a query ([`Governance::register`]), asks for a place
 //! ([`Governance::enter`]: a running slot, a queued one, or a refusal), waits
 //! for its slot ([`Governance::admit`]) and holds the [`Permit`] while the
 //! query executes.
 
 mod admission;
+mod kill;
 pub mod metrics;
 mod registry;
 mod table;
@@ -25,6 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub use admission::{Admission, GLOBAL_GROUP, Permit, Refusal, Scope, Ticket, whole_match};
+pub use kill::{ADMINISTRATIVELY_KILLED, KillError, KillRequest, kill_request, kill_request_sql};
 pub use metrics::Phase;
 pub use registry::{Failure, Protocol, QueryInfo, QueryRecord, QueryRegistry, QueryState, RegistryLimits};
 pub use table::{QueriesTable, system_catalog};

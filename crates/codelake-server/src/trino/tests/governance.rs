@@ -341,3 +341,69 @@ async fn session_statements_do_not_queue() {
     h.cancel(&holder).await;
     h.load_becomes((0, 0)).await;
 }
+
+/// `CALL system.runtime.kill_query`: only the owner kills; it answers at once
+/// on a full node (no slot); the killed query fails with
+/// `ADMINISTRATIVELY_KILLED` and its memory and slot are given back.
+#[tokio::test]
+async fn kill_query_call_stops_a_running_query() {
+    let h = governed(&GovernanceConfig {
+        max_running_queries: 1,
+        max_queued_queries: 0,
+        ..GovernanceConfig::default()
+    });
+    let holder = h.submit_as("ana", HOLDS_A_SLOT, &[]).await;
+    h.load_becomes((1, 0)).await;
+    let id = holder["id"].as_str().unwrap().to_owned();
+
+    let error = |outcome: &Outcome| outcome.last["error"].clone();
+    let stranger = h
+        .follow_body(
+            h.submit_as("bob", &format!("CALL system.runtime.kill_query('{id}')"), &[])
+                .await,
+        )
+        .await;
+    assert_eq!(error(&stranger)["errorName"], "PERMISSION_DENIED");
+    assert_eq!(
+        error(&stranger)["message"],
+        "Access Denied: Cannot kill query owned by ana"
+    );
+    let missing = h
+        .follow_body(
+            h.submit_as("ana", "CALL system.runtime.kill_query(query_id => 'nope')", &[])
+                .await,
+        )
+        .await;
+    assert_eq!(error(&missing)["errorName"], "NOT_FOUND");
+    assert_eq!(error(&missing)["message"], "Target query not found: nope");
+
+    let killed = h
+        .follow_body(
+            h.submit_as(
+                "ana",
+                &format!("CALL system.runtime.kill_query(query_id => '{id}', message => 'runaway')"),
+                &[],
+            )
+            .await,
+        )
+        .await;
+    assert!(killed.last.get("error").is_none(), "{}", killed.last);
+    assert_eq!(killed.last["updateType"], "CALL");
+    let outcome = h.follow_body(holder).await;
+    assert_eq!(error(&outcome)["errorName"], "ADMINISTRATIVELY_KILLED");
+    assert_eq!(error(&outcome)["errorType"], "USER_ERROR");
+    assert_eq!(error(&outcome)["message"], "Query killed. Message: runaway");
+    h.load_becomes((0, 0)).await;
+    let again = h
+        .follow_body(
+            h.submit_as("ana", &format!("CALL system.runtime.kill_query('{id}')"), &[])
+                .await,
+        )
+        .await;
+    assert_eq!(error(&again)["errorName"], "NOT_SUPPORTED");
+    assert_eq!(
+        error(&again)["message"],
+        format!("Target query is not running: {id}")
+    );
+    assert_eq!(h.pool_drains().await, 0);
+}
