@@ -743,38 +743,79 @@ async fn audit_declared_cursor_is_bounded_by_its_time_limit() {
     );
 }
 
-/// The extended protocol (tokio-postgres `query`, JDBC, psycopg3) holds a
-/// statement's slot until its rows are sent, as the simple protocol does,
-/// and does not keep a whole result in server memory outside the pool.
-/// Found by the F6 audit: `pgwire` 0.40 collects every row of an `Execute`
-/// without a row limit into a vector before sending any, so the statement
-/// is `FINISHED` (slot freed, time limit over) while its client has read
-/// nothing and the rows sit in unreserved memory.
+/// A join that streams rows (2 M, as its probe side advances) while its
+/// build side stays reserved in the pool.
+const STREAMS_WITH_MEMORY: &str = "SELECT a.value FROM generate_series(1, 2000000) a \
+                                   JOIN generate_series(1, 3000000000) b ON a.value = b.value";
+
+/// The extended protocol (JDBC, psycopg3, `tokio-postgres`' `query`) sends
+/// rows as they are produced: a client that has read nothing keeps its
+/// statement `RUNNING` (slot held, time limit counting) instead of the whole
+/// result waiting in server memory outside the pool, and every row arrives,
+/// in order. Past its time limit a statement whose client stopped reading is
+/// stopped: `57014`, slot and pool given back. (`pgwire`'s default handler
+/// collected the rows of an `Execute` without a row limit before sending
+/// any; found by the F6 audit.)
 #[tokio::test]
-async fn audit_extended_protocol_does_not_buffer_the_whole_result() {
+async fn extended_protocol_streams_rows_under_governance() {
     use futures::StreamExt;
 
     let dir = tempfile::tempdir().unwrap();
     let server = start_server(dir.path());
     server.wait_ready().await;
     let client = server.connect("ext").await;
-    let sql = "SELECT value FROM generate_series(1, 3000000)";
-    let rows = client.query_raw(sql, std::iter::empty::<i64>()).await.unwrap();
-    let mut rows = std::pin::pin!(rows);
-    // The client reads nothing for a while.
-    tokio::time::sleep(Duration::from_secs(10)).await;
     let observer = server.connect("observer").await;
-    let states = states_of(&observer, "ext").await;
-    let rss = std::fs::read_to_string(format!("/proc/{}/status", server.child.id()))
-        .ok()
-        .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS")).map(str::to_owned));
-    let reserved = server.reserved().await;
+    let rows = client
+        .query_raw(
+            "SELECT value FROM generate_series(1, 3000000)",
+            std::iter::empty::<i64>(),
+        )
+        .await
+        .unwrap();
+    let mut rows = std::pin::pin!(rows);
+    // The client reads nothing for a while: the statement waits for it.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(states_of(&observer, "ext").await, [["RUNNING", "-"]]);
+    assert_eq!(load(&server).await, (1, 0), "its slot is held");
+    let (mut count, mut sum, mut previous) = (0_i64, 0_i64, 0_i64);
+    while let Some(row) = rows.next().await {
+        let value: i64 = row.unwrap().get(0);
+        assert_eq!(value, previous + 1, "rows out of order");
+        previous = value;
+        count += 1;
+        sum += value;
+    }
+    assert_eq!((count, sum), (3_000_000, 3_000_000 * 3_000_001 / 2));
+    assert_eq!(rows.rows_affected(), Some(3_000_000));
+    assert_eq!(states_of(&observer, "ext").await, [["FINISHED", "-"]]);
+
+    // The time limit covers the sending: a client that stops reading is cut
+    // off at its deadline and the join's memory returns to the pool.
+    client
+        .batch_execute("SET statement_timeout = '2s'")
+        .await
+        .unwrap();
+    let rows = client
+        .query_raw(STREAMS_WITH_MEMORY, std::iter::empty::<i64>())
+        .await
+        .unwrap();
+    let mut rows = std::pin::pin!(rows);
+    let held = pool_fills(&server).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    server.slots_free().await;
+    assert_eq!(server.pool_drains().await, 0, "reservations left (held {held})");
+    let mut read = 0_u64;
+    let error = loop {
+        match rows.next().await {
+            Some(Ok(_)) => read += 1,
+            Some(Err(error)) => break error,
+            None => panic!("all rows arrived after the time limit ({read})"),
+        }
+    };
+    assert_eq!(error.code(), Some(&SqlState::QUERY_CANCELED), "{error:?}");
+    assert!(read < 2_000_000, "{read} rows read");
     assert_eq!(
-        states,
-        [["RUNNING", "-"]],
-        "3 M rows produced while the client read none (pool reserved {reserved} bytes, \
-         server {rss:?})"
+        states_of(&observer, "ext").await,
+        [["FINISHED", "-"], ["FAILED", "EXCEEDED_TIME_LIMIT"]]
     );
-    let first = rows.next().await.unwrap().unwrap();
-    assert_eq!(first.get::<_, i64>(0), 1);
 }

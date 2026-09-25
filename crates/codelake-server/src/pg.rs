@@ -16,8 +16,11 @@
 //!   pool; the client gets SQLSTATE `57014` (`query_canceled`).
 //!
 //! The slot is held until the statement's rows are all sent (or its stream
-//! dropped). Statements the session answers itself (`SET`, `SHOW`,
-//! transaction control) neither register nor take a slot.
+//! dropped): rows go to the client as the stream yields them, on the
+//! extended protocol too ([`execute`]), so a client that reads slowly holds
+//! its statement, and the statement's deadline, until it has read.
+//! Statements the session answers itself (`SET`, `SHOW`, transaction
+//! control) neither register nor take a slot.
 //!
 //! Stopping a statement from outside, which also frees its slot and memory:
 //!
@@ -70,11 +73,14 @@ use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
 use datafusion_postgres::pgwire::messages::cancel::CancelRequest;
 use datafusion_postgres::pgwire::messages::data::DataRow;
+use datafusion_postgres::pgwire::messages::extendedquery::Execute;
 use datafusion_postgres::{DfSessionService, QueryHook};
 use futures::{Sink, Stream};
 use tokio::sync::Notify;
 
 use crate::trino::{Everything, QueryError};
+
+mod execute;
 
 /// Client metadata key where `datafusion-postgres` keeps `SET
 /// statement_timeout` (milliseconds).
@@ -733,6 +739,17 @@ impl ExtendedQueryHandler for Governed {
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
         ExtendedQueryHandler::query_parser(&*self.inner)
+    }
+
+    /// Streams the rows to the client instead of collecting them first.
+    async fn on_execute<C>(&self, client: &mut C, message: Execute) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        execute::execute(self, client, message).await
     }
 
     async fn do_describe_statement<C>(

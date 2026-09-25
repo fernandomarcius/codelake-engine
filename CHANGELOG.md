@@ -102,6 +102,11 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- PostgreSQL wire, extended protocol (JDBC, psycopg3, `tokio-postgres`' `query`): an
+  `Execute` without a row limit collected every row of the result in server memory, outside
+  the pool, before sending the first; the statement then ended (slot freed, time limit over)
+  while its client had read nothing. Rows now stream to the client as they are produced, so
+  the statement holds its slot and its time limit until they are read (ADR 0016).
 - Red-team W1 (ADR 0007): a NANOSECONDS hive catalog read `INT96` timestamps outside
   1677–2262 as other instants (1500-06-01 as 2084-12-18) and its `OPTIMIZE` rewrote them
   into the files; `OPTIMIZE` in any other catalog rounded stored nanoseconds to

@@ -97,7 +97,12 @@ server's cancel handler maps the request's process id and secret key to the
 connection's live statements (a wrong secret key cancels nothing), then lets
 `datafusion-postgres` interrupt what it is planning. A hook plans
 `kill_query` as an empty statement on the extended protocol, where
-`DataFusion` could not plan `CALL`.
+`DataFusion` could not plan `CALL`. The server also replaces `pgwire`'s
+`Execute` handler (`crates/codelake-server/src/pg/execute.rs`): the default
+collects every row of a portal executed without a row limit (JDBC,
+psycopg3) before sending the first, which would end the statement — slot
+freed, time limit over — while its rows wait in memory outside the pool;
+the replacement sends rows as the stream yields them.
 
 Metrics (Prometheus, `metrics` facade in the core): gauges
 `codelake_queries_running`, `codelake_queries_queued`,
