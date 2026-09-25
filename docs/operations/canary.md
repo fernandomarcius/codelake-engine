@@ -86,13 +86,25 @@ Environment overrides: `CANARY_CONFIG`, `CANARY_NAME`, `CANARY_USER`,
 
 ### Recording expected values
 
-Write the checks without `expect`, run once, and copy what the line reports
-(`value`, `rows`, `sha256`) after checking it by hand or against the
-reference engine:
+Write the checks without `expect`, run once, check the answer by hand or
+against the reference engine, then record it:
 
 ```bash
 scripts/ops/canary.sh --config canary.json --once | jq '.checks[] | {name, rows, value, sha256}'
 ```
+
+What each field of the line can become:
+
+| Line field | Is | Record it as |
+|---|---|---|
+| `rows` | the **number** of rows, not the rows | `expect.row_count` |
+| `sha256` | sha256 of all the canonical rows | `expect.sha256` |
+| `value` | the **first cell** of the first (sorted) row, cut at 200 characters | `expect.value` only for a one-row, one-column answer shorter than that; `min`/`max` bounds around it |
+
+For a multi-column answer, `expect.value` must be the whole row's canonical
+text (cells joined by a tab), which the line does not show: prefer
+`expect.sha256`, or write `expect.rows` from the answer of the SQL run by
+hand (e.g. `[["closed", 18000], ["returned", 342]]`).
 
 The canonical text of a row is its cells joined by tabs, `NULL` as `\N`,
 tabs/newlines/backslashes escaped; rows are sorted (bytewise) unless
