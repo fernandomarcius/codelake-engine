@@ -1,7 +1,10 @@
 # ISS-003 — INT96 time zone configurable per hive catalog, default `America/Sao_Paulo`
 
-- Kind: compatibility risk · Accepted by: Fernando Farias, 2026-09-24 (risk explained before acceptance) · Status: open (implementation pending in the W1 front)
+- Kind: compatibility risk · Accepted by: Fernando Farias, 2026-09-24 (risk explained before acceptance) · Status: open (implemented 2026-09-25 in 53b95cf; the risk stands until the revisit conditions below)
 - Accepted: `parquet_time_zone` per hive catalog, IANA name, default `America/Sao_Paulo`, matching the reference engine's `hive.parquet.time-zone` as deployed.
 - Risk: Parquet files whose INT96 values were written in UTC (by another engine or another installation) are read shifted by the zone offset; the default is installation-specific, not neutral.
 - Revisit when: an installation reads files from more than one writer, or INT96 is dropped in favor of INT64 timestamps.
-- References: ADR 0007; W1 front.
+- Implemented: `parquet_time_zone` in each hive source of the configuration, checked when it loads (an offset such as `-03:00` or an unknown name is an error naming the source); writes convert the wall-clock time from the zone to UTC and record it under `writer.time.zone`, reads convert back, with Joda-Time's rules (a skipped time moves forward, a repeated time is the earlier instant west of Greenwich); only `INT96` columns convert; `OPTIMIZE` keeps stored instants. Proven row by row against the reference engine (431) with `hive.parquet.time-zone=America/Sao_Paulo`: `hive_redteam_w1::w1_parquet_time_zone_reads_and_writes_like_the_reference_engine` (each engine reads what the other wrote, stored instants agree through UTC catalogs, skipped and repeated times, local mean time before 1914, nanoseconds and `OPTIMIZE`).
+- Also found: the reference engine's own Parquet writer fails now and then to write a skipped local time (it re-reads a sample of its files and the value comes back moved); only `CodeLake` writes those in the test.
+- Before the M2 canary: set each hive catalog to the production reference engine's `hive.parquet.time-zone` (or JVM zone).
+- References: ADR 0007; commits 53b95cf (feature), 91b7ee4 (exact timestamps it builds on).

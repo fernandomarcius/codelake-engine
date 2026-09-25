@@ -40,8 +40,14 @@ Blocking items, in order:
    pushdown policy to MySQL (same collation hazard) before any reference use.
 2. 🔧 **Hive-style Parquet catalog** (R4–R7, F2) — implemented; the red-team's
    critical and high findings are fixed (ADR 0007, "Red-team corrections";
-   probes in `hive_redteam.rs`), except owner-based security (R11), which
-   waits on authentication (item 5, F5): directory per table on local disk or
+   probes in `hive_redteam.rs`), and so are the second red-team's (W1: exact
+   `INT96` timestamps in NANOSECONDS scans and `OPTIMIZE`, `char(n)`
+   comparisons refused wherever they are, in-memory tables inside the pool;
+   "Red-team W1 corrections", `hive_redteam_w1.rs`), except owner-based
+   security (R11, W1-6), which waits on authentication (item 5, F5).
+   `INT96` time zone per catalog (`parquet_time_zone`, default
+   `America/Sao_Paulo`, ISS-003), proven row by row against Trino 431 set to
+   the same zone: directory per table on local disk or
    S3/MinIO, file-based metastore; `CREATE SCHEMA`, CTAS `WITH (format='PARQUET')`,
    `INSERT INTO … SELECT` appending **one new file per insert**, `DROP TABLE`,
    `CREATE/DROP VIEW`, `ALTER TABLE ADD COLUMN`. Output readable by SQL Server 2022
@@ -79,6 +85,9 @@ Blocking items, in order:
 
 - Canary: CodeLake serves the 2-minute micro-batch while Trino keeps the heavy
   21h/03h runs; compare end-to-end latency (target ≤ 5 min, median today 2.5 min).
+  Before it: set each hive catalog's `parquet_time_zone` to the production
+  Trino's `hive.parquet.time-zone` (or its JVM zone), or every `INT96`
+  timestamp reads shifted (ADR 0007, ISS-003).
 - ✅ Compaction without `docker exec` (R9, F9): Trino's `ALTER TABLE … EXECUTE
   optimize`, rewriting with the same Trino 431 Parquet writer (INT96) as
   `INSERT`, preserving row count and columns, crash-safe (ADR 0009).
@@ -87,7 +96,9 @@ Blocking items, in order:
   the 6 failures are test SQL Trino 431 rejects since F4 (`md5(varchar)`,
   `to_timestamp_millis` stored in hive), not OPTIMIZE, and wait on the
   testers (with Trino SQL, 15/16 passed). Not in F9: re-seeding the sink
-  checkpoint after a compaction.
+  checkpoint after a compaction. Since red-team W1 (W1-3/W1-7), `OPTIMIZE`
+  keeps every stored instant to the nanosecond, whatever the catalog's
+  precision (ADR 0009).
 - Runbooks: memory tuning, spill disk sizing, source outage, rollback to Trino.
 
 **DoD:** 14 days serving production with zero wrong-result incidents and SLO met.

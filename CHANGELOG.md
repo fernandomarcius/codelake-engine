@@ -25,6 +25,11 @@ versioning: [SemVer](https://semver.org/).
   error codes, `query_max_run_time`, `system.runtime.queries` (ADR 0012).
 - Session-property registry: system properties plus catalog properties declared by connectors;
   undeclared names are rejected, performance-only Trino knobs are accepted with a warning.
+- `parquet_time_zone` per hive catalog (IANA name, validated at load, default
+  `America/Sao_Paulo`): `INT96` timestamps are written as the instant of the wall-clock
+  time in that zone and read back, as Trino's `hive.parquet.time-zone` (ADR 0007,
+  ISS-003). **Risk:** files another engine wrote in UTC read three hours earlier; set it
+  to the zone of every engine that shares the warehouse.
 
 ### Changed
 - A hash join whose estimated build side does not fit its slice of the memory pool
@@ -36,6 +41,13 @@ versioning: [SemVer](https://semver.org/).
   the pool past its limit.
 - DataFusion 54.1 train: `datafusion-federation` 0.5.5, per-connector
   `datafusion-table-providers` 0.13.1 crates, `datafusion-postgres` 0.18.0 (ADR 0002).
+- **Breaking:** hive `INT96` timestamps convert through the catalog's `parquet_time_zone`,
+  `America/Sao_Paulo` by default; they were stored and read as UTC. Set
+  `parquet_time_zone = "UTC"` to keep the former behavior (ADR 0007, ISS-003).
+- **Breaking:** a comparison of a `char(n)` value (`=`, `<`, `IN`, `LIKE`, `BETWEEN`,
+  `CASE x WHEN`, join conditions) fails with `NOT_SUPPORTED` wherever it is in the plan,
+  until the engine compares char values padded; `CAST(ch AS varchar)` compares text
+  (ADR 0007, red-team W1-4).
 - **Breaking:** text compared with a number (`varchar_col > 9`, `x IN ('1.0')`) fails with
   `TYPE_MISMATCH` on the engine's client protocols, as on Trino; cast explicitly
   (ADR 0014). It answered rows before, through DataFusion's coercion.
@@ -52,6 +64,17 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- Red-team W1 (ADR 0007): a NANOSECONDS hive catalog read `INT96` timestamps outside
+  1677–2262 as other instants (1500-06-01 as 2084-12-18) and its `OPTIMIZE` rewrote them
+  into the files; `OPTIMIZE` in any other catalog rounded stored nanoseconds to
+  microseconds. Timestamps are now read and compacted exactly; an instant Arrow
+  nanoseconds cannot hold is an error naming it (ADR 0009).
+- `char(n)` comparisons above the hive scan (over `LIMIT`, a window, a volatile predicate)
+  dropped rows the reference engine returns; they are refused (see Changed).
+- Tables of the in-memory catalog (`CREATE TABLE datafusion.…`) kept their rows outside
+  the memory pool; they are reserved in it for as long as the table exists.
+- Test helpers and the golden generator wait until the reference server lists an active
+  worker, instead of sending statements that fail with "No nodes available to run query".
 - DataFusion 54 correctness guards (ADR 0014): `NOT IN (subquery)` as a condition of
   `WHERE`/`HAVING` joined by `AND` keeps its NULL semantics (dynamic filter, filter
   inference, sort-merge join, constant and correlated forms); nested loop joins over the

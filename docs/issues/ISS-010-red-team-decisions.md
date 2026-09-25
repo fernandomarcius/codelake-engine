@@ -11,4 +11,5 @@
 8. Table and schema names containing `/` are refused.
 9. `CREATE OR REPLACE` on hive tables is refused, as on the reference engine.
 10. Differential red-team tests that need users wait for F5 (auth).
-- Revisit when: confirmed or overturned by a human; 7–9 are implemented in the W1 front.
+- Implemented: 6 in 2ccc9a7 (char comparisons refused wherever they are, W1-4); 7 in 91b7ee4 (W1-3/W1-7); 8 in 0f364c7; 9 in 87072b8 (W1-1). Decisions the W1 corrections added by recommendation: ISS-014.
+- Revisit when: confirmed or overturned by a human.

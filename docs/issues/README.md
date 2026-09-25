@@ -23,3 +23,4 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-011](ISS-011-configurable-compat-names.md) | Compatibility names configurable, CodeLake names by default | compatibility | 2026-09-24 | open |
 | [ISS-012](ISS-012-spice-code-reuse.md) | Code copied from Spice.ai under Apache-2.0 | licensing | 2026-09-24 | open |
 | [ISS-013](ISS-013-reference-engine-credentials-in-git.md) | Reference engine catalog credentials committed in an external repository | security (external) | 2026-09-24 | open |
+| [ISS-014](ISS-014-w1-corrections-by-recommendation.md) | W1 corrections: choices applied by recommendation | behavior | 2026-09-25 | awaiting-confirmation |
