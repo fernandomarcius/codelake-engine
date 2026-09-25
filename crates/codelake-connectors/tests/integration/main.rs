@@ -16,6 +16,8 @@ mod f4_acceptance;
 #[cfg(feature = "hive")]
 mod f9_acceptance;
 #[cfg(feature = "hive")]
+mod hash_join_spill;
+#[cfg(feature = "hive")]
 mod hive_acceptance;
 #[cfg(feature = "hive")]
 mod hive_optimize;

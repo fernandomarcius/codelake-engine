@@ -54,10 +54,10 @@ const SHARED_MOUNT: &str = "/work/target";
 /// Prefix of the Trino containers; a random suffix keeps parallel runs apart.
 const TRINO_CONTAINER: &str = "codelake-jr-trino";
 
-type Rows = Vec<Vec<String>>;
+pub(crate) type Rows = Vec<Vec<String>>;
 
 #[allow(clippy::print_stderr, reason = "evidence for the report")]
-fn note(what: &str, detail: impl std::fmt::Display) {
+pub(crate) fn note(what: &str, detail: impl std::fmt::Display) {
     eprintln!("[JR] {what}: {detail}");
 }
 
@@ -65,13 +65,13 @@ fn note(what: &str, detail: impl std::fmt::Display) {
 // Shared warehouse directory (same absolute path here and in Trino).
 // ---------------------------------------------------------------------------
 
-struct Shared {
+pub(crate) struct Shared {
     dir: PathBuf,
     mount: Mount,
 }
 
 impl Shared {
-    fn warehouse(&self) -> PathBuf {
+    pub(crate) fn warehouse(&self) -> PathBuf {
         self.dir.join("warehouse")
     }
 }
@@ -97,7 +97,7 @@ async fn own_mount(destination: &str) -> Option<Mount> {
     }
 }
 
-async fn shared() -> Shared {
+pub(crate) async fn shared() -> Shared {
     let run = format!("run-{}", uuid::Uuid::new_v4().simple());
     let (base, mount) = if let Some(mount) = own_mount(SHARED_MOUNT).await {
         (Path::new(SHARED_MOUNT).join("join-regressions"), mount)
@@ -115,10 +115,10 @@ async fn shared() -> Shared {
 // Trino 431, the reference.
 // ---------------------------------------------------------------------------
 
-struct Trino(ContainerAsync<GenericImage>);
+pub(crate) struct Trino(ContainerAsync<GenericImage>);
 
 impl Trino {
-    async fn start(shared: &Shared, name: &str) -> Self {
+    pub(crate) async fn start(shared: &Shared, name: &str) -> Self {
         let properties = format!(
             "connector.name=hive\n\
              hive.metastore=file\n\
@@ -203,7 +203,7 @@ impl Trino {
 
     /// Runs `statements` in one CLI call (each start of the CLI costs
     /// seconds) and splits the output by a marker row.
-    async fn batch(&self, statements: &[&str]) -> Vec<Rows> {
+    pub(crate) async fn batch(&self, statements: &[&str]) -> Vec<Rows> {
         const MARK: &str = "@@end-of-statement@@";
         let mut script = String::new();
         for statement in statements {
@@ -232,7 +232,7 @@ impl Trino {
 
 /// An engine over the shared warehouse with `settings` applied
 /// (`datafusion.*` session options).
-async fn open(
+pub(crate) async fn open(
     warehouse: &Path,
     spill: &Path,
     limit: ByteSize,
@@ -300,7 +300,7 @@ fn to_rows(batches: &[RecordBatch]) -> Rows {
 }
 
 /// The rows `sql` answers, or the error it fails with.
-async fn try_cl(engine: &Engine, sql: &str) -> Result<Rows, String> {
+pub(crate) async fn try_cl(engine: &Engine, sql: &str) -> Result<Rows, String> {
     let frame = engine.sql(sql).await.map_err(|e| format!("planning: {e}"))?;
     let batches = frame.collect().await.map_err(|e| format!("running: {e}"))?;
     Ok(to_rows(&batches))
@@ -308,7 +308,7 @@ async fn try_cl(engine: &Engine, sql: &str) -> Result<Rows, String> {
 
 /// The text of every row `EXPLAIN [ANALYZE] sql` answers for `kind`
 /// (`physical_plan`, `Plan with Metrics`).
-async fn explain(engine: &Engine, prefix: &str, sql: &str, kind: &str) -> Result<String, String> {
+pub(crate) async fn explain(engine: &Engine, prefix: &str, sql: &str, kind: &str) -> Result<String, String> {
     let batches = engine
         .sql(&format!("{prefix} {sql}"))
         .await
@@ -332,13 +332,13 @@ async fn explain(engine: &Engine, prefix: &str, sql: &str, kind: &str) -> Result
     Ok(text)
 }
 
-async fn physical_plan(engine: &Engine, sql: &str) -> String {
+pub(crate) async fn physical_plan(engine: &Engine, sql: &str) -> String {
     explain(engine, "EXPLAIN", sql, "physical_plan")
         .await
         .unwrap_or_else(|e| panic!("EXPLAIN `{sql}`: {e}"))
 }
 
-fn sorted(mut rows: Rows) -> Rows {
+pub(crate) fn sorted(mut rows: Rows) -> Rows {
     rows.sort();
     rows
 }
@@ -374,7 +374,7 @@ fn nested_loop_joins_spilled(analyzed: &str) -> bool {
 }
 
 /// The pool is back to zero once the tasks a failed query aborted are gone.
-async fn assert_pool_given_back(engine: &Engine) {
+pub(crate) async fn assert_pool_given_back(engine: &Engine) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while engine.memory().reserved_bytes != 0 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
