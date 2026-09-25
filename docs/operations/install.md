@@ -47,12 +47,20 @@ stack of sources, not a production file).
 1. Prepare a directory on the host, for example `/srv/codelake`:
 
    ```bash
-   sudo install -d -m 0750 /srv/codelake
+   DEPLOY_USER=<account that runs docker compose>   # root if you always use sudo
+   sudo install -d -o "$DEPLOY_USER" -m 0750 /srv/codelake
    sudo install -d -o 65532 -g 65532 -m 0750 /srv/codelake/spill
    sudo install -d -o 65532 -g 65532 -m 0750 /srv/codelake/warehouse   # only with a hive catalog on this host
-   sudo install -m 0640 codelake.toml /srv/codelake/codelake.toml
-   sudo install -m 0600 codelake.env  /srv/codelake/codelake.env       # secrets
+   sudo install -o root -g 65532 -m 0640 codelake.toml /srv/codelake/codelake.toml
+   sudo install -o "$DEPLOY_USER" -m 0600 codelake.env /srv/codelake/codelake.env   # secrets
    ```
+
+   The container runs as uid/gid 65532 and reads the mounted `codelake.toml`
+   itself, so the file must be readable by group 65532: a root-only `0640`
+   file stops `serve` with `cannot read config file …: Permission denied`.
+   `codelake.env` is read by the `docker compose` command, not by the
+   container, so it (and the directory) must be readable by the account that
+   runs `docker compose`.
 
    In the configuration, the listeners must bind `0.0.0.0` inside the
    container (Docker forwards to the container address) and therefore need
