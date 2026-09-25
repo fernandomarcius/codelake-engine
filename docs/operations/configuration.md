@@ -96,6 +96,11 @@ sources' credentials. Therefore:
 - Set it only when the network layer restricts who reaches the port: the
   `NetworkPolicy` of `deploy/k8s`, ports published on the host's `127.0.0.1`
   (Compose), or a firewall/security group that admits only the client hosts.
+  With Docker, a host firewall on the `INPUT` chain (`ufw`, `firewalld`) does
+  **not** filter published ports: publish on the private interface's address
+  and filter in the `DOCKER-USER` chain
+  ([install.md](install.md#docker-compose-single-node)). Whatever the control,
+  prove it with a connection attempt from a host that must be refused.
 - The ops listener has no secrets but `/healthz` shows source host names and
   errors: expose it to the monitoring network only.
 - The identity a client sends (`user`) is recorded in

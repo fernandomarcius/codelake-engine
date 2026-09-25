@@ -21,8 +21,11 @@ without evidence is not done.
 - [ ] No secret in the TOML, the repository, the ConfigMap or a command line;
       source accounts are read-only where the engine only reads.
 - [ ] Query listeners reachable only from the client network (NetworkPolicy,
-      loopback publish, or firewall) because there is no client
+      loopback publish, or private-interface publish filtered in
+      `DOCKER-USER`; never `0.0.0.0`) because there is no client
       authentication yet; ops listener reachable by monitoring only.
+      **Proven by a negative test**: a connection from outside the client
+      network is refused ([install.md](install.md)).
 - [ ] `memory.limit` ≈ 75% of the container limit; spill on a dedicated
       volume larger than `spill_limit` ([sizing.md](sizing.md)).
 - [ ] Client time limits (`query_max_run_time`) set in the pipelines'

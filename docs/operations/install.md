@@ -70,6 +70,39 @@ stack of sources, not a production file).
    `memory.spill_dir` must be `/var/lib/codelake/spill` and a `hive`
    warehouse `/data/warehouse` (the mount points of the compose file).
 
+   **Clients on other hosts.** Never publish the query ports on `0.0.0.0`:
+   that exposes an engine without authentication to every network the host
+   reaches. Instead:
+
+   - publish on the address of the host's private interface
+     (`export CODELAKE_QUERY_BIND=<private-ip>`; `CODELAKE_OPS_BIND` does the
+     same for the ops port and the monitoring network);
+   - filter in the `DOCKER-USER` chain. A port published by Docker is
+     forwarded by DNAT and never crosses the host's `INPUT` chain, so `ufw`,
+     `firewalld` zones or `INPUT` rules do **not** protect it:
+
+     ```bash
+     # Drop everything but the clients' network on the published query ports
+     # (host ports; --ctorigdstport matches them before Docker's DNAT).
+     for port in 5432 8081; do
+       sudo iptables -I DOCKER-USER -p tcp -m conntrack --ctorigdstport "$port" \
+         --ctdir ORIGINAL ! -s <client-cidr> -j DROP
+     done
+     sudo iptables -S DOCKER-USER
+     ```
+
+     Make the rules persistent with the host's firewall tooling (they are lost
+     on reboot otherwise), and repeat them for `ip6tables` if the address is
+     IPv6;
+   - prove it with a **negative test**: from a host outside `<client-cidr>`,
+     `nc -vz -w 5 <private-ip> 5432` and the same for `8081` must fail, and
+     succeed from a client host. Repeat it after every firewall or Docker
+     upgrade.
+
+   A cloud security group or network firewall in front of the host is a
+   valid alternative when it admits only the client hosts; the negative test
+   applies all the same.
+
 2. Start it:
 
    ```bash

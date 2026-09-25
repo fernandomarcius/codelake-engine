@@ -26,12 +26,16 @@ services:
     environment:
       RUST_LOG: ${CODELAKE_RUST_LOG:-info}
     # The query listeners have no client authentication yet: publish on the
-    # host's loopback only (the config binds 0.0.0.0 inside the container and
-    # sets allow_unauthenticated_network = true because of this).
+    # host's loopback by default (the config binds 0.0.0.0 inside the container
+    # and sets allow_unauthenticated_network = true because of this). For
+    # clients on other hosts set CODELAKE_QUERY_BIND to the private interface's
+    # address, never 0.0.0.0, and filter in the DOCKER-USER chain: published
+    # ports bypass the host's INPUT rules (ufw, firewalld). See
+    # docs/operations/install.md.
     ports:
-      - "127.0.0.1:${CODELAKE_PG_PORT:-5432}:5432"    # PostgreSQL wire
-      - "127.0.0.1:${CODELAKE_HTTP_PORT:-8081}:8081"  # client HTTP protocol ([server.trino] listen)
-      - "127.0.0.1:${CODELAKE_OPS_PORT:-8080}:8080"   # /livez /readyz /healthz /metrics
+      - "${CODELAKE_QUERY_BIND:-127.0.0.1}:${CODELAKE_PG_PORT:-5432}:5432"    # PostgreSQL wire
+      - "${CODELAKE_QUERY_BIND:-127.0.0.1}:${CODELAKE_HTTP_PORT:-8081}:8081"  # client HTTP protocol ([server.trino] listen)
+      - "${CODELAKE_OPS_BIND:-127.0.0.1}:${CODELAKE_OPS_PORT:-8080}:8080"     # /livez /readyz /healthz /metrics
     volumes:
       - ./codelake.toml:/etc/codelake/codelake.toml:ro
       - ./spill:/var/lib/codelake/spill
