@@ -110,8 +110,19 @@ The canonical text of a row is its cells joined by tabs, `NULL` as `\N`,
 tabs/newlines/backslashes escaped; rows are sorted (bytewise) unless
 `ordered`. Values arrive as the protocol encodes them, so a `sha256` recorded
 over HTTP is not valid over the PostgreSQL wire: record per protocol.
-Integers above 2^53 may lose precision in older jq versions: cast them to
-`varchar` in the SQL.
+
+Over HTTP, the canonical text of a **number** depends on the jq version:
+jq 1.7 and later keep the literal the server sent (`42.0`, `1E+3`), jq 1.6
+normalizes it and loses precision above 2^53. A `sha256` or `value` recorded
+on one host can therefore fail on another, and two engines that write the
+same double differently differ from each other. So:
+
+- pin the jq version in the canary's host or image, and record expected
+  values with that same version;
+- cast `double`, `real`, `decimal` and integers that can exceed 2^53 to
+  `varchar` in the SQL (or aggregate them into an integer), always in a check
+  with `expect.reference`, and in every `sha256` or `value` check that is
+  meant to survive a change of host.
 
 ## Run
 
