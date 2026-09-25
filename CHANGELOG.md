@@ -47,7 +47,9 @@ versioning: [SemVer](https://semver.org/).
 - **Breaking:** a comparison of a `char(n)` value (`=`, `<`, `IN`, `LIKE`, `BETWEEN`,
   `CASE x WHEN`, join conditions) fails with `NOT_SUPPORTED` wherever it is in the plan,
   until the engine compares char values padded; `CAST(ch AS varchar)` compares text
-  (ADR 0007, red-team W1-4).
+  (ADR 0007, red-team W1-4). So do char values as join keys (`USING`, `NATURAL`,
+  `INTERSECT`, `EXCEPT`), in a `UNION` (with or without `ALL`) and as arguments of
+  `nullif`, `greatest` and `least` (DEFECT-W1T-2).
 - **Breaking:** text compared with a number (`varchar_col > 9`, `x IN ('1.0')`) fails with
   `TYPE_MISMATCH` on the engine's client protocols, as on Trino; cast explicitly
   (ADR 0014). It answered rows before, through DataFusion's coercion.
@@ -72,7 +74,14 @@ versioning: [SemVer](https://semver.org/).
 - `char(n)` comparisons above the hive scan (over `LIMIT`, a window, a volatile predicate)
   dropped rows the reference engine returns; they are refused (see Changed).
 - Tables of the in-memory catalog (`CREATE TABLE datafusion.…`) kept their rows outside
-  the memory pool; they are reserved in it for as long as the table exists.
+  the memory pool; they are reserved in it for as long as the table exists. `UPDATE` and
+  `DELETE` of such a table run when the plan executes (they changed the rows while
+  planning, `EXPLAIN` included), and an `UPDATE` the pool cannot hold fails with the rows
+  unchanged instead of growing the table past the ceiling (DEFECT-W1T-3).
+- `OPTIMIZE` in a catalog whose `parquet_time_zone` is not UTC rewrote `INT64`
+  timestamps of other writers (Spark, pandas) as `INT96` without converting them: they
+  read shifted by the zone offset afterwards. They are now kept; a wall-clock time the
+  zone skips makes `OPTIMIZE` fail instead of changing it (DEFECT-W1T-1).
 - Test helpers and the golden generator wait until the reference server lists an active
   worker, instead of sending statements that fail with "No nodes available to run query".
 - DataFusion 54 correctness guards (ADR 0014): `NOT IN (subquery)` as a condition of
