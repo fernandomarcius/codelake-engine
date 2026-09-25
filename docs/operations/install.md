@@ -65,8 +65,8 @@ stack of sources, not a production file).
    In the configuration, the listeners must bind `0.0.0.0` inside the
    container (Docker forwards to the container address) and therefore need
    `allow_unauthenticated_network = true`; the compose file publishes every
-   port on the host's `127.0.0.1` only, which is what keeps the unauthenticated
-   listeners private (see [configuration.md](configuration.md#listeners-and-security)).
+   port on the host's `127.0.0.1` by default, which is what keeps the
+   unauthenticated listeners private (see [configuration.md](configuration.md#listeners-and-security)).
    `memory.spill_dir` must be `/var/lib/codelake/spill` and a `hive`
    warehouse `/data/warehouse` (the mount points of the compose file).
 
