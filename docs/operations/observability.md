@@ -20,7 +20,7 @@ and what does not:
 |---|---|---|
 | `/livez` | `ok` while the process responds; never checks sources | liveness probe |
 | `/readyz` | 200 `{"ready":true}`; 503 when draining or a **required** source is down (`reason`) | readiness probe, load balancer |
-| `/healthz` | version, draining, memory (`limit_bytes`, `reserved_bytes`, `spill_used_bytes`, `spill_limit_bytes`), every source with `up` and its error | humans, incident start |
+| `/healthz` | version, draining, memory (`limit_bytes`, `reserved_bytes`, `spill_used_bytes`, `spill_limit_bytes`), queries (`running`, `queued`), every source with `up` and its error | humans, incident start |
 
 Source checks are cached for 5 s and time out after 2 s, so probes and
 scrapes do not load the sources.
@@ -34,6 +34,11 @@ scrapes do not load the sources.
 | `codelake_spill_used_bytes` | gauge | spill on disk now |
 | `codelake_spill_limit_bytes` | gauge | `memory.spill_limit` |
 | `codelake_source_up{source,kind}` | gauge | 1 reachable, 0 not |
+| `codelake_queries_running`, `codelake_queries_queued` | gauge | admission slots in use on the node |
+| `codelake_resource_group_running{resource_group}`, `codelake_resource_group_queued{resource_group}` | gauge | the same per configured group |
+| `codelake_queries_rejected_total{scope}` | counter | refused with a full queue; `scope`: `node`, `resource_group`, `user` |
+| `codelake_queries_timed_out_total{phase}` | counter | time limit reached; `phase`: `queued`, `running` |
+| `codelake_queries_completed_total{protocol,state}` | counter | governed queries ended, `FINISHED` or `FAILED` |
 | `codelake_statements_total{protocol}` | counter | statements received on the PostgreSQL wire (`simple`, `extended`) |
 
 The canary adds, when run with `--textfile`: `codelake_canary_run_ok`,

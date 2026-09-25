@@ -41,7 +41,30 @@ versioning: [SemVer](https://semver.org/).
 - `deploy/compose/codelake.yml` (the engine alone on one host, ports on loopback) and a generic
   production configuration example (`docs/examples/codelake.production.toml`).
 
+- Query governance for every client protocol (`[governance]`, ADR 0016): a bounded admission
+  queue (`max_running_queries`, `max_queued_queries`, `queue_timeout_secs`), per-user limits
+  (`max_running_per_user`, `max_queued_per_user`) and resource groups
+  (`[[governance.resource_group]]`, selected by user and source); a full queue is refused with
+  `QUERY_QUEUE_FULL` over HTTP and SQLSTATE `53400` on the PostgreSQL wire. Time limits
+  (`query_max_run_time` from submission, `query_max_execution_time` from admission, configured
+  defaults, PostgreSQL `statement_timeout`) stop the query's operators and return their memory
+  to the pool, also for a PostgreSQL portal the client stopped reading. Metrics
+  `codelake_queries_{running,queued,rejected_total,timed_out_total,completed_total}` and
+  `codelake_resource_group_{running,queued}`.
+- Stopping a query from outside, on both client protocols: `CALL system.runtime.kill_query(query_id
+  => '…', message => '…')` (`ADMINISTRATIVELY_KILLED`, owner only, no admission slot needed),
+  PostgreSQL cancel requests (`psql` Ctrl-C, JDBC `Statement.cancel`) while a statement waits,
+  plans or sends rows (SQLSTATE `57014`), and `DELETE /v1/query/{id}` for PostgreSQL queries
+  too. The memory returns to the pool. The PostgreSQL statement span carries `codelake.query_id`.
+
 ### Changed
+- The query registry moved to the core: `system.runtime.queries` lists the queries of both
+  protocols and exists on the PostgreSQL wire too; `resource_group_id` is `["global"]` (or
+  `["global", "<group>"]`) instead of NULL. `[server.trino] history_size` and
+  `history_retention_secs` are deprecated in favour of `[governance]` (still honored when set).
+- PostgreSQL wire: `statement_timeout` now bounds execution and the sending of rows, not only
+  planning; a timed-out statement answers SQLSTATE `57014` with
+  `Query exceeded maximum time limit of …`.
 - A hash join whose estimated build side does not fit its slice of the memory pool
   runs as a sort-merge join, which spills, instead of failing with
   `EXCEEDED_LOCAL_MEMORY_LIMIT` (ADR 0003; session property `sort_merge_oversized_joins`,

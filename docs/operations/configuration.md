@@ -72,6 +72,21 @@ stops startup.
 Use a read-only database account for federated sources. A hive warehouse must
 be writable by uid 65532.
 
+## Query governance (`[governance]`, both protocols)
+
+| Key | Meaning |
+|---|---|
+| `max_running_queries` | queries executing at once on the node (32); more wait |
+| `max_queued_queries` | queries waiting (1000); more are refused (`QUERY_QUEUE_FULL`, SQLSTATE `53400`) |
+| `max_running_per_user`, `max_queued_per_user` | the same per user the client names (16, 500) |
+| `queue_timeout_secs` | longest wait for a slot (600); then `EXCEEDED_TIME_LIMIT` |
+| `query_max_run_time`, `query_max_execution_time` | default time limits (`100d`): from submission and from admission; sessions may set their own |
+| `history_size`, `history_retention_secs` | finished queries kept in `system.runtime.queries` (100, 900 s) |
+| `[[governance.resource_group]]` | `name`, `users` / `user_pattern` / `source_pattern` (whole-text regex), `max_running`, `max_queued`; the first match applies |
+
+Users are the names clients send (no authentication yet, see below): a
+per-user limit restrains well-behaved clients, not a hostile one.
+
 ## Listeners and security
 
 | Key | Meaning |
@@ -83,7 +98,7 @@ be writable by uid 65532.
 | `server.shutdown_grace_secs` | drain time after SIGTERM (default 30); keep it below the orchestrator's kill timeout |
 | `[server.trino] max_active_queries` | accepted and unfinished queries (default 100); more are refused with `QUERY_QUEUE_FULL` |
 | `[server.trino] client_timeout_secs` | a query whose client stops polling this long is canceled (`ABANDONED_QUERY`, default 300) |
-| `[server.trino] history_size`, `history_retention_secs` | finished queries kept in `system.runtime.queries` (100, 900 s) |
+| `[server.trino] history_size`, `history_retention_secs` | deprecated: use `[governance]`; still honored when set |
 | `[server.trino] max_query_length` | longest SQL text (1 000 000 characters) |
 | `server.tls` | `cert_path`, `key_path` for the PostgreSQL listener; a missing file stops startup |
 

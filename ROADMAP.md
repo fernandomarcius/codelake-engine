@@ -69,7 +69,22 @@ Blocking items, in order:
    `trino_functions` golden and unit test passed.
 5. **Client authentication** on both listeners (SCRAM-SHA-256 for PostgreSQL wire,
    password/JWT for the Trino protocol) and table ownership semantics (R11).
-6. **Query governance** (R12): per-query timeout, admission queue, per-user limits.
+6. 🔧 **Query governance** (R12, F6) — implemented in the core for both client
+   protocols (ADR 0016): one query registry (`system.runtime.queries` lists
+   PostgreSQL wire and HTTP queries), `query_max_run_time` /
+   `query_max_execution_time` with configured defaults (`statement_timeout` on
+   the PostgreSQL wire) that stop the operators and return their memory to the
+   pool, a bounded admission queue (`QUERY_QUEUE_FULL`, SQLSTATE `53400`), a
+   queue timeout, per-user and resource-group concurrency, Prometheus metrics,
+   and stopping a query from outside (`CALL system.runtime.kill_query` on both
+   protocols, PostgreSQL cancel requests, `DELETE /v1/query/{id}`).
+   Proven with `tokio-postgres` and the Python client against the binary
+   (`tests/governance.rs`). Not covered: memory-based admission, group
+   hierarchy and weights. Pending: execution shares the Tokio workers with
+   the protocol listeners, so a CPU-heavy query delays protocol requests
+   (ISS-009); a dedicated CPU runtime needs a row channel between runtimes on
+   the PostgreSQL wire and a new worker budget (ADR 0016, Consequences) —
+   measure protocol latency under CPU saturation first.
 7. ✅ **OTLP traces** (F7) with correlation ID across client → engine → source
    (ADR 0010). Evidence: `scripts/gates.sh integration` on integ/wave1 9f8950a →
    `f7_acceptance` 9/9 and `otlp` 2/2 passed.

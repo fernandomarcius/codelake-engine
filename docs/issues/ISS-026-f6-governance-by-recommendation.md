@@ -1,0 +1,11 @@
+# ISS-026 — F6 query governance: choices applied by recommendation
+
+- Kind: behavior · Applied: 2026-09-25 · Status: awaiting-confirmation
+1. Killing or canceling a query by id (`CALL system.runtime.kill_query`, `DELETE /v1/query/{id}`) is allowed to the query's owner only (`Access Denied: Cannot kill query owned by <owner>`, `PERMISSION_DENIED` / SQLSTATE `42501`). The reference engine 431 lets any user kill any query with its default access control (checked against `trinodb/trino:431`). Users are the names clients send until F5, so the rule prevents mistakes, not abuse. The alternative, anyone kills anything, matches the reference engine and makes an operator's kill possible without knowing the owner's name.
+2. A full queue answers SQLSTATE `53400` (`configuration_limit_exceeded`) on the PostgreSQL wire, not `53300` (`too_many_connections`): the limit reached is a configured queue, not a connection count. Clients that retry on `53300` do not retry on it.
+3. Default limits (breaking): 32 queries running per node and 16 per user, 1000 and 500 waiting, 600 s in the queue. Before, a node ran every query it received. Deployments with more concurrent clients must raise them in `[governance]`.
+4. A PostgreSQL client that stops reading a portal keeps its running slot until the statement's time limit, whose default is `100d`: the HTTP protocol cancels an abandoned query after `client_timeout_secs`, the PostgreSQL wire has no such signal while the connection stays open. Setting `[governance] query_max_run_time` bounds it; the default was kept so no long query changes behavior.
+5. Query execution keeps sharing the Tokio workers with the protocol listeners (ADR 0016, Consequences): a dedicated CPU runtime needs a row channel between runtimes on the PostgreSQL wire and a new worker budget, and was left out of F6.
+6. The ADR is 0016, not 0015: F5 (authentication) holds 0015 in its branch.
+- Revisit when: confirmed or overturned by a human; item 1 with F5 (roles); item 4 if clients leave portals open; item 5 after measuring protocol latency under CPU saturation.
+- References: ADR 0016; `crates/codelake-core/src/governance/`, `crates/codelake-server/src/pg.rs`.

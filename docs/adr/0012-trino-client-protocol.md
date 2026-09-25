@@ -127,8 +127,10 @@ A separate listener (`[server.trino]`, off by default) serves:
   `trino` client (`crates/codelake-server/tests/trino_clients.rs`,
   `f3_acceptance.rs`), and protocol details in
   `crates/codelake-server/src/trino/tests.rs`.
-- Queries through the PostgreSQL wire do not appear in `system.runtime.queries`
-  yet; query governance (ROADMAP M1 item 6) moves the registry into the core.
+- Queries through the PostgreSQL wire appear in `system.runtime.queries` since
+  query governance (ADR 0016) moved the registry into the core; this listener
+  keeps a paging index only, and its `history_*` settings moved to
+  `[governance]`.
 - The engine has no `char(n)`, bounded `varchar(n)`, `json` or `uuid` types:
   such columns travel as `varchar`, and `JSON '…'` / `UUID '…'` literals fail
   with `NOT_SUPPORTED`, until the engine carries those types.

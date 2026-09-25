@@ -42,18 +42,32 @@ The query fails with `USER_CANCELED`, its memory returns to the pool and its
 worker stops (operators yield cooperatively, ADR 0012). A client that simply
 stops polling is canceled after `client_timeout_secs` (`ABANDONED_QUERY`).
 
-**Act (PostgreSQL wire):** there is no server-side kill command on this
-listener yet. Cancel from the client (closing the connection drops the
-query's result stream). If CPU and `codelake_memory_reserved_bytes` stay up,
-drain and restart the node (Kubernetes: `kubectl -n <ns> delete pod <pod>`,
-the other replica keeps serving; Compose: `docker compose … restart codelake`).
+**Act (either protocol, from `psql` or any client):** kill it by id as its
+owner (connect with the `user` it runs as); the call needs no free slot, so
+it works on a full node:
 
-**Verify:** the query shows `FAILED` with `USER_CANCELED`;
+```sql
+CALL system.runtime.kill_query(query_id => '<query_id>', message => 'incident 123');
+```
+
+The query fails with `ADMINISTRATIVELY_KILLED` (`Query killed. Message: …`;
+SQLSTATE `57014` on the PostgreSQL wire). Another user gets `Access Denied`
+(`42501`). From a PostgreSQL client, a cancel request (`psql` Ctrl-C, JDBC
+`Statement.cancel`) stops that connection's statement the same way, and
+`DELETE /v1/query/<query_id>` above works for PostgreSQL queries too. If CPU
+and `codelake_memory_reserved_bytes` stay up after the kill, drain and restart
+the node (Kubernetes: `kubectl -n <ns> delete pod <pod>`, the other replica
+keeps serving; Compose: `docker compose … restart codelake`).
+
+**Verify:** the query shows `FAILED` with `USER_CANCELED` or
+`ADMINISTRATIVELY_KILLED`;
 `codelake_memory_reserved_bytes` falls; CPU drops.
 
-**Prevent:** set `query_max_run_time` in the clients' session (for example
-`1h` in the dbt profile's `session_properties`); it fails the query with
-`EXCEEDED_TIME_LIMIT` instead of letting it run.
+**Prevent:** set `[governance] query_max_run_time` (the default for every
+client), or `query_max_run_time` in the clients' session (for example `1h` in
+the dbt profile's `session_properties`; `SET statement_timeout` on the
+PostgreSQL wire); it fails the query with `EXCEEDED_TIME_LIMIT` instead of
+letting it run.
 
 ## Out of memory
 
@@ -171,17 +185,27 @@ See [compaction.md](compaction.md) for the procedure that avoids these cases.
 
 ## Queue full
 
-**Shows as:** clients get `QUERY_QUEUE_FULL` on the HTTP protocol.
+**Shows as:** clients get `QUERY_QUEUE_FULL` on the HTTP protocol or SQLSTATE
+`53400` (`Too many queued queries for <node | resource group | user> (limit
+N)`) on the PostgreSQL wire; `codelake_queries_rejected_total{scope}` grows;
+`codelake_queries_queued` stays high.
 
-`[server.trino] max_active_queries` (default 100) queries are accepted and
-unfinished. Usually clients that submit and never read (they are canceled
-after `client_timeout_secs`) or a burst from a scheduler.
+The message names the limit reached: the node's `[governance]
+max_queued_queries`, a resource group's `max_queued`, or the user's
+`max_queued_per_user`. Queries wait while the node runs `max_running_queries`
+(or the group / user its own maximum). On the HTTP protocol,
+`[server.trino] max_active_queries` (default 100) also caps accepted and
+unfinished queries, usually clients that submit and never read (canceled
+after `client_timeout_secs`). A PostgreSQL client that stops reading a
+portal keeps its running slot until its time limit.
 
-**Act:** list them (query above, grouped by `"user"` and `source`); cancel
-abandoned ones; fix the client that leaks queries. Raise the limit only
-with the memory to back it (each active query holds buffers in the pool).
+**Act:** list them (query above, grouped by `"user"` and `source`); kill
+abandoned or runaway ones (`kill_query` above); fix the client that leaks
+queries; give a noisy workload its own `[[governance.resource_group]]`.
+Raise the limits only with the memory to back them (each running query holds
+memory in the pool).
 
-**Verify:** new submissions succeed; the count of active queries falls.
+**Verify:** new submissions succeed; `codelake_queries_queued` falls.
 
 ## Latency above the objective
 
