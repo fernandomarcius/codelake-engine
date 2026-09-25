@@ -20,6 +20,7 @@ pub mod information_schema;
 pub mod join_guard;
 pub mod join_spill;
 mod literals;
+mod memory_tables;
 pub mod operand_checks;
 pub mod output;
 pub mod overflow;

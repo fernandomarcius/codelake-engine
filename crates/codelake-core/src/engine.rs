@@ -914,7 +914,8 @@ impl Engine {
 
     /// `CREATE TABLE [AS]` in `DataFusion`'s in-memory catalogs, as `DataFusion`
     /// does it, but answering the rows written, like a writable catalog (and
-    /// like Trino's `CREATE TABLE AS`).
+    /// like Trino's `CREATE TABLE AS`), and with the rows reserved in the
+    /// memory pool for as long as the table exists ([`crate::memory_tables`]).
     async fn create_memory_table(
         ctx: &SessionContext,
         create: &datafusion::logical_expr::CreateMemoryTable,
@@ -949,7 +950,8 @@ impl Engine {
         let from_query = !matches!(input, LogicalPlan::EmptyRelation(_));
         let physical = DataFrame::new(ctx.state(), input).create_physical_plan().await?;
         let schema = lower_case_columns(&table_schema(&physical.schema(), columns, from_query))?;
-        let batches = datafusion::physical_plan::collect_partitioned(physical, ctx.task_ctx()).await?;
+        let reservation = crate::memory_tables::reservation(&create.name.to_string(), &ctx.task_ctx());
+        let batches = crate::memory_tables::collect_reserved(physical, ctx.task_ctx(), &reservation).await?;
         // Rows under the table's (lower-case) column names.
         let batches = batches
             .into_iter()
@@ -985,6 +987,7 @@ impl Engine {
         if exists {
             ctx.deregister_table(create.name.clone())?;
         }
+        let table = crate::memory_tables::PooledTable::new(table, reservation);
         ctx.register_table(create.name.clone(), Arc::new(table))?;
         Self::row_count(ctx, rows)
     }

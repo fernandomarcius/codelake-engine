@@ -563,7 +563,6 @@ async fn w1_char_comparisons_above_the_scan_never_drop_rows() {
 /// default catalog keeps every row in server memory after the statement,
 /// outside the pool: with a 48 MiB pool it must not hold ~120 MB.
 #[tokio::test]
-#[ignore = "DEFECT-W1-5: CREATE TABLE in the in-memory default catalog keeps rows outside the memory pool (no ceiling)"]
 async fn w1_in_memory_tables_never_escape_the_pool() {
     let dir = tempfile::tempdir().unwrap();
     let spill = tempfile::tempdir().unwrap();
