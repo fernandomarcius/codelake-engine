@@ -69,7 +69,7 @@ Blocking items, in order:
    `trino_functions` golden and unit test passed.
 5. **Client authentication** on both listeners (SCRAM-SHA-256 for PostgreSQL wire,
    password/JWT for the Trino protocol) and table ownership semantics (R11).
-6. 🔧 **Query governance** (R12, F6) — implemented in the core for both client
+6. ✅ **Query governance** (R12, F6) — implemented in the core for both client
    protocols (ADR 0016): one query registry (`system.runtime.queries` lists
    PostgreSQL wire and HTTP queries), `query_max_run_time` /
    `query_max_execution_time` with configured defaults (`statement_timeout` on
@@ -79,7 +79,10 @@ Blocking items, in order:
    and stopping a query from outside (`CALL system.runtime.kill_query` on both
    protocols, PostgreSQL cancel requests, `DELETE /v1/query/{id}`).
    Proven with `tokio-postgres` and the Python client against the binary
-   (`tests/governance.rs`). Not covered: memory-based admission, group
+   (`tests/governance.rs`: pool back at zero after a timeout, a cancel
+   request, a kill and a `DELETE`). Evidence: `scripts/gates.sh integration`
+   on front/f6-governance 259dbf1 → 285/285 passed, `governance` 1/1;
+   `scripts/gates.sh fast` → 714 passed. Not covered: memory-based admission, group
    hierarchy and weights. Pending: execution shares the Tokio workers with
    the protocol listeners, so a CPU-heavy query delays protocol requests
    (ISS-009); a dedicated CPU runtime needs a row channel between runtimes on
