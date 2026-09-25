@@ -1,0 +1,16 @@
+# Base configuration of the candidate in the self-test; `codelake config
+# import --base` appends the imported sources. Isolated Docker network only.
+[server]
+pg_listen = "127.0.0.1:5432"
+http_listen = "0.0.0.0:8081"
+allow_unauthenticated_network = true
+shutdown_grace_secs = 1
+
+[server.trino]
+listen = "0.0.0.0:8080"
+
+[memory]
+limit = "${ENV:CODELAKE_MEMORY_LIMIT}"
+spill_dir = "/tmp/codelake-spill"
+spill_limit = "2GiB"
+metadata_cache_limit = "16MiB"

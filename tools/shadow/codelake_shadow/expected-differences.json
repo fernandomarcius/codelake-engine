@@ -1,0 +1,16 @@
+{
+  "differences": [
+    {
+      "id": "ISS-019",
+      "kind": "declared_type",
+      "reason": "CTAS of a literal infers unbounded varchar where the reference engine makes varchar(n); any varchar(n) to unbounded change is accepted as a type difference, values are still compared",
+      "reference": ["varchar(*)"],
+      "candidate": ["varchar", "string"]
+    },
+    {
+      "id": "ISS-018",
+      "kind": "name_case",
+      "reason": "Names keep the case they were written with; the reference engine folds them to lower case"
+    }
+  ]
+}

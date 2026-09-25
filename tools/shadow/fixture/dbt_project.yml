@@ -1,0 +1,33 @@
+# Self-test project for the shadow-run harness (tools/shadow/selftest.sh).
+# It mirrors the patterns of the acceptance pipelines, not their content:
+# CDC change tables read from SQL Server, incremental `append` models over an
+# LSN watermark, `table` models dropped and recreated, a view, Parquet output
+# in a Hive-style catalog.
+name: shadow_fixture
+version: "1.0.0"
+config-version: 2
+profile: shadow_fixture
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+target-path: "target"
+
+models:
+  shadow_fixture:
+    +materialized: view
+    raw:
+      +materialized: incremental
+      +incremental_strategy: append
+      +on_schema_change: append_new_columns
+      +properties:
+        format: "'PARQUET'"
+    pilot:
+      +materialized: incremental
+      +incremental_strategy: append
+      +on_schema_change: append_new_columns
+      +properties:
+        format: "'PARQUET'"
+    marts:
+      +on_table_exists: drop
+      +properties:
+        format: "'PARQUET'"
