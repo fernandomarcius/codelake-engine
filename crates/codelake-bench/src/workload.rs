@@ -68,6 +68,10 @@ pub(crate) enum WorkloadError {
     Duplicate(String),
     #[error("unknown placeholder in `{0}`")]
     Placeholder(String),
+    #[error("repetition override `{0}`: expected `<case id>=<reps>` or `<case id>=<reps>/<warmup>`")]
+    OverrideSyntax(String),
+    #[error("repetition override for unknown case `{0}`")]
+    OverrideCase(String),
 }
 
 fn read(path: &Path) -> Result<String, WorkloadError> {
@@ -109,6 +113,38 @@ pub(crate) fn load(dir: &Path, names: &[String]) -> Result<Vec<Case>, WorkloadEr
         }
     }
     Ok(cases)
+}
+
+/// Applies run-time repetition overrides (`--case-reps`, `BENCH_CASE_REPS`):
+/// `<case id>=<reps>` or `<case id>=<reps>/<warmup>`. They win over the
+/// manifest, so a large scale can run its longest cases fewer times without
+/// editing the workload files; the run records them. An unknown id is an error
+/// (a typo must not silently keep the long default).
+pub(crate) fn apply_overrides(cases: &mut [Case], overrides: &[String]) -> Result<(), WorkloadError> {
+    for text in overrides.iter().map(|o| o.trim()).filter(|o| !o.is_empty()) {
+        let syntax = || WorkloadError::OverrideSyntax(text.to_owned());
+        let (id, counts) = text.split_once('=').ok_or_else(syntax)?;
+        let (reps, warmup) = match counts.split_once('/') {
+            Some((reps, warmup)) => (reps, Some(warmup)),
+            None => (counts, None),
+        };
+        let reps: usize = reps.trim().parse().map_err(|_| syntax())?;
+        let warmup: Option<usize> = warmup
+            .map(|w| w.trim().parse().map_err(|_| syntax()))
+            .transpose()?;
+        if reps == 0 {
+            return Err(syntax());
+        }
+        let case = cases
+            .iter_mut()
+            .find(|c| c.spec.id == id.trim())
+            .ok_or_else(|| WorkloadError::OverrideCase(id.trim().to_owned()))?;
+        case.spec.reps = Some(reps);
+        if warmup.is_some() {
+            case.spec.warmup = warmup;
+        }
+    }
+    Ok(())
 }
 
 /// Values for the placeholders of one engine run.
@@ -195,6 +231,32 @@ mod tests {
         assert!(matches!(
             load(dir.path(), &["w".into(), "w".into()]),
             Err(WorkloadError::Duplicate(_))
+        ));
+    }
+
+    #[test]
+    fn overrides_replace_reps_and_optionally_warmup() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("w.toml"),
+            "workload = \"w\"\n[[case]]\nid = \"a\"\nsql = \"SELECT 1\"\nreps = 3\nwarmup = 2\n\
+             [[case]]\nid = \"b\"\nsql = \"SELECT 2\"\n",
+        )
+        .unwrap();
+        let mut cases = load(dir.path(), &["w".into()]).unwrap();
+        apply_overrides(&mut cases, &["a=1/0".into(), " b=2 ".into(), String::new()]).unwrap();
+        assert_eq!((cases[0].spec.reps, cases[0].spec.warmup), (Some(1), Some(0)));
+        assert_eq!((cases[1].spec.reps, cases[1].spec.warmup), (Some(2), None));
+
+        for bad in ["a", "a=x", "a=0", "a=1/x"] {
+            assert!(matches!(
+                apply_overrides(&mut cases, &[bad.into()]),
+                Err(WorkloadError::OverrideSyntax(_))
+            ));
+        }
+        assert!(matches!(
+            apply_overrides(&mut cases, &["zz=1".into()]),
+            Err(WorkloadError::OverrideCase(_))
         ));
     }
 

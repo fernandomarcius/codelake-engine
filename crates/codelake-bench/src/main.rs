@@ -30,7 +30,7 @@ mod workload;
 use driver::{Driver, EmbeddedClient, TrinoClient};
 use model::{EngineRun, ProcessMetrics};
 use probe::{Cgroup, SpillProbe};
-use run::{Endpoint, Selection, Settings, log};
+use run::{Endpoint, Reconnect, Selection, Settings, log};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum DriverKind {
@@ -84,6 +84,10 @@ struct RunArgs {
     reps: usize,
     #[arg(long, default_value_t = 1)]
     warmup: usize,
+    /// Per-case repetitions that win over the workload files:
+    /// `<case id>=<reps>[/<warmup>]`, comma separated.
+    #[arg(long, value_delimiter = ',')]
+    case_reps: Vec<String>,
     #[arg(long, default_value_t = 1800)]
     timeout_secs: u64,
     /// Mounted cgroup v2 root of the Docker host, with `--container-id`.
@@ -184,13 +188,14 @@ fn cgroup(args: &RunArgs) -> Result<Option<Cgroup>, BoxError> {
 }
 
 async fn run(args: RunArgs) -> Result<(), BoxError> {
-    let cases = workload::load(&args.workloads_dir, &args.workloads)?;
+    let mut cases = workload::load(&args.workloads_dir, &args.workloads)?;
+    workload::apply_overrides(&mut cases, &args.case_reps)?;
     let cgroup = cgroup(&args)?;
     let timeout = Duration::from_secs(args.timeout_secs);
     let (_, tpch) = workload::tpch_schemas(&args.scale);
     let started_at_ms = args.started_at.as_deref().and_then(run::parse_rfc3339_ms);
     let url = || args.url.clone().ok_or("--url is required for this driver");
-    let (driver, ready_ms, spill) = match args.driver {
+    let (driver, ready_ms, spill, reconnect) = match args.driver {
         DriverKind::Pg | DriverKind::Trino => {
             let endpoint = if args.driver == DriverKind::Pg {
                 Endpoint::Postgres(url()?)
@@ -201,10 +206,15 @@ async fn run(args: RunArgs) -> Result<(), BoxError> {
                 .ready_sql
                 .clone()
                 .unwrap_or_else(|| format!("SELECT count(*) FROM {}.{tpch}.region", args.catalog));
-            let (driver, ready) =
-                run::connect_when_ready(&endpoint, &probe, started_at_ms, Duration::from_secs(600)).await?;
+            let deadline = Duration::from_secs(600);
+            let (driver, ready) = run::connect_when_ready(&endpoint, &probe, started_at_ms, deadline).await?;
             let spill = args.metrics.clone().map_or(SpillProbe::None, SpillProbe::Metrics);
-            (driver, ready, spill)
+            let reconnect = Reconnect {
+                endpoint,
+                probe_sql: probe,
+                deadline,
+            };
+            (driver, ready, spill, Some(reconnect))
         }
         DriverKind::Embedded => {
             let config = args
@@ -213,7 +223,7 @@ async fn run(args: RunArgs) -> Result<(), BoxError> {
                 .ok_or("--config is required for the embedded driver")?;
             let embedded = EmbeddedClient::start(config).await?;
             let spill = SpillProbe::Engine(std::sync::Arc::clone(&embedded.engine));
-            (Driver::Embedded(embedded), None, spill)
+            (Driver::Embedded(embedded), None, spill, None)
         }
     };
     log(&format!(
@@ -249,7 +259,7 @@ async fn run(args: RunArgs) -> Result<(), BoxError> {
         idle_anon_bytes,
         container_peak_bytes: None,
     };
-    let result: EngineRun = run::run_cases(driver, &settings, &cases, process).await;
+    let result: EngineRun = run::run_cases(driver, &settings, &cases, process, reconnect.as_ref()).await;
     write_json(&args.out, &result)
 }
 

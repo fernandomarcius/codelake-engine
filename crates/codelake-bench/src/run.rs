@@ -135,6 +135,22 @@ pub(crate) async fn connect_when_ready(
     }
 }
 
+/// How to reach a network engine again after it went away mid-run (the
+/// orchestrator restarts a container that died, e.g. killed for exceeding its
+/// memory limit). Without it one crash would turn every later case into an
+/// error that says nothing about that case.
+#[derive(Debug, Clone)]
+pub(crate) struct Reconnect {
+    pub(crate) endpoint: Endpoint,
+    /// Readiness probe, the same one the phase started with.
+    pub(crate) probe_sql: String,
+    pub(crate) deadline: Duration,
+}
+
+/// Appended to the error of the case during which the engine went away.
+pub(crate) const ENGINE_LOST: &str =
+    "engine connection lost during this case; the next case ran on a restarted engine";
+
 struct Recorder<'a> {
     driver: &'a mut Driver,
     settings: &'a Settings,
@@ -246,12 +262,49 @@ impl Recorder<'_> {
     }
 }
 
-/// Runs the selected cases on a connected driver.
+impl Recorder<'_> {
+    /// After a failed case: if the engine no longer answers, waits for it to
+    /// come back and replaces the connection. Returns whether it reconnected.
+    async fn recover(&mut self, reconnect: &Reconnect) -> bool {
+        let alive = self
+            .driver
+            .execute(&reconnect.probe_sql, Duration::from_secs(10))
+            .await
+            .is_ok();
+        if alive {
+            return false;
+        }
+        log("engine unreachable; waiting for it to restart");
+        match connect_when_ready(
+            &reconnect.endpoint,
+            &reconnect.probe_sql,
+            None,
+            reconnect.deadline,
+        )
+        .await
+        {
+            Ok((driver, _)) => {
+                *self.driver = driver;
+                log("engine back; continuing with the next case");
+                true
+            }
+            Err(err) => {
+                log(&format!("engine did not come back: {err}"));
+                false
+            }
+        }
+    }
+}
+
+/// Runs the selected cases on a connected driver. With `reconnect`, a network
+/// engine that dies during a case is waited for and reconnected before the
+/// next case (the dead case stays an error, marked [`ENGINE_LOST`]).
 pub(crate) async fn run_cases(
     mut driver: Driver,
     settings: &Settings,
     cases: &[Case],
     mut process: ProcessMetrics,
+    reconnect: Option<&Reconnect>,
 ) -> EngineRun {
     let label = driver.label().to_owned();
     let selected: Vec<&Case> = cases.iter().filter(|c| settings.selection.includes(c)).collect();
@@ -261,7 +314,14 @@ pub(crate) async fn run_cases(
         settings,
     };
     for (n, case) in selected.iter().enumerate() {
-        let run = recorder.case(case).await;
+        let mut run = recorder.case(case).await;
+        if run.status == RunStatus::Error
+            && let Some(reconnect) = reconnect
+            && recorder.recover(reconnect).await
+        {
+            let error = run.error.take().unwrap_or_default();
+            run.error = Some(format!("{error} ({ENGINE_LOST})"));
+        }
         log(&format!(
             "{}/{} {} {}: p50={}us p95={}us",
             n + 1,
@@ -302,6 +362,43 @@ mod tests {
         assert_eq!(parse_rfc3339_ms("2024-02-29T12:00:00Z"), Some(1_709_208_000_000));
         assert_eq!(parse_rfc3339_ms("not a date"), None);
         assert_eq!(parse_rfc3339_ms("2026-09-24T01:26:31"), None);
+    }
+
+    fn settings() -> Settings {
+        Settings {
+            engine: "trino".into(),
+            engine_version: None,
+            scale: "tiny".into(),
+            reps: 1,
+            warmup: 0,
+            timeout: Duration::from_secs(1),
+            vars: Vars {
+                catalog: "hive".into(),
+                tpch: "tpch_tiny".into(),
+                work: "bench_trino".into(),
+            },
+            selection: Selection::All,
+            cgroup: None,
+            spill: SpillProbe::None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_engine_that_does_not_come_back_is_not_reconnected() {
+        // Nothing listens on port 1: every probe fails at once.
+        let url = "http://127.0.0.1:1";
+        let mut driver = Driver::Trino(TrinoClient::new(url, "bench"));
+        let settings = settings();
+        let mut recorder = Recorder {
+            driver: &mut driver,
+            settings: &settings,
+        };
+        let reconnect = Reconnect {
+            endpoint: Endpoint::Trino(url.into()),
+            probe_sql: "SELECT 1".into(),
+            deadline: Duration::from_millis(200),
+        };
+        assert!(!recorder.recover(&reconnect).await);
     }
 
     #[test]
