@@ -22,3 +22,13 @@ invalid. Expired entries fail review until renewed or removed.
 - `datafusion-federation` lost-filter defect (0.5.3, still present in 0.5.5):
   mitigated in code by `federation_guard.rs`, covered by an integration test. Not
   suppressed; fixed.
+- DataFusion 54.1 join defects (null-aware anti join: dynamic filter
+  apache/datafusion#23104, filter inference, sort-merge join #22810, constant and
+  correlated `NOT IN`; nested loop join spill fallback #24675, #24746, #24677):
+  mitigated in code by `join_guard.rs` (ADR 0014), each with a canary unit test
+  and an integration test against Trino 431 (`join_regressions.rs`). A nested
+  loop join over the memory limit fails instead of spilling. Not suppressed;
+  guarded.
+- Text compared with a number and `time ± interval`: refused by
+  `operand_checks.rs` on the engine's client protocols (ADR 0014); the
+  PostgreSQL wire path keeps DataFusion's coercion.

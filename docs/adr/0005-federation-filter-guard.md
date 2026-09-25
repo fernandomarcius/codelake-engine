@@ -21,6 +21,8 @@ unaffected.
 ## Consequences
 
 Filters that could not be expressed in the logical plan run locally instead of at
-the source, which may move more rows. Correctness wins. Remove the guard only when
+the source, which may move more rows. Correctness wins. The same pass-through
+barrier idea guards the subquery side of null-aware anti joins on DataFusion 54
+(ADR 0014). Remove the guard only when
 an upstream fix ships and the regression test passes without it; the upstream
 report is pending (needs maintainer approval to file).

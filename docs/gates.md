@@ -43,7 +43,7 @@ scripts/dev.sh scripts/gates.sh <gate>
 
 | Crate / module | Criticality | Minimum score |
 |---|---|---|
-| `codelake-core` (memory, config, federation guard) | HIGH | 80% |
+| `codelake-core` (memory, config, federation guard, join guards) | HIGH | 80% |
 | `codelake-connectors` | MEDIUM | 70% (enforced once connector unit tests exist; integration tests cover today) |
 | `codelake-server` | MEDIUM | 70% (same) |
 

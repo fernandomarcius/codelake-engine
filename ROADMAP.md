@@ -106,10 +106,12 @@ Blocking items, in order:
 - Dependency train (F11): on DataFusion 54.1 since 2026-09-24, with
   `datafusion-federation = "=0.5.5"`, the per-connector
   `datafusion-table-providers` 0.13.1 crates and `datafusion-postgres` 0.18.0,
-  Iceberg left out (ADR 0002, ADR 0013). Pending: the full `semantics` suite
-  against DataFusion 54 (string/number coercion, codepoint
-  `lpad`/`rpad`/`translate`, `approx_percentile`, scalar subqueries executed by
-  their own operator). Skip DataFusion 55 (no `datafusion-table-providers` or
+  Iceberg left out (ADR 0002, ADR 0013). The join defects the train brought
+  (null-aware anti join, nested loop join spill fallback) and the string/number
+  coercion change are guarded in the engine (ADR 0014); codepoint
+  `lpad`/`rpad`/`translate` and `approx_percentile` match Trino 431. Pending:
+  correlated scalar subqueries (`scalar_subquery_to_join` fails, a refusal, not
+  a wrong result). Skip DataFusion 55 (no `datafusion-table-providers` or
   `datafusion-postgres` for it).
 - `hive-s3` (S3/MinIO warehouses) waits for DataFusion 56: DataFusion 53–55 need
   `object_store` ^0.13 (quick-xml ^0.39); DataFusion 56 moves to

@@ -59,6 +59,11 @@ dynamic filter, so the whole remote table would be read on every run.
    rule right after federation checks again what runs in the engine. `restrict_federation` re-checks the
    nodes it keeps local.
 
+8. On DataFusion 54, every `push_down_filter` of the list runs wrapped so
+   that nothing is inferred from the keys of a null-aware anti join, and a
+   `NOT IN` compared with a constant or over a correlated subquery is
+   rewritten before decorrelation (ADR 0014).
+
 ## Consequences
 
 - Correctness first: some operators Trino pushes down run locally here, moving
