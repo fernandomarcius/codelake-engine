@@ -56,7 +56,7 @@
     {
       "name": "source_reachable_over_pg_wire",
       "protocol": "pg",
-      "sql": "SELECT count(*) FROM erp.public.customers WHERE customer_id = 1",
+      "sql": "SELECT count(*) FROM erp.dbo.customers WHERE customer_id = 1",
       "expect": { "value": "1" },
       "max_latency_ms": 5000
     }

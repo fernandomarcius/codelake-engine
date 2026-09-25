@@ -103,7 +103,11 @@ needs cleaning by hand while the process runs. Cancel the query that is
 spilling (the largest running one), then raise `memory.spill_limit` and the
 volume (`emptyDir.sizeLimit`, or the host directory's file system) together,
 or move the heavy runs apart. After a crash, files left in `spill_dir` belong
-to no query: with the process stopped, `rm -rf <spill_dir>/*` is safe.
+to no query: with the process stopped, delete them with the literal path
+of `memory.spill_dir` written out, never through a variable or placeholder
+that could be empty (for example `rm -rf -- /srv/codelake/spill/*` on
+Compose). On Kubernetes the `emptyDir` survives a container restart and is
+emptied only when the pod is deleted: `kubectl -n <ns> delete pod <pod>`.
 
 **Verify:** `codelake_spill_used_bytes` returns to 0 after the heavy run.
 
