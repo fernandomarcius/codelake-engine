@@ -147,19 +147,16 @@ requires where Trino has no equivalent.
   of another precision with Trino's message ("Incorrect timestamp precision
   for timestamp(6); the configured precision is MILLISECONDS; column name:
   ts"); `ADD COLUMN` accepts any and records `timestamp`, as Trino does.
-  `OPTIMIZE` keeps what files hold (microseconds, or nanoseconds for a
-  `NANOSECONDS` catalog).
+  `OPTIMIZE` keeps what files hold, to the nanosecond (ADR 0009).
 - **`varchar(n)`** is stored as declared; an `INSERT` of a longer value fails
   as in Trino (`INVALID_CAST_ARGUMENT`, only trailing spaces are cut) and reads
   cut values to `n` characters, as Trino's reader. **`char(n)`** is stored as
   declared, written without trailing spaces (as Trino stores it; a longer
   value fails like Trino's `INSERT`) and read padded to `n` (`'ab   '`,
   length 5, as Trino shows it). Trino also compares char values padded
-  (`ch = 'ab'` is true); the engine has no char type, so a filter on a char
-  column (other than `IS [NOT] NULL`) is refused instead of answered as a
-  varchar comparison. Comparisons outside a filter on the table or view (a
-  join with a varchar, a `CASE`) still compare the padded text: pending an
-  engine char type.
+  (`ch = 'ab'` is true); the engine has no char type, so a comparison of a
+  char column is refused instead of answered as a varchar comparison,
+  wherever the plan holds it (see "Red-team W1 corrections").
 - **Checksums are verified.** A metadata file whose `.crc` does not match is
   an error ("Checksum error"), as in Trino, never a table read with other
   columns. A mismatch is re-read briefly first: writers replace the checksum
@@ -178,6 +175,50 @@ requires where Trino has no equivalent.
 - **Pending, F5.** Owner-based security (R11): Trino with
   `hive.security=sql-standard` refuses `DROP`/`INSERT` on another user's
   table; `CodeLake` writes `.trinoPermissions` but does not check them yet.
+
+## Red-team W1 corrections
+
+A second red-team (`tests/integration/hive_redteam_w1.rs`, after the F9
+`OPTIMIZE` integration) found seven defects; each probe below failed before
+its correction and passes after it (2026-09-25).
+
+- **W1-1 `CREATE OR REPLACE` over a foreign directory** deleted it. The
+  statement is refused as Trino 431 refuses it (see above), so nothing is
+  deleted (`w1_or_replace_never_deletes_a_foreign_directory`).
+- **W1-2 NANOSECONDS scans of `INT96` outside 1677–2262** answered another
+  instant (the reader's nanoseconds wrap: 1500-06-01 read as 2084-12-18).
+  A NANOSECONDS catalog now reads its timestamps exactly
+  (`hive/exact_timestamps.rs`: microseconds and nanoseconds read over the
+  same files, paired row by row); an instant Arrow nanoseconds cannot hold
+  is an error naming the value and column, never another instant. Writing
+  one fails the statement instead of storing NULL
+  (`w1_nanosecond_catalog_never_reads_a_wrong_instant`). Each of the two
+  reads keeps every file in its partition and in order: `DataFusion` 54 lets
+  an idle partition take files queued for another, which paired rows of
+  different files (found by the time zone test, 2026-09-25;
+  `w1_nanosecond_catalog_pairs_rows_of_many_files`).
+- **W1-3 (critical) `OPTIMIZE` in a NANOSECONDS catalog** rewrote those
+  values as other instants, and **W1-7** `OPTIMIZE` in another catalog
+  rounded nanoseconds to microseconds: compaction rewrites the exact stored
+  instants, whatever the catalog's precision (ADR 0009;
+  `w1_nanosecond_optimize_never_rewrites_other_instants`,
+  `w1_optimize_keeps_the_nanoseconds_trino_wrote`).
+- **W1-4 `char(n)` comparisons above the scan** (under `LIMIT`, a window, a
+  volatile predicate) compared unpadded text and dropped rows. An analyzer
+  rule (`codelake_core::char_comparisons`) refuses every comparison of a
+  char value, wherever it is in the plan (filters, joins, `CASE`,
+  projections, subqueries), until the engine has a char type; an explicit
+  `CAST(ch AS varchar)` compares text (owner decision: char(n) as
+  implemented) (`w1_char_comparisons_above_the_scan_never_drop_rows`).
+- **W1-5 tables of the in-memory catalog** (`CREATE TABLE datafusion.…`)
+  held their rows outside the memory pool. Their rows are reserved in the
+  pool for as long as the table exists (`codelake_core::memory_tables`):
+  `CREATE TABLE … AS` and `INSERT` fail with nothing kept once the pool is
+  full; `DELETE`, `UPDATE` and `DROP` give memory back
+  (`w1_in_memory_tables_never_escape_the_pool`). Pending, F5: those tables
+  are visible to every user, like the rest of the catalogs until ownership
+  (R11) is checked.
+- **W1-6** owner checks (R11): pending F5, the probe stays ignored.
 
 ## Acceptance (F2 DoD)
 
