@@ -21,7 +21,9 @@ use codelake_connectors::hive::{HiveConnector, HiveParams};
 use codelake_core::config::{ExecutionConfig, HiveTimestampPrecision, MemoryConfig};
 use codelake_core::parquet_time_zone::ParquetTimeZone;
 use codelake_core::{ByteSize, Engine, QueryOptions};
-use datafusion::arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, TimestampNanosecondArray};
+use datafusion::arrow::array::{
+    Array, ArrayRef, Int64Array, RecordBatch, TimestampMillisecondArray, TimestampNanosecondArray,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::parquet::arrow::ArrowWriter;
@@ -1870,4 +1872,125 @@ async fn nanoseconds_in_the_zone(s: &Shared, checks: &mut Checks) {
             data_files(&s.warehouse.join("s/ns_trino")).len().to_string(),
         ]]),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Tester probes of the W1 corrections (front/w1-df54)
+// ---------------------------------------------------------------------------
+
+/// A Parquet file with `id` and an `INT64` timestamp (Arrow milliseconds,
+/// not adjusted to UTC), as Spark or pandas write it.
+fn int64_timestamps(ids: &[i64], millis: &[i64]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef,
+            Arc::new(TimestampMillisecondArray::from(millis.to_vec())) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+/// 2026-01-01 10:00:00.456 as milliseconds since the epoch.
+const TEN_O_CLOCK_456: i64 = 1_767_261_600_456;
+
+/// `OPTIMIZE` rewrites every timestamp as `INT96` without converting it, and
+/// in a catalog whose `parquet_time_zone` is not UTC only `INT96` converts on
+/// read: an `INT64` timestamp another writer left in the table must read the
+/// same after compaction.
+#[tokio::test]
+#[ignore = "DEFECT-W1T-1: OPTIMIZE rewrites INT64 timestamps as unconverted INT96, which a catalog outside UTC then reads shifted by the zone offset"]
+async fn w1t_optimize_keeps_int64_timestamps_of_other_writers() {
+    let l = Local::new().await;
+    cl(&l.engine, "CREATE SCHEMA hive.s").await;
+    cl(
+        &l.engine,
+        "CREATE TABLE hive.s.mixed AS SELECT CAST(1 AS BIGINT) AS id, TIMESTAMP '2026-01-01 10:00:00.123' AS ts",
+    )
+    .await;
+    put_parquet(
+        &l.warehouse.join("s/mixed/spark-00000.parquet"),
+        &int64_timestamps(&[2, 3], &[TEN_O_CLOCK_456, -1]),
+    );
+    let q = "SELECT id, CAST(ts AS varchar) FROM hive.s.mixed ORDER BY id";
+    let before = cl_try(&l.engine, q).await;
+    let compacted = optimize(&l.engine, "hive.s.mixed").await;
+    let after = cl_try(&l.engine, q).await;
+    note(
+        "w1t_optimize_int64",
+        "before, OPTIMIZE, files, after",
+        (
+            &before,
+            &compacted,
+            data_files(&l.warehouse.join("s/mixed")),
+            &after,
+        ),
+    );
+    assert_eq!(
+        before,
+        Ok(rows(&[
+            &["1", "2026-01-01 10:00:00.123"],
+            &["2", "2026-01-01 10:00:00.456"],
+            &["3", "1969-12-31 23:59:59.999"],
+        ])),
+        "INT64 timestamps read as stored"
+    );
+    assert!(compacted.is_ok(), "{compacted:?}");
+    assert_eq!(after, before, "OPTIMIZE changed the values");
+}
+
+/// [`w1t_optimize_keeps_int64_timestamps_of_other_writers`] with Trino 431
+/// as the oracle: it reads the `INT64` file unconverted, and must read the
+/// same after `CodeLake` compacts the table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "DEFECT-W1T-1: OPTIMIZE rewrites INT64 timestamps as unconverted INT96, which a catalog outside UTC then reads shifted by the zone offset"]
+async fn w1t_optimize_keeps_int64_timestamps_like_trino_431() {
+    let s = Shared::new("codelake-w1t-trino-i64").await;
+    let mut checks = Checks::new("w1t_optimize_int64_trino");
+    s.trino.ok("CREATE SCHEMA hive.s").await;
+    s.trino
+        .ok("CREATE TABLE hive.s.i64 (id bigint, ts timestamp(3)) WITH (format = 'PARQUET')")
+        .await;
+    s.trino
+        .ok("INSERT INTO hive.s.i64 VALUES (1, TIMESTAMP '2026-01-01 10:00:00.123')")
+        .await;
+    put_parquet(
+        &s.warehouse.join("s/i64/spark-00000.parquet"),
+        &int64_timestamps(&[2], &[TEN_O_CLOCK_456]),
+    );
+    let q = "SELECT id, CAST(ts AS varchar) FROM hive.s.i64 ORDER BY id";
+    let trino_before = s.trino.sql(q).await;
+    checks.same(
+        "I64",
+        "Trino before OPTIMIZE",
+        &trino_before,
+        &Ok(rows(&[
+            &["1", "2026-01-01 10:00:00.123"],
+            &["2", "2026-01-01 10:00:00.456"],
+        ])),
+    );
+    checks.same(
+        "I64",
+        "CodeLake before OPTIMIZE",
+        &cl_try(&s.engine, q).await,
+        &trino_before,
+    );
+    let compacted = optimize(&s.engine, "hive.s.i64").await;
+    note(checks.probe, "OPTIMIZE i64", &compacted);
+    checks.same(
+        "I64",
+        "Trino after OPTIMIZE",
+        &s.trino.sql(q).await,
+        &trino_before,
+    );
+    checks.same(
+        "I64",
+        "CodeLake after OPTIMIZE",
+        &cl_try(&s.engine, q).await,
+        &trino_before,
+    );
+    checks.assert_none();
 }
