@@ -92,7 +92,11 @@ Server 2022, and each is the behavior of Trino 431 itself.
   (`codelake_core::parquet_time_zone`). Only `INT96` columns convert: the
   Parquet reader marks them (`coerce_int96_tz`) so `INT64` timestamps keep
   their values, as in Trino. `OPTIMIZE` rewrites stored instants unconverted
-  (ADR 0009). Proven row by row against a Trino 431 whose catalogs set
+  (ADR 0009) and writes every timestamp as `INT96`, so it reads an `INT64`
+  timestamp (another writer's wall-clock time) as the instant of the zone,
+  which reads back unchanged; a wall-clock time the zone skips has no such
+  instant, and `OPTIMIZE` refuses it instead of changing it (DEFECT-W1T-1,
+  `w1t_optimize_keeps_int64_timestamps_of_other_writers`, `…_like_trino_431`). Proven row by row against a Trino 431 whose catalogs set
   `hive.parquet.time-zone=America/Sao_Paulo`
   (`hive_redteam_w1::w1_parquet_time_zone_reads_and_writes_like_the_reference_engine`:
   each engine reads what the other wrote, the instants stored agree through

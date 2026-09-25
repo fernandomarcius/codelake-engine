@@ -1906,7 +1906,6 @@ const TEN_O_CLOCK_456: i64 = 1_767_261_600_456;
 /// read: an `INT64` timestamp another writer left in the table must read the
 /// same after compaction.
 #[tokio::test]
-#[ignore = "DEFECT-W1T-1: OPTIMIZE rewrites INT64 timestamps as unconverted INT96, which a catalog outside UTC then reads shifted by the zone offset"]
 async fn w1t_optimize_keeps_int64_timestamps_of_other_writers() {
     let l = Local::new().await;
     cl(&l.engine, "CREATE SCHEMA hive.s").await;
@@ -1946,11 +1945,46 @@ async fn w1t_optimize_keeps_int64_timestamps_of_other_writers() {
     assert_eq!(after, before, "OPTIMIZE changed the values");
 }
 
+/// An `INT64` wall-clock time the zone skips (2018-11-04 00:30 in
+/// `America/Sao_Paulo`) has no `INT96` instant that reads back as it:
+/// `OPTIMIZE` refuses the table and leaves its files as they were.
+#[tokio::test]
+async fn w1t_optimize_refuses_an_int64_time_the_zone_skips() {
+    let l = Local::new().await;
+    cl(&l.engine, "CREATE SCHEMA hive.s").await;
+    cl(
+        &l.engine,
+        "CREATE TABLE hive.s.gap AS SELECT CAST(1 AS BIGINT) AS id, TIMESTAMP '2026-01-01 10:00:00.123' AS ts",
+    )
+    .await;
+    put_parquet(
+        &l.warehouse.join("s/gap/spark-00000.parquet"),
+        &int64_timestamps(&[2], &[1_541_291_400_000]),
+    );
+    let q = "SELECT id, CAST(ts AS varchar) FROM hive.s.gap ORDER BY id";
+    let before = cl_try(&l.engine, q).await;
+    let files = data_files(&l.warehouse.join("s/gap"));
+    let compacted = optimize(&l.engine, "hive.s.gap").await;
+    let err = compacted.expect_err("OPTIMIZE must refuse a time the zone skips");
+    assert!(
+        err.contains("does not exist in time zone America/Sao_Paulo"),
+        "{err}"
+    );
+    assert_eq!(data_files(&l.warehouse.join("s/gap")), files);
+    assert_eq!(
+        before,
+        Ok(rows(&[
+            &["1", "2026-01-01 10:00:00.123"],
+            &["2", "2018-11-04 00:30:00.000"],
+        ]))
+    );
+    assert_eq!(cl_try(&l.engine, q).await, before);
+}
+
 /// [`w1t_optimize_keeps_int64_timestamps_of_other_writers`] with Trino 431
 /// as the oracle: it reads the `INT64` file unconverted, and must read the
 /// same after `CodeLake` compacts the table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "DEFECT-W1T-1: OPTIMIZE rewrites INT64 timestamps as unconverted INT96, which a catalog outside UTC then reads shifted by the zone offset"]
 async fn w1t_optimize_keeps_int64_timestamps_like_trino_431() {
     let s = Shared::new("codelake-w1t-trino-i64").await;
     let mut checks = Checks::new("w1t_optimize_int64_trino");

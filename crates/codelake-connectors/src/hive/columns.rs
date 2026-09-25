@@ -26,7 +26,12 @@
 //! The Parquet reader marks `INT96` columns with the zone
 //! [`INT96_ZONE_MARKER`] so the adapter can tell them apart.
 //!
-//! A `raw` adapter (compaction) keeps stored values as they are. A
+//! A `raw` adapter (compaction) keeps stored values as they are, but for
+//! one thing: compaction writes every timestamp back as an `INT96` instant,
+//! so in a catalog whose Parquet time zone is not UTC it reads the other
+//! timestamps (wall-clock times, `INT64` from Spark or pandas) as the
+//! instants of that zone. A wall-clock time the zone skips has no instant
+//! that reads back as it: reading it is an error, never another value. A
 //! `nanos_only` adapter reads only the timestamps a file stores in
 //! nanoseconds, every other column as NULL (see `exact_timestamps.rs`).
 
@@ -36,6 +41,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::compute::{CastOptions, cast, cast_with_options};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Int64Type, Schema, SchemaRef, TimeUnit};
+use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::common::ScalarValue;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::error::{DataFusionError, Result};
@@ -86,6 +92,9 @@ enum Read {
     /// `INT96` instants as the zone's wall-clock time, in this unit (the
     /// stored one, or a finer one).
     Local(ParquetTimeZone, TimeUnit),
+    /// Wall-clock times (not `INT96`) as the zone's instants, in this unit
+    /// (cast from the stored one): what compaction writes as `INT96`.
+    Instant(ParquetTimeZone, TimeUnit),
 }
 
 /// A column read with [`Read`] applied (see the module documentation).
@@ -117,6 +126,7 @@ impl fmt::Display for HiveRead {
             Read::Cut(length) => write!(f, "hive_varchar({}, {length})", self.child),
             Read::Pad(length) => write!(f, "hive_char({}, {length})", self.child),
             Read::Local(zone, _) => write!(f, "hive_local({}, {zone})", self.child),
+            Read::Instant(zone, _) => write!(f, "hive_instant({}, {zone})", self.child),
         }
     }
 }
@@ -136,7 +146,7 @@ impl PhysicalExpr for HiveRead {
         let child = self.child.return_field(input_schema)?;
         let data_type = match &self.read {
             Read::Round(unit, zone) => DataType::Timestamp(*unit, zone.clone()),
-            Read::Local(_, unit) => DataType::Timestamp(*unit, None),
+            Read::Local(_, unit) | Read::Instant(_, unit) => DataType::Timestamp(*unit, None),
             Read::Cut(_) | Read::Pad(_) => DataType::Utf8,
         };
         Ok(Arc::new(child.as_ref().clone().with_data_type(data_type)))
@@ -147,6 +157,7 @@ impl PhysicalExpr for HiveRead {
         let read = match &self.read {
             Read::Round(unit, zone) => round_timestamps(&values, *unit, zone.clone())?,
             Read::Local(zone, unit) => local_timestamps(&values, *zone, *unit)?,
+            Read::Instant(zone, unit) => instant_timestamps(&values, *zone, *unit)?,
             Read::Cut(length) => {
                 let text = cast(&values, &DataType::Utf8)?;
                 let text = text.as_string::<i32>();
@@ -239,6 +250,59 @@ fn local_timestamps(array: &ArrayRef, zone: ParquetTimeZone, unit: TimeUnit) -> 
     )?)
 }
 
+/// Wall-clock times (a timestamp array that is not `INT96`) as the instants
+/// of `zone`, in `unit`. The zone's offsets are whole seconds, so the digits
+/// below a second stay; the cast to `unit` is the one a raw read without a
+/// zone makes. A time the zone skips (a gap) is an error: its instant reads
+/// back as another wall-clock time.
+fn instant_timestamps(array: &ArrayRef, zone: ParquetTimeZone, unit: TimeUnit) -> Result<ArrayRef> {
+    let DataType::Timestamp(stored, _) = array.data_type() else {
+        return Err(DataFusionError::Internal(format!(
+            "reading a {} as a timestamp",
+            array.data_type()
+        )));
+    };
+    let per = i128::from(per_second(*stored));
+    let nanos_per = 1_000_000_000 / per;
+    let raw = cast(array, &DataType::Int64)?;
+    let instants: Int64Array = raw
+        .as_primitive::<Int64Type>()
+        .iter()
+        .enumerate()
+        .map(|(row, value)| {
+            value
+                .map(|v| {
+                    let local = i128::from(v) * nanos_per;
+                    zone.local_to_utc(local)
+                        .filter(|instant| zone.utc_to_local(*instant) == Some(local))
+                        .and_then(|instant| i64::try_from(instant / nanos_per).ok())
+                        .ok_or_else(|| {
+                            let shown = array_value_to_string(array, row).unwrap_or_else(|_| v.to_string());
+                            DataFusionError::Execution(format!(
+                                "timestamp {shown} does not exist in time zone {zone} (the clocks skip it): \
+                                 written as INT96 it would read as another time"
+                            ))
+                        })
+                })
+                .transpose()
+        })
+        .collect::<Result<_>>()?;
+    let instants: ArrayRef = Arc::new(instants);
+    let instants = cast(&instants, &DataType::Timestamp(*stored, None))?;
+    if *stored == unit {
+        return Ok(instants);
+    }
+    let checked = CastOptions {
+        safe: false,
+        ..CastOptions::default()
+    };
+    Ok(cast_with_options(
+        &instants,
+        &DataType::Timestamp(unit, None),
+        &checked,
+    )?)
+}
+
 /// Whether values stored as `file` read as `table` without loss or invention.
 fn readable_as(file: &DataType, table: &DataType) -> bool {
     use DataType::{
@@ -306,6 +370,14 @@ impl PhysicalExprAdapterFactory for HiveColumns {
                 continue;
             };
             let read: Vec<Read> = match (stored.data_type(), field.data_type()) {
+                (DataType::Timestamp(..), DataType::Timestamp(to, _))
+                    if self.raw && !is_int96(stored.data_type()) =>
+                {
+                    self.zone
+                        .map(|zone| Read::Instant(zone, *to))
+                        .into_iter()
+                        .collect()
+                }
                 _ if self.raw => Vec::new(),
                 (DataType::Timestamp(from, _), DataType::Timestamp(to, zone)) => {
                     let local = self
@@ -340,7 +412,7 @@ impl PhysicalExprAdapterFactory for HiveColumns {
             fields.push(
                 if read
                     .iter()
-                    .any(|read| matches!(read, Read::Round(..) | Read::Local(..)))
+                    .any(|read| matches!(read, Read::Round(..) | Read::Local(..) | Read::Instant(..)))
                 {
                     spelled.with_data_type(stored.data_type().clone())
                 } else {
@@ -460,6 +532,56 @@ mod tests {
         ] {
             assert!(!readable_as(&file, &table), "{file} as {table}");
         }
+    }
+
+    #[test]
+    fn compaction_reads_wall_clock_times_as_instants_of_the_zone() {
+        use datafusion::arrow::array::{Array, TimestampMillisecondArray};
+        let zone: ParquetTimeZone = "America/Sao_Paulo".parse().unwrap();
+        // 2026-01-01 10:00:00.456 (UTC-3) and 1969-12-31 23:59:59.999 (UTC-3).
+        let wall: ArrayRef = Arc::new(TimestampMillisecondArray::from(vec![
+            Some(1_767_261_600_456),
+            None,
+            Some(-1),
+        ]));
+        let instants = instant_timestamps(&wall, zone, TimeUnit::Microsecond).unwrap();
+        assert_eq!(
+            instants.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        let micros = cast(&instants, &DataType::Int64).unwrap();
+        let micros = micros.as_primitive::<Int64Type>();
+        assert_eq!(micros.value(0), (1_767_261_600_456 + 3 * 3_600_000) * 1_000);
+        assert!(micros.is_null(1));
+        assert_eq!(micros.value(2), (-1 + 3 * 3_600_000) * 1_000);
+        // Reading them back in the zone gives the wall-clock times again.
+        let back = local_timestamps(&instants, zone, TimeUnit::Millisecond).unwrap();
+        assert_eq!(
+            cast(&back, &DataType::Int64)
+                .unwrap()
+                .as_primitive::<Int64Type>()
+                .values(),
+            cast(&wall, &DataType::Int64)
+                .unwrap()
+                .as_primitive::<Int64Type>()
+                .values()
+        );
+    }
+
+    #[test]
+    fn compaction_refuses_a_wall_clock_time_the_zone_skips() {
+        use datafusion::arrow::array::TimestampSecondArray;
+        let zone: ParquetTimeZone = "America/Sao_Paulo".parse().unwrap();
+        // 2018-11-04 00:30:00: the clocks jumped from 00:00 to 01:00.
+        let wall: ArrayRef = Arc::new(TimestampSecondArray::from(vec![1_541_291_400]));
+        let err = instant_timestamps(&wall, zone, TimeUnit::Microsecond)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("2018-11-04T00:30:00")
+                && err.contains("does not exist in time zone America/Sao_Paulo"),
+            "{err}"
+        );
     }
 
     #[test]
