@@ -96,6 +96,16 @@ config "$WORK/incomplete.json" '[{"name": "empty", "sql": "SELECT empty"}, {"nam
 expect_run "a result that never finished fails" 1 "$WORK/incomplete.json"
 expect_jq "incomplete results reported as errors" '.checks_total == 2 and ([.checks[] | .status == "error" and (.message | test("not FINISHED"))] | all)'
 
+config "$WORK/elsewhere.json" '[{"name": "elsewhere", "sql": "SELECT elsewhere"}]'
+expect_run "a nextUri to another host is not followed" 1 "$WORK/elsewhere.json"
+expect_jq "foreign nextUri reported" '.checks[0].status == "error" and (.checks[0].message | test("elsewhere.invalid.*not followed"))'
+
+# The password travels in curl's config syntax: quotes and backslashes must
+# arrive intact (the canonical text escapes the backslash).
+jq -n --arg url "$URL" '{user: "canary", http: {url: $url, password_env: "SELFTEST_PW"},
+  checks: [{name: "whoami", sql: "SELECT whoami", expect: {value: "canary:pa\"ss\\\\wo rd"}}]}' >"$WORK/auth.json"
+SELFTEST_PW='pa"ss\wo rd' expect_run "a password with quotes and backslashes is sent as written" 0 "$WORK/auth.json"
+
 # A stand-in psql: prints 1, or hangs like a statement that never answers.
 mkdir -p "$WORK/bin"
 cat >"$WORK/bin/psql" <<'EOF'

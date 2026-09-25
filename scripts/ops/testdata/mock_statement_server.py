@@ -10,6 +10,7 @@ query to <cancel-log>. A base path of /ref serves the "reference engine"
 variant (see `SELECT drift`).
 """
 
+import base64
 import json
 import sys
 import threading
@@ -80,10 +81,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(401, {"message": "missing user"})
         if sql == "SELECT empty":  # an empty 200 from something in the way
             return self.send_json(200, {})
+        if sql == "SELECT elsewhere":  # a nextUri that leaves the endpoint
+            return self.send_json(200, {"id": "q0", "stats": {"state": "QUEUED"},
+                                        "nextUri": "http://elsewhere.invalid/v1/statement/executing/q0/x/0"})
         with LOCK:
             COUNTER[0] += 1
             qid = f"q{COUNTER[0]}"
             QUERIES[qid] = answer(sql, reference) + (sql,)
+            if sql == "SELECT whoami":  # the Basic credentials, as received
+                auth = self.headers.get("Authorization", "")
+                user = base64.b64decode(auth[6:]).decode() if auth.startswith("Basic ") else ""
+                QUERIES[qid] = ([{"name": "u", "type": "varchar"}], [[[user]]], None, 0, sql)
         body = {"id": qid, "stats": {"state": "QUEUED"},
                 "nextUri": f"{self.base(reference)}/v1/statement/executing/{qid}/x/0"}
         self.send_json(200, body)

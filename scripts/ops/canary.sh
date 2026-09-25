@@ -262,11 +262,19 @@ fi
 curl_with_auth() {
   local pw_var="$1" user="$2"; shift 2
   if [ -n "$pw_var" ]; then
-    printf 'user = "%s:%s"\n' "$user" "${!pw_var}" | curl -K - "$@"
+    # Quoted string in curl's config syntax: escape backslashes, quotes and
+    # line breaks so any password reaches the server as written.
+    local cred="$user:${!pw_var}"
+    cred="${cred//\\/\\\\}"; cred="${cred//\"/\\\"}"
+    cred="${cred//$'\n'/\\n}"; cred="${cred//$'\r'/\\r}"; cred="${cred//$'\t'/\\t}"
+    printf 'user = "%s"\n' "$cred" | curl -K - "$@"
   else
     curl "$@" </dev/null
   fi
 }
+
+# scheme://authority of an http(s) URL, lower-cased.
+url_origin() { local rest="${1#*://}"; printf '%s://%s' "${1%%://*}" "${rest%%/*}" | tr '[:upper:]' '[:lower:]'; }
 
 # Runs $1 (SQL) against an HTTP endpoint. Writes one JSON array per row to $2.
 # Sets HTTP_ERROR on failure. Arguments: sql rows_file base_url user catalog
@@ -275,6 +283,8 @@ HTTP_ERROR=""
 http_query() {
   local sql="$1" rows="$2" base="$3" user="$4" catalog="$5" schema="$6" prefix="$7" pw_var="$8" timeout="$9"
   local body="$WORK/body.json" sqlfile="$WORK/statement.sql" code next deadline now left attempt
+  local base_origin next_origin
+  base_origin="$(url_origin "$base")"
   HTTP_ERROR=""
   : >"$rows"
   printf '%s' "$sql" >"$sqlfile"
@@ -310,6 +320,15 @@ http_query() {
       [ "$state" = FINISHED ] && return 0
       HTTP_ERROR="result ended without nextUri in state $(shorten "$state"), not FINISHED"; return 1
     fi
+    # Follow nextUri only to the configured endpoint, so the credentials never
+    # go to another host. The engine builds nextUri as http://<Host header>,
+    # so behind a TLS proxy only the scheme differs: keep the configured one.
+    next_origin="$(url_origin "$next")"
+    if [ "${next_origin#*://}" != "${base_origin#*://}" ]; then
+      HTTP_ERROR="nextUri points to $(shorten "$next_origin"), not the configured ${base_origin}; not followed"
+      return 1
+    fi
+    next="${base_origin%%://*}://${next#*://}"
     now="$(now_ms)"
     if [ "$now" -ge "$deadline" ]; then
       curl_with_auth "$pw_var" "$user" -sS -o /dev/null --max-time 10 -X DELETE "${headers[@]}" "$next" 2>/dev/null

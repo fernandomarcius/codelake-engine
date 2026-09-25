@@ -28,7 +28,7 @@ A JSON file; example: [docs/examples/canary.json](../examples/canary.json).
 |---|---|
 | `name` | label in every line and metric |
 | `user` | user sent with each query (default `canary`); give it its own name so its queries are easy to find |
-| `http.url`, `http.catalog`, `http.schema`, `http.time_zone` | client HTTP protocol endpoint and session |
+| `http.url`, `http.catalog`, `http.schema`, `http.time_zone` | client HTTP protocol endpoint and session. The canary follows `nextUri` only to this URL's host and port, always with this URL's scheme (behind a TLS proxy the engine answers `http://`); a proxy in front must pass the client's `Host` header through |
 | `http.password_env` | variable holding a password, once the engine authenticates (sent through curl's stdin, never on the command line) |
 | `http.header_prefix` | protocol header prefix (default the reference engine's) |
 | `pg.url` | `postgresql://user@host:port/db`, **without** password (use `PGPASSWORD` or a pgpass file; a URL with a password, as `user:pw@` or a `password=` parameter, is refused) |
