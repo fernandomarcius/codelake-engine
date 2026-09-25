@@ -52,7 +52,7 @@ use crate::overflow::decimal::{MAX_PRECISION, as_decimal};
 use crate::trino_types::Declared;
 
 /// Name of the identity that marks a value of a `VALUES` list.
-const VALUES_CELL: &str = "codelake_values_cell";
+pub(crate) const VALUES_CELL: &str = "codelake_values_cell";
 
 /// `codelake_values_cell(x)`: `x` (see the module documentation).
 #[derive(Debug, PartialEq, Eq, Hash)]

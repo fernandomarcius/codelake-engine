@@ -34,7 +34,7 @@ use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, TimeUnit};
 use datafusion::arrow::error::ArrowError;
 use datafusion::common::tree_node::Transformed;
-use datafusion::common::{DFSchema, Result, ScalarValue, exec_err, plan_err};
+use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue, exec_err, plan_err};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::logical_plan::dml::{DmlStatement, WriteOp};
 use datafusion::logical_expr::{
@@ -333,12 +333,26 @@ fn typed_call(expr: sql::Expr, declared: Declared) -> sql::Expr {
 
 /// `CAST(x AS varchar(n) | char(n) | timestamp(p))` → `codelake_trino_type`
 /// (see the module documentation). A `timestamp(p)` is first read with nine
-/// digits, then rounded.
-pub(crate) fn rewrite_declared_casts(statement: &mut DFStatement) {
+/// digits, then rounded. `TRY_CAST(x AS char(n))` fails (`NOT_SUPPORTED`):
+/// the engine would hold it as text, compared unpadded
+/// ([`crate::char_comparisons`]).
+pub(crate) fn rewrite_declared_casts(statement: &mut DFStatement) -> Result<()> {
     let DFStatement::Statement(inner) = statement else {
-        return;
+        return Ok(());
     };
-    let _ = visit_expressions_mut(inner.as_mut(), |expr| {
+    let flow = visit_expressions_mut(inner.as_mut(), |expr| {
+        if let sql::Expr::Cast {
+            kind: CastKind::TryCast | CastKind::SafeCast,
+            data_type,
+            ..
+        } = expr
+            && let Some(declared @ Declared::Char(_)) = declared_type(data_type)
+        {
+            return ControlFlow::Break(DataFusionError::NotImplemented(format!(
+                "TRY_CAST to {} is not supported yet: char values compare padded with spaces; use CAST",
+                declared.name(&DataType::Utf8)
+            )));
+        }
         if let sql::Expr::Cast {
             kind: CastKind::Cast | CastKind::DoubleColon,
             data_type,
@@ -358,8 +372,12 @@ pub(crate) fn rewrite_declared_casts(statement: &mut DFStatement) {
                 *expr = typed_call(*value, declared);
             }
         }
-        ControlFlow::<()>::Continue(())
+        ControlFlow::Continue(())
     });
+    match flow {
+        ControlFlow::Break(err) => Err(err),
+        ControlFlow::Continue(()) => Ok(()),
+    }
 }
 
 /// The declared types of the columns of a `CREATE TABLE` (`varchar(n)`,
@@ -654,7 +672,7 @@ mod tests {
         .unwrap()
         .pop_front()
         .unwrap();
-        rewrite_declared_casts(&mut statement);
+        rewrite_declared_casts(&mut statement).unwrap();
         assert_eq!(
             statement.to_string(),
             "SELECT codelake_trino_type(a, 'varchar(5)'), codelake_trino_type(b, 'char(3)'), CAST(c AS VARCHAR), \

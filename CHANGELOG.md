@@ -49,7 +49,8 @@ versioning: [SemVer](https://semver.org/).
   until the engine compares char values padded; `CAST(ch AS varchar)` compares text
   (ADR 0007, red-team W1-4). So do char values as join keys (`USING`, `NATURAL`,
   `INTERSECT`, `EXCEPT`), in a `UNION` (with or without `ALL`) and as arguments of
-  `nullif`, `greatest` and `least` (DEFECT-W1T-2).
+  `nullif`, `greatest` and `least` (DEFECT-W1T-2), and in a `VALUES` list that puts
+  them with other text; `TRY_CAST(x AS char(n))` fails with `NOT_SUPPORTED`.
 - **Breaking:** text compared with a number (`varchar_col > 9`, `x IN ('1.0')`) fails with
   `TYPE_MISMATCH` on the engine's client protocols, as on Trino; cast explicitly
   (ADR 0014). It answered rows before, through DataFusion's coercion.
@@ -73,6 +74,9 @@ versioning: [SemVer](https://semver.org/).
   nanoseconds cannot hold is an error naming it (ADR 0009).
 - `char(n)` comparisons above the hive scan (over `LIMIT`, a window, a volatile predicate)
   dropped rows the reference engine returns; they are refused (see Changed).
+- `TRY_CAST('ab' AS char(5)) = 'ab '` answered false and `VALUES ('ab '),
+  (CAST('ab' AS char(5)))` held two distinct values (the reference: true, one value):
+  the engine held the char value as unpadded text. Both are refused (see Changed).
 - Tables of the in-memory catalog (`CREATE TABLE datafusion.…`) kept their rows outside
   the memory pool; they are reserved in it for as long as the table exists. `UPDATE` and
   `DELETE` of such a table run when the plan executes (they changed the rows while

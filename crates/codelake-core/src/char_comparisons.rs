@@ -19,12 +19,18 @@
 //!   the engine holds unpadded), which a `DISTINCT`, a `GROUP BY` or the
 //!   `UNION` itself then compares;
 //! - the functions that compare their arguments (`nullif`, `greatest`,
-//!   `least`).
+//!   `least`);
+//! - a `VALUES` list that puts char values and other text in one column
+//!   (`VALUES ('ab '), (CAST('ab' AS char(5)))`), which a `DISTINCT` or a
+//!   `GROUP BY` then compares.
 //!
 //! The rule runs before type coercion, so every cast it sees is one the
 //! statement wrote. An operand is a char value when its field declares
-//! `char(n)` after its aliases are removed; an explicit `CAST(ch AS varchar)`
-//! is text, compared as text (the padded value), and is allowed, as are
+//! `char(n)` after its aliases are removed, or when it is a
+//! `CAST … AS char(n)` (planned as `codelake_trino_type`, which declares it;
+//! `TRY_CAST … AS char(n)` is refused before planning); an explicit
+//! `CAST(ch AS varchar)` is text, compared as text (the padded value), and
+//! is allowed, as are
 //! `IS [NOT] NULL`, `ORDER BY` and `GROUP BY`, which compare no char value
 //! with other text. Not seen: a char value passed through a function or an
 //! aggregate whose result does not declare the type (`max(ch)`,
@@ -33,11 +39,11 @@
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::common::{DFSchema, Result};
+use datafusion::common::{DFSchema, Result, ScalarValue};
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::expr::{
-    Alias, Between, Case, InList, InSubquery, Like, ScalarFunction, SetComparison,
+    Alias, Between, Case, Cast, InList, InSubquery, Like, ScalarFunction, SetComparison,
 };
 use datafusion::logical_expr::{BinaryExpr, Expr, ExprSchemable, LogicalPlan, Operator};
 use datafusion::optimizer::AnalyzerRule;
@@ -86,7 +92,8 @@ fn input_schema(node: &LogicalPlan) -> Arc<DFSchema> {
 }
 
 /// A char column `node` compares without a comparison expression: a join
-/// key, or a column of a `UNION`.
+/// key, a column of a `UNION`, or a column of a `VALUES` list that puts char
+/// values and other text together.
 fn compared_by_node(node: &LogicalPlan, schema: &DFSchema) -> Option<String> {
     match node {
         LogicalPlan::Join(join) => join
@@ -95,7 +102,40 @@ fn compared_by_node(node: &LogicalPlan, schema: &DFSchema) -> Option<String> {
             .flat_map(|(left, right)| [left, right])
             .find_map(|key| char_operand(key, schema)),
         LogicalPlan::Union(union) => union.inputs.iter().find_map(|input| char_column(input)),
+        LogicalPlan::Values(values) if values.values.len() > 1 => {
+            let empty = DFSchema::empty();
+            (0..values.schema.fields().len()).find_map(|index| {
+                let cells = values.values.iter().filter_map(|row| row.get(index));
+                let mut names = cells
+                    .filter(|cell| !is_null(cell))
+                    .map(|cell| char_operand(cell, &empty));
+                let first = names.next()?;
+                let mut mixed = None;
+                for name in names {
+                    if name.is_some() != first.is_some() {
+                        mixed = first.clone().or(name);
+                        break;
+                    }
+                }
+                mixed
+            })
+        }
         _ => None,
+    }
+}
+
+/// `NULL`, as a `VALUES` list holds it (marked, see `crate::coercion`, and
+/// cast to the column's type).
+fn is_null(cell: &Expr) -> bool {
+    match cell {
+        Expr::Literal(value, _) => value.is_null(),
+        Expr::Alias(Alias { expr, .. }) | Expr::Cast(Cast { expr, .. }) => is_null(expr),
+        Expr::ScalarFunction(ScalarFunction { func, args })
+            if func.name() == crate::coercion::VALUES_CELL =>
+        {
+            matches!(args.as_slice(), [only] if is_null(only))
+        }
+        _ => false,
     }
 }
 
@@ -199,11 +239,29 @@ fn char_operand(operand: &Expr, schema: &DFSchema) -> Option<String> {
     while let Expr::Alias(Alias { expr, .. }) = operand {
         operand = expr;
     }
+    if let Some(declared) = declared_cast(operand) {
+        return matches!(declared, Declared::Char(_)).then(|| operand.schema_name().to_string());
+    }
     if matches!(operand, Expr::Cast(_) | Expr::TryCast(_)) {
         return None;
     }
     let (_, field) = operand.to_field(schema).ok()?;
     matches!(declared(&field), Some(Declared::Char(_))).then(|| field.name().clone())
+}
+
+/// The type `codelake_trino_type(x, '<type>')` (a `CAST … AS char(n)`,
+/// `varchar(n)` or `timestamp(p)`) gives its value.
+fn declared_cast(expr: &Expr) -> Option<Declared> {
+    let Expr::ScalarFunction(ScalarFunction { func, args }) = expr else {
+        return None;
+    };
+    if func.name() != crate::declared::TRINO_TYPED {
+        return None;
+    }
+    match args.get(1)? {
+        Expr::Literal(ScalarValue::Utf8(Some(name)), _) => Declared::parse(name),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -312,6 +370,67 @@ mod tests {
             "SELECT nullif(CAST(ch AS varchar), 'ab   ') FROM t",
         ] {
             assert_eq!(error(&ctx, sql).await, None, "{sql}");
+        }
+    }
+
+    /// `sql` through the engine (its statement rewrites, `CAST … AS char(n)`
+    /// included): the rows as text, or the error.
+    async fn through_engine(sql: &str) -> Result<String, String> {
+        use crate::bytes::ByteSize;
+        use crate::config::{ExecutionConfig, MemoryConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let memory = MemoryConfig {
+            limit: ByteSize::mib(64),
+            spill_dir: dir.path().to_owned(),
+            spill_limit: ByteSize::mib(64),
+            metadata_cache_limit: ByteSize::mib(1),
+        };
+        let engine = crate::engine::Engine::new(&memory, &ExecutionConfig::default()).unwrap();
+        let frame = engine.sql(sql).await.map_err(|e| e.to_string())?;
+        let batches = frame.collect().await.map_err(|e| e.to_string())?;
+        Ok(datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+            .map_err(|e| e.to_string())?
+            .to_string())
+    }
+
+    #[tokio::test]
+    async fn char_casts_are_char_values() {
+        for sql in [
+            "SELECT count(*) FROM (SELECT 'ab ' UNION SELECT CAST('ab' AS char(5)))",
+            "SELECT CAST('ab' AS char(5)) = 'ab '",
+            "SELECT 'ab ' = CAST('ab' AS char(5))",
+            "SELECT count(*) FROM (VALUES ('ab '), (CAST('ab' AS char(5))))",
+            "SELECT count(DISTINCT x) FROM (VALUES ('ab '), (CAST('ab' AS char(5)))) AS t(x)",
+        ] {
+            let err = through_engine(sql).await.unwrap_err();
+            assert!(
+                err.contains("comparing the char column ") && err.contains(" is not supported yet"),
+                "{sql}: {err}"
+            );
+        }
+        for sql in [
+            "SELECT TRY_CAST('ab' AS char(5)) = 'ab '",
+            "SELECT count(*) FROM (SELECT 'ab ' UNION SELECT TRY_CAST('ab' AS char(5)))",
+        ] {
+            let err = through_engine(sql).await.unwrap_err();
+            assert!(
+                err.contains("TRY_CAST to char(5) is not supported yet"),
+                "{sql}: {err}"
+            );
+        }
+        for (sql, rows) in [
+            ("SELECT count(*) AS n FROM (VALUES ('ab '), ('ab'))", "2"),
+            (
+                "SELECT count(*) AS n FROM (VALUES (CAST('ab' AS char(5))), (CAST('cd' AS char(5))))",
+                "2",
+            ),
+            (
+                "SELECT count(*) AS n FROM (VALUES (CAST('ab' AS char(5))), (NULL))",
+                "2",
+            ),
+        ] {
+            let answer = through_engine(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(answer, format!("+---+\n| n |\n+---+\n| {rows} |\n+---+"), "{sql}");
         }
     }
 }

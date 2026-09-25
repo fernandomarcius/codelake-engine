@@ -2204,6 +2204,16 @@ async fn w1t_char_values_compared_outside_predicates_like_trino_431() {
             "CH8",
             "SELECT id FROM hive.s.cht WHERE ch = ANY (SELECT ch FROM hive.s.vct) ORDER BY 1",
         ),
+        (
+            "CH9",
+            "SELECT count(*) FROM (SELECT 'ab ' UNION SELECT CAST('ab' AS char(5)))",
+        ),
+        ("CH10", "SELECT CAST('ab' AS char(5)) = 'ab '"),
+        (
+            "CH11",
+            "SELECT count(DISTINCT x) FROM (VALUES ('ab '), (CAST('ab' AS char(5)))) AS t(x)",
+        ),
+        ("CH12", "SELECT TRY_CAST('ab' AS char(5)) = 'ab '"),
     ] {
         let (codelake, trino) = (cl_try(&s.engine, q).await, s.trino.sql(q).await);
         same_or_refused(&mut checks, id, q, &codelake, &trino);
