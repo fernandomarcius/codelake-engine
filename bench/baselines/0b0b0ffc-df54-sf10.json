@@ -1,0 +1,1002 @@
+{
+  "schema_version": 1,
+  "commit": "0b0b0ffcaa14-dirty",
+  "date": "2026-09-25",
+  "comparable": {
+    "scale": "10",
+    "cpus": "8",
+    "memory_mib": "8192",
+    "reps": 5,
+    "warmup": 1
+  },
+  "env": {
+    "cpus": "8",
+    "memory_mib": "8192",
+    "host_cpu": "Apple M5 Pro",
+    "host_os": "Darwin 25.6.0 arm64",
+    "docker": "server 29.4.0, OrbStack, kernel 7.0.14-orbstack-00380-ga7e0a2dc9535, 18 CPUs, 12597719040 bytes, cgroup v2",
+    "other_containers_running": "32, not ours",
+    "other_containers_cpu_before_phase": "trino: 143%;codelake-pg: 107%;codelake-embedded: 108%; (100% = one core; VM has 18 CPUs)",
+    "trino": "trinodb/trino:431 (trinodb/trino@sha256:0fcd9b75aecd77967d6c27be6a538178c19e1978dde8c697fb1805254e3ccef3), JVM: -XX:InitialRAMPercentage=80 -XX:MaxRAMPercentage=80 , config: image defaults + bench/trino/catalog",
+    "codelake": "codelake 0.1.0, release profile (CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_LTO=off), runtime codelake-dev:local, memory.limit 6144MiB, target_partitions 8",
+    "dataset_generation": "15 s with 8 CPUs, 8192 MiB (Trino 431 CTAS; existing tables only re-counted)",
+    "engine_container_deaths": "none",
+    "case_repetition_overrides": "none",
+    "statement_timeout_secs": "1800",
+    "codelake_protocols": "reads over PostgreSQL wire; writes embedded (PG wire does not route DDL to hive yet)",
+    "dataset": "TPC-H scale 10 from Trino 431 tpch connector, Parquet via Hive file metastore, money as decimal(15,2): {\"scale\":\"10\",\"schema\":\"tpch_sf10\",\"rows\":{\"customer\":1500000,\"lineitem\":59986052,\"nation\":25,\"orders\":15000000,\"part\":2000000,\"partsupp\":8000000,\"region\":5,\"supplier\":100000}}"
+  },
+  "process": {
+    "codelake": {
+      "ready_ms": 664,
+      "idle_anon_bytes": 10903552,
+      "container_peak_bytes": 3876188160
+    },
+    "trino": {
+      "ready_ms": 8461,
+      "idle_anon_bytes": 1181564928,
+      "container_peak_bytes": 8589934592
+    }
+  },
+  "cases": [
+    {
+      "id": "tpch_q01",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 2122491,
+        "p95_us": 2137540,
+        "cpu_usec_p50": 11873419,
+        "peak_anon_bytes": 370106368,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 1442731,
+        "p95_us": 1601225,
+        "cpu_usec_p50": 10278266,
+        "peak_anon_bytes": 6861144064,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q02",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 446585,
+        "p95_us": 486194,
+        "cpu_usec_p50": 1579140,
+        "peak_anon_bytes": 177446912,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 1054657,
+        "p95_us": 1128466,
+        "cpu_usec_p50": 5737353,
+        "peak_anon_bytes": 7091433472,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q03",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 1045349,
+        "p95_us": 1070100,
+        "cpu_usec_p50": 5330774,
+        "peak_anon_bytes": 396566528,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 1376858,
+        "p95_us": 2079736,
+        "cpu_usec_p50": 9600170,
+        "peak_anon_bytes": 7629824000,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q04",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 516235,
+        "p95_us": 521579,
+        "cpu_usec_p50": 2585919,
+        "peak_anon_bytes": 221143040,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 1289050,
+        "p95_us": 1790540,
+        "cpu_usec_p50": 9430032,
+        "peak_anon_bytes": 7842607104,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q05",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 1250875,
+        "p95_us": 1288275,
+        "cpu_usec_p50": 6626580,
+        "peak_anon_bytes": 521183232,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 2352920,
+        "p95_us": 3156234,
+        "cpu_usec_p50": 15504361,
+        "peak_anon_bytes": 7838498816,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q06",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 678718,
+        "p95_us": 687898,
+        "cpu_usec_p50": 3636648,
+        "peak_anon_bytes": 332472320,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 1036101,
+        "p95_us": 1346864,
+        "cpu_usec_p50": 7637934,
+        "peak_anon_bytes": 7842967552,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q07",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 1455516,
+        "p95_us": 1501762,
+        "cpu_usec_p50": 8836656,
+        "peak_anon_bytes": 1352888320,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 2832465,
+        "p95_us": 2926322,
+        "cpu_usec_p50": 17529772,
+        "peak_anon_bytes": 7849660416,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q08",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 1453859,
+        "p95_us": 1475463,
+        "cpu_usec_p50": 7470761,
+        "peak_anon_bytes": 817512448,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 3760636,
+        "p95_us": 4434003,
+        "cpu_usec_p50": 25216244,
+        "peak_anon_bytes": 7853498368,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q09",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 2164138,
+        "p95_us": 2215227,
+        "cpu_usec_p50": 11662817,
+        "peak_anon_bytes": 1893048320,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 4302891,
+        "p95_us": 6571128,
+        "cpu_usec_p50": 31360048,
+        "peak_anon_bytes": 7860531200,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q10",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 1557429,
+        "p95_us": 1595401,
+        "cpu_usec_p50": 6170795,
+        "peak_anon_bytes": 507555840,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 2699477,
+        "p95_us": 3803671,
+        "cpu_usec_p50": 12614845,
+        "peak_anon_bytes": 7864324096,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q11",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 316289,
+        "p95_us": 329912,
+        "cpu_usec_p50": 1364408,
+        "peak_anon_bytes": 149368832,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 870659,
+        "p95_us": 972606,
+        "cpu_usec_p50": 4568585,
+        "peak_anon_bytes": 7864389632,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q12",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 971229,
+        "p95_us": 1009395,
+        "cpu_usec_p50": 5011899,
+        "peak_anon_bytes": 1149808640,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 2350422,
+        "p95_us": 3631530,
+        "cpu_usec_p50": 16633731,
+        "peak_anon_bytes": 7868350464,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q13",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 917093,
+        "p95_us": 947346,
+        "cpu_usec_p50": 4383234,
+        "peak_anon_bytes": 428572672,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 1994660,
+        "p95_us": 2207165,
+        "cpu_usec_p50": 13670567,
+        "peak_anon_bytes": 7872376832,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q14",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 788328,
+        "p95_us": 803255,
+        "cpu_usec_p50": 3881955,
+        "peak_anon_bytes": 435572736,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 1021537,
+        "p95_us": 1795718,
+        "cpu_usec_p50": 6336018,
+        "peak_anon_bytes": 7873515520,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q15",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 1116968,
+        "p95_us": 1140839,
+        "cpu_usec_p50": 5850224,
+        "peak_anon_bytes": 413483008,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 2529854,
+        "p95_us": 2981321,
+        "cpu_usec_p50": 17172467,
+        "peak_anon_bytes": 7876345856,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q16",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 342223,
+        "p95_us": 350940,
+        "cpu_usec_p50": 736229,
+        "peak_anon_bytes": 321433600,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 826129,
+        "p95_us": 894329,
+        "cpu_usec_p50": 4512775,
+        "peak_anon_bytes": 7877902336,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q17",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 2064891,
+        "p95_us": 2077961,
+        "cpu_usec_p50": 11858047,
+        "peak_anon_bytes": 432476160,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 3557249,
+        "p95_us": 4644037,
+        "cpu_usec_p50": 25063292,
+        "peak_anon_bytes": 7884406784,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q18",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": [
+          "column name: trino=`_col5` codelake=`sum(hive.tpch_sf10.lineitem.l_quantity)`"
+        ]
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 2234592,
+        "p95_us": 2254682,
+        "cpu_usec_p50": 14255117,
+        "peak_anon_bytes": 1940148224,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 3987481,
+        "p95_us": 4455486,
+        "cpu_usec_p50": 24725466,
+        "peak_anon_bytes": 7885070336,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q19",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 1539017,
+        "p95_us": 1599893,
+        "cpu_usec_p50": 7933922,
+        "peak_anon_bytes": 455393280,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 2101383,
+        "p95_us": 2740636,
+        "cpu_usec_p50": 15150652,
+        "peak_anon_bytes": 7885422592,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q20",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 918644,
+        "p95_us": 933353,
+        "cpu_usec_p50": 4443793,
+        "peak_anon_bytes": 745320448,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 2685032,
+        "p95_us": 4462917,
+        "cpu_usec_p50": 18425942,
+        "peak_anon_bytes": 7889051648,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q21",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 1994678,
+        "p95_us": 2022399,
+        "cpu_usec_p50": 11584996,
+        "peak_anon_bytes": 530886656,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 5740007,
+        "p95_us": 6651246,
+        "cpu_usec_p50": 33690257,
+        "peak_anon_bytes": 7896616960,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "tpch_q22",
+      "workload": "tpch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 5,
+        "p50_us": 385084,
+        "p95_us": 403214,
+        "cpu_usec_p50": 916484,
+        "peak_anon_bytes": 126574592,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 5,
+        "p50_us": 809108,
+        "p95_us": 999186,
+        "cpu_usec_p50": 4516525,
+        "peak_anon_bytes": 7894941696,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "mb_orders_window_agg",
+      "workload": "microbatch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 30,
+        "p50_us": 127690,
+        "p95_us": 146426,
+        "cpu_usec_p50": 215275,
+        "peak_anon_bytes": 110317568,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 30,
+        "p50_us": 112905,
+        "p95_us": 179790,
+        "cpu_usec_p50": 232036,
+        "peak_anon_bytes": 7899168768,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "mb_lineitem_window_rows",
+      "workload": "microbatch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 30,
+        "p50_us": 262589,
+        "p95_us": 296136,
+        "cpu_usec_p50": 1688781,
+        "peak_anon_bytes": 369459200,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 30,
+        "p50_us": 144755,
+        "p95_us": 252956,
+        "cpu_usec_p50": 547964,
+        "peak_anon_bytes": 7904268288,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "mb_point_lookup",
+      "workload": "microbatch",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 30,
+        "p50_us": 217218,
+        "p95_us": 227189,
+        "cpu_usec_p50": 365520,
+        "peak_anon_bytes": 144416768,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 30,
+        "p50_us": 129365,
+        "p95_us": 202707,
+        "cpu_usec_p50": 236073,
+        "peak_anon_bytes": 7911665664,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "meta_schemata",
+      "workload": "metadata",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 10,
+        "p50_us": 579,
+        "p95_us": 1449,
+        "cpu_usec_p50": 601,
+        "peak_anon_bytes": 44191744,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 10,
+        "p50_us": 189581,
+        "p95_us": 248200,
+        "cpu_usec_p50": 260325,
+        "peak_anon_bytes": 7911804928,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "meta_tables",
+      "workload": "metadata",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 10,
+        "p50_us": 1415,
+        "p95_us": 1948,
+        "cpu_usec_p50": 1364,
+        "peak_anon_bytes": 44871680,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 10,
+        "p50_us": 24828,
+        "p95_us": 55685,
+        "cpu_usec_p50": 63986,
+        "peak_anon_bytes": 7912980480,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "meta_columns",
+      "workload": "metadata",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 10,
+        "p50_us": 1620,
+        "p95_us": 2434,
+        "cpu_usec_p50": 1635,
+        "peak_anon_bytes": 45207552,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 10,
+        "p50_us": 31068,
+        "p95_us": 57503,
+        "cpu_usec_p50": 57693,
+        "peak_anon_bytes": 7913639936,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "meta_column_types",
+      "workload": "metadata",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "pg-wire",
+        "reps": 10,
+        "p50_us": 1676,
+        "p95_us": 3965,
+        "cpu_usec_p50": 1565,
+        "peak_anon_bytes": 45400064,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 10,
+        "p50_us": 30164,
+        "p95_us": 56293,
+        "cpu_usec_p50": 65549,
+        "peak_anon_bytes": 7914946560,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "ctas_lineitem",
+      "workload": "pipeline",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "embedded",
+        "reps": 3,
+        "p50_us": 29795986,
+        "p95_us": 29993776,
+        "cpu_usec_p50": 49251098,
+        "peak_anon_bytes": 2030817280,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 3,
+        "p50_us": 120416955,
+        "p95_us": 124180483,
+        "cpu_usec_p50": 318860407,
+        "peak_anon_bytes": 7930621952,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "ctas_revenue_mart",
+      "workload": "pipeline",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "embedded",
+        "reps": 3,
+        "p50_us": 1634203,
+        "p95_us": 1760656,
+        "cpu_usec_p50": 10590374,
+        "peak_anon_bytes": 2426204160,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 3,
+        "p50_us": 3350554,
+        "p95_us": 3812654,
+        "cpu_usec_p50": 22423163,
+        "peak_anon_bytes": 7933124608,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "insert_incremental",
+      "workload": "pipeline",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "embedded",
+        "reps": 10,
+        "p50_us": 858938,
+        "p95_us": 920173,
+        "cpu_usec_p50": 3884664,
+        "peak_anon_bytes": 2053406720,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 10,
+        "p50_us": 2330367,
+        "p95_us": 2817406,
+        "cpu_usec_p50": 6368470,
+        "peak_anon_bytes": 7939043328,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    },
+    {
+      "id": "insert_microbatch",
+      "workload": "pipeline",
+      "correctness": {
+        "status": "OK",
+        "divergences": [],
+        "notes": []
+      },
+      "codelake": {
+        "driver": "embedded",
+        "reps": 30,
+        "p50_us": 738668,
+        "p95_us": 774830,
+        "cpu_usec_p50": 1244380,
+        "peak_anon_bytes": 1977741312,
+        "spill_peak_bytes": 0,
+        "error": null
+      },
+      "trino": {
+        "driver": "trino-http",
+        "reps": 30,
+        "p50_us": 94688,
+        "p95_us": 110271,
+        "cpu_usec_p50": 167462,
+        "peak_anon_bytes": 7941521408,
+        "spill_peak_bytes": null,
+        "error": null
+      }
+    }
+  ]
+}
