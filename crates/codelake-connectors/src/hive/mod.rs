@@ -5,6 +5,7 @@
 mod catalog;
 mod columns;
 mod crc;
+mod exact_timestamps;
 #[cfg(test)]
 mod f2_tests;
 mod metastore;

@@ -19,7 +19,9 @@
 //! `DataFusion`'s default adapter matches names exactly and casts whatever
 //! Arrow can cast. This one renames the table's columns to the file's
 //! spelling, checks the types, then hands over to the default adapter.
-//! A `raw` adapter (compaction) keeps stored values as they are.
+//! A `raw` adapter (compaction) keeps stored values as they are. A
+//! `nanos_only` adapter reads only the timestamps a file stores in
+//! nanoseconds, every other column as NULL (see `exact_timestamps.rs`).
 
 use std::fmt;
 use std::sync::Arc;
@@ -27,11 +29,12 @@ use std::sync::Arc;
 use datafusion::arrow::array::{AsArray, RecordBatch, StringArray};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef, TimeUnit};
+use datafusion::common::ScalarValue;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::expressions::{Column, Literal};
 
 use super::table::{finer, round_timestamps};
 use super::types::{char_column, declared_length};
@@ -45,6 +48,9 @@ pub(crate) struct HiveColumns {
     pub(crate) table: String,
     /// Stored values as they are: no rounding, no `varchar(n)` cut.
     pub(crate) raw: bool,
+    /// Only columns the file stores as nanosecond timestamps (`INT96` read
+    /// in nanoseconds included); any other column reads as NULL.
+    pub(crate) nanos_only: bool,
 }
 
 /// How a column's stored values become the table's.
@@ -203,6 +209,7 @@ impl PhysicalExprAdapterFactory for HiveColumns {
         let mut fields: Vec<Field> = Vec::with_capacity(logical_file_schema.fields().len());
         let mut refused = Vec::with_capacity(logical_file_schema.fields().len());
         let mut reads = Vec::with_capacity(logical_file_schema.fields().len());
+        let mut nulls = Vec::with_capacity(logical_file_schema.fields().len());
         for field in logical_file_schema.fields() {
             let stored = if let Ok(index) = physical_file_schema.index_of(field.name()) {
                 Some(index)
@@ -217,21 +224,28 @@ impl PhysicalExprAdapterFactory for HiveColumns {
                     _ => None,
                 }
             };
-            let Some(index) = stored else {
+            let stored = stored.map(|index| physical_file_schema.field(index));
+            let skipped = self.nanos_only
+                && !stored
+                    .is_some_and(|f| matches!(f.data_type(), DataType::Timestamp(TimeUnit::Nanosecond, _)));
+            nulls.push(skipped);
+            let Some(stored) = stored.filter(|_| !skipped) else {
                 fields.push(field.as_ref().clone());
                 refused.push(None);
-                reads.push(None);
+                reads.push(Vec::new());
                 continue;
             };
-            let stored = physical_file_schema.field(index);
-            let read = match (stored.data_type(), field.data_type()) {
-                _ if self.raw => None,
-                (DataType::Timestamp(from, _), DataType::Timestamp(to, zone)) if finer(*from, *to) => {
-                    Some(Read::Round(*to, zone.clone()))
-                }
+            let read: Vec<Read> = match (stored.data_type(), field.data_type()) {
+                _ if self.raw => Vec::new(),
+                (DataType::Timestamp(from, _), DataType::Timestamp(to, zone)) => finer(*from, *to)
+                    .then(|| Read::Round(*to, zone.clone()))
+                    .into_iter()
+                    .collect(),
                 _ => declared_length(field)
                     .map(Read::Cut)
-                    .or_else(|| char_column(field).map(Read::Pad)),
+                    .or_else(|| char_column(field).map(Read::Pad))
+                    .into_iter()
+                    .collect(),
             };
             // Refused only if the query reads the column, as in Trino.
             refused.push((!readable_as(stored.data_type(), field.data_type())).then(|| {
@@ -244,12 +258,13 @@ impl PhysicalExprAdapterFactory for HiveColumns {
                     field.data_type()
                 )
             }));
-            // A rounded column reaches the adapter below in its stored type,
-            // so it does not cast (cut) it first.
+            // A rounded column reaches the adapter below in its
+            // stored type, so it does not cast (cut) it first.
             let spelled = field.as_ref().clone().with_name(stored.name());
-            fields.push(match read {
-                Some(Read::Round(..)) => spelled.with_data_type(stored.data_type().clone()),
-                _ => spelled,
+            fields.push(if read.iter().any(|read| matches!(read, Read::Round(..))) {
+                spelled.with_data_type(stored.data_type().clone())
+            } else {
+                spelled
             });
             reads.push(read);
         }
@@ -260,6 +275,7 @@ impl PhysicalExprAdapterFactory for HiveColumns {
         Ok(Arc::new(HiveColumnAdapter {
             refused,
             reads,
+            nulls,
             logical: logical_file_schema,
             renamed: Arc::clone(&renamed),
             inner: DefaultPhysicalExprAdapter::new(renamed, physical_file_schema),
@@ -271,8 +287,10 @@ impl PhysicalExprAdapterFactory for HiveColumns {
 struct HiveColumnAdapter {
     /// Why each table column cannot be read from this file, if it cannot.
     refused: Vec<Option<String>>,
-    /// How each table column's stored values become the table's.
-    reads: Vec<Option<Read>>,
+    /// How each table column's stored values become the table's, in order.
+    reads: Vec<Vec<Read>>,
+    /// Columns read as NULL whatever the file holds (`nanos_only`).
+    nulls: Vec<bool>,
     /// The table's columns (what expressions refer to).
     logical: SchemaRef,
     /// The same columns, spelled as in the file.
@@ -296,21 +314,25 @@ impl PhysicalExprAdapter for HiveColumnAdapter {
                 if logical.name() != column.name() {
                     return Ok(Transformed::no(expr));
                 }
+                if self.nulls.get(index).copied().unwrap_or(false) {
+                    let null = ScalarValue::try_from(logical.data_type())?;
+                    return Ok(Transformed::yes(
+                        Arc::new(Literal::new(null)) as Arc<dyn PhysicalExpr>
+                    ));
+                }
                 if let Some(Some(reason)) = self.refused.get(index) {
                     return Err(DataFusionError::Execution(reason.clone()));
                 }
-                let read = self.reads.get(index).cloned().flatten();
-                if renamed.name() == column.name() && read.is_none() {
+                let reads = self.reads.get(index).cloned().unwrap_or_default();
+                if renamed.name() == column.name() && reads.is_empty() {
                     return Ok(Transformed::no(expr));
                 }
                 let respelled: Arc<dyn PhysicalExpr> = Arc::new(Column::new(renamed.name(), index));
-                Ok(Transformed::yes(match read {
-                    Some(read) => Arc::new(HiveRead {
-                        child: respelled,
-                        read,
+                Ok(Transformed::yes(
+                    reads.into_iter().fold(respelled, |child, read| {
+                        Arc::new(HiveRead { child, read }) as Arc<dyn PhysicalExpr>
                     }),
-                    None => respelled,
-                }))
+                ))
             })
             .data()?;
         self.inner.rewrite(respelled)
@@ -382,6 +404,7 @@ mod tests {
         let factory = HiveColumns {
             table: "s.t".into(),
             raw: false,
+            nanos_only: false,
         };
         let adapter = factory.create(Arc::clone(&table), Arc::clone(&file)).unwrap();
         let nome: Arc<dyn PhysicalExpr> = Arc::new(Column::new("nome", 1));

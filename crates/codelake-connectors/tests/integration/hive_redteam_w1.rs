@@ -456,7 +456,6 @@ async fn w1_or_replace_never_deletes_a_foreign_directory() {
 /// timestamps outside 1677–2262, which Trino writes and reads: `CodeLake`
 /// must read the value or fail, never answer another instant.
 #[tokio::test]
-#[ignore = "DEFECT-W1-2: a NANOSECONDS catalog reads INT96 timestamps outside 1677-2262 as other instants (silent overflow)"]
 async fn w1_nanosecond_catalog_never_reads_a_wrong_instant() {
     let l = Local::new().await;
     cl(&l.engine, "CREATE SCHEMA hive.s").await;
@@ -490,10 +489,58 @@ async fn w1_nanosecond_catalog_never_reads_a_wrong_instant() {
     }
 }
 
+/// A NANOSECONDS catalog reads a table two ways and pairs the reads row by
+/// row (`exact_timestamps.rs`): over many files of unequal sizes, each row
+/// must keep its own timestamp, whichever partition reads its file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w1_nanosecond_catalog_pairs_rows_of_many_files() {
+    let l = Local::new().await;
+    cl(&l.engine, "CREATE SCHEMA hive.s").await;
+    cl(
+        &l.engine,
+        "CREATE TABLE hive.s.many AS SELECT CAST(0 AS BIGINT) AS id, TIMESTAMP '2026-01-01 00:00:00.000' AS ts",
+    )
+    .await;
+    let mut next = 1;
+    for file in 1..=12_i64 {
+        let rows = file * file * 500;
+        cl(
+            &l.engine,
+            &format!(
+                "INSERT INTO hive.s.many SELECT CAST(value AS BIGINT), \
+                 date_add('millisecond', CAST(value AS BIGINT), TIMESTAMP '2026-01-01 00:00:00.000') \
+                 FROM generate_series({next}, {}) ",
+                next + rows - 1
+            ),
+        )
+        .await;
+        next += rows;
+    }
+    let nanos = engine_at(
+        &l.warehouse,
+        l.spill.path(),
+        ByteSize::mib(256),
+        HiveTimestampPrecision::Nanoseconds,
+    )
+    .await;
+    let q = "SELECT count(*), \
+             count(*) FILTER (WHERE ts <> date_add('millisecond', id, TIMESTAMP '2026-01-01 00:00:00.000')) \
+             FROM hive.s.many";
+    let millis = cl_try(&l.engine, q).await;
+    let got = cl_try(&nanos, q).await;
+    note(
+        "w1_nanosecond_many_files",
+        "MILLISECONDS / NANOSECONDS",
+        (&millis, &got),
+    );
+    let expected = Ok(rows(&[&[&next.to_string(), "0"]]));
+    assert_eq!(millis, expected);
+    assert_eq!(got, expected);
+}
+
 /// `OPTIMIZE` in a NANOSECONDS catalog must not rewrite those rows as other
 /// instants: the MILLISECONDS catalog reads what it wrote.
 #[tokio::test]
-#[ignore = "DEFECT-W1-3: OPTIMIZE in a NANOSECONDS catalog rewrites INT96 timestamps outside 1677-2262 as other instants"]
 async fn w1_nanosecond_optimize_never_rewrites_other_instants() {
     let l = Local::new().await;
     cl(&l.engine, "CREATE SCHEMA hive.s").await;
@@ -1531,7 +1578,6 @@ async fn w1_trino_reads_every_operation_and_optimize() {
 /// Nanoseconds Trino wrote (NANOSECONDS catalog), compacted by a default
 /// `CodeLake` catalog: the NANOSECONDS reader must see the same values.
 #[tokio::test]
-#[ignore = "DEFECT-W1-7: OPTIMIZE rounds nanosecond timestamps written by a Trino NANOSECONDS catalog to microseconds"]
 async fn w1_optimize_keeps_the_nanoseconds_trino_wrote() {
     let s = Shared::new("codelake-w1-trino-ns").await;
     let mut checks = Checks::new("w1_optimize_keeps_nanoseconds");

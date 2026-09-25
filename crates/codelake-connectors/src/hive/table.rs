@@ -33,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use codelake_core::trace::{self, TARGET, field};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, Int64Array, StringArray};
-use datafusion::arrow::compute::cast;
+use datafusion::arrow::compute::{CastOptions, cast, cast_with_options};
 use datafusion::arrow::datatypes::{DataType, Int64Type, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
@@ -60,6 +60,7 @@ use tracing::{Instrument, Span};
 
 use super::catalog::refuse_unsupported;
 use super::columns::HiveColumns;
+use super::exact_timestamps;
 use super::metastore::{ColumnMetadata, FileMetastore, TableMetadata};
 use super::optimize::MARKER;
 use super::statistics::{MetastoreStatistics, scan_statistics};
@@ -174,7 +175,9 @@ fn fit_char(array: &ArrayRef, length: usize) -> Result<ArrayRef> {
 
 /// `batch` in the table's column types, as an `INSERT` or CTAS stores it:
 /// timestamps rounded to the column's precision, `varchar(n)` and `char(n)`
-/// checked.
+/// checked. A value the column type cannot hold (an instant outside
+/// 1677–2262 in a NANOSECONDS catalog) fails the statement: Arrow's default
+/// cast would store NULL instead.
 pub(crate) fn conform_for_write(schema: &SchemaRef, batch: &RecordBatch) -> Result<RecordBatch> {
     let columns = batch
         .columns()
@@ -188,7 +191,11 @@ pub(crate) fn conform_for_write(schema: &SchemaRef, batch: &RecordBatch) -> Resu
                 let cast = if column.data_type() == field.data_type() {
                     Arc::clone(column)
                 } else {
-                    cast(column, field.data_type())?
+                    let checked = CastOptions {
+                        safe: false,
+                        ..CastOptions::default()
+                    };
+                    cast_with_options(column, field.data_type(), &checked)?
                 };
                 match (declared_length(field), char_column(field)) {
                     (Some(length), _) => fit_varchar(&cast, length),
@@ -273,6 +280,19 @@ fn is_data_file(dir: &Path, meta: &ObjectMeta) -> bool {
 
 pub(crate) fn external(err: impl std::error::Error + Send + Sync + 'static) -> DataFusionError {
     DataFusionError::External(Box::new(err))
+}
+
+/// How a scan reads the stored values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reading {
+    /// As the table shows them: timestamps rounded half up to the table's
+    /// units, `varchar(n)` values cut, `char(n)` values padded.
+    Table,
+    /// As they are stored (compaction must not change them).
+    Raw,
+    /// Only the timestamps a file stores in nanoseconds, as stored; any
+    /// other column reads as NULL (see `exact_timestamps.rs`).
+    NanosOnly,
 }
 
 #[derive(Debug, Clone)]
@@ -412,7 +432,7 @@ impl HiveTable {
         self.scan_config(
             runtime,
             Arc::clone(&self.schema),
-            false,
+            Reading::Table,
             groups,
             projection,
             limit,
@@ -420,19 +440,23 @@ impl HiveTable {
     }
 
     /// [`HiveTable::scan_files`] into `schema` (the table's columns, possibly
-    /// at another timestamp precision). `raw` reads the stored values as they
-    /// are (compaction must not change them): no rounding below the schema's
-    /// units and no `varchar(n)` cut.
+    /// at another timestamp precision), reading the stored values as
+    /// `reading` says. Each partition reads the files of its group, in order:
+    /// `exact_timestamps.rs` pairs two such scans of the same files row by
+    /// row, which `DataFusion`'s default (idle partitions take files queued
+    /// for their siblings) would pair with rows of other files.
     pub(crate) fn scan_files_as(
         &self,
         runtime: &RuntimeEnv,
         schema: SchemaRef,
-        raw: bool,
+        reading: Reading,
         groups: Vec<Vec<PartitionedFile>>,
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let config = self.scan_config(runtime, schema, raw, groups, projection, limit)?;
+        let config = self
+            .scan_config(runtime, schema, reading, groups, projection, limit)?
+            .with_preserve_order(true);
         Ok(DataSourceExec::from_data_source(config.build()))
     }
 
@@ -442,7 +466,7 @@ impl HiveTable {
         &self,
         runtime: &RuntimeEnv,
         schema: SchemaRef,
-        raw: bool,
+        reading: Reading,
         groups: Vec<Vec<PartitionedFile>>,
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
@@ -452,6 +476,8 @@ impl HiveTable {
         }
         // `INT96` is decoded in one unit for the whole file: never coarser
         // than microseconds, so a finer value is rounded (below), not cut.
+        // In nanoseconds, a value outside 1677–2262 wraps into another
+        // instant: see `exact_timestamps.rs` for how those are read.
         let finest = schema
             .fields()
             .iter()
@@ -469,7 +495,8 @@ impl HiveTable {
         let source = ParquetSource::new(schema).with_table_parquet_options(options);
         let columns = HiveColumns {
             table: format!("{}.{}", self.schema_name, self.table),
-            raw,
+            raw: reading != Reading::Table,
+            nanos_only: reading == Reading::NanosOnly,
         };
         Ok(
             FileScanConfigBuilder::new(self.store_url.clone(), Arc::new(source))
@@ -557,6 +584,18 @@ impl TableProvider for HiveTable {
         let group_count = groups.len();
         for (index, meta) in files.into_iter().enumerate() {
             groups[index % group_count].push(PartitionedFile::new_from_meta(meta));
+        }
+        // A NANOSECONDS catalog cannot take `INT96` values in nanoseconds
+        // from the Parquet reader as they come (see `exact_timestamps.rs`).
+        if exact_timestamps::has_nanoseconds(&self.schema, projection) {
+            return exact_timestamps::nanosecond_scan(
+                self,
+                state.runtime_env(),
+                groups,
+                projection,
+                limit,
+                &statistics,
+            );
         }
         // Statistics are all inexact (see `statistics.rs`): they change the
         // plan, never an answer.

@@ -22,7 +22,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit, TimestampMicrosecondType};
+use datafusion::arrow::datatypes::{
+    DataType, Decimal128Type, Schema, SchemaRef, TimeUnit, TimestampMicrosecondType, TimestampNanosecondType,
+};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::parquet::arrow::ArrowSchemaConverter;
 use datafusion::parquet::arrow::arrow_writer::{
@@ -45,7 +47,7 @@ pub(crate) const ROW_GROUP_ROWS: usize = 128 * 1024;
 /// Close the open row group once its buffers hold this many bytes.
 const FLUSH_BYTES: usize = 64 * 1024 * 1024;
 const JULIAN_DAY_OF_EPOCH: i64 = 2_440_588;
-const MICROS_PER_DAY: i64 = 86_400_000_000;
+const NANOS_PER_DAY: i128 = 86_400_000_000_000;
 const INT96_BYTES: usize = 12;
 
 fn is_int96(data_type: &DataType) -> bool {
@@ -105,22 +107,62 @@ pub(crate) fn trino_parquet_schema(schema: &Schema) -> Result<SchemaDescriptor> 
     Ok(SchemaDescriptor::new(Arc::new(root)))
 }
 
-/// Wall-clock microseconds since the epoch as `INT96`. Microseconds keep
-/// every value Trino writes at `MILLISECONDS` or `MICROSECONDS` precision,
-/// over the whole `0001`–`9999` range.
-fn int96_from_micros(micros: i64) -> Result<Int96> {
-    let day = u32::try_from(micros.div_euclid(MICROS_PER_DAY) + JULIAN_DAY_OF_EPOCH).map_err(|_| {
-        DataFusionError::Execution(format!(
-            "timestamp {micros} µs since 1970 is outside the range Parquet INT96 stores"
-        ))
-    })?;
-    let nanos = u64::try_from(micros.rem_euclid(MICROS_PER_DAY) * 1_000).unwrap_or_default();
+/// Wall-clock nanoseconds since the epoch as `INT96` (Julian day and
+/// nanoseconds of the day), exactly: `i128` holds every instant `INT96`
+/// stores, `0001`–`9999` at nanosecond precision included.
+fn int96_from_nanos(nanos: i128) -> Result<Int96> {
+    let day = i64::try_from(nanos.div_euclid(NANOS_PER_DAY))
+        .ok()
+        .map(|day| day + JULIAN_DAY_OF_EPOCH)
+        // Readers take the day as a signed 32-bit number.
+        .and_then(|day| i32::try_from(day).ok())
+        .and_then(|day| u32::try_from(day).ok())
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "timestamp {nanos} ns since 1970 is outside the range Parquet INT96 stores"
+            ))
+        })?;
+    let nanos = u64::try_from(nanos.rem_euclid(NANOS_PER_DAY)).unwrap_or_default();
     // Less than 2^47: both halves fit.
     let low = u32::try_from(nanos & 0xFFFF_FFFF).unwrap_or_default();
     let high = u32::try_from(nanos >> 32).unwrap_or_default();
     let mut value = Int96::new();
     value.set_data(low, high, day);
     Ok(value)
+}
+
+/// Wall-clock microseconds since the epoch as `INT96`.
+#[cfg(test)]
+fn int96_from_micros(micros: i64) -> Result<Int96> {
+    int96_from_nanos(i128::from(micros) * 1_000)
+}
+
+/// Nanoseconds since the epoch of each value of a timestamp column, exactly:
+/// nanosecond arrays as they are, coarser units scaled, and `Decimal128`
+/// arrays of scale 0 as exact nanoseconds (compaction's values outside the
+/// range of Arrow nanoseconds, see `exact_timestamps.rs`).
+fn exact_nanos(array: &ArrayRef) -> Result<Vec<Option<i128>>> {
+    Ok(match array.data_type() {
+        DataType::Decimal128(_, 0) => array.as_primitive::<Decimal128Type>().iter().collect(),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => array
+            .as_primitive::<TimestampNanosecondType>()
+            .iter()
+            .map(|v| v.map(i128::from))
+            .collect(),
+        _ => {
+            let micros_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+            let micros = if array.data_type() == &micros_type {
+                Arc::clone(array)
+            } else {
+                cast(array, &micros_type)?
+            };
+            micros
+                .as_primitive::<TimestampMicrosecondType>()
+                .iter()
+                .map(|v| v.map(|v| i128::from(v) * 1_000))
+                .collect()
+        }
+    })
 }
 
 /// One column of the open row group.
@@ -160,18 +202,10 @@ impl Column {
                 }
             }
             Self::Int96 { values, definition } => {
-                let micros_type = DataType::Timestamp(TimeUnit::Microsecond, None);
-                let array = if array.data_type() == &micros_type {
-                    Arc::clone(array)
-                } else {
-                    cast(array, &micros_type)?
-                };
-                let micros = array.as_primitive::<TimestampMicrosecondType>();
-                for row in 0..micros.len() {
-                    let present = micros.is_valid(row);
+                for value in exact_nanos(array)? {
                     match definition {
-                        Some(levels) => levels.push(i16::from(present)),
-                        None if !present => {
+                        Some(levels) => levels.push(i16::from(value.is_some())),
+                        None if value.is_none() => {
                             return Err(DataFusionError::Execution(format!(
                                 "NULL in required column `{}`",
                                 field.name()
@@ -179,8 +213,8 @@ impl Column {
                         }
                         None => {}
                     }
-                    if present {
-                        values.push(int96_from_micros(micros.value(row))?);
+                    if let Some(nanos) = value {
+                        values.push(int96_from_nanos(nanos)?);
                     }
                 }
             }
@@ -493,6 +527,52 @@ mod tests {
                 "column {index}"
             );
         }
+    }
+
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+    #[test]
+    fn int96_keeps_nanoseconds_over_the_whole_range() {
+        // 1500-06-01 00:00:00.000000001 and 9999-12-31 23:59:59.999999999:
+        // outside what Arrow nanoseconds hold, exact here.
+        let far = [
+            -14_818_723_199_999_999_999_i128,
+            253_402_300_799_999_999_999,
+            1_767_261_600_123_456_789,
+            -1,
+        ];
+        for nanos in far {
+            let value = int96_from_nanos(nanos).unwrap();
+            let (low, high, day) = (value.data()[0], value.data()[1], value.data()[2]);
+            let of_day = (i128::from(high) << 32) | i128::from(low);
+            let back = (i128::from(day) - i128::from(JULIAN_DAY_OF_EPOCH)) * NANOS_PER_DAY + of_day;
+            assert_eq!(back, nanos);
+        }
+        assert!(int96_from_nanos(i128::MIN).is_err());
+        assert!(int96_from_nanos(i128::from(i32::MAX) * NANOS_PER_DAY).is_err());
+    }
+
+    #[test]
+    fn timestamp_columns_reach_int96_exactly() {
+        let nanos: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![
+            Some(1_767_261_600_123_456_789),
+            None,
+        ]));
+        assert_eq!(
+            exact_nanos(&nanos).unwrap(),
+            vec![Some(1_767_261_600_123_456_789), None]
+        );
+        let millis: ArrayRef = Arc::new(TimestampMillisecondArray::from(vec![Some(-1)]));
+        assert_eq!(exact_nanos(&millis).unwrap(), vec![Some(-1_000_000)]);
+        let exact: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(-14_818_723_199_999_999_999), None])
+                .with_precision_and_scale(38, 0)
+                .unwrap(),
+        );
+        assert_eq!(
+            exact_nanos(&exact).unwrap(),
+            vec![Some(-14_818_723_199_999_999_999), None]
+        );
     }
 
     #[test]

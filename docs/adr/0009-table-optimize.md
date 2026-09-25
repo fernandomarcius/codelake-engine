@@ -84,11 +84,18 @@ observed on a real `trinodb/trino:431` with a file metastore (2026-09-23):
   loss (a column dropped and added again as another type) fails the read
   with `Unsupported Trino column type` instead of being cast. Zero-byte
   files are not data (Trino skips them).
-- Timestamps are read and written in **microseconds**, whatever the
-  precision scans use (milliseconds, Trino's default): a table written by a
-  Trino catalog with `hive.timestamp-precision=MICROSECONDS` keeps its
-  microseconds. The files are written by the same Trino-compatible writer as
-  `INSERT` (`INT96` timestamps, ADR 0007).
+- Timestamps are rewritten **exactly as stored**, whatever the precision
+  and Parquet time zone of the catalog that compacts (amended 2026-09-25,
+  red-team W1-3/W1-7; owner decision: OPTIMIZE keeps the original
+  precision): the instants `INT96` holds, to the nanosecond, over its whole
+  range (years 1 to 9999). The Parquet reader decodes `INT96` in one Arrow
+  unit, and nanoseconds wrap outside 1677–2262, so the files are read twice
+  in the same order, in microseconds (every instant fits) and in
+  nanoseconds (the digits below a microsecond), and paired row by row into
+  exact `Decimal128` nanoseconds (`hive/exact_timestamps.rs`). The files are
+  written by the same Trino-compatible writer as `INSERT` (`INT96`
+  timestamps, ADR 0007), without any time zone conversion: the instants are
+  kept, and `writer.time.zone` records the catalog's zone.
 - Streaming: one Parquet scan over the snapshot (one partition, files in
   listing order) feeding writers that roll over at `target_max_file_size`.
   The open row group is reserved in the memory pool
@@ -176,8 +183,9 @@ second marker, and concurrent `OPTIMIZE` + reads in one process
 - **CodeLake and Trino compacting the same table at once** is not
   supported, as in Trino: Trino does not take the lock.
 - **Sub-microsecond timestamps** (a Trino catalog at `NANOSECONDS`
-  precision) are truncated to microseconds by `OPTIMIZE`, as a Trino
-  `OPTIMIZE` at `MICROSECONDS` precision would.
+  precision) are kept by `OPTIMIZE` since 2026-09-25 (they were rounded to
+  microseconds before); compaction reads each file twice for that (see
+  above).
 - **Orphans of a crash before step 3**: hidden `.inprogress` files (and, on a
   local disk, `object_store` staging files) stay until removed by hand. They
   cost disk only.

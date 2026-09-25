@@ -40,12 +40,14 @@ use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::parquet::arrow::ParquetRecordBatchStreamBuilder;
 use datafusion::parquet::arrow::async_reader::ParquetObjectReader;
 use datafusion::parquet::arrow::async_writer::ParquetObjectWriter;
+use datafusion::physical_plan::ExecutionPlan;
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use super::exact_timestamps;
 use super::metastore::MetastoreError;
 use super::table::{HiveTable, conform, data_file_name, external};
 use super::trino_parquet::{ROW_GROUP_ROWS, TrinoParquetWriter};
@@ -270,8 +272,11 @@ struct Open {
 /// Streams rows into hidden files, rolling over at the target size.
 struct Compactor<'a> {
     table: &'a HiveTable,
-    /// Columns of the files written ([`full_precision`] of the table's).
+    /// Columns of the rows read: the table's, timestamps as exact
+    /// nanoseconds (`exact_timestamps.rs`).
     schema: SchemaRef,
+    /// Columns of the files written ([`file_columns`] of the table's).
+    file_schema: SchemaRef,
     target: u64,
     reservation: MemoryReservation,
     open: Option<Open>,
@@ -284,7 +289,7 @@ impl Compactor<'_> {
         let temporary = format!(".{name}.inprogress");
         let writer = TrinoParquetWriter::try_new(
             ParquetObjectWriter::new(Arc::clone(store(self.table)), file(self.table, &temporary)),
-            Arc::clone(&self.schema),
+            Arc::clone(&self.file_schema),
             ROW_GROUP_ROWS,
         )?;
         Ok(Open {
@@ -342,25 +347,18 @@ impl Compactor<'_> {
     }
 }
 
-/// The table's columns with timestamps in microseconds, or in the catalog's
-/// unit when it is finer (`NANOSECONDS`): compaction never rounds away what
-/// the files hold.
-fn full_precision(schema: &SchemaRef) -> SchemaRef {
+/// The table's columns as the files written store them: timestamps as
+/// `INT96`, which holds the exact nanoseconds read (never rounded to the
+/// catalog's precision: compaction keeps what the files hold).
+fn file_columns(schema: &SchemaRef) -> SchemaRef {
     let fields: Vec<Field> = schema
         .fields()
         .iter()
         .map(|field| match field.data_type() {
-            DataType::Timestamp(unit, zone) => {
-                let unit = if *unit == TimeUnit::Nanosecond {
-                    TimeUnit::Nanosecond
-                } else {
-                    TimeUnit::Microsecond
-                };
-                field
-                    .as_ref()
-                    .clone()
-                    .with_data_type(DataType::Timestamp(unit, zone.clone()))
-            }
+            DataType::Timestamp(..) => field
+                .as_ref()
+                .clone()
+                .with_data_type(DataType::Timestamp(TimeUnit::Nanosecond, None)),
             _ => field.as_ref().clone(),
         })
         .collect();
@@ -381,21 +379,16 @@ pub(crate) async fn write_compacted(
         .cloned()
         .map(PartitionedFile::new_from_meta)
         .collect();
-    // Timestamps are read and rewritten in microseconds, not at the
-    // millisecond precision of scans: compaction must not truncate what a
-    // Trino catalog at `hive.timestamp-precision=MICROSECONDS` wrote.
-    let schema = full_precision(&table.schema);
-    let plan = table.scan_files_as(
-        context.runtime_env().as_ref(),
-        Arc::clone(&schema),
-        true,
-        vec![group],
-        None,
-        None,
-    )?;
+    // Timestamps are read and rewritten exactly, whatever the catalog's
+    // precision: compaction must neither round what another catalog wrote
+    // (a catalog at MICROSECONDS or NANOSECONDS) nor wrap an instant
+    // outside what Arrow nanoseconds hold (`exact_timestamps.rs`).
+    let plan = exact_timestamps::exact_scan(table, &context.runtime_env(), vec![group])?;
+    let schema = plan.schema();
     let mut compactor = Compactor {
         table,
         schema,
+        file_schema: file_columns(&table.schema),
         target,
         reservation: MemoryConsumer::new(format!("HiveOptimize[{}]", table.table))
             .register(context.memory_pool()),
