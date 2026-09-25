@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use codelake_core::env_refs;
+use codelake_core::parquet_time_zone::ParquetTimeZone;
 use secrecy::ExposeSecret;
 use toml::Value;
 
@@ -52,6 +53,11 @@ pub(crate) struct ImportArgs {
     /// Replace `--out` and `--env-out` when they exist.
     #[arg(long)]
     pub(crate) force: bool,
+    /// IANA time zone of the reference engine's JVM, for hive catalogs
+    /// without `hive.parquet.time-zone` (their `INT96` timestamps use it).
+    /// Without it, such catalogs are skipped.
+    #[arg(long)]
+    pub(crate) reference_time_zone: Option<String>,
 }
 
 /// What an import did, for the exit code.
@@ -72,6 +78,8 @@ pub(crate) enum ImportError {
     Exists(PathBuf),
     #[error("--env-prefix must match [A-Z_][A-Z0-9_]* (or be empty)")]
     Prefix,
+    #[error("--reference-time-zone {0}")]
+    TimeZone(String),
     #[error("{0} has no *.properties file")]
     Empty(PathBuf),
     #[error("base configuration {path}: {problem}")]
@@ -93,7 +101,7 @@ spill_limit = "40GiB"
 "#;
 
 /// Keys of a source in the order they are written; any other key follows.
-const KEY_ORDER: [&str; 17] = [
+const KEY_ORDER: [&str; 18] = [
     "name",
     "kind",
     "host",
@@ -111,6 +119,7 @@ const KEY_ORDER: [&str; 17] = [
     "access_key_id_env",
     "secret_access_key_env",
     "timestamp_precision",
+    "parquet_time_zone",
 ];
 
 enum Entry {
@@ -309,8 +318,15 @@ pub(crate) fn run(args: &ImportArgs, report: &mut dyn Write) -> Result<Outcome, 
         }
         None => (DEFAULT_HEADER.to_owned(), BTreeSet::new()),
     };
+    let reference_time_zone = args
+        .reference_time_zone
+        .as_deref()
+        .map(str::parse::<ParquetTimeZone>)
+        .transpose()
+        .map_err(ImportError::TimeZone)?;
     let ctx = Context {
         env_prefix: &args.env_prefix,
+        reference_time_zone,
     };
     let mut catalogs = read_catalogs(&args.from, &ctx)?;
     for catalog in &mut catalogs {
@@ -488,7 +504,8 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.join("hive.properties"),
-            "connector.name=hive\nhive.metastore=file\nhive.metastore.catalog.dir=file:/warehouse\n",
+            "connector.name=hive\nhive.metastore=file\nhive.metastore.catalog.dir=file:/warehouse\n\
+             hive.parquet.time-zone=UTC\n",
         )
         .unwrap();
         std::fs::write(
@@ -508,6 +525,7 @@ mod tests {
             env_prefix: "CODELAKE_".to_owned(),
             base: None,
             force: false,
+            reference_time_zone: None,
         }
     }
 
@@ -702,6 +720,33 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         config.validate(&values, &|_| true).unwrap();
+    }
+
+    #[test]
+    fn a_hive_catalog_without_its_time_zone_needs_the_reference_zone() {
+        let (_dir, mut args) = setup();
+        std::fs::write(
+            args.from.join("hive.properties"),
+            "connector.name=hive\nhive.metastore=file\nhive.metastore.catalog.dir=/warehouse\n",
+        )
+        .unwrap();
+        let mut report = Vec::new();
+        let outcome = run(&args, &mut report).unwrap();
+        assert_eq!(outcome.imported, 1);
+        let report = String::from_utf8(report).unwrap();
+        assert!(report.contains("pass --reference-time-zone"), "{report}");
+
+        args.force = true;
+        args.reference_time_zone = Some("Brasilia".to_owned());
+        let err = run(&args, &mut Vec::new()).unwrap_err();
+        assert!(matches!(err, ImportError::TimeZone(_)), "{err}");
+        args.reference_time_zone = Some("America/Sao_Paulo".to_owned());
+        assert_eq!(run(&args, &mut Vec::new()).unwrap().imported, 2);
+        let text = std::fs::read_to_string(&args.out).unwrap();
+        assert!(
+            text.contains("warehouse = \"/warehouse\"\nparquet_time_zone = \"America/Sao_Paulo\""),
+            "{text}"
+        );
     }
 
     #[test]

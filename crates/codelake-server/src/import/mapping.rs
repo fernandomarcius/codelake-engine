@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 
 use codelake_core::env_refs;
+use codelake_core::parquet_time_zone::ParquetTimeZone;
 use secrecy::SecretString;
 use toml::{Table, Value};
 
@@ -54,6 +55,9 @@ pub(crate) struct Skipped {
 pub(crate) struct Context<'a> {
     /// Prefix of generated environment variable names (`CODELAKE_`).
     pub(crate) env_prefix: &'a str,
+    /// Zone of hive catalogs without `hive.parquet.time-zone`: the
+    /// reference engine's JVM time zone, given by the operator.
+    pub(crate) reference_time_zone: Option<ParquetTimeZone>,
 }
 
 /// Whether a property holds a credential, by its name.
@@ -446,13 +450,21 @@ fn sqlserver(
         Some(value) => bool_value("trustServerCertificate", &value)?,
         None => false,
     };
+    // With encrypt=false the JDBC driver still encrypts the login, without
+    // validating the certificate; `off` does the same only with
+    // `trust_server_certificate`.
+    let trust = trust || encrypt == "off";
     insert_connection(source, "sqlserver", &settings, database);
     source.insert("encrypt".into(), Value::String(encrypt.to_owned()));
     if trust {
         source.insert("trust_server_certificate".into(), Value::Boolean(true));
     }
     if encrypt == "off" {
-        notes.push("encrypt = \"off\": credentials and data travel in clear text".to_owned());
+        notes.push(
+            "encrypt = \"off\": data travel in clear text; the login is encrypted without \
+             certificate validation (trust_server_certificate = true), as with the JDBC driver"
+                .to_owned(),
+        );
     }
     url_leftovers(&settings.url, notes);
     Ok(())
@@ -583,6 +595,36 @@ fn hive(
         }
         source.insert("timestamp_precision".into(), Value::String(precision));
     }
+    hive_time_zone(props, secrets.ctx, source, notes)
+}
+
+/// `hive.parquet.time-zone` → `parquet_time_zone`. Without it, the
+/// reference engine converts `INT96` timestamps with its JVM time zone, which
+/// the catalog file does not show: the operator names it
+/// (`--reference-time-zone`), or the catalog is skipped. A guessed zone
+/// would shift every `INT96` timestamp silently.
+fn hive_time_zone(
+    props: &mut Props,
+    ctx: &Context<'_>,
+    source: &mut Table,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    let zone = if let Some(zone) = props.take("hive.parquet.time-zone") {
+        literal("hive.parquet.time-zone", &zone)?
+            .trim()
+            .parse::<ParquetTimeZone>()
+            .map_err(|_| "hive.parquet.time-zone is not an IANA time zone name".to_owned())?
+    } else {
+        let zone = ctx.reference_time_zone.ok_or(
+            "hive.parquet.time-zone is not set: the reference engine then uses its JVM time zone, \
+             which the catalog file does not show; pass --reference-time-zone <IANA zone>",
+        )?;
+        notes.push(
+            "hive.parquet.time-zone not set: parquet_time_zone is the --reference-time-zone".to_owned(),
+        );
+        zone
+    };
+    source.insert("parquet_time_zone".into(), Value::String(zone.name().to_owned()));
     Ok(())
 }
 
@@ -672,6 +714,7 @@ mod tests {
     fn ctx() -> Context<'static> {
         Context {
             env_prefix: "CODELAKE_",
+            reference_time_zone: Some(ParquetTimeZone::UTC),
         }
     }
 
@@ -736,6 +779,18 @@ mod tests {
             "the source default applies"
         );
         assert!(imported.source.get("trust_server_certificate").is_none());
+        let mut off = base.to_vec();
+        off[1] = (
+            "connection-url",
+            "jdbc:sqlserver://h;databaseName=d;encrypt=false",
+        );
+        let imported = import("a", &off).unwrap();
+        assert_eq!(imported.source["encrypt"].as_str(), Some("off"));
+        assert_eq!(
+            imported.source["trust_server_certificate"].as_bool(),
+            Some(true),
+            "login-only encryption without validation, as the JDBC driver"
+        );
     }
 
     #[test]
@@ -917,6 +972,45 @@ mod tests {
             assert!(imported.secrets.is_empty());
             assert!(imported.notes.iter().any(|n| n.contains("hive.security")));
         }
+    }
+
+    #[test]
+    fn hive_parquet_time_zone_is_carried_over_or_must_be_named() {
+        let base = [
+            ("connector.name", "hive"),
+            ("hive.metastore", "file"),
+            ("hive.metastore.catalog.dir", "/wh"),
+        ];
+        let with = |zone: &str| {
+            let mut pairs = base.to_vec();
+            pairs.push(("hive.parquet.time-zone", zone));
+            import("lake", &pairs)
+        };
+        let imported = with(" America/Sao_Paulo ").unwrap();
+        assert_eq!(
+            imported.source["parquet_time_zone"].as_str(),
+            Some("America/Sao_Paulo")
+        );
+        assert!(imported.notes.is_empty(), "{:?}", imported.notes);
+        for bad in ["-03:00", "Brasilia", "${ENV:TZ}"] {
+            let skipped = with(bad).unwrap_err();
+            assert!(skipped.reason.contains("hive.parquet.time-zone"), "{skipped:?}");
+            assert!(!skipped.reason.contains(bad), "{skipped:?}");
+        }
+        // Unset: the operator names the reference engine's zone, or the
+        // catalog is skipped rather than guessed.
+        let imported = import("lake", &base).unwrap();
+        assert_eq!(imported.source["parquet_time_zone"].as_str(), Some("UTC"));
+        assert!(imported.notes.iter().any(|n| n.contains("--reference-time-zone")));
+        let ctx = Context {
+            env_prefix: "CODELAKE_",
+            reference_time_zone: None,
+        };
+        let skipped = map_catalog("lake", props(&base), &ctx).unwrap_err();
+        assert!(
+            skipped.reason.contains("pass --reference-time-zone"),
+            "{skipped:?}"
+        );
     }
 
     #[test]
@@ -1174,6 +1268,7 @@ mod tests {
     fn env_var_names_are_upper_case_with_the_prefix() {
         let ctx = Context {
             env_prefix: "SHADOW_",
+            reference_time_zone: None,
         };
         assert_eq!(env_var(&ctx, "erp_2", "PASSWORD"), "SHADOW_ERP_2_PASSWORD");
     }
