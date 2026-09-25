@@ -882,6 +882,10 @@ impl Trino {
                 catalog("hive.security=sql-standard\n"),
             )
             .with_copy_to(
+                "/etc/trino/catalog/hive_berlin.properties",
+                format!("{base}hive.parquet.time-zone=Europe/Berlin\nhive.security=allow-all\n").into_bytes(),
+            )
+            .with_copy_to(
                 "/etc/trino/catalog/hive_utc.properties",
                 format!("{base}hive.parquet.time-zone=UTC\nhive.security=allow-all\n").into_bytes(),
             )
@@ -2122,5 +2126,65 @@ async fn w1t_char_values_compared_outside_predicates_like_trino_431() {
         let (codelake, trino) = (cl_try(&s.engine, q).await, s.trino.sql(q).await);
         same_or_refused(&mut checks, id, q, &codelake, &trino);
     }
+    checks.assert_none();
+}
+
+/// `parquet_time_zone` east of Greenwich (`Europe/Berlin`), with Trino 431
+/// set to the same zone: a repeated time written by each engine is the same
+/// instant, and a skipped time `CodeLake` wrote reads the same in both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w1t_parquet_time_zone_east_of_greenwich_like_trino_431() {
+    let s = Shared::new("codelake-w1t-trino-berlin").await;
+    let mut checks = Checks::new("w1t_berlin");
+    s.trino.ok("CREATE SCHEMA hive.s").await;
+    let berlin = s
+        .zoned(HiveTimestampPrecision::Milliseconds, "Europe/Berlin")
+        .await;
+    let utc = s.zoned(HiveTimestampPrecision::Milliseconds, "UTC").await;
+    let repeated = "(1, TIMESTAMP '2024-10-27 02:30:00.000'), (2, TIMESTAMP '2024-07-01 12:00:00.000'), \
+                    (3, TIMESTAMP '1890-01-01 00:00:00.000')";
+    s.trino
+        .ok(&parquet_ctas("hive_berlin.s.be_trino", repeated))
+        .await;
+    cl(&berlin, &ctas("hive.s.be_codelake", repeated)).await;
+    checks.same(
+        "BE1",
+        "instants of Berlin wall-clock times: CodeLake / Trino",
+        &cl_try(&utc, &read_zoned("hive.s.be_codelake")).await,
+        &s.trino.sql(&read_zoned("hive_utc.s.be_trino")).await,
+    );
+    checks.same(
+        "BE2",
+        "Trino's Berlin table read in Berlin",
+        &cl_try(&berlin, &read_zoned("hive.s.be_trino")).await,
+        &s.trino.sql(&read_zoned("hive_berlin.s.be_trino")).await,
+    );
+    cl(
+        &berlin,
+        &ctas("hive.s.be_gap", "(1, TIMESTAMP '2024-03-31 02:30:00.000')"),
+    )
+    .await;
+    checks.same(
+        "BE3",
+        "a skipped Berlin time CodeLake wrote, read in Berlin",
+        &cl_try(&berlin, &read_zoned("hive.s.be_gap")).await,
+        &s.trino.sql(&read_zoned("hive_berlin.s.be_gap")).await,
+    );
+    checks.same(
+        "BE4",
+        "its instant",
+        &cl_try(&utc, &read_zoned("hive.s.be_gap")).await,
+        &s.trino.sql(&read_zoned("hive_utc.s.be_gap")).await,
+    );
+    checks.same(
+        "BE5",
+        "the instants, read without the engines' help",
+        &cl_try(&utc, &read_zoned("hive.s.be_codelake")).await,
+        &Ok(rows(&[
+            &["1", "2024-10-27 01:30:00.000"],
+            &["2", "2024-07-01 10:00:00.000"],
+            &["3", "1889-12-31 23:06:32.000"],
+        ])),
+    );
     checks.assert_none();
 }
