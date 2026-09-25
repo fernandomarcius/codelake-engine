@@ -174,6 +174,9 @@ pub fn parse_data_size(text: &str) -> Result<u64, String> {
 
 pub const QUERY_MAX_RUN_TIME: &str = "query_max_run_time";
 pub const QUERY_MAX_EXECUTION_TIME: &str = "query_max_execution_time";
+/// Hash joins too large for the memory pool run as sort-merge joins
+/// ([`crate::join_spill`]).
+pub const SORT_MERGE_OVERSIZED_JOINS: &str = "sort_merge_oversized_joins";
 
 type Declaration = (&'static str, PropertyType, &'static str, Effect, &'static str);
 
@@ -193,6 +196,14 @@ const SYSTEM: &[Declaration] = &[
         "100d",
         Effect::Enforced,
         "Maximum execution time of a query",
+    ),
+    (
+        SORT_MERGE_OVERSIZED_JOINS,
+        PropertyType::Boolean,
+        "true",
+        Effect::Enforced,
+        "Run a hash join whose estimated build side exceeds its share of the memory pool as a \
+         sort-merge join, which spills to disk",
     ),
     (
         "scale_writers",

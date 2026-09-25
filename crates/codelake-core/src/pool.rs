@@ -60,6 +60,12 @@ enum Class {
     Spiller,
 }
 
+/// Whether `consumer` is an exchange channel, which spills what it is refused
+/// and has its own slice of the pool.
+pub(crate) fn is_exchange_buffer(consumer: &MemoryConsumer) -> bool {
+    class(consumer) == Class::Buffer
+}
+
 fn class(consumer: &MemoryConsumer) -> Class {
     if !consumer.can_spill() {
         Class::Unspillable
@@ -80,6 +86,9 @@ struct State {
     spilling: usize,
     /// Spilling operators registered, whether they hold memory or not.
     registered: usize,
+    /// Most bytes reserved at once since the pool started or the last
+    /// [`CeilingPool::reset_peak`].
+    peak: usize,
 }
 
 impl State {
@@ -93,6 +102,7 @@ impl State {
             Class::Buffer => self.buffers += bytes,
             Class::Spiller => self.spilling += bytes,
         }
+        self.peak = self.peak.max(self.total());
     }
 
     fn remove(&mut self, consumer: &MemoryConsumer, bytes: usize) {
@@ -121,6 +131,18 @@ impl CeilingPool {
 
     fn buffers_cap(&self) -> usize {
         self.limit / BUFFERS_DIVISOR
+    }
+
+    /// Most bytes reserved at once since the pool started or the last
+    /// [`CeilingPool::reset_peak`].
+    pub fn peak(&self) -> usize {
+        self.state().peak
+    }
+
+    /// Restarts [`CeilingPool::peak`] from what is reserved now.
+    pub fn reset_peak(&self) {
+        let mut state = self.state();
+        state.peak = state.total();
     }
 
     fn state(&self) -> MutexGuard<'_, State> {

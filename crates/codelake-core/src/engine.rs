@@ -250,7 +250,9 @@ fn trino_literal(value: &ScalarValue) -> String {
 /// the null-aware anti join guard (both must run before `FilterPushdown`; see
 /// [`crate::federation_guard`] and [`crate::join_guard`]), with
 /// aggregates answered from statistics only over exact sources (see
-/// [`crate::statistics_guard`]), and followed by
+/// [`crate::statistics_guard`]), hash joins too large for the pool planned as
+/// sort-merge joins right after `EnforceSorting` ([`crate::join_spill`]), and
+/// followed by
 /// [`PlainViews`], which keeps string views out of operators that retain rows
 /// (ADR 0003), [`ComputedBatches`], which sizes the batches of computed values
 /// in bytes, the nested loop join spill guard ([`crate::join_guard`]), and
@@ -260,6 +262,7 @@ pub(crate) fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Syn
     let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> =
         vec![Arc::new(FederationFilterGuard), Arc::new(NullAwareAntiJoinGuard)];
     rules.extend(PhysicalOptimizer::new().rules);
+    let rules = crate::join_spill::with_sort_merge_oversized_joins(rules);
     let mut rules = guard_aggregate_statistics(rules);
     rules.extend(crate::trino_functions::physical_rules());
     rules.push(Arc::new(PlainViews));
@@ -672,6 +675,9 @@ impl Engine {
             .with_batch_size(execution.batch_size)
             .with_information_schema(false);
         session = crate::runtime::sort_settings(session, memory);
+        session = session.with_option_extension(crate::join_spill::JoinSpillOptions::for_pool(
+            memory.limit.as_usize(),
+        ));
         // `1.5` is `decimal(2,1)`, as in Trino (and PostgreSQL), not a double.
         session.options_mut().sql_parser.parse_float_as_decimal = true;
         if let Some(partitions) = execution.target_partitions {
@@ -770,6 +776,17 @@ impl Engine {
         }
         if let Some(zone) = &options.time_zone {
             state.config_mut().options_mut().execution.time_zone = Some(zone.clone());
+        }
+        if let Some(value) = options
+            .properties
+            .get(crate::session_properties::SORT_MERGE_OVERSIZED_JOINS)
+            && let Some(join_spill) = state
+                .config_mut()
+                .options_mut()
+                .extensions
+                .get_mut::<crate::join_spill::JoinSpillOptions>()
+        {
+            join_spill.sort_merge_oversized_joins = value == "true";
         }
         for function in &options.functions {
             // Replacing a built-in is the point; the previous one is not needed.
@@ -1513,6 +1530,17 @@ impl Engine {
 
     pub fn memory(&self) -> MemoryStats {
         self.runtime.stats()
+    }
+
+    /// Most bytes the memory pool held at once since the engine started or
+    /// the last [`Engine::reset_memory_peak`].
+    pub fn memory_peak(&self) -> u64 {
+        self.runtime.peak_reserved()
+    }
+
+    /// Restarts [`Engine::memory_peak`] from what is reserved now.
+    pub fn reset_memory_peak(&self) {
+        self.runtime.reset_peak();
     }
 
     /// Pings every attached source concurrently.

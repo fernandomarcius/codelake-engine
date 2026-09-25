@@ -60,7 +60,7 @@ pub struct MemoryStats {
 #[derive(Debug, Clone)]
 pub struct EngineRuntime {
     env: Arc<RuntimeEnv>,
-    pool: Arc<dyn MemoryPool>,
+    pool: Arc<TrackConsumersPool<CeilingPool>>,
     limit: u64,
 }
 
@@ -68,14 +68,14 @@ impl EngineRuntime {
     pub fn new(config: &MemoryConfig) -> Result<Self> {
         let limit = config.limit.as_usize();
         let top = NonZeroUsize::new(TOP_CONSUMERS_IN_ERRORS).unwrap_or(NonZeroUsize::MIN);
-        let pool: Arc<dyn MemoryPool> = Arc::new(TrackConsumersPool::new(CeilingPool::new(limit), top));
+        let pool = Arc::new(TrackConsumersPool::new(CeilingPool::new(limit), top));
 
         let disk = DiskManagerBuilder::default()
             .with_mode(DiskManagerMode::Directories(vec![config.spill_dir.clone()]))
             .with_max_temp_directory_size(config.spill_limit.as_u64());
 
         let env = RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::clone(&pool))
+            .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
             .with_disk_manager_builder(disk)
             .with_metadata_cache_limit(config.metadata_cache_limit.as_usize())
             .build_arc()?;
@@ -89,6 +89,18 @@ impl EngineRuntime {
 
     pub fn env(&self) -> Arc<RuntimeEnv> {
         Arc::clone(&self.env)
+    }
+
+    /// Most bytes the pool held at once since the engine started or the last
+    /// [`EngineRuntime::reset_peak`]: what operators reserved, not the
+    /// process's resident memory.
+    pub fn peak_reserved(&self) -> u64 {
+        self.pool.inner().peak() as u64
+    }
+
+    /// Restarts [`EngineRuntime::peak_reserved`] from what is reserved now.
+    pub fn reset_peak(&self) {
+        self.pool.inner().reset_peak();
     }
 
     pub fn stats(&self) -> MemoryStats {

@@ -7,3 +7,11 @@ This product includes software developed at The Apache Software Foundation
 It also depends on datafusion-federation and datafusion-table-providers
 (Apache-2.0, maintained by the DataFusion community and Spice AI).
 The full dependency list with licenses is published as an SBOM with each release.
+
+This product includes software from Spice.ai OSS
+(https://github.com/spiceai/spiceai), Copyright 2024-2025 The Spice.ai OSS
+Authors, licensed under the Apache License, Version 2.0:
+- crates/codelake-core/src/join_spill.rs: derived from
+  `CayenneAntiJoinSortMergeRewriter` (crates/cayenne/src/optimizer_rules.rs,
+  commit 10bf93e), modified by CodeLake contributors (the file lists the
+  changes).
