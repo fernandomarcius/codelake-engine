@@ -47,3 +47,17 @@ pub async fn query(engine: &Engine, sql: &str) -> String {
 pub fn host() -> String {
     std::env::var("TESTCONTAINERS_HOST_OVERRIDE").unwrap_or_else(|_| "127.0.0.1".to_owned())
 }
+
+/// Counts the workers the reference engine's coordinator lists as active.
+/// It logs "SERVER STARTED" before its own worker registers, and a query sent
+/// in between fails with "No nodes available to run query": a server is
+/// ready once this answers at least one.
+pub const ACTIVE_WORKERS: &str = "SELECT count(*) FROM system.runtime.nodes WHERE state = 'active'";
+
+/// Whether an answer to [`ACTIVE_WORKERS`] (its first cell, as text, quoted
+/// or not) counts at least one worker.
+pub fn counts_a_worker(first_cell: Option<&str>) -> bool {
+    first_cell
+        .and_then(|cell| cell.trim().trim_matches('"').parse::<u64>().ok())
+        .is_some_and(|workers| workers > 0)
+}

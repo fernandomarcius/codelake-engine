@@ -140,6 +140,11 @@ async fn wait_info(base: &str) -> Res<()> {
     }
 }
 
+/// Counts the workers the reference server's coordinator lists as active: it
+/// logs "SERVER STARTED" before its own worker registers, and a query sent in
+/// between fails with "No nodes available to run query".
+const ACTIVE_WORKERS: &str = "SELECT count(*) FROM system.runtime.nodes WHERE state = 'active'";
+
 static TRINO_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 /// A real Trino 431 with its stock catalogs (`memory`, `tpch`) plus `hive`
@@ -177,6 +182,16 @@ async fn trino_431() -> Res<(ContainerAsync<GenericImage>, String)> {
     let port = container.get_host_port_ipv4(8080).await.map_err(text)?;
     let base = format!("http://{host}:{port}");
     wait_info(&base).await?;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while run(&base, "system", ACTIVE_WORKERS, None).await?["rows"][0][0]
+        .as_u64()
+        .is_none_or(|workers| workers == 0)
+    {
+        if Instant::now() > deadline {
+            return Err("Trino never listed an active worker".into());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     // The memory connector answers NO_NODES_AVAILABLE until the node
     // registers itself; wait until it can scan a table.
     let deadline = Instant::now() + Duration::from_secs(90);

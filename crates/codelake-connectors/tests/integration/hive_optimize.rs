@@ -64,13 +64,16 @@ async fn trino(files: Vec<(String, Vec<u8>)>) -> ContainerAsync<GenericImage> {
         request = request.with_copy_to(format!("/warehouse/{path}"), bytes);
     }
     let container = request.start().await.expect("trino 431 starts");
-    for _ in 0..60 {
-        if run_trino(&container, "SELECT 1").await.is_ok() {
+    // Ready once the coordinator lists an active worker (CSV: header, count).
+    for _ in 0..120 {
+        if let Ok(answer) = run_trino(&container, common::ACTIVE_WORKERS).await
+            && common::counts_a_worker(answer.lines().nth(1))
+        {
             return container;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    panic!("trino did not accept queries");
+    panic!("trino did not list an active worker");
 }
 
 /// Runs `sql` with the Trino CLI. A coordinator under load can drop out of

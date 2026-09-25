@@ -127,14 +127,21 @@ impl Trino {
             .unwrap();
         let trino = Self(container);
         let deadline = Instant::now() + STARTUP_TIMEOUT;
+        // Ready once the coordinator lists an active worker.
         loop {
-            match trino.try_sql("SELECT 1").await {
-                Ok(_) => break,
-                Err(e) if Instant::now() < deadline && e.contains("No nodes available") => {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+            match trino.try_sql(common::ACTIVE_WORKERS).await {
+                Ok(rows)
+                    if common::counts_a_worker(
+                        rows.first().and_then(|row| row.first()).map(String::as_str),
+                    ) =>
+                {
+                    break;
                 }
+                Ok(rows) => assert!(Instant::now() < deadline, "no active worker in time: {rows:?}"),
+                Err(e) if Instant::now() < deadline && e.contains("No nodes available") => {}
                 Err(e) => panic!("Trino did not accept queries: {e}"),
             }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
         trino
     }

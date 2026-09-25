@@ -821,13 +821,18 @@ impl Trino {
             .await
             .expect("trino 431 starts");
         let trino = Self { container };
+        // Ready once the coordinator lists an active worker.
         for _ in 0..120 {
-            if matches!(trino.try_sql_as("root", "SELECT 1").await, Ok(Ok(_))) {
+            if let Ok(Ok(rows)) = trino.try_sql_as("root", crate::common::ACTIVE_WORKERS).await
+                && crate::common::counts_a_worker(
+                    rows.first().and_then(|row| row.first()).map(String::as_str),
+                )
+            {
                 return trino;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        panic!("trino did not accept queries");
+        panic!("trino did not list an active worker");
     }
 
     async fn try_sql_as(&self, user: &str, sql: &str) -> Result<Result<Rows, String>, String> {

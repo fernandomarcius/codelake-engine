@@ -312,15 +312,17 @@ impl Trino {
             .await
             .expect("trino 431 starts");
         let trino = Self { container };
+        // Ready once the coordinator lists an active worker.
         for _ in 0..120 {
-            if let Ok(answers) = trino.try_run(&[], &["SELECT 1"]).await
-                && matches!(answers.first(), Some(Answer::Rows(_)))
+            if let Ok(answers) = trino.try_run(&[], &[crate::common::ACTIVE_WORKERS]).await
+                && let Some(Answer::Rows(rows)) = answers.first()
+                && rows[0][0].as_u64().is_some_and(|workers| workers > 0)
             {
                 return trino;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        panic!("trino did not accept queries");
+        panic!("trino did not list an active worker");
     }
 
     async fn exec(&self, command: Vec<String>) -> Result<String, String> {

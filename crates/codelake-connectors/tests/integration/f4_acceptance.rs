@@ -575,7 +575,10 @@ impl Trino {
             .with_host_config_modifier(|config| config.memory = Some(3 << 29))
             .with_copy_to("/etc/trino/jvm.config", JVM.as_bytes().to_vec())
             .with_copy_to("/tmp/client.py", CLIENT.as_bytes().to_vec())
-            .with_copy_to("/tmp/ready.json", br#"["SELECT 1"]"#.to_vec());
+            .with_copy_to(
+                "/tmp/ready.json",
+                json!([crate::common::ACTIVE_WORKERS]).to_string().into_bytes(),
+            );
         for (name, statements) in lists {
             image = image.with_copy_to(
                 format!("/tmp/{name}.json"),
@@ -584,12 +587,22 @@ impl Trino {
         }
         let container = image.start().await.expect("trino 431 starts");
         let trino = Self { container };
-        let ready = trino.run("ready", 1).await;
-        assert!(
-            matches!(ready.first(), Some(Answer::Rows { .. })),
-            "trino answers: {ready:?}"
-        );
-        trino
+        // Ready once the coordinator lists an active worker.
+        let mut ready = Vec::new();
+        for _ in 0..120 {
+            ready = trino.run("ready", 1).await;
+            if let Some(Answer::Rows { rows, .. }) = ready.first()
+                && rows
+                    .first()
+                    .and_then(|row| row.first())
+                    .and_then(Value::as_u64)
+                    .is_some_and(|workers| workers > 0)
+            {
+                return trino;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        panic!("trino did not list an active worker: {ready:?}");
     }
 
     async fn exec(&self, command: Vec<String>) -> String {

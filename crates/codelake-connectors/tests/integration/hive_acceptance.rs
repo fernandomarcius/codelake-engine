@@ -201,20 +201,31 @@ impl Trino {
 
     /// "SERVER STARTED" comes before the coordinator registers itself as a
     /// worker; a query sent in between fails with "No nodes available".
+    /// Waits until the node list shows an active worker.
     async fn wait_until_it_runs_queries(&self) {
         let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
         loop {
-            match self.run_once(None, "SELECT 1").await {
-                Ok(_) => return,
+            match self.run_once(None, common::ACTIVE_WORKERS).await {
+                Ok(rows)
+                    if common::counts_a_worker(
+                        rows.first().and_then(|row| row.first()).map(String::as_str),
+                    ) =>
+                {
+                    return;
+                }
+                Ok(rows) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "no active worker in time: {rows:?}"
+                ),
                 Err(error) if std::time::Instant::now() < deadline => {
                     assert!(
                         error.contains("No nodes available"),
                         "Trino failed to start: {error}"
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
                 Err(error) => panic!("Trino did not accept queries in time: {error}"),
             }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
 

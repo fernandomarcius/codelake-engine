@@ -603,7 +603,51 @@ async fn trino(otlp_grpc_port: u16) -> (ContainerAsync<GenericImage>, String) {
         .await
         .expect("trino starts");
     let port = container.get_host_port_ipv4(8080).await.unwrap();
-    (container, format!("http://{}:{port}", host()))
+    let url = format!("http://{}:{port}", host());
+    wait_for_active_worker(&url).await;
+    (container, url)
+}
+
+/// Waits until the coordinator lists an active worker: it logs "SERVER
+/// STARTED" before its own worker registers, and a query sent in between
+/// fails with "No nodes available to run query".
+async fn wait_for_active_worker(url: &str) {
+    let client = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let mut workers = None;
+        let mut response = client
+            .post(format!("{url}/v1/statement"))
+            .header("X-Trino-User", "acc")
+            .body("SELECT count(*) FROM system.runtime.nodes WHERE state = 'active'")
+            .send()
+            .await
+            .ok();
+        while let Some(sent) = response.take() {
+            let Some(page) = sent
+                .text()
+                .await
+                .ok()
+                .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+            else {
+                break;
+            };
+            if let Some(count) = page["data"][0][0].as_u64() {
+                workers = Some(count);
+            }
+            if let Some(next) = page["nextUri"].as_str() {
+                response = client.get(next).send().await.ok();
+            }
+        }
+        if workers.is_some_and(|count| count > 0) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the reference server never listed an active worker"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// Runs `SELECT 1` on Trino with the given headers; returns the query id and

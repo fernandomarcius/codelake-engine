@@ -8,6 +8,7 @@ A fixture is {"category": ..., "cases": [{"name", "sql", ["ulps"], "trino"}]}.
 """
 import json
 import sys
+import time
 import urllib.request
 
 HEADERS = {
@@ -34,8 +35,23 @@ def run(url, sql):
     return {"types": [c["type"] for c in columns or []], "rows": rows}
 
 
+def wait_for_active_worker(url, seconds=240):
+    """The server logs "SERVER STARTED" before its own worker registers; a
+    case run in between would record "No nodes available to run query" as
+    its golden answer."""
+    deadline = time.monotonic() + seconds
+    while True:
+        answer = run(url, "SELECT count(*) FROM system.runtime.nodes WHERE state = 'active'")
+        if answer.get("rows") and answer["rows"][0][0] > 0:
+            return
+        if time.monotonic() > deadline:
+            sys.exit(f"no active worker at {url}: {answer}")
+        time.sleep(1)
+
+
 def main():
     url, paths = sys.argv[1], sys.argv[2:]
+    wait_for_active_worker(url)
     for path in paths:
         with open(path, encoding="utf-8") as handle:
             fixture = json.load(handle)
