@@ -98,7 +98,9 @@ versioning: [SemVer](https://semver.org/).
 - `OPTIMIZE` in a catalog whose `parquet_time_zone` is not UTC rewrote `INT64`
   timestamps of other writers (Spark, pandas) as `INT96` without converting them: they
   read shifted by the zone offset afterwards. They are now kept; a wall-clock time the
-  zone skips makes `OPTIMIZE` fail instead of changing it (DEFECT-W1T-1).
+  zone skips makes `OPTIMIZE` fail instead of changing it (DEFECT-W1T-1). A wall-clock
+  time whose instant nanoseconds cannot hold (after 2262-04-11 23:47:16 UTC) fails
+  naming the range, not as a time the zone skips.
 - Test helpers and the golden generator wait until the reference server lists an active
   worker, instead of sending statements that fail with "No nodes available to run query".
 - DataFusion 54 correctness guards (ADR 0014): `NOT IN (subquery)` as a condition of

@@ -250,6 +250,18 @@ fn local_timestamps(array: &ArrayRef, zone: ParquetTimeZone, unit: TimeUnit) -> 
     )?)
 }
 
+/// The timestamp type a column stored in `unit` holds, and its range.
+fn range_of(unit: TimeUnit) -> &'static str {
+    match unit {
+        TimeUnit::Second => "timestamp(0)",
+        TimeUnit::Millisecond => "timestamp(3)",
+        TimeUnit::Microsecond => "timestamp(6)",
+        TimeUnit::Nanosecond => {
+            "timestamp(9) (1677-09-21 00:12:43.145224192 to 2262-04-11 23:47:16.854775807 UTC)"
+        }
+    }
+}
+
 /// Wall-clock times (a timestamp array that is not `INT96`) as the instants
 /// of `zone`, in `unit`. The zone's offsets are whole seconds, so the digits
 /// below a second stay; the cast to `unit` is the one a raw read without a
@@ -273,16 +285,26 @@ fn instant_timestamps(array: &ArrayRef, zone: ParquetTimeZone, unit: TimeUnit) -
             value
                 .map(|v| {
                     let local = i128::from(v) * nanos_per;
-                    zone.local_to_utc(local)
-                        .filter(|instant| zone.utc_to_local(*instant) == Some(local))
-                        .and_then(|instant| i64::try_from(instant / nanos_per).ok())
-                        .ok_or_else(|| {
-                            let shown = array_value_to_string(array, row).unwrap_or_else(|_| v.to_string());
-                            DataFusionError::Execution(format!(
-                                "timestamp {shown} does not exist in time zone {zone} (the clocks skip it): \
-                                 written as INT96 it would read as another time"
-                            ))
-                        })
+                    let shown = || array_value_to_string(array, row).unwrap_or_else(|_| v.to_string());
+                    let out_of_range = || {
+                        DataFusionError::Execution(format!(
+                            "timestamp {} in time zone {zone} is an instant outside the range of {}",
+                            shown(),
+                            range_of(*stored)
+                        ))
+                    };
+                    let instant = zone.local_to_utc(local).ok_or_else(out_of_range)?;
+                    match zone.utc_to_local(instant) {
+                        Some(back) if back == local => {
+                            i64::try_from(instant / nanos_per).map_err(|_| out_of_range())
+                        }
+                        Some(_) => Err(DataFusionError::Execution(format!(
+                            "timestamp {} does not exist in time zone {zone} (the clocks skip it): \
+                             written as INT96 it would read as another time",
+                            shown()
+                        ))),
+                        None => Err(out_of_range()),
+                    }
                 })
                 .transpose()
         })
@@ -580,6 +602,26 @@ mod tests {
         assert!(
             err.contains("2018-11-04T00:30:00")
                 && err.contains("does not exist in time zone America/Sao_Paulo"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn compaction_names_an_instant_nanoseconds_cannot_hold() {
+        use datafusion::arrow::array::TimestampNanosecondArray;
+        let zone: ParquetTimeZone = "America/Sao_Paulo".parse().unwrap();
+        // 2262-04-11 21:50:36.854775807 in São Paulo is 2262-04-12
+        // 00:50:36.854775807 UTC, past the last instant Arrow nanoseconds hold.
+        let wall: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![i64::MAX - 7_000_000_000_000]));
+        let err = instant_timestamps(&wall, zone, TimeUnit::Nanosecond)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("2262-04-11T21:50:36.854775807")
+                && err.contains(
+                    "in time zone America/Sao_Paulo is an instant outside the range of timestamp(9)"
+                )
+                && !err.contains("does not exist"),
             "{err}"
         );
     }
