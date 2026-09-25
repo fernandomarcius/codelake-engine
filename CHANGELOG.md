@@ -47,11 +47,15 @@ versioning: [SemVer](https://semver.org/).
 - `codelake config import --from <dir> --out codelake.toml --env-out codelake.env`: catalog
   `.properties` files (`sqlserver`, `postgresql`, `hive` with a file metastore) become sources;
   secrets go to an env file with mode 0600, never to the TOML or the terminal; other catalogs
-  are skipped with a reason (exit 3) (ADR 0015).
+  are skipped with a reason (exit 3); `hive.parquet.time-zone` becomes `parquet_time_zone`, and a
+  hive catalog without it needs `--reference-time-zone` (never guessed) (ADR 0015, ISS-026).
 - Shadow-run harness (`scripts/shadow-run.sh`, `tools/shadow`): runs a dbt project against a
   reference and a candidate engine with the same cutoff, compares every output table with
   DuckDB (row count, order-insensitive checksum, per-column checksums, differing rows by hash),
   samples peak RSS per side, and writes JSON and Markdown reports per cycle and cumulative;
+  declared-type and name-case differences are divergent unless an expected-differences rule
+  documents them (a rule file named by the run; ISS-018 and ISS-019 shipped), and no rule
+  covers values;
   self-test with SQL Server CDC and mutation scenarios (`tools/shadow/selftest.sh`,
   docs/shadow-run.md).
 

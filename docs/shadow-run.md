@@ -13,7 +13,7 @@ by a person, with the steps below.
 
 ```bash
 codelake config import --from catalog/ --out codelake.toml --env-out codelake.env \
-    [--base base.toml] [--env-prefix CODELAKE_] [--force]
+    [--base base.toml] [--env-prefix CODELAKE_] [--reference-time-zone UTC] [--force]
 ```
 
 - `catalog/` holds one `<name>.properties` per catalog (`connector.name=…`).
@@ -21,6 +21,12 @@ codelake config import --from catalog/ --out codelake.toml --env-out codelake.en
   (local directory or `s3://`). Anything else is skipped with a reason; the
   files are still written and the exit code is 3 (0 when every catalog was
   imported, 2 on an error that wrote nothing).
+- A hive catalog's `hive.parquet.time-zone` becomes `parquet_time_zone`.
+  Without it, the reference engine converts `INT96` timestamps with its JVM
+  time zone, which the catalog file does not show: pass it as
+  `--reference-time-zone <IANA zone>` (`UTC` in the stock container image),
+  or the catalog is skipped. A wrong zone would shift every `INT96`
+  timestamp silently (ADR 0007).
 - `--base` is an existing configuration whose sections (`[server]`,
   `[memory]`, sources) are kept; imported sources are appended. Without it, a
   loopback-only header is written.
@@ -137,7 +143,7 @@ same path inside it.
 | `SHADOW_REFERENCE_RSS`, `SHADOW_CANDIDATE_RSS` | memory meter: `pid:<pid>`, `container:<name>`, `cmd:<command printing bytes>` | none |
 | `SHADOW_RSS_INTERVAL_MS` | sampling period | `200` |
 | `SHADOW_RSS_MAX_RATIO` | fail when candidate/reference peak exceeds it (M1: `0.5`) | report only |
-| `SHADOW_EXPECTED_DIFFERENCES` | rule file of expected, documented differences (below); `none` for no rule | the shipped `tools/shadow/codelake_shadow/expected-differences.json` |
+| `SHADOW_EXPECTED_DIFFERENCES` | rule file of expected, documented differences (below): a path, or `default` for the shipped `tools/shadow/codelake_shadow/expected-differences.json` | none (no rule) |
 | `SHADOW_SAMPLE`, `SHADOW_SHOW_ROWS` | differing row hashes listed; print their values (opt-in) | `10`, `false` |
 | `SHADOW_DUCKDB_MEMORY` | DuckDB memory limit (it spills beyond it) | `2GB` |
 | `SHADOW_S3_ENDPOINT`, `SHADOW_S3_REGION`, `SHADOW_S3_PATH_STYLE` | S3 warehouses; keys from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` via `SHADOW_PASS_ENV`, or the credential chain | — |
@@ -215,12 +221,35 @@ in the output is declared, not hidden. A rule file (JSON) lists them:
   columns present on one side only are always compared. A table whose only
   difference is a documented type is equal; the same table with one changed
   value is divergent.
-- The shipped file declares ISS-019 and ISS-018. The other removed limitations
+- No rule applies unless the run names a file: a rule is a decision about a
+  run, not a default. The shipped file (`default`) declares ISS-019 and
+  ISS-018; use it once those limitations are removed in the candidate. The
+  other removed limitations
   (ISS-017 atomic `CREATE OR REPLACE`, ISS-020 size units, ISS-023 `DROP VIEW`)
   change no table content: where they change a dbt run (a model that fails on
   one side only), the harness reports it as a model status difference, which
   no rule covers. ISS-019's rule accepts any `varchar(n)` → unbounded change,
-  including a length lost from a source column; review the listed columns.
+  including a length lost from a source column (finding F8-2 below): do not
+  use it while that finding is open.
+
+## Findings of the self-test
+
+The self-test runs the acceptance pipelines' patterns; three of them fail on
+the candidate today. Each is a candidate defect, not a harness choice, and
+blocks the M1 shadow run on the real project. The fixture works around them
+behind the dbt variable `shadow_workarounds` (default true; each workaround is
+a no-op on the reference engine), so the harness itself is proven;
+`SHADOW_SELFTEST_STRICT=1` runs the fixture as the pipelines write it and
+fails until they are fixed.
+
+| ID | Pattern | Reference engine | CodeLake today | Workaround in the fixture |
+|---|---|---|---|---|
+| F8-1 | CTAS/INSERT of a SQL Server `datetime`/`datetime2(3)` column into a `MILLISECONDS` hive catalog | `timestamp(3)`, stored | the column arrives as `timestamp(6)`: `Incorrect timestamp precision for timestamp(6)` | `CAST(… AS timestamp(3))` |
+| F8-2 | CTAS of a SQL Server `varchar(n)` column | declares `varchar(n)` | declares unbounded `string` (values equal) | `CAST(… AS varchar(n))` with the source's declared type |
+| F8-3 | `ROW_NUMBER() OVER (PARTITION BY … ORDER BY "__$seqval")` (varbinary) | ordered by bytes | `Cannot run range queries on datatype: Binary` | `ORDER BY to_hex(…)` |
+
+Values were equal on every table and cycle once the workarounds let both sides
+run.
 
 ## Self-test
 

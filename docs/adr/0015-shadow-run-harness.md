@@ -65,6 +65,12 @@ configuration sections use it instead of inventing their own.
   the server at load. The import never reads the environment. Where the
   import must read a value to map it (a port, a boolean, the scheme of a
   warehouse), a reference is refused with a reason.
+- `hive.parquet.time-zone` becomes `parquet_time_zone`. A hive catalog
+  without it takes the zone the operator names with `--reference-time-zone`
+  (the reference engine's JVM zone, which decides its `INT96` timestamps);
+  without that flag the catalog is skipped. The import never guesses a zone:
+  CodeLake's default (`America/Sao_Paulo`) and the stock reference image's
+  (UTC) differ, and a wrong one shifts timestamps silently.
 - The generated document is parsed and validated before anything is written.
 
 ### Harness (`tools/shadow`, `scripts/shadow-run.sh`)
@@ -95,7 +101,8 @@ configuration sections use it instead of inventing their own.
 - **Expected differences.** The engine removed limitations copied from the
   reference engine (ISS-017..020, ISS-023); their effect on output is
   declared in a rule file (`SHADOW_EXPECTED_DIFFERENCES`, JSON; the harness
-  ships ISS-018 names and ISS-019 unbounded `varchar`). A rule cites the
+  ships ISS-018 names and ISS-019 unbounded `varchar`, applied only when a
+  run names it: a rule is a decision about a run, not a default). A rule cites the
   accepted issue and a reason, and classifies only a declared-type or
   name-case difference as "expected and documented"; it is listed per table
   and column and counted in the cumulative report. Values are always
@@ -127,6 +134,16 @@ varchar, varbinary). Two cycles with CDC changes between them must report no
 divergence; mutations of the candidate's output (a row more or less, a
 decimal, a timestamp +3h, a trailing space, NULL to `''`) must each be
 detected on the right column, and a layout-only rewrite must not.
+
+### Findings
+
+The self-test surfaced three candidate defects on the acceptance pipelines'
+patterns (docs/shadow-run.md, "Findings"): SQL Server `datetime`/`datetime2(3)`
+columns arrive as `timestamp(6)` and a `MILLISECONDS` hive CTAS refuses them
+(F8-1); SQL Server `varchar(n)` columns lose their length in CTAS (F8-2); a
+window `ORDER BY` on varbinary fails (F8-3). They belong to the connector and
+planner, not to this front. The fixture works around them behind a dbt
+variable so the harness is proven; `SHADOW_SELFTEST_STRICT=1` shows them.
 
 ## Consequences
 

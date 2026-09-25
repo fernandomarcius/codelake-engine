@@ -84,10 +84,16 @@ Blocking items, in order:
   `codelake config import` (catalog `.properties` → `codelake.toml`, secrets to a
   0600 env file), `${ENV:NAME}` references in `codelake.toml`, and the harness
   `scripts/shadow-run.sh` (same cutoff on both sides, DuckDB checksums per table
-  and column, peak RSS per side, reports per cycle and cumulative). Evidence:
+  and column, declared-type and name-case differences classified by documented
+  rules without ever masking a value, peak RSS per side, reports per cycle and
+  cumulative). Evidence:
   `tools/shadow/selftest.sh` (SQL Server 2022 CDC, Trino 431, CodeLake) — two
-  cycles without divergence, every injected mutation detected. Pending: the run
-  itself in homologation (a person, three days).
+  cycles without divergence, every injected mutation detected. Findings that
+  block the real run (docs/shadow-run.md): SQL Server `datetime` columns arrive
+  as `timestamp(6)` and a `MILLISECONDS` hive CTAS refuses them (F8-1), SQL
+  Server `varchar(n)` loses its length in CTAS (F8-2), window `ORDER BY` on
+  varbinary fails (F8-3). Pending: those fixes, then the run itself in
+  homologation (a person, three days).
 
 ## M2 — Production cut-over
 

@@ -1,0 +1,12 @@
+# ISS-026 — Shadow-run harness: choices applied by recommendation
+
+- Kind: behavior · Applied: 2026-09-25 · Status: awaiting-confirmation
+1. `codelake config import` never guesses a hive catalog's `INT96` time zone: `hive.parquet.time-zone` becomes `parquet_time_zone`; without it, the zone comes from `--reference-time-zone` (the reference engine's JVM zone), or the catalog is skipped. The alternative, CodeLake's default (`America/Sao_Paulo`) or the stock image's (UTC), shifts every `INT96` timestamp silently when it is the wrong one.
+2. The harness ships an expected-differences file with ISS-018 (name case) and ISS-019 (`varchar(n)` → unbounded), applied only when a run names it (`SHADOW_EXPECTED_DIFFERENCES=default` or a path). The ISS-019 rule cannot tell a literal from a source column: enabled by default, it classified finding F8-2 (a SQL Server `varchar(n)` length lost) as expected in the self-test. No rule covers values.
+7. The self-test fixture works around findings F8-1..F8-3 (candidate defects on the acceptance pipelines' patterns) behind the dbt variable `shadow_workarounds`, so the harness is proven while they are open; `SHADOW_SELFTEST_STRICT=1` runs without them and fails. The alternative, a self-test that cannot pass until the connector and planner are fixed, proves nothing about the harness.
+3. Declared types come from each table's metastore file; without it on either side, the Parquet types stand for them. A declared-type difference without a rule is a divergence; Parquet storage types that differ under equal declared types (INT96 vs INT64 timestamps, decimal widths) are warnings, since values are compared by class.
+4. Partitioned tables are refused (reported as an error, which fails the cycle) rather than compared; neither acceptance pipeline partitions.
+5. Views are listed as not compared (no data files); the tables built from them are compared.
+6. A SQL Server catalog with `encrypt=false` imports as `encrypt = "off"` with `trust_server_certificate = true`: the JDBC driver encrypts the login without validating the certificate, and the source does the same only with both. The alternative, validating the certificate, fails to connect wherever the reference engine connects today with a self-signed certificate.
+- Revisit when: confirmed or overturned by a human; item 2 when ISS-018/ISS-019 are implemented; item 4 if a pipeline partitions.
+- References: ADR 0015, docs/shadow-run.md, ADR 0007 (`parquet_time_zone`).

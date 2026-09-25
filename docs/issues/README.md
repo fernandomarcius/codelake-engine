@@ -35,3 +35,4 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-023](ISS-023-drop-view-keeps-files.md) | DROP VIEW never deletes data files | deliberate divergence | 2026-09-25 | open |
 | [ISS-024](ISS-024-char-semantics.md) | char(n) semantics instead of refusals | removed limitation | 2026-09-25 | open |
 | [ISS-025](ISS-025-char-wrong-results-merged.md) | Known char(n) wrong results merged into main | known defect | 2026-09-25 | open |
+| [ISS-026](ISS-026-shadow-run-choices-by-recommendation.md) | Shadow-run harness: choices applied by recommendation | behavior | 2026-09-25 | awaiting-confirmation |
