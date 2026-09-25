@@ -2131,24 +2131,44 @@ async fn w1t_in_memory_update_never_escapes_the_pool() {
                 "an UPDATE answered {updated:?} but the rows went from {held} to {reserved} bytes"
             ));
         }
+        if let Err(err) = updated
+            && !err.contains("Resources exhausted")
+        {
+            wrong.push(format!(
+                "an UPDATE failed for another reason than the pool: {err}"
+            ));
+        }
         held = *reserved;
+    }
+    // Doubling 4000 rows of 1000 bytes five times outgrows 48 MiB: the probe
+    // must see an UPDATE answer and one fail, or it proved nothing.
+    if !steps.iter().any(|(updated, _)| updated.is_ok()) {
+        wrong.push("no UPDATE answered".into());
+    }
+    if !steps.iter().any(|(updated, _)| updated.is_err()) {
+        wrong.push("no UPDATE reached the pool's limit".into());
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Same rows as Trino, or a `CodeLake` error (a refusal is acceptable).
+/// The refusal of a comparison of char values (`codelake_core::char_comparisons`).
+const CHAR_REFUSAL: &[&str] = &["comparing the char column ", " is not supported yet"];
+
+/// Same rows as Trino, or `CodeLake`'s refusal: an error holding every one
+/// of `refusal` (any other error is a difference).
 fn same_or_refused(
     checks: &mut Checks,
-    id: &str,
-    what: &str,
+    (id, what): (&str, &str),
     codelake: &Result<Rows, String>,
     trino: &Result<Rows, String>,
+    refusal: &[&str],
 ) {
-    if codelake.is_err() {
-        note(checks.probe, &format!("{id} {what} (refused)"), (codelake, trino));
-        return;
+    match codelake {
+        Err(err) if refusal.iter().all(|part| err.contains(part)) => {
+            note(checks.probe, &format!("{id} {what} (refused)"), (codelake, trino));
+        }
+        _ => checks.same(id, what, codelake, trino),
     }
-    checks.same(id, what, codelake, trino);
 }
 
 /// `char(n)` values compared where the W1-4 rule does not look: set
@@ -2171,68 +2191,86 @@ async fn w1t_char_values_compared_outside_predicates_like_trino_431() {
     s.trino
         .ok("INSERT INTO hive.s.vct VALUES (1, 'ab'), (3, 'cd')")
         .await;
-    for (id, q) in [
+    for (id, q, refusal) in [
         (
             "CH1",
             "SELECT count(*) FROM hive.s.cht JOIN hive.s.vct USING (ch)",
+            CHAR_REFUSAL,
         ),
         (
             "CH2",
             "SELECT count(*) FROM (SELECT ch FROM hive.s.cht INTERSECT SELECT ch FROM hive.s.vct)",
+            CHAR_REFUSAL,
         ),
         (
             "CH3",
             "SELECT count(*) FROM (SELECT ch FROM hive.s.cht EXCEPT SELECT ch FROM hive.s.vct)",
+            CHAR_REFUSAL,
         ),
         (
             "CH4",
             "SELECT count(*) FROM (SELECT ch FROM hive.s.cht UNION SELECT ch FROM hive.s.vct)",
+            CHAR_REFUSAL,
         ),
         (
             "CH5",
             "SELECT id FROM hive.s.cht WHERE nullif(ch, 'ab') IS NULL ORDER BY 1",
+            CHAR_REFUSAL,
         ),
         (
             "CH6",
             "SELECT count(DISTINCT c) FROM (SELECT ch AS c FROM hive.s.cht UNION ALL SELECT CAST('ab' AS char(5)))",
+            CHAR_REFUSAL,
         ),
         (
             "CH7",
             "SELECT id FROM hive.s.cht WHERE (ch, id) = ('ab', 1) ORDER BY 1",
+            CHAR_REFUSAL,
         ),
         (
             "CH8",
             "SELECT id FROM hive.s.cht WHERE ch = ANY (SELECT ch FROM hive.s.vct) ORDER BY 1",
+            CHAR_REFUSAL,
         ),
         (
             "CH9",
             "SELECT count(*) FROM (SELECT 'ab ' UNION SELECT CAST('ab' AS char(5)))",
+            CHAR_REFUSAL,
         ),
-        ("CH10", "SELECT CAST('ab' AS char(5)) = 'ab '"),
+        ("CH10", "SELECT CAST('ab' AS char(5)) = 'ab '", CHAR_REFUSAL),
         (
             "CH11",
             "SELECT count(DISTINCT x) FROM (VALUES ('ab '), (CAST('ab' AS char(5)))) AS t(x)",
+            CHAR_REFUSAL,
         ),
-        ("CH12", "SELECT TRY_CAST('ab' AS char(5)) = 'ab '"),
+        (
+            "CH12",
+            "SELECT TRY_CAST('ab' AS char(5)) = 'ab '",
+            &["TRY_CAST to char(5) is not supported yet"],
+        ),
         (
             "CH13",
             "SELECT count(*) FROM (SELECT max(ch) FROM hive.s.cht UNION SELECT ch FROM hive.s.vct)",
+            CHAR_REFUSAL,
         ),
         (
             "CH14",
             "SELECT count(*) FROM (SELECT coalesce(ch, 'x') FROM hive.s.cht UNION SELECT ch FROM hive.s.vct)",
+            CHAR_REFUSAL,
         ),
         (
             "CH15",
             "SELECT id FROM (SELECT id, max(ch) AS m FROM hive.s.cht GROUP BY id) WHERE m = 'ab' ORDER BY 1",
+            CHAR_REFUSAL,
         ),
         (
             "CH16",
             "SELECT id FROM hive.s.cht WHERE upper(ch) = 'AB ' ORDER BY 1",
+            CHAR_REFUSAL,
         ),
     ] {
         let (codelake, trino) = (cl_try(&s.engine, q).await, s.trino.sql(q).await);
-        same_or_refused(&mut checks, id, q, &codelake, &trino);
+        same_or_refused(&mut checks, (id, q), &codelake, &trino, refusal);
     }
     checks.assert_none();
 }
