@@ -6,18 +6,23 @@
 //! reservation of what its rows take, for as long as the table exists:
 //! `CREATE TABLE … AS` reserves each batch as it arrives and fails, with
 //! nothing registered, once the pool cannot hold more; `INSERT` reserves
-//! what it appends and gives it back if it fails; `DELETE` and `UPDATE`
-//! resize the reservation to what the table then holds. Dropping or
-//! replacing the table frees it.
+//! what it appends and gives it back if it fails. `DELETE` and `UPDATE` run
+//! when their plan executes (never while it is planned or explained), over
+//! the whole table at once: `UPDATE` reserves the values it computes before
+//! the table changes, so one the pool cannot hold fails with the rows as
+//! they were; then the reservation is resized to what the table holds.
+//! Dropping or replacing the table frees it.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch};
+use datafusion::arrow::compute::kernels::zip::zip;
+use datafusion::arrow::compute::{and, filter_record_batch};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::Constraints;
+use datafusion::common::{Constraints, DFSchema};
 use datafusion::datasource::memory::PartitionData;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::{MemTable, TableType};
@@ -26,6 +31,8 @@ use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties};
 use futures::StreamExt;
 
@@ -80,20 +87,28 @@ impl PooledTable {
         Self { inner, reservation }
     }
 
-    /// Resizes the reservation to what the table holds now. Rows already
-    /// changed are recorded even beyond the ceiling (the change cannot be
-    /// undone), so later statements find the pool full.
-    async fn account(&self) {
-        let mut bytes = 0;
-        for partition in &self.inner.batches {
-            bytes += partition
-                .read()
-                .await
-                .iter()
-                .map(RecordBatch::get_array_memory_size)
-                .sum::<usize>();
-        }
-        lock(&self.reservation).resize(bytes);
+    /// A plan that runs `change` over the rows `filters` select (every row
+    /// without filters) when it executes, and answers how many it changed.
+    fn rewrite(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+        change: Change,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let df_schema = DFSchema::try_from(self.inner.schema())?;
+        let filters = filters
+            .into_iter()
+            .map(|filter| state.create_physical_expr(filter, &df_schema))
+            .collect::<Result<_>>()?;
+        let sink = RewriteSink {
+            partitions: self.inner.batches.clone(),
+            schema: self.inner.schema(),
+            reservation: Arc::clone(&self.reservation),
+            filters,
+            change,
+        };
+        let input = Arc::new(EmptyExec::new(self.inner.schema()));
+        Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
     }
 }
 
@@ -154,9 +169,7 @@ impl TableProvider for PooledTable {
     }
 
     async fn delete_from(&self, state: &dyn Session, filters: Vec<Expr>) -> Result<Arc<dyn ExecutionPlan>> {
-        let deleted = self.inner.delete_from(state, filters).await;
-        self.account().await;
-        deleted
+        self.rewrite(state, filters, Change::Delete)
     }
 
     async fn update(
@@ -165,9 +178,168 @@ impl TableProvider for PooledTable {
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let updated = self.inner.update(state, assignments, filters).await;
-        self.account().await;
-        updated
+        let schema = self.inner.schema();
+        let df_schema = DFSchema::try_from(Arc::clone(&schema))?;
+        let mut set = Vec::with_capacity(assignments.len());
+        for (name, expr) in assignments {
+            let Ok(index) = schema.index_of(&name) else {
+                let available: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+                return Err(DataFusionError::Plan(format!(
+                    "UPDATE failed: column '{name}' does not exist. Available columns: {}",
+                    available.join(", ")
+                )));
+            };
+            set.push((index, state.create_physical_expr(expr, &df_schema)?));
+        }
+        self.rewrite(state, filters, Change::Update(set))
+    }
+}
+
+/// What a [`RewriteSink`] does to the rows its filters select.
+#[derive(Debug)]
+enum Change {
+    Delete,
+    /// New values of these columns (by index).
+    Update(Vec<(usize, Arc<dyn PhysicalExpr>)>),
+}
+
+/// Rows of `batch` every filter holds for (NULL does not hold); `None`
+/// without filters (every row).
+fn selected(filters: &[Arc<dyn PhysicalExpr>], batch: &RecordBatch) -> Result<Option<BooleanArray>> {
+    let mut mask: Option<BooleanArray> = None;
+    for filter in filters {
+        let values = filter.evaluate(batch)?.into_array(batch.num_rows())?;
+        let values = values
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| DataFusionError::Internal("a filter did not evaluate to boolean".into()))?
+            .clone();
+        mask = Some(match mask {
+            Some(mask) => and(&mask, &values)?,
+            None => values,
+        });
+    }
+    // Only TRUE selects a row.
+    Ok(mask.map(|mask| mask.iter().map(|v| Some(v == Some(true))).collect()))
+}
+
+/// Runs a `DELETE` or `UPDATE` of a [`PooledTable`] over every partition at
+/// once, holding them all: the table changes only if the whole statement
+/// succeeds (see the module documentation).
+struct RewriteSink {
+    partitions: Vec<PartitionData>,
+    schema: SchemaRef,
+    reservation: Shared,
+    filters: Vec<Arc<dyn PhysicalExpr>>,
+    change: Change,
+}
+
+impl fmt::Debug for RewriteSink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RewriteSink")
+            .field("partitions", &self.partitions.len())
+            .field("filters", &self.filters)
+            .field("change", &self.change)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DisplayAs for RewriteSink {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let what = match self.change {
+            Change::Delete => "DELETE",
+            Change::Update(_) => "UPDATE",
+        };
+        write!(f, "MemoryTable {what} (partitions={})", self.partitions.len())
+    }
+}
+
+impl RewriteSink {
+    /// The new rows of `batch` and how many rows changed; values an `UPDATE`
+    /// computes are reserved on `grown` first.
+    fn rewrite(&self, batch: &RecordBatch, grown: &mut usize) -> Result<(RecordBatch, u64)> {
+        let mask = selected(&self.filters, batch)?;
+        let selected = mask.as_ref().map_or(batch.num_rows(), BooleanArray::true_count);
+        let changed = u64::try_from(selected).unwrap_or(u64::MAX);
+        if selected == 0 {
+            return Ok((batch.clone(), 0));
+        }
+        match &self.change {
+            Change::Delete => {
+                let keep = match mask {
+                    Some(mask) => datafusion::arrow::compute::not(&mask)?,
+                    None => BooleanArray::from(vec![false; batch.num_rows()]),
+                };
+                Ok((filter_record_batch(batch, &keep)?, changed))
+            }
+            Change::Update(set) => {
+                let mask = mask.unwrap_or_else(|| BooleanArray::from(vec![true; batch.num_rows()]));
+                let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+                for (index, expr) in set {
+                    // Only the selected rows are evaluated (no error from a row
+                    // left as it is).
+                    let values = expr
+                        .evaluate_selection(batch, &mask)?
+                        .into_array(batch.num_rows())?;
+                    let original: &dyn Array = batch.column(*index).as_ref();
+                    let new: &dyn Array = values.as_ref();
+                    let column = zip(&mask, &new, &original)?;
+                    let bytes = column.get_array_memory_size();
+                    lock(&self.reservation).try_grow(bytes)?;
+                    *grown += bytes;
+                    columns[*index] = column;
+                }
+                Ok((RecordBatch::try_new(Arc::clone(&self.schema), columns)?, changed))
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl DataSink for RewriteSink {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    async fn write_all(&self, _data: SendableRecordBatchStream, _context: &Arc<TaskContext>) -> Result<u64> {
+        // Every partition, in order (as `INSERT` takes them): no statement
+        // sees the table half changed.
+        let mut held = Vec::with_capacity(self.partitions.len());
+        for partition in &self.partitions {
+            held.push(partition.write().await);
+        }
+        let mut grown = 0;
+        let mut changed = 0_u64;
+        let mut rewritten = Vec::with_capacity(held.len());
+        let computed = (|| {
+            for partition in &held {
+                let mut batches = Vec::with_capacity(partition.len());
+                for batch in partition.iter().filter(|batch| batch.num_rows() > 0) {
+                    let (batch, count) = self.rewrite(batch, &mut grown)?;
+                    changed += count;
+                    if batch.num_rows() > 0 {
+                        batches.push(batch);
+                    }
+                }
+                rewritten.push(batches);
+            }
+            Ok::<_, DataFusionError>(())
+        })();
+        if let Err(err) = computed {
+            lock(&self.reservation).shrink(grown);
+            return Err(err);
+        }
+        let mut bytes = 0;
+        for (partition, batches) in held.iter_mut().zip(rewritten) {
+            bytes += batches
+                .iter()
+                .map(RecordBatch::get_array_memory_size)
+                .sum::<usize>();
+            **partition = batches;
+        }
+        // At most what was reserved: the old rows and the new values.
+        lock(&self.reservation).resize(bytes);
+        Ok(changed)
     }
 }
 
@@ -309,5 +481,78 @@ mod tests {
         assert!(reserved(&engine) < held / 10, "{}", reserved(&engine));
         run(&engine, "DROP TABLE datafusion.public.small").await.unwrap();
         assert_eq!(reserved(&engine), 0);
+    }
+
+    #[tokio::test]
+    async fn an_update_the_pool_cannot_hold_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(48));
+        let rows = WIDE.replace("{rows}", "4000");
+        run(&engine, &format!("CREATE TABLE datafusion.public.t AS {rows}"))
+            .await
+            .unwrap();
+        let sizes = "SELECT count(*), sum(length(s)) FROM datafusion.public.t";
+        let mut answers = Vec::new();
+        for _ in 0..5 {
+            let before = (reserved(&engine), run(&engine, sizes).await.unwrap());
+            let updated = run(&engine, "UPDATE datafusion.public.t SET s = concat(s, s)").await;
+            let after = (reserved(&engine), run(&engine, sizes).await.unwrap());
+            assert!(
+                after.0 <= ByteSize::mib(48).as_u64(),
+                "{} bytes reserved",
+                after.0
+            );
+            match &updated {
+                Ok(_) => assert_ne!(after, before, "an UPDATE that answered changed the rows"),
+                Err(err) => {
+                    assert!(err.contains("Resources exhausted"), "{err}");
+                    assert_eq!(after, before, "an UPDATE that failed kept its rows");
+                }
+            }
+            answers.push(updated.is_ok());
+        }
+        assert!(answers.contains(&true) && answers.contains(&false), "{answers:?}");
+    }
+
+    #[tokio::test]
+    async fn delete_and_update_change_rows_only_when_they_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(48));
+        run(
+            &engine,
+            "CREATE TABLE datafusion.public.t AS SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, NULL)) AS v(id, s)",
+        )
+        .await
+        .unwrap();
+        let all = "SELECT id, s FROM datafusion.public.t ORDER BY id";
+        let before = run(&engine, all).await.unwrap();
+        run(&engine, "EXPLAIN UPDATE datafusion.public.t SET s = 'z'")
+            .await
+            .unwrap();
+        run(&engine, "EXPLAIN DELETE FROM datafusion.public.t")
+            .await
+            .unwrap();
+        assert_eq!(
+            run(&engine, all).await.unwrap(),
+            before,
+            "EXPLAIN changed the rows"
+        );
+
+        let updated = run(&engine, "UPDATE datafusion.public.t SET s = 'z' WHERE s <> 'a'")
+            .await
+            .unwrap();
+        assert!(updated.contains("| 1     |"), "{updated}");
+        let deleted = run(&engine, "DELETE FROM datafusion.public.t WHERE id = 1")
+            .await
+            .unwrap();
+        assert!(deleted.contains("| 1     |"), "{deleted}");
+        assert_eq!(
+            run(&engine, all).await.unwrap(),
+            "+----+---+\n| id | s |\n+----+---+\n| 2  | z |\n| 3  |   |\n+----+---+"
+        );
+        let err = run(&engine, "UPDATE datafusion.public.t SET nope = 1")
+            .await
+            .unwrap_err();
+        assert!(err.contains("No field named nope"), "{err}");
     }
 }

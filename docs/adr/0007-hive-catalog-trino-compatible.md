@@ -219,7 +219,13 @@ its correction and passes after it (2026-09-25).
   pool for as long as the table exists (`codelake_core::memory_tables`):
   `CREATE TABLE … AS` and `INSERT` fail with nothing kept once the pool is
   full; `DELETE`, `UPDATE` and `DROP` give memory back
-  (`w1_in_memory_tables_never_escape_the_pool`). Pending, F5: those tables
+  (`w1_in_memory_tables_never_escape_the_pool`). `DELETE` and `UPDATE` run
+  when the plan executes, not while it is planned (`DataFusion`'s own
+  tables change their rows while planning, `EXPLAIN` included), and
+  `UPDATE` reserves the values it computes before the table changes: one
+  the pool cannot hold fails with the rows as they were, instead of
+  growing the table past the ceiling (DEFECT-W1T-3,
+  `w1t_in_memory_update_never_escapes_the_pool`). Pending, F5: those tables
   are visible to every user, like the rest of the catalogs until ownership
   (R11) is checked.
 - **W1-6** owner checks (R11): pending F5, the probe stays ignored.

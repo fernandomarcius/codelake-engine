@@ -2037,7 +2037,6 @@ async fn w1t_optimize_keeps_int64_timestamps_like_trino_431() {
 /// makes the rows larger must not take the table past the ceiling, and an
 /// `UPDATE` answered with an error must not have changed the rows.
 #[tokio::test]
-#[ignore = "DEFECT-W1T-3: UPDATE of an in-memory table grows it past the pool ceiling, and changes the rows even when it answers an error"]
 async fn w1t_in_memory_update_never_escapes_the_pool() {
     let dir = tempfile::tempdir().unwrap();
     let spill = tempfile::tempdir().unwrap();
