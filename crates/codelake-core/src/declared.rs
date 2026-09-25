@@ -25,10 +25,11 @@
 //! the engine records on the new table's fields, and [`check_insert`] adds
 //! Trino's length check to an `INSERT` into such columns.
 //!
-//! A `char(n)` value is stored without its padding (comparisons ignore
-//! trailing spaces in Trino) and padded when sent to a client. Text keeps
-//! the Arrow type it came with (`Utf8View` in, `Utf8View` out): a table's
-//! column and the values an `INSERT` writes into it must agree.
+//! A `char(n)` value is held padded with spaces to `n` characters, as the
+//! reference engine shows it; comparing it with other text is the business
+//! of [`crate::char_semantics`]. Text keeps the Arrow type it came with
+//! (`Utf8View` in, `Utf8View` out): a table's column and the values an
+//! `INSERT` writes into it must agree.
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -38,7 +39,7 @@ use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, TimeUnit};
 use datafusion::arrow::error::ArrowError;
 use datafusion::common::tree_node::Transformed;
-use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue, exec_err, plan_err};
+use datafusion::common::{DFSchema, Result, ScalarValue, exec_err, plan_err};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::logical_plan::dml::{DmlStatement, WriteOp};
 use datafusion::logical_expr::{
@@ -156,7 +157,8 @@ fn too_long(mode: Mode, text: &str, declared: Declared) -> ArrowError {
     }
 }
 
-/// A text as a `varchar(n)` / `char(n)` value (`char` without its padding).
+/// A text as a `varchar(n)` / `char(n)` value (`char` padded with spaces to
+/// `n` characters).
 fn bounded(mode: Mode, text: &str, declared: Declared, length: u32) -> Result<String, ArrowError> {
     let length = usize::try_from(length).unwrap_or(usize::MAX);
     let mut value: String = if text.chars().count() <= length {
@@ -170,7 +172,8 @@ fn bounded(mode: Mode, text: &str, declared: Declared, length: u32) -> Result<St
         }
     };
     if matches!(declared, Declared::Char(_)) {
-        value.truncate(value.trim_end_matches(' ').len());
+        let count = value.chars().count();
+        value.extend(std::iter::repeat_n(' ', length.saturating_sub(count)));
     }
     Ok(value)
 }
@@ -216,6 +219,24 @@ impl ScalarUDFImpl for TrinoTyped {
             TRINO_TRY_TYPED
         } else {
             TRINO_TYPED
+        }
+    }
+
+    /// With `''` (no declared type), the name of the value: the call only
+    /// marks it (see [`rewrite_declared_casts`]).
+    fn schema_name(&self, args: &[Expr]) -> Result<String> {
+        match args {
+            [value, Expr::Literal(ScalarValue::Utf8(Some(name)), _)] if name.is_empty() => {
+                Ok(value.schema_name().to_string())
+            }
+            _ => Ok(format!(
+                "{}({})",
+                self.name(),
+                args.iter()
+                    .map(|a| a.schema_name().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
         }
     }
 
@@ -351,6 +372,29 @@ fn declared_type(data_type: &sql::DataType) -> Option<Declared> {
     }
 }
 
+fn is_unbounded_text(data_type: &sql::DataType) -> bool {
+    use sql::DataType as T;
+    matches!(
+        data_type,
+        T::Varchar(None) | T::CharacterVarying(None) | T::CharVarying(None) | T::Text | T::String(None)
+    )
+}
+
+/// `codelake_trino_type(<cast>, '')`: a cast to unbounded `varchar`.
+fn marked_text(cast: sql::Expr) -> sql::Expr {
+    use sql::{FunctionArg, FunctionArgExpr};
+    let mut call = typed_call(TRINO_TYPED, cast, Declared::Varchar(0));
+    if let sql::Expr::Function(function) = &mut call
+        && let sql::FunctionArguments::List(list) = &mut function.args
+        && let Some(name) = list.args.get_mut(1)
+    {
+        *name = FunctionArg::Unnamed(FunctionArgExpr::Expr(sql::Expr::value(
+            sql::Value::SingleQuotedString(String::new()),
+        )));
+    }
+    call
+}
+
 fn typed_call(function: &str, expr: sql::Expr, declared: Declared) -> sql::Expr {
     use sql::{
         Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident, ObjectName,
@@ -383,25 +427,21 @@ fn typed_call(function: &str, expr: sql::Expr, declared: Declared) -> sql::Expr 
 /// `CAST(x AS varchar(n) | char(n) | timestamp(p))` → `codelake_trino_type`,
 /// `TRY_CAST` → `codelake_trino_try_type` (see the module documentation). A
 /// `timestamp(p)` is first read with nine digits (by the same kind of cast),
-/// then rounded. `TRY_CAST(x AS char(n))` fails (`NOT_SUPPORTED`): the
-/// engine would hold it as text, compared unpadded
-/// ([`crate::char_comparisons`]).
-pub(crate) fn rewrite_declared_casts(statement: &mut DFStatement) -> Result<()> {
+/// then rounded. A cast to unbounded `varchar` is kept, marked with
+/// `codelake_trino_type(…, '')`: the statement asked for `varchar`, which
+/// tells it from the casts between Arrow's text types that type coercion
+/// adds (`crate::char_semantics` reads the type of text through those).
+pub(crate) fn rewrite_declared_casts(statement: &mut DFStatement) {
     let DFStatement::Statement(inner) = statement else {
-        return Ok(());
+        return;
     };
-    let flow = visit_expressions_mut(inner.as_mut(), |expr| {
-        if let sql::Expr::Cast {
-            kind: CastKind::TryCast | CastKind::SafeCast,
-            data_type,
-            ..
-        } = expr
-            && let Some(declared @ Declared::Char(_)) = declared_type(data_type)
+    let _ = visit_expressions_mut(inner.as_mut(), |expr| {
+        if let sql::Expr::Cast { data_type, .. } = expr
+            && is_unbounded_text(data_type)
         {
-            return ControlFlow::Break(DataFusionError::NotImplemented(format!(
-                "TRY_CAST to {} is not supported yet: char values compare padded with spaces; use CAST",
-                declared.name(&DataType::Utf8)
-            )));
+            let cast = std::mem::replace(expr, sql::Expr::value(sql::Value::Null));
+            *expr = marked_text(cast);
+            return ControlFlow::Continue(());
         }
         if let sql::Expr::Cast { kind, data_type, .. } = expr
             && let Some(declared) = declared_type(data_type)
@@ -422,12 +462,8 @@ pub(crate) fn rewrite_declared_casts(statement: &mut DFStatement) -> Result<()> 
                 *expr = typed_call(function, *value, declared);
             }
         }
-        ControlFlow::Continue(())
+        ControlFlow::<()>::Continue(())
     });
-    match flow {
-        ControlFlow::Break(err) => Err(err),
-        ControlFlow::Continue(()) => Ok(()),
-    }
 }
 
 /// The declared types of the columns of a `CREATE TABLE` (`varchar(n)`,
@@ -599,12 +635,13 @@ pub(crate) fn with_declared(
 }
 
 /// `INSERT` into `varchar(n)` / `char(n)` columns: each value checked as Trino
-/// checks it (see the module documentation).
+/// checks it (see the module documentation), a char value padded. So is
+/// every value an `UPDATE` writes.
 pub(crate) fn check_insert(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let LogicalPlan::Dml(dml) = plan else {
         return Ok(Transformed::no(plan));
     };
-    if !matches!(dml.op, WriteOp::Insert(_)) {
+    if !matches!(dml.op, WriteOp::Insert(_) | WriteOp::Update) {
         return Ok(Transformed::no(LogicalPlan::Dml(dml)));
     }
     let table = dml.target.schema();
@@ -678,7 +715,12 @@ mod tests {
         );
         let c3 = Declared::Char(3);
         assert_eq!(bounded(Mode::Cast, "abcdefg", c3, 3).unwrap(), "abc");
-        assert_eq!(bounded(Mode::Cast, "a  ", c3, 3).unwrap(), "a");
+        assert_eq!(bounded(Mode::Cast, "a  ", c3, 3).unwrap(), "a  ");
+        assert_eq!(bounded(Mode::Cast, "a", c3, 3).unwrap(), "a  ");
+        assert_eq!(bounded(Mode::Cast, "", c3, 3).unwrap(), "   ");
+        assert_eq!(bounded(Mode::Cast, "çã", c3, 3).unwrap(), "çã ");
+        assert_eq!(bounded(Mode::Insert, "ab    ", c3, 3).unwrap(), "ab ");
+        assert!(bounded(Mode::Insert, "abcd", c3, 3).is_err());
     }
 
     /// `TRY_CAST` answers what `CAST` answers, `NULL` where `CAST` fails
@@ -718,9 +760,9 @@ mod tests {
         assert_eq!(cut.data_type(), &DataType::Utf8View);
         let cut: Vec<Option<&str>> = cut.as_string_view().iter().collect();
         assert_eq!(cut, [Some("abc"), None, Some("ab")]);
-        let char3 = call(&lenient, text, "char(3)").unwrap();
-        let char3: Vec<Option<&str>> = char3.as_string_view().iter().collect();
-        assert_eq!(char3, [Some("abc"), None, Some("ab")]);
+        let padded = call(&lenient, text, "char(3)").unwrap();
+        let padded: Vec<Option<&str>> = padded.as_string_view().iter().collect();
+        assert_eq!(padded, [Some("abc"), None, Some("ab ")]);
         // A number too long for the type: NULL, where CAST fails.
         let numbers: ArrayRef = Arc::new(StringArray::from(vec!["12345", "12"]));
         let strict = ScalarUDF::new_from_impl(TrinoTyped::new(Mode::Strict, true));
@@ -782,30 +824,27 @@ mod tests {
         .unwrap()
         .pop_front()
         .unwrap();
-        rewrite_declared_casts(&mut statement).unwrap();
+        rewrite_declared_casts(&mut statement);
         assert_eq!(
             statement.to_string(),
-            "SELECT codelake_trino_type(a, 'varchar(5)'), codelake_trino_type(b, 'char(3)'), CAST(c AS VARCHAR), \
+            "SELECT codelake_trino_type(a, 'varchar(5)'), codelake_trino_type(b, 'char(3)'), \
+             codelake_trino_type(CAST(c AS VARCHAR), ''), \
              codelake_trino_type(CAST(d AS TIMESTAMP(9)), 'timestamp(1)'), CAST(e AS TIMESTAMP(6)), \
              codelake_trino_type(CAST(f AS TIMESTAMP(9) WITH TIME ZONE), 'timestamp(2)')"
         );
         let mut statement = DFParser::parse_sql(
-            "SELECT TRY_CAST(a AS VARCHAR(3)), TRY_CAST(d AS TIMESTAMP(1)), TRY_CAST(e AS VARCHAR)",
+            "SELECT TRY_CAST(a AS VARCHAR(3)), TRY_CAST(b AS CHAR(2)), TRY_CAST(d AS TIMESTAMP(1)), TRY_CAST(e AS VARCHAR)",
         )
         .unwrap()
         .pop_front()
         .unwrap();
-        rewrite_declared_casts(&mut statement).unwrap();
+        rewrite_declared_casts(&mut statement);
         assert_eq!(
             statement.to_string(),
-            "SELECT codelake_trino_try_type(a, 'varchar(3)'), \
-             codelake_trino_try_type(TRY_CAST(d AS TIMESTAMP(9)), 'timestamp(1)'), TRY_CAST(e AS VARCHAR)"
+            "SELECT codelake_trino_try_type(a, 'varchar(3)'), codelake_trino_try_type(b, 'char(2)'), \
+             codelake_trino_try_type(TRY_CAST(d AS TIMESTAMP(9)), 'timestamp(1)'), \
+             codelake_trino_type(TRY_CAST(e AS VARCHAR), '')"
         );
-        let mut refused = DFParser::parse_sql("SELECT TRY_CAST(b AS CHAR(2))")
-            .unwrap()
-            .pop_front()
-            .unwrap();
-        assert!(rewrite_declared_casts(&mut refused).is_err());
         let mut create =
             DFParser::parse_sql("CREATE TABLE t (a VARCHAR(10), b CHAR(3), c VARCHAR, d BIGINT)")
                 .unwrap()

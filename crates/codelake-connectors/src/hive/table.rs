@@ -616,7 +616,8 @@ impl TableProvider for HiveTable {
     }
 
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Result<Vec<TableProviderFilterPushDown>> {
-        // Row-group statistics prune files; the filter is still applied above.
+        // Applied again above the scan: a filter on a char column never
+        // prunes by statistics of the stored (unpadded) text (`types.rs`).
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
@@ -624,7 +625,7 @@ impl TableProvider for HiveTable {
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        filters: &[Expr],
+        _filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let span = tracing::info_span!(
@@ -639,7 +640,6 @@ impl TableProvider for HiveTable {
             codelake.hive.file_names = Empty,
         );
         refuse_unsupported(&self.schema, projection)?;
-        refuse_char_comparisons(&self.schema, filters)?;
         let files = self
             .committed_data_files()
             .instrument(span.clone())
@@ -698,39 +698,6 @@ impl TableProvider for HiveTable {
             None,
         )))
     }
-}
-
-/// Trino compares `char(n)` values padded (`ch = 'ab'` is true for a
-/// `char(5)` holding `'ab'`); the engine would compare the padded text as a
-/// varchar and drop the row. A filter that uses a char column other than
-/// `IS [NOT] NULL` is refused instead of answered differently.
-pub(crate) fn refuse_char_comparisons(schema: &Schema, filters: &[Expr]) -> Result<()> {
-    let chars: Vec<&str> = schema
-        .fields()
-        .iter()
-        .filter(|field| char_column(field).is_some())
-        .map(|field| field.name().as_str())
-        .collect();
-    if chars.is_empty() {
-        return Ok(());
-    }
-    for filter in filters {
-        if matches!(filter, Expr::IsNull(_) | Expr::IsNotNull(_)) {
-            continue;
-        }
-        if let Some(column) = filter
-            .column_refs()
-            .into_iter()
-            .find(|column| chars.contains(&column.name.as_str()))
-        {
-            return Err(DataFusionError::NotImplemented(format!(
-                "comparing the char column {} is not supported yet: Trino compares char values padded \
-                 with spaces; compare CAST({} AS varchar) with the padded value instead",
-                column.name, column.name
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// Records what a scan will read: file count, total bytes, first names.

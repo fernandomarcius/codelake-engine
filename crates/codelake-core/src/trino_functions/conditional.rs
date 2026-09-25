@@ -13,6 +13,8 @@ use datafusion::logical_expr::type_coercion::binary::BinaryTypeCoercer;
 use datafusion::logical_expr::type_coercion::binary::type_union_resolution;
 use datafusion::logical_expr::{Operator, ScalarUDF};
 
+use crate::trino_types::{Declared, declared};
+
 use super::support::{Call, Func, as_bool, bools, not_found, string_array, trino_type_name};
 
 fn coerce_if(name: &str, types: &[DataType]) -> Result<Vec<DataType>> {
@@ -61,12 +63,12 @@ pub(crate) fn typeof_function() -> ScalarUDF {
         },
         |_| Ok(DataType::Utf8),
         |call| {
-            let name = if call
-                .fields
-                .first()
-                .is_some_and(|f| super::support::is_json_field(f))
-            {
+            let field = call.fields.first();
+            let name = if field.is_some_and(|f| super::support::is_json_field(f)) {
                 "json".to_owned()
+            } else if let Some(Declared::Char(n)) = field.and_then(|f| declared(f)) {
+                // Recorded in the field (`crate::char_semantics`).
+                Declared::Char(n).name(&DataType::Utf8)
             } else {
                 trino_type_name(call.arg(0)?.data_type())
             };

@@ -272,10 +272,10 @@ requires where Trino has no equivalent.
   cut values to `n` characters, as Trino's reader. **`char(n)`** is stored as
   declared, written without trailing spaces (as Trino stores it; a longer
   value fails like Trino's `INSERT`) and read padded to `n` (`'ab   '`,
-  length 5, as Trino shows it). Trino also compares char values padded
-  (`ch = 'ab'` is true); the engine has no char type, so a comparison of a
-  char column is refused instead of answered as a varchar comparison,
-  wherever the plan holds it (see "Red-team W1 corrections").
+  length 5, as Trino shows it). The engine compares, converts and combines
+  char values as Trino does (`ch = 'ab'` is true), wherever the plan holds
+  them (ADR 0015); a filter the scan receives is applied again above it and
+  never prunes a file by statistics of a char column.
 - **Checksums are verified.** A metadata file whose `.crc` does not match is
   an error ("Checksum error"), as in Trino, never a table read with other
   columns. A mismatch is re-read briefly first: writers replace the checksum
@@ -325,19 +325,14 @@ its correction and passes after it (2026-09-25).
   `w1_nanosecond_optimize_never_rewrites_other_instants`,
   `w1_optimize_keeps_the_nanoseconds_trino_wrote`).
 - **W1-4 `char(n)` comparisons above the scan** (under `LIMIT`, a window, a
-  volatile predicate) compared unpadded text and dropped rows. An analyzer
-  rule (`codelake_core::char_comparisons`) refuses every comparison of a
-  char value, wherever it is in the plan (filters, joins, `CASE`,
-  projections, subqueries), until the engine has a char type; an explicit
-  `CAST(ch AS varchar)` compares text (owner decision: char(n) as
-  implemented) (`w1_char_comparisons_above_the_scan_never_drop_rows`).
-  The comparisons a plan makes without a comparison expression are refused
-  too (DEFECT-W1T-2, which answered other counts than Trino 431): join keys
-  (`USING`, `NATURAL`, `INTERSECT`, `EXCEPT`), a `UNION` holding a char
-  column (it mixes padded values with unpadded ones, a varchar or a
-  `CAST … AS char(n)`, which `DISTINCT` and `GROUP BY` then compare), and
-  `nullif`, `greatest` and `least`
-  (`w1t_char_values_compared_outside_predicates_like_trino_431`).
+  volatile predicate) compared unpadded text and dropped rows. They were
+  first refused wherever a rule recognized them; verification kept finding
+  shapes the rule missed (DEFECT-W1T-2, then P1–P16: subqueries, `CASE`,
+  `coalesce`, casts), so the engine now implements Trino's char semantics
+  instead (ADR 0015, ISS-024): every such comparison answers Trino's rows
+  (`w1_char_comparisons_above_the_scan_never_drop_rows`,
+  `w1t_char_values_compared_outside_predicates_like_trino_431`, the matrix
+  `char_matrix`).
 - **W1-5 tables of the in-memory catalog** (`CREATE TABLE datafusion.…`)
   held their rows outside the memory pool. Their rows are reserved in the
   pool for as long as the table exists (`codelake_core::memory_tables`):

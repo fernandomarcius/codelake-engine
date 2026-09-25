@@ -151,6 +151,30 @@ fn literal_for(value: ScalarValue) -> Expr {
     }
 }
 
+/// A text literal that stands for a `char(n)` subquery records the type (a
+/// comparison with other text follows char semantics,
+/// [`crate::char_semantics`]).
+fn typed(literal: Expr, char_length: Option<u32>) -> Expr {
+    match (literal, char_length) {
+        (Expr::Literal(value, None), Some(n))
+            if matches!(
+                value.data_type(),
+                DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8
+            ) =>
+        {
+            let metadata = crate::trino_types::Declared::Char(n)
+                .metadata()
+                .into_iter()
+                .collect();
+            Expr::Literal(
+                value,
+                Some(datafusion::common::metadata::FieldMetadata::new(metadata)),
+            )
+        }
+        (literal, _) => literal,
+    }
+}
+
 /// Replaces `target` by `replacement` everywhere in `plan`; output columns
 /// keep their names (a projected subquery is named after its column).
 fn substitute(plan: LogicalPlan, target: &Subquery, replacement: &Expr) -> Result<LogicalPlan> {
@@ -187,7 +211,11 @@ pub async fn pre_evaluate_scalar_subqueries(
             return Ok(plan);
         };
         let value = evaluate(ctx, &subquery).await?;
-        plan = substitute(plan, &subquery, &literal_for(value))?;
+        let literal = typed(
+            literal_for(value),
+            crate::char_semantics::char_column(&subquery.subquery, 0),
+        );
+        plan = substitute(plan, &subquery, &literal)?;
     }
     Err(DataFusionError::Plan(format!(
         "more than {MAX_SUBSTITUTIONS} scalar subqueries in one statement"

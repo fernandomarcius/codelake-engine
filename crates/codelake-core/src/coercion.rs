@@ -1296,7 +1296,7 @@ fn unify_union_numbers(union: Union) -> Result<Transformed<LogicalPlan>> {
 
 /// The join `INTERSECT` or `EXCEPT` is planned as: a left semi (anti) join
 /// of every column, `NULL` equal to `NULL`, answering the left input.
-fn is_set_operation(join: &datafusion::logical_expr::Join) -> bool {
+pub(crate) fn is_set_operation(join: &datafusion::logical_expr::Join) -> bool {
     use datafusion::common::NullEquality;
     use datafusion::logical_expr::JoinType;
     let (left, right) = (join.left.schema(), join.right.schema());

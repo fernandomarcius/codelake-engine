@@ -137,15 +137,23 @@ versioning: [SemVer](https://semver.org/).
 - **Breaking:** hive `INT96` timestamps convert through the catalog's `parquet_time_zone`,
   `America/Sao_Paulo` by default; they were stored and read as UTC. Set
   `parquet_time_zone = "UTC"` to keep the former behavior (ADR 0007, ISS-003).
-- **Breaking:** a comparison of a `char(n)` value (`=`, `<`, `IN`, `LIKE`, `BETWEEN`,
-  `CASE x WHEN`, join conditions) fails with `NOT_SUPPORTED` wherever it is in the plan,
-  until the engine compares char values padded; `CAST(ch AS varchar)` compares text
-  (ADR 0007, red-team W1-4). So do char values as join keys (`USING`, `NATURAL`,
-  `INTERSECT`, `EXCEPT`), in a `UNION` (with or without `ALL`) and as arguments of
-  `nullif`, `greatest` and `least` (DEFECT-W1T-2), and in a `VALUES` list that puts
-  them with other text; `TRY_CAST(x AS char(n))` fails with `NOT_SUPPORTED`. A value
-  computed from a char value (`max(ch)`, `lag(ch)`, `coalesce(ch, …)`, `upper(ch)`,
-  `ch || 'x'`) counts as one.
+- **Breaking:** `char(n)` values follow the reference engine's semantics instead of being
+  refused (ADR 0015, ISS-024): every char value is held padded to `n` (so
+  `length(CAST('ab' AS char(5)))` is 5 and `CAST(CAST('ab' AS char(5)) AS varchar)` is
+  `'ab   '`), and where it meets other text both are converted to the common char type:
+  comparisons (`=`, `<`, `IN`, `BETWEEN`, `LIKE`, `CASE x WHEN`, `nullif`, `greatest`,
+  `least`, join conditions, `IN`/`ANY`/`ALL` subqueries, scalar subqueries) answer what
+  Trino 431 answers, and `CASE`, `coalesce`, `UNION`, `INTERSECT`, `EXCEPT`, `VALUES`,
+  `USING` and `||` output the common type, padded (`char(65536)` against unbounded
+  `varchar`). The refusals of W1-4 and DEFECT-W1T-2 are gone; `TRY_CAST(x AS char(n))`
+  is answered. `typeof`, the client protocol and `CREATE TABLE … AS` see `char(n)` for
+  computed char values (`max(ch)`, `coalesce(ch, 'x')`, `ch || 'x'`).
+- **Breaking:** refused like the reference engine refuses them: `NATURAL JOIN` over any
+  columns ("Natural join not supported"), `char(n) || <unbounded varchar>` and
+  `char(n) || NULL`. Refused because the engine cannot guarantee the reference's answer
+  (ADR 0015): a char value output together with text of a length it does not derive
+  (`CASE … THEN ch ELSE replace(s, 'a', 'bc') END`), and char values in arrays that are
+  not written out (`contains(array_agg(ch), 'ab')`).
 - **Breaking:** `TRY_CAST(x AS varchar(n))` cuts to `n` characters and
   `TRY_CAST(x AS timestamp(p))` rounds to `p` digits, as `CAST` does (`NULL` where `CAST`
   fails); they returned the value as it was.
@@ -282,16 +290,11 @@ versioning: [SemVer](https://semver.org/).
   into the files; `OPTIMIZE` in any other catalog rounded stored nanoseconds to
   microseconds. Timestamps are now read and compacted exactly; an instant Arrow
   nanoseconds cannot hold is an error naming it (ADR 0009).
-- `char(n)` comparisons above the hive scan (over `LIMIT`, a window, a volatile predicate)
-  dropped rows the reference engine returns; they are refused (see Changed).
-- `TRY_CAST('ab' AS char(5)) = 'ab '` answered false and `VALUES ('ab '),
-  (CAST('ab' AS char(5)))` held two distinct values (the reference: true, one value):
-  the engine held the char value as unpadded text. Both are refused (see Changed).
-- A char value passed through an aggregate, a window function, a function, a `CASE` or
-  `||` (`max(ch)`, `lag(ch)`, `coalesce(ch, …)`, `upper(ch)`) was compared as plain text:
-  `SELECT max(ch) FROM t UNION SELECT s FROM v` held two rows where the reference holds
-  one. Such values are followed through the plan and refused like the column (see
-  Changed).
+- `char(n)` values answered other rows than the reference engine wherever the refusals did
+  not see them (P1–P16 of the W1 verification): `IN`/`NOT IN`/`= ANY` with the char value
+  in the subquery, scalar subqueries of char values, `CASE`/`coalesce` mixing char and
+  text, `CAST … AS char(n)` held unpadded; and over the hive scan (under `LIMIT`, a
+  window). They now answer the reference's rows (ADR 0015).
 - `max(ch)` over a char column of an in-memory table panicked (`Utf8`×`Utf8View`) and
   `CAST(ch AS varchar)` failed ("expected Utf8View but found Utf8"): `INSERT` wrote
   `Utf8` values into a `Utf8View` column. Values keep the column's Arrow type.

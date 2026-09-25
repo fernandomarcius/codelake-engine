@@ -230,7 +230,7 @@ async fn bounded_varchar_is_enforced_on_insert_and_cut_on_read_like_trino() {
 }
 
 #[tokio::test]
-async fn char_columns_read_padded_and_refuse_what_trino_answers_differently() {
+async fn char_columns_read_padded_and_compare_like_trino() {
     let lake = lake().await;
     lake.ok("CREATE TABLE hive.s.ch (id bigint, ch char(5))").await;
     assert_eq!(lake.columns("ch")[1], ("ch".into(), "char(5)".into()));
@@ -254,13 +254,25 @@ async fn char_columns_read_padded_and_refuse_what_trino_answers_differently() {
             &["5", "NULL", "NULL", "NULL"],
         ])
     );
-    // Trino compares char values padded (`ch = 'ab'` is true): refused
-    // rather than answered as a varchar comparison would.
-    let err = lake.err("SELECT id FROM hive.s.ch WHERE ch = 'ab'").await;
-    assert!(
-        err.contains("comparing the char column ch is not supported"),
-        "{err}"
-    );
+    // Trino compares char values padded: `ch = 'ab'` and `ch = 'ab '` are
+    // true, `ch < 'ab' || chr(9)` is false (the tab sorts below a space).
+    let two: &[&[&str]] = &[&["2"]];
+    for (q, expected) in [
+        ("SELECT id FROM hive.s.ch WHERE ch = 'ab' ORDER BY 1", two),
+        ("SELECT id FROM hive.s.ch WHERE ch = 'ab  ' ORDER BY 1", two),
+        ("SELECT id FROM hive.s.ch WHERE ch IN ('ab', 'x') ORDER BY 1", two),
+        ("SELECT id FROM hive.s.ch WHERE ch = '' ORDER BY 1", &[&["4"]]),
+        (
+            "SELECT id FROM hive.s.ch WHERE ch < 'ab' || chr(9) ORDER BY 1",
+            &[&["4"]],
+        ),
+        (
+            "SELECT id FROM hive.s.ch WHERE ch > 'ab' || chr(9) ORDER BY 1",
+            &[&["2"], &["3"]],
+        ),
+    ] {
+        assert_eq!(lake.ok(q).await, rows(expected), "{q}");
+    }
     assert_eq!(
         lake.ok("SELECT id FROM hive.s.ch WHERE ch IS NULL").await,
         rows(&[&["5"]])

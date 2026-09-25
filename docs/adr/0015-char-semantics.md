@@ -1,0 +1,145 @@
+# ADR 0015 — `char(n)` semantics instead of refusals
+
+- Status: Accepted
+- Date: 2026-09-25
+- Related: ADR 0007 (hive catalog), ADR 0008 (function library), ADR 0014,
+  ISS-024, ISS-025
+
+## Context
+
+Arrow has no char type. The hive catalog reads a `char(n)` column padded to
+`n` characters, as Trino 431 shows it, and records `char(n)` in the field
+metadata. Trino compares char values padded: for a `char(5)` holding `'ab'`,
+`ch = 'ab'` and `ch = 'ab  '` are true, and `ch < 'ab' || chr(9)` is false
+(the tab sorts below the padding space).
+
+Until now the engine refused every comparison it recognized as one of char
+values (`codelake_core::char_comparisons`, a black list of plan shapes), and
+held a `CAST … AS char(n)` unpadded. Three rounds of independent verification
+against Trino 431 found shapes the list missed, each answering wrong rows
+without an error: `IN`/`NOT IN`/`= ANY` with the char value in the subquery,
+scalar subqueries of char values, `CASE`/`coalesce` mixing char and text,
+`CAST(CAST('ab' AS char(5)) AS varchar)` unpadded, `TRY_CAST(x AS varchar(n))`
+not cutting, and a panic of `max(ch)` over an in-memory char table
+(`scratchpad/verif-char-trino.log`, P1–P16). A black list cannot be complete;
+the owner decided (ISS-024) to implement the semantics.
+
+## Decision
+
+`codelake_core::char_semantics`, an analyzer rule before type coercion,
+gives char values Trino 431's semantics (every rule below observed on
+`trinodb/trino:431`):
+
+1. **Representation.** Every `char(n)` value is held padded with spaces to
+   `n` characters: hive scans (as before), `CAST`/`TRY_CAST … AS char(n)`,
+   `INSERT` and `UPDATE` of a char column (in-memory and hive; the hive
+   writer still stores values without trailing spaces, as Trino), values
+   the rule pads. Text keeps the Arrow type it came with (`Utf8View` stays
+   `Utf8View`), which removes the `Utf8`×`Utf8View` panic of in-memory char
+   tables.
+2. **Types.** The rule follows the Trino type of every text value through
+   the plan: declared fields, literals (`varchar(length)`), `CAST`s the
+   statement wrote (marked `codelake_trino_type(…, '')`, so the casts type
+   coercion adds between Arrow's text types keep their argument's type and
+   a plan analyzed twice is rewritten once), aggregates (`max`, `min`,
+   `first_value`, `array_agg`, …), window functions, `CASE` and the functions
+   whose result length Trino derives from their arguments (`upper`, `rtrim`,
+   `substr`, `concat`, …). A projection records `char(n)` in the field of
+   each char column it computes (a client, `typeof`, `CREATE TABLE … AS` and
+   views see it) and removes it from a text a cast made from a char value. A
+   scalar subquery computed ahead (`crate::subquery`) becomes a literal that
+   records its char type.
+3. **Common type.** `char(n)` with `char(m)` is `char(max)`; with `varchar(k)`
+   `char(max(n, k))`; with unbounded `varchar` `char(65536)`; `NULL` takes
+   the other type.
+4. **Comparisons** (`=`, `<>`, `<`…, `IS [NOT] DISTINCT FROM`, `IN` lists,
+   `BETWEEN`, simple `CASE`, `nullif`, join conditions, `IN (subquery)`,
+   rows and arrays written out, `contains`/`array_position`) compare the
+   values padded to the common length: equality on the values without
+   trailing spaces (`codelake_char_key`), ordering with
+   `codelake_char_compare` (character by character, the shorter padded with
+   spaces), a text literal short enough padded to the char's length instead.
+   `x op ANY/ALL (subquery)` becomes the `EXISTS` tests it means, `NULL`
+   alike: DataFusion 54 cannot plan the mark join it makes of a quantified
+   comparison over a computed column.
+5. **Values in a common type** are padded to its length: `CASE` branches,
+   `coalesce`, `nvl`, `ifnull`, `nvl2`, `greatest`, `least`, the default of
+   `lag`/`lead`, array elements, the columns of `UNION`, `INTERSECT`,
+   `EXCEPT`, `VALUES` and the key of a `USING` join (Trino outputs the
+   `USING` column in the common type: `char(65536)` against unbounded
+   `varchar`, padded to 65536 characters).
+6. **Concatenation** of a char value is `char(total)`, every other operand
+   padded to its own length (`char(3) || varchar(2)` is `char(5)`).
+7. **Functions** see the padded text: `upper`/`lower` are `char(n)`, `rtrim`,
+   `trim`, `substr` are `varchar(n)` of the padded text, `LIKE` matches it,
+   `length` counts it. Functions Trino has no char version of (`strpos`,
+   `replace`, …) and refuses see the padded text, as `CAST(ch AS varchar)`
+   gives it.
+8. **Scans** never refuse a filter on a char column any more: the filter is
+   applied above the scan (pushdown `Inexact`), and statistics never prune a
+   file by it (the scan rewrites the column to its padded value, which the
+   statistics of the stored text cannot answer); a table with a file per
+   value is part of the matrix.
+9. `TRY_CAST(x AS varchar(n) | char(n) | timestamp(p))` answers what `CAST`
+   answers, `NULL` where `CAST` fails (P13).
+
+### Refusals that remain
+
+Where Trino 431 fails too:
+
+- `NATURAL JOIN` ("Natural join not supported"), refused before planning,
+  whatever the columns;
+- `char(n) || <unbounded varchar>` (Trino: "Unknown type: char(65541)"),
+  `char(n) || NULL` ("Could not choose a best candidate operator"), and a
+  concatenation longer than `char(65536)`.
+
+Where the engine cannot guarantee Trino's answer (documented, each an
+error naming a way around it):
+
+- a char value output together with text whose length the rule does not
+  know (`CASE WHEN … THEN ch ELSE replace(s, 'a', 'bc') END`): Trino types it
+  `char(max(n, k))` with a `k` the rule does not derive; comparing such
+  values is answered;
+- a char value searched in an array not written out, or text in an array
+  of char values (`contains(array_agg(ch), 'ab')`), and an array of char
+  values compared with, or put in a `UNION` with, another array: element
+  types of arrays are followed only for arrays written out (`ARRAY[…]`);
+- an ordering of rows or arrays of char values whose common length is not
+  known, and `ANY`/`ALL` of a value that holds an aggregate or a subquery.
+
+### Where the reference engine is wrong
+
+- `EXISTS (SELECT 1 FROM v WHERE v.s = t.ch)` repeats a row of `t` once per
+  distinct `varchar` value of `v` equal to it as char (Trino 431 joins on the
+  distinct varchar values before converting them to char). The engine
+  answers each row once, as `EXISTS` means.
+- `VALUES ((SELECT CAST('ab' AS char(5)))), ('ab ')` fails in Trino 431
+  ("Unexpected subquery expression in logical plan"); the engine answers
+  what the same `VALUES` answers without the subquery.
+
+## Consequences
+
+- Breaking for queries that were refused (they now answer Trino's rows), for
+  `NATURAL JOIN` over any columns (now refused, as Trino), and for char values
+  a `CAST` computed (now padded: `length(CAST('ab' AS char(5)))` is 5).
+- The `USING` key against unbounded `varchar` and the other `char(65536)`
+  results hold 65,536 characters per value, as Trino's.
+- Found on the way, not a char defect: DataFusion 54 fails to plan
+  `x < ALL (SELECT c FROM <hive table> WHERE c IS NOT NULL)` for any text
+  column (ProjectionPushdown: "Input field name c does not match with the
+  projection expression"). It fails loudly and is left to the DataFusion
+  54 guards (ADR 0014).
+
+## Verification
+
+- Unit (`char_semantics::tests`): 86 queries over in-memory tables, each with
+  the rows Trino 431 answers to the same SQL in its memory catalog; the
+  engine's own storage (in-memory `INSERT`/`UPDATE`, CTAS, views); the
+  refusals.
+- Integration (`hive_redteam_w1`, against `trinodb/trino:431` on one
+  warehouse): CH1–CH16 and P1–P16; and the matrix `char_matrix`: operations
+  × operand (`char(3)`, `char(5)`, `varchar`, `varchar(3)`, six literals,
+  `NULL`) × origin of the char value (hive table Trino wrote, in-memory
+  table, literals, subquery, view Trino wrote, hive table the engine wrote)
+  — 990 row operations and 384 set operations, joins and subqueries, every
+  one Trino's rows or refused by both.
