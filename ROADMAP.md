@@ -108,7 +108,10 @@ Blocking items, in order:
   `datafusion-table-providers` 0.13.1 crates and `datafusion-postgres` 0.18.0,
   Iceberg left out (ADR 0002, ADR 0013). The join defects the train brought
   (null-aware anti join, nested loop join spill fallback) and the string/number
-  coercion change are guarded in the engine (ADR 0014); codepoint
+  coercion change are guarded in the engine (ADR 0014). A hash join whose
+  estimated build side exceeds its slice of the pool runs as a spilling
+  sort-merge join (ADR 0003, `sort_merge_oversized_joins`); one without
+  statistics still fails cleanly. Codepoint
   `lpad`/`rpad`/`translate` and `approx_percentile` match Trino 431. Pending:
   correlated scalar subqueries (`scalar_subquery_to_join` fails, a refusal, not
   a wrong result). Skip DataFusion 55 (no `datafusion-table-providers` or

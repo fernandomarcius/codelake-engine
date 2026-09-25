@@ -27,6 +27,10 @@ versioning: [SemVer](https://semver.org/).
   undeclared names are rejected, performance-only Trino knobs are accepted with a warning.
 
 ### Changed
+- A hash join whose estimated build side does not fit its slice of the memory pool
+  runs as a sort-merge join, which spills, instead of failing with
+  `EXCEEDED_LOCAL_MEMORY_LIMIT` (ADR 0003; session property `sort_merge_oversized_joins`,
+  default on). Derived from Spice.ai's rule (Apache-2.0, NOTICE).
 - DataFusion 54.1 train: `datafusion-federation` 0.5.5, per-connector
   `datafusion-table-providers` 0.13.1 crates, `datafusion-postgres` 0.18.0 (ADR 0002).
 

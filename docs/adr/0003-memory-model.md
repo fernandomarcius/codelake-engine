@@ -2,7 +2,8 @@
 
 - Status: Accepted
 - Date: 2026-09-23; amended 2026-09-24 after the memory ceiling red team
-  (DEFECT-MEM1..MEM9)
+  (DEFECT-MEM1..MEM9), and on 2026-09-24 for hash joins over the pool
+  (DataFusion 54 train)
 
 ## Decision
 
@@ -82,6 +83,41 @@
   twice their bytes, so consumers do not reserve the whole input once per slice.
   The same 12 Trino clients grow the process by 73 MiB (was 187-213), 8
   PostgreSQL connections by 23 MiB (was 155-227).
+- Hash joins whose build side does not fit run as sort-merge joins
+  (`codelake_core::join_spill`, derived from Spice.ai's
+  `CayenneAntiJoinSortMergeRewriter`, Apache-2.0, see NOTICE). A
+  `HashJoinExec` holds its whole build side in a reservation that cannot
+  spill, in DataFusion 53 and 54 alike. A physical rule right after
+  `EnforceSorting` estimates the build side (rows × bytes per row × 5/2 for
+  the hash table; column sizes from statistics, else the rows' total size,
+  else 64 bytes per variable-width value) and compares it with the join's
+  slice: the smaller of half of the pool less the exchange slice and an even
+  share of that among the plan's hash joins. Past the slice the join becomes a
+  `SortMergeJoinExec`: each input merged into one stream and sorted by one
+  external sort (a sort per partition keeps its own merge headroom, and 2 × N
+  of them starve a small pool before any holds a batch), each side run within
+  a budget of a third of the pool less the exchange slice (`JoinSideBudget`:
+  the sort that finishes first merges its spilled runs with as many files as
+  the pool has room for and left the other sort without a batch), and the
+  output spread again over the hash join's partitioning. The join trades
+  parallelism for a plan that fits.
+  - Statistics: an exact row count is used as it is; an estimate (`Inexact`:
+    a filter's selectivity, the hive metastore or footers) must exceed the
+    slice twice over; a build side of unknown size (no statistics: a
+    `generate_series`, a source without them) stays a hash join and fails
+    cleanly if it does not fit. Either operator answers the same rows, so a
+    wrong estimate costs speed or a refusal, never rows.
+  - The join stays a hash join whenever the sort-merge join could answer
+    other rows: a null-aware anti join (`NOT IN`, apache/datafusion#22810,
+    ADR 0014), mark joins, keys that compare NULLs as equal, a residual
+    (non-equi) condition, a key computed by an expression (checked arithmetic
+    and `try` are installed on hash join keys only), a key type the
+    sort-merge comparator does not support or orders differently (floating
+    point, zoned timestamps, decimals other than 128-bit, times, intervals,
+    nested types), a pushed limit, an output ordering. Joins with no equality
+    are nested loop joins, whose spill fallback stays off (ADR 0014).
+  - Session property `sort_merge_oversized_joins` (default `true`) turns it
+    off per query.
 - Spill goes to a dedicated directory bounded by `memory.spill_limit`; the
   Kubernetes volume has its own `sizeLimit` above that value.
 - When memory and spill are exhausted, the query fails with a resources error;
@@ -118,9 +154,13 @@ binary over its warmed-up idle footprint (~81 MiB), `memory.limit = 128 MiB`,
 Sizing: keep `workers × 2 × batch bytes` inside the 25% headroom. Computed
 values take care of themselves; for sources whose rows are wide (documents,
 long text), lower `execution.batch_size` (at 1024, 4 KiB rows make 4 MiB
-batches), or `memory.limit`. A hash join whose
-build side does not fit fails cleanly (220 MiB build under 128 MiB: 116-120 MiB
-of growth). Admission control per query and per user is M1.
+batches), or `memory.limit`. A sort gets its fair share among every spilling
+operator the plan registered, idle grouped aggregations included: under a
+small pool a sort of wide rows needs smaller batches (24 MiB, 4 partitions,
+rows of ~210 bytes: 2048 rows per batch). A hash join whose build side does
+not fit runs as a sort-merge join when the planner can size it (above); one it
+cannot size fails cleanly (220 MiB `generate_series` build under 128 MiB:
+116-120 MiB of growth). Admission control per query and per user is M1.
 
 ## Evidence
 
@@ -143,4 +183,16 @@ of growth). Admission control per query and per user is M1.
   clients 73 MiB, 8 PostgreSQL connections 23 MiB, a sort of ~330 MiB 115 MiB
   (spilled 311 MiB, rows right; its test stays ignored for the `row_number()`
   type), an aggregation of 1M groups 121 MiB (spilled 424 MiB, counts right), a
-  220 MiB hash join build 116 MiB (`EXCEEDED_LOCAL_MEMORY_LIMIT`).
+  220 MiB hash join build 116 MiB (`EXCEEDED_LOCAL_MEMORY_LIMIT`: its
+  `generate_series` inputs have no statistics, so it stays a hash join).
+- Hash joins over the pool (`join_spill`): in process
+  (`join_spill::tests::a_build_side_larger_than_the_pool_completes_as_a_sort_merge_join`),
+  a ~20 MB build under 16 MiB fails as a hash join (`Resources exhausted`) and
+  completes as a sort-merge join with the right numbers, the pool's own peak
+  under its limit. Against Trino 431
+  (`crates/codelake-connectors/tests/integration/hash_join_spill.rs`, hive
+  tables of 200 000 and 250 000 rows of ~210 bytes, pool 24 MiB): the hash
+  join is refused; inner, left, right, full, semi and anti joins (integer
+  and text keys, NULLs on both sides) return Trino's rows, both sorts spill,
+  the pool peaks at 11-16 MB. The guarded shapes stay hash joins with the
+  same rows (`join_spill::tests::guarded_joins_stay_hash_joins`).

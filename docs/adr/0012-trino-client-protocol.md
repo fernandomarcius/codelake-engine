@@ -78,7 +78,9 @@ A separate listener (`[server.trino]`, off by default) serves:
   properties declared by each connector. Undeclared names fail with
   `INVALID_SESSION_PROPERTY`, as in Trino. Trino tuning knobs that only change
   performance are accepted and answered with a warning. `query_max_run_time`
-  and `query_max_execution_time` are enforced (`EXCEEDED_TIME_LIMIT`).
+  and `query_max_execution_time` are enforced (`EXCEEDED_TIME_LIMIT`);
+  `sort_merge_oversized_joins` (CodeLake's own) turns off the sort-merge plan
+  of hash joins over the pool (ADR 0003).
 - **Errors** carry Trino's `errorCode/errorName/errorType`, because clients
   branch on them: structural mappings (syntax, missing column, ambiguous name,
   cast out of range) plus a message rule table (`errors.rs`, `MESSAGE_RULES`)
