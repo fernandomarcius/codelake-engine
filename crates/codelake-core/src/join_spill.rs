@@ -382,14 +382,18 @@ pub fn keeps_hash_join(join: &HashJoinExec) -> Option<&'static str> {
 }
 
 /// `plan` without the exchange `EnforceDistribution` put on top of it
-/// (a hash exchange or a merge), which the sort-merge join replaces.
+/// (a hash exchange or a merge), which the sort-merge join replaces. A merge
+/// that carries a limit (`fetch`, which `EnforceDistribution` and the
+/// order-preserving rewrite put on merges) stays: it is the input's `LIMIT`.
 fn below_exchange(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
     if let Some(exchange) = plan.downcast_ref::<RepartitionExec>()
         && !exchange.preserve_order()
     {
         return Arc::clone(exchange.input());
     }
-    if let Some(merge) = plan.downcast_ref::<CoalescePartitionsExec>() {
+    if let Some(merge) = plan.downcast_ref::<CoalescePartitionsExec>()
+        && merge.fetch().is_none()
+    {
         return Arc::clone(merge.input());
     }
     Arc::clone(plan)
@@ -1250,6 +1254,77 @@ mod tests {
             .build()
             .unwrap();
         assert!(keeps_hash_join(&limited).is_some());
+    }
+
+    /// A merge that carries a limit is the input's `LIMIT`, not an exchange:
+    /// it stays below the sort-merge join, which then joins only its rows.
+    #[tokio::test]
+    async fn a_limited_merge_stays_below_the_rewritten_join() {
+        use datafusion::arrow::array::{Int64Array, RecordBatch};
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::physical_plan::joins::PartitionMode;
+        let schema = Arc::new(schema(&[DataType::Int64]));
+        // Batches of 500 rows: the sorts run within a budget of ~150 kB.
+        let batch = |values: std::ops::RangeInclusive<i64>| -> Vec<RecordBatch> {
+            values
+                .collect::<Vec<_>>()
+                .chunks(500)
+                .map(|chunk| {
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::new(Int64Array::from(chunk.to_vec()))],
+                    )
+                    .unwrap()
+                })
+                .collect()
+        };
+        // 30 000 keys over two partitions, merged with a limit of 20 000.
+        let input = MemorySourceConfig::try_new_exec(
+            &[batch(1..=15_000), batch(15_001..=30_000)],
+            Arc::clone(&schema),
+            None,
+        )
+        .unwrap();
+        let limited: Arc<dyn ExecutionPlan> =
+            Arc::new(CoalescePartitionsExec::new(input).with_fetch(Some(20_000)));
+        assert!(Arc::ptr_eq(&below_exchange(&limited), &limited));
+        let merge: Arc<dyn ExecutionPlan> =
+            Arc::new(CoalescePartitionsExec::new(Arc::clone(limited.children()[0])));
+        assert!(Arc::ptr_eq(&below_exchange(&merge), merge.children()[0]));
+
+        let probe =
+            MemorySourceConfig::try_new_exec(&[batch(1..=30_000)], Arc::clone(&schema), None).unwrap();
+        let key = || Arc::new(Column::new("c0", 0)) as Arc<dyn PhysicalExpr>;
+        let join = HashJoinExec::try_new(
+            limited,
+            probe,
+            vec![(key(), key())],
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )
+        .unwrap();
+        // 20 000 exact rows of 8 bytes, ×5/2: 400 kB, over the slice of a
+        // 512 KiB pool (224 KiB).
+        let mut config = ConfigOptions::new();
+        config.extensions.insert(JoinSpillOptions::for_pool(512 << 10));
+        let plan = SortMergeOversizedJoins.optimize(Arc::new(join), &config).unwrap();
+        let text = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(text.contains("SortMergeJoinExec"), "{text}");
+        assert!(text.contains("CoalescePartitionsExec: fetch=20000"), "{text}");
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_batch_size(512)
+                .with_sort_spill_reservation_bytes(16 << 10),
+        );
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 20_000);
     }
 
     /// Off by session: the planner keeps the hash join.
