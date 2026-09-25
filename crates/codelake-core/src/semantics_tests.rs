@@ -582,3 +582,46 @@ async fn second_suite_session_zone_and_errors_follow_trino() {
     )
     .await;
 }
+
+/// `NOT IN` with a NULL in the subquery (or a NULL value) is UNKNOWN: the
+/// row is filtered out. Every answer below is Trino 431's; `DataFusion`
+/// answered the constant and correlated forms without the NULL semantics.
+#[tokio::test]
+async fn not_in_keeps_null_semantics_in_every_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    assert_same(
+        &engine,
+        &[
+            (
+                "SELECT count(*) FROM (VALUES 1, 2) t(x) WHERE 3 NOT IN (SELECT y FROM (VALUES 1, NULL) u(y))",
+                answer(&["bigint"], &[&["0"]]),
+            ),
+            (
+                "SELECT x FROM (VALUES 1, 2) t(x) WHERE 3 NOT IN (SELECT y FROM (VALUES 1, 2) u(y)) ORDER BY x",
+                answer(&["integer"], &[&["1"], &["2"]]),
+            ),
+            (
+                "SELECT count(*) FROM (VALUES 1, 2, 3) t(x) WHERE x NOT IN (SELECT y FROM (VALUES 1, NULL) u(y))",
+                answer(&["bigint"], &[&["0"]]),
+            ),
+            (
+                "SELECT id FROM (VALUES (1, 1), (2, 2)) o(id, g) \
+                 WHERE 3 NOT IN (SELECT i FROM (VALUES (1, 1), (NULL, 2)) n(i, g) WHERE n.g = o.g) ORDER BY id",
+                answer(&["integer"], &[&["1"]]),
+            ),
+            (
+                "SELECT id FROM (VALUES (1, 1), (2, 2), (3, 3)) o(id, g) \
+                 WHERE id NOT IN (SELECT i FROM (VALUES (1, 1), (NULL, 2), (5, 3)) n(i, g) WHERE n.g = o.g) \
+                 ORDER BY id",
+                answer(&["integer"], &[&["3"]]),
+            ),
+            (
+                "SELECT id FROM (VALUES (1, CAST(NULL AS integer)), (2, 5)) o(id, k) \
+                 WHERE k NOT IN (SELECT i FROM (VALUES (1, 7)) n(g, i) WHERE n.g = o.id) ORDER BY id",
+                answer(&["integer"], &[&["2"]]),
+            ),
+        ],
+    )
+    .await;
+}

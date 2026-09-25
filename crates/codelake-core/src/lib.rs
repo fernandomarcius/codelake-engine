@@ -16,6 +16,7 @@ pub mod federation_guard;
 pub mod federation_policy;
 pub mod functions;
 pub mod information_schema;
+pub mod join_guard;
 mod literals;
 pub mod output;
 pub mod overflow;

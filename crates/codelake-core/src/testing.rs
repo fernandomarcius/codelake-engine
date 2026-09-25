@@ -150,7 +150,7 @@ pub(crate) fn federated_session() -> datafusion::prelude::SessionContext {
         .with_default_features()
         .with_analyzer_rules(crate::engine::analyzer_rules())
         .with_optimizer_rules(crate::engine::optimizer_rules())
-        .with_query_planner(Arc::new(datafusion_federation::FederatedQueryPlanner::new()))
+        .with_query_planner(crate::engine::query_planner())
         .with_physical_optimizer_rules(crate::engine::physical_rules())
         .build();
     datafusion::prelude::SessionContext::new_with_state(state)

@@ -33,6 +33,7 @@ use crate::connector::{Connector, ConnectorError, ViewDefinition, WritableCatalo
 use crate::ddl::{self, Prepared, RelationKind, Rewrite, TableExecute, ViewSecurity};
 use crate::federation_guard::FederationFilterGuard;
 use crate::information_schema::CatalogList;
+use crate::join_guard::{JoinQueryPlanner, NullAwareAntiJoinGuard};
 use crate::output::AccountedOutput;
 use crate::plain_views::PlainViews;
 use crate::runtime::{EngineRuntime, MemoryStats};
@@ -198,7 +199,9 @@ pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + S
     );
     rules.insert(position, Arc::new(crate::overflow::UncheckBeforeFederation));
     rules.extend(crate::trino_functions::optimizer_rules());
-    rules
+    // `NOT IN` keeps its NULL semantics, and nothing is inferred from the
+    // keys of a null-aware join (`crate::join_guard`).
+    crate::join_guard::guard_filter_pushdown(crate::join_guard::with_null_safe_not_in(rules))
 }
 
 /// `DataFusion`'s analyzer rules with the engine's: Trino's decimal types and
@@ -243,8 +246,9 @@ fn trino_literal(value: &ScalarValue) -> String {
     }
 }
 
-/// Default `DataFusion` physical rules, preceded by the federation guard (it must
-/// run before `FilterPushdown`; see [`crate::federation_guard`]), with
+/// Default `DataFusion` physical rules, preceded by the federation guard and
+/// the null-aware anti join guard (both must run before `FilterPushdown`; see
+/// [`crate::federation_guard`] and [`crate::join_guard`]), with
 /// aggregates answered from statistics only over exact sources (see
 /// [`crate::statistics_guard`]), and followed by
 /// [`PlainViews`], which keeps string views out of operators that retain rows
@@ -252,7 +256,8 @@ fn trino_literal(value: &ScalarValue) -> String {
 /// in bytes, and [`AccountedOutput`], which keeps the buffers between the plan
 /// and the client inside the memory pool.
 pub(crate) fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
-    let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = vec![Arc::new(FederationFilterGuard)];
+    let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> =
+        vec![Arc::new(FederationFilterGuard), Arc::new(NullAwareAntiJoinGuard)];
     rules.extend(PhysicalOptimizer::new().rules);
     let mut rules = guard_aggregate_statistics(rules);
     rules.extend(crate::trino_functions::physical_rules());
@@ -260,6 +265,12 @@ pub(crate) fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Syn
     rules.push(Arc::new(ComputedBatches));
     rules.push(Arc::new(AccountedOutput));
     rules
+}
+
+/// The engine's query planner: the federation planner, with null-aware anti
+/// joins kept on hash joins ([`crate::join_guard`]).
+pub(crate) fn query_planner() -> Arc<dyn datafusion::execution::context::QueryPlanner + Send + Sync> {
+    Arc::new(JoinQueryPlanner::new(Arc::new(FederatedQueryPlanner::new())))
 }
 
 /// Output schema of `plan` once analyzed: the analyzer settles some types
@@ -674,7 +685,7 @@ impl Engine {
             .with_default_features()
             .with_analyzer_rules(analyzer_rules())
             .with_optimizer_rules(optimizer_rules())
-            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .with_query_planner(query_planner())
             .with_physical_optimizer_rules(physical_rules())
             .build();
         let mut ctx = SessionContext::new_with_state(state);
