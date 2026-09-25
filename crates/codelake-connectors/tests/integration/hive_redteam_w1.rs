@@ -2048,3 +2048,79 @@ async fn w1t_in_memory_update_never_escapes_the_pool() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Same rows as Trino, or a `CodeLake` error (a refusal is acceptable).
+fn same_or_refused(
+    checks: &mut Checks,
+    id: &str,
+    what: &str,
+    codelake: &Result<Rows, String>,
+    trino: &Result<Rows, String>,
+) {
+    if codelake.is_err() {
+        note(checks.probe, &format!("{id} {what} (refused)"), (codelake, trino));
+        return;
+    }
+    checks.same(id, what, codelake, trino);
+}
+
+/// `char(n)` values compared where the W1-4 rule does not look: set
+/// operations, `USING` joins and functions that compare, over tables Trino
+/// 431 wrote. Each answer must be Trino's, or a refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "DEFECT-W1T-2: INTERSECT, EXCEPT, UNION, DISTINCT and nullif compare char(n) values unpadded and answer other rows than Trino"]
+async fn w1t_char_values_compared_outside_predicates_like_trino_431() {
+    let s = Shared::new("codelake-w1t-trino-char").await;
+    let mut checks = Checks::new("w1t_char_trino");
+    s.trino.ok("CREATE SCHEMA hive.s").await;
+    s.trino
+        .ok("CREATE TABLE hive.s.cht (id bigint, ch char(5)) WITH (format = 'PARQUET')")
+        .await;
+    s.trino
+        .ok("INSERT INTO hive.s.cht VALUES (1, 'ab'), (2, 'zz')")
+        .await;
+    s.trino
+        .ok("CREATE TABLE hive.s.vct (id bigint, ch varchar) WITH (format = 'PARQUET')")
+        .await;
+    s.trino
+        .ok("INSERT INTO hive.s.vct VALUES (1, 'ab'), (3, 'cd')")
+        .await;
+    for (id, q) in [
+        (
+            "CH1",
+            "SELECT count(*) FROM hive.s.cht JOIN hive.s.vct USING (ch)",
+        ),
+        (
+            "CH2",
+            "SELECT count(*) FROM (SELECT ch FROM hive.s.cht INTERSECT SELECT ch FROM hive.s.vct)",
+        ),
+        (
+            "CH3",
+            "SELECT count(*) FROM (SELECT ch FROM hive.s.cht EXCEPT SELECT ch FROM hive.s.vct)",
+        ),
+        (
+            "CH4",
+            "SELECT count(*) FROM (SELECT ch FROM hive.s.cht UNION SELECT ch FROM hive.s.vct)",
+        ),
+        (
+            "CH5",
+            "SELECT id FROM hive.s.cht WHERE nullif(ch, 'ab') IS NULL ORDER BY 1",
+        ),
+        (
+            "CH6",
+            "SELECT count(DISTINCT c) FROM (SELECT ch AS c FROM hive.s.cht UNION ALL SELECT CAST('ab' AS char(5)))",
+        ),
+        (
+            "CH7",
+            "SELECT id FROM hive.s.cht WHERE (ch, id) = ('ab', 1) ORDER BY 1",
+        ),
+        (
+            "CH8",
+            "SELECT id FROM hive.s.cht WHERE ch = ANY (SELECT ch FROM hive.s.vct) ORDER BY 1",
+        ),
+    ] {
+        let (codelake, trino) = (cl_try(&s.engine, q).await, s.trino.sql(q).await);
+        same_or_refused(&mut checks, id, q, &codelake, &trino);
+    }
+    checks.assert_none();
+}
