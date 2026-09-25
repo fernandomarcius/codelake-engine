@@ -43,7 +43,7 @@ changes a correct answer.
 | 4 | `JoinQueryPlanner` (query planner around the federation planner): a plan holding a null-aware join is planned with hash joins preferred | `codelake_core::join_guard` |
 | 5 | `NullSafeNotIn` (logical, right before `decorrelate_predicate_subquery`): a `NOT IN` conjunct compared with a constant or over a correlated subquery becomes `NOT EXISTS (… WHERE <correlation> AND (x = y OR x IS NULL OR y IS NULL))`, its exact meaning where UNKNOWN filters a row out | `codelake_core::join_guard` |
 | 6, 7, 8 | `NestedLoopJoinSpillGuard` (physical, after every rule that rebuilds joins): runs each `NestedLoopJoinExec` with a runtime that cannot write temporary files (the fallback's precondition) and gives its inputs the engine's runtime back, so sorts and aggregations below still spill. Over the limit the join fails with `Resources exhausted`, as in DataFusion 53 | `codelake_core::join_guard` |
-| 9, 10 | `operand_checks::check_plan` in `Engine::sql` before analysis (the bodies of the views a statement reads included, so a view stored without the check is refused when read): text compared with a number (`=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT] DISTINCT FROM`, `IN` lists, `IN (subquery)`, `BETWEEN`, `CASE x WHEN`) fails with `TYPE_MISMATCH`; `time ± interval` fails with `NOT_SUPPORTED`. The PostgreSQL wire path keeps DataFusion's coercion (an untyped literal takes the other side's type there) | `codelake_core::operand_checks` |
+| 9, 10 | `operand_checks::check_plan` in `Engine::sql` before analysis (the bodies of the views a statement reads included, so a view stored without the check is refused when read): text compared with a number (`=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT] DISTINCT FROM`, `IN` lists, `IN (subquery)`, `BETWEEN`, `CASE x WHEN`) fails with `TYPE_MISMATCH`; `time ± interval` fails with `NOT_SUPPORTED`. On the PostgreSQL wire the same checks run in `PolicyHook` (`operand_checks::postgres_refusal`; a simple statement is planned in the hook, an extended one is checked at execute) with PostgreSQL's typing, where a quoted literal or a parameter is untyped and takes the other side's type (`int_col > '20'` answers), and PostgreSQL's errors: SQLSTATE `42883` "operator does not exist: text > integer", `0A000` for `time ± interval` | `codelake_core::operand_checks`, `codelake-server` `hooks.rs` |
 | 11 | A partition task that panics sends an error into the merge (`catch_unwind`) | `codelake_core::output` |
 | 12 | `UnknownMembershipGuard` (logical, right before `decorrelate_predicate_subquery`, after `NullSafeNotIn`): an `IN (subquery)` whose value or subquery column may be NULL is refused (`NOT_SUPPORTED`) unless it sits where FALSE and UNKNOWN filter the same rows: a conjunct of a filter (a semi or null-aware anti join), or inside a filter under `AND`/`OR` with an even number of negations above an `IN` (odd above a `NOT IN`). Non-nullable sides answer everywhere | `codelake_core::join_guard` |
 
@@ -76,11 +76,15 @@ tests of `join_regressions.rs` check the rows against Trino 431.
 - Clients of the engine that relied on comparing text with numbers now get
   `TYPE_MISMATCH`, as on Trino. Cast explicitly. This is a breaking change
   (CHANGELOG), shipped as `fix(core)` in 9ef792e without the `!` marker.
-- The PostgreSQL wire path keeps DataFusion's coercion, and its answers to
-  text compared with a number changed with the train: DataFusion 54 converts
-  the text to the number where 53 compared text (`varchar_col > 9`). Listed
-  as breaking in the CHANGELOG; whether that path should refuse too is open
-  for the maintainers.
+- PostgreSQL wire clients get `42883` ("operator does not exist: text >
+  integer") for typed text against a number (`varchar_col > 9`,
+  `'7'::varchar = 7`, `varchar_col IN (1, 2)`), as from PostgreSQL itself,
+  where DataFusion 53 compared text and 54 converted the text to the number;
+  `time ± interval` gets `0A000`. Untyped literals keep PostgreSQL's
+  meaning (`int_col > '20'` compares numbers). Breaking (CHANGELOG, ISS-006).
+  A simple-protocol statement is planned twice (once in the hook to check
+  it); a statement the hook cannot plan is left to `DataFusion`, which
+  reports its own error.
 - `time ± interval` is refused until the train reaches DataFusion 55.
 - Removing a guard needs the DataFusion release with the fix **and** the
   matching test of `join_regressions.rs` passing without it. Upstream reports

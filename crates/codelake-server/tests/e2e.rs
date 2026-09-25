@@ -22,6 +22,9 @@ mod otlp;
 #[path = "e2e/f7_acceptance.rs"]
 mod f7_acceptance;
 
+#[path = "e2e/pg_operands.rs"]
+mod pg_operands;
+
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()

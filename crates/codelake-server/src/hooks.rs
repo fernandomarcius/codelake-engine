@@ -5,8 +5,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use codelake_core::statement_policy;
 use codelake_core::trace::{self, TARGET, TraceParent};
+use codelake_core::{operand_checks, statement_policy};
 use datafusion::common::ParamValues;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
@@ -64,7 +64,10 @@ impl QueryHook for MetricsHook {
 /// no client may run (`COPY`, `CREATE EXTERNAL TABLE`, runtime settings,
 /// `""`): the engine's statement policy
 /// ([`codelake_core::statement_policy`]), applied to the PostgreSQL wire
-/// protocol, which runs statements on the session directly.
+/// protocol, which runs statements on the session directly. It also refuses
+/// the operand types the engine does not combine (text against a number,
+/// `time ± interval`; ADR 0014), with PostgreSQL's typing rules and errors
+/// ([`codelake_core::operand_checks::postgres_refusal`]).
 #[derive(Debug)]
 pub(crate) struct PolicyHook;
 
@@ -85,15 +88,50 @@ fn check(statement: &Statement) -> PgWireResult<()> {
     statement_policy::check_sql(&statement.to_string(), &PostgreSqlDialect {}).map_err(|err| refusal(&err))
 }
 
+/// Refuses a planned statement whose operands the engine does not combine,
+/// as PostgreSQL words it (SQLSTATE `42883` "operator does not exist: text >
+/// integer", or `0A000`).
+fn check_operands(plan: &LogicalPlan) -> PgWireResult<()> {
+    match operand_checks::postgres_refusal(plan) {
+        Ok(None) => Ok(()),
+        Ok(Some(found)) => {
+            let mut info = ErrorInfo::new("ERROR".to_owned(), found.code.to_owned(), found.message);
+            info.hint = found.hint.map(str::to_owned);
+            Err(PgWireError::UserError(Box::new(info)))
+        }
+        Err(err) => Err(refusal(&err)),
+    }
+}
+
+/// A simple-protocol statement arrives unplanned: it is planned here to
+/// check its operands. A statement that does not plan (a command answered by
+/// a later hook, a syntax `DataFusion` rejects) is left to what runs it,
+/// which reports its own error.
+async fn check_simple(statement: &Statement, session_context: &SessionContext) -> PgWireResult<()> {
+    let planned = session_context
+        .state()
+        .statement_to_plan(datafusion::sql::parser::Statement::Statement(Box::new(
+            statement.clone(),
+        )))
+        .await;
+    match planned {
+        Ok(plan) => check_operands(&plan),
+        Err(_) => Ok(()),
+    }
+}
+
 #[async_trait]
 impl QueryHook for PolicyHook {
     async fn handle_simple_query(
         &self,
         statement: &Statement,
-        _session_context: &SessionContext,
+        session_context: &SessionContext,
         _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
-        check(statement).err().map(Err)
+        if let Err(err) = check(statement) {
+            return Some(Err(err));
+        }
+        check_simple(statement, session_context).await.err().map(Err)
     }
 
     async fn handle_extended_parse_query(
@@ -116,9 +154,10 @@ impl QueryHook for PolicyHook {
         if let Err(err) = check(statement) {
             return Some(Err(err));
         }
-        statement_policy::check_plan(logical_plan)
-            .err()
-            .map(|err| Err(refusal(&err)))
+        if let Err(err) = statement_policy::check_plan(logical_plan) {
+            return Some(Err(refusal(&err)));
+        }
+        check_operands(logical_plan).err().map(Err)
     }
 }
 

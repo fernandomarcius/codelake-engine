@@ -30,5 +30,5 @@ invalid. Expired entries fail review until renewed or removed.
   loop join over the memory limit fails instead of spilling. Not suppressed;
   guarded.
 - Text compared with a number and `time ± interval`: refused by
-  `operand_checks.rs` on the engine's client protocols (ADR 0014); the
-  PostgreSQL wire path keeps DataFusion's coercion.
+  `operand_checks.rs` on the engine's client protocols and on the PostgreSQL
+  wire (ADR 0014). Not suppressed; guarded.
