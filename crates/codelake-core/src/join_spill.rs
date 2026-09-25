@@ -55,7 +55,9 @@ limitations under the License.
 //! own merge headroom, and 2 × N of them starve a small pool before any holds
 //! a batch; each side runs within a budget ([`JoinSideBudget`]), so that the
 //! sort that finishes first cannot take, to merge its spilled runs, the
-//! memory the other needs.
+//! memory the other needs. Rewritten joins side by side share that budget
+//! ([`shared_side_budget`]); the joins inside an input do not count against
+//! it, only against the engine's pool.
 //!
 //! A join stays a hash join whenever the sort-merge join could answer
 //! different rows ([`keeps_hash_join`]):
@@ -204,6 +206,23 @@ pub fn join_slice(pool_bytes: usize, hash_joins: usize) -> usize {
 /// exchange buffers leave, so both sides and the join's own buffers fit.
 pub fn side_budget(pool_bytes: usize) -> usize {
     pool_bytes.saturating_sub(pool_bytes / BUFFERS_DIVISOR) / SIDE_DIVISOR
+}
+
+/// [`side_budget`] shared among `joins` rewritten joins that run side by
+/// side (not one inside an input of another), but never below `floor` (what
+/// a sort needs to merge its runs and hold a batch) unless the whole budget
+/// is smaller.
+pub fn shared_side_budget(pool_bytes: usize, joins: usize, floor: usize) -> usize {
+    let budget = side_budget(pool_bytes);
+    (budget / joins.max(1)).max(floor.min(budget))
+}
+
+/// Rewritten joins of `plan` that are not inside an input of another one.
+fn outermost_rewrites(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    if plan.is::<SortMergeWithinCeiling>() {
+        return 1;
+    }
+    plan.children().into_iter().map(outermost_rewrites).sum()
 }
 
 /// Whether a build side of `estimate` does not fit `slice`.
@@ -525,10 +544,29 @@ fn count_hash_joins(plan: &Arc<dyn ExecutionPlan>) -> usize {
 
 /// Memory pool of one join input: forwards every reservation to the
 /// engine's pool (which keeps the ceiling and names the consumers in its
-/// errors) and refuses what would take the input's operators past `budget`.
-/// An operator refused spills, as when the engine's pool refuses it.
-/// Exchange channels are not counted: they have their own slice of the
-/// engine's pool and spill what it refuses.
+/// errors) and refuses what would take the input's sorts, merges and
+/// aggregations past `budget`. An operator refused spills, as when the
+/// engine's pool refuses it. Exchange channels are not counted: they have
+/// their own slice of the engine's pool and spill what it refuses. Nor are
+/// the joins inside the input ([`JOIN_STATE`]): a hash join's build side
+/// cannot spill, a refusal fails it, and before the rewrite only the
+/// engine's pool bounded it. A sort's merge headroom, which cannot spill
+/// either, is counted: the sort relies on it fitting beside its batches.
+fn budgeted(consumer: &MemoryConsumer) -> bool {
+    !is_exchange_buffer(consumer) && !JOIN_STATE.iter().any(|name| consumer.name().starts_with(name))
+}
+
+/// Consumer names of the state `DataFusion` 54's joins hold (build sides,
+/// bitmaps, the sort-merge join's buffered rows).
+pub const JOIN_STATE: [&str; 6] = [
+    "HashJoinInput",
+    "CrossJoinExec",
+    "NestedLoopJoin",
+    "PiecewiseMergeJoinInput",
+    "SMJStream",
+    "SymmetricHashJoinStream",
+];
+
 #[derive(Debug)]
 struct BudgetPool {
     inner: Arc<dyn MemoryPool>,
@@ -570,21 +608,21 @@ impl MemoryPool for BudgetPool {
 
     fn grow(&self, reservation: &MemoryReservation, additional: usize) {
         self.inner.grow(reservation, additional);
-        if !is_exchange_buffer(reservation.consumer()) {
+        if budgeted(reservation.consumer()) {
             *self.used() += additional;
         }
     }
 
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
         self.inner.shrink(reservation, shrink);
-        if !is_exchange_buffer(reservation.consumer()) {
+        if budgeted(reservation.consumer()) {
             let mut used = self.used();
             *used = used.saturating_sub(shrink);
         }
     }
 
     fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
-        if is_exchange_buffer(reservation.consumer()) {
+        if !budgeted(reservation.consumer()) {
             return self.inner.try_grow(reservation, additional);
         }
         let mut used = self.used();
@@ -614,8 +652,9 @@ impl MemoryPool for BudgetPool {
 
 /// Runs its input (one sorted side of a rewritten join) with a memory pool
 /// in front of the engine's that refuses what would take the input's
-/// operators past `budget` bytes (exchange channels apart). A refused
-/// operator spills, as when the engine's pool refuses it.
+/// sorts, merges and aggregations past `budget` bytes (exchange channels
+/// and joins apart). A refused operator spills, as when the engine's pool
+/// refuses it.
 #[derive(Debug)]
 pub struct JoinSideBudget {
     input: Arc<dyn ExecutionPlan>,
@@ -962,25 +1001,44 @@ impl PhysicalOptimizerRule for SortMergeOversizedJoins {
         }
         let slice = join_slice(pool_bytes, count_hash_joins(&plan));
         let side_budget = side_budget(pool_bytes);
-        plan.transform_up(|node| {
-            let Some(join) = node.downcast_ref::<HashJoinExec>() else {
-                return Ok(Transformed::no(node));
-            };
-            if let Some(reason) = keeps_hash_join(join) {
-                tracing::trace!(reason, "hash join kept");
-                return Ok(Transformed::no(node));
-            }
-            let estimate = build_estimate(below_exchange(join.left()).as_ref());
-            if !exceeds_slice(estimate, slice) {
-                return Ok(Transformed::no(node));
-            }
-            match sort_merge(join, side_budget)? {
-                Some(merge) => {
-                    tracing::debug!(?estimate, slice, "hash join planned as a sort-merge join");
-                    Ok(Transformed::yes(merge))
+        let plan = plan
+            .transform_up(|node| {
+                let Some(join) = node.downcast_ref::<HashJoinExec>() else {
+                    return Ok(Transformed::no(node));
+                };
+                if let Some(reason) = keeps_hash_join(join) {
+                    tracing::trace!(reason, "hash join kept");
+                    return Ok(Transformed::no(node));
                 }
-                None => Ok(Transformed::no(node)),
+                let estimate = build_estimate(below_exchange(join.left()).as_ref());
+                if !exceeds_slice(estimate, slice) {
+                    return Ok(Transformed::no(node));
+                }
+                match sort_merge(join, side_budget)? {
+                    Some(merge) => {
+                        tracing::debug!(?estimate, slice, "hash join planned as a sort-merge join");
+                        Ok(Transformed::yes(merge))
+                    }
+                    None => Ok(Transformed::no(node)),
+                }
+            })
+            .data()?;
+        // Rewritten joins side by side (a UNION ALL of two) run at once:
+        // their inputs share what one join's inputs would get. A join inside
+        // an input of another already runs within that input's budget.
+        let joins = outermost_rewrites(&plan);
+        if joins < 2 {
+            return Ok(plan);
+        }
+        let floor = config.execution.sort_spill_reservation_bytes.saturating_mul(2);
+        let shared = shared_side_budget(pool_bytes, joins, floor);
+        plan.transform_up(|node| match node.downcast_ref::<JoinSideBudget>() {
+            Some(side) if side.budget != shared => {
+                Ok(Transformed::yes(
+                    Arc::new(JoinSideBudget::new(Arc::clone(&side.input), shared)) as Arc<dyn ExecutionPlan>,
+                ))
             }
+            _ => Ok(Transformed::no(node)),
         })
         .data()
     }
@@ -1268,8 +1326,20 @@ mod tests {
         assert_eq!((budget.reserved(), engine.reserved()), (0, 0));
         assert!(matches!(budget.memory_limit(), MemoryLimit::Finite(MIB)));
         assert!(budget.to_string().contains("budget: 1024.0 KB"), "{budget}");
+        // Joins inside the input use the engine's pool only.
+        let greedy = MemoryConsumer::new("HashJoinInput[2]").register(&budget);
+        greedy.try_grow(2 * MIB).unwrap();
+        greedy.grow(MIB);
+        assert_eq!((budget.reserved(), engine.reserved()), (0, 3 * MIB));
+        greedy.shrink(MIB);
+        assert_eq!((budget.reserved(), engine.reserved()), (0, 2 * MIB));
+        // A sort's merge headroom cannot spill but is counted.
+        let merge = MemoryConsumer::new("ExternalSorterMerge[0]").register(&budget);
+        merge.try_grow(MIB).unwrap();
+        assert!(merge.try_grow(1).is_err());
+        assert_eq!((budget.reserved(), engine.reserved()), (MIB, 3 * MIB));
+        drop(merge);
         // The engine's pool still refuses what exceeds it.
-        let greedy = MemoryConsumer::new("HashJoinInput").register(&budget);
         let small: Arc<dyn MemoryPool> = Arc::new(BudgetPool {
             inner: Arc::new(crate::pool::CeilingPool::new(MIB)),
             budget: 4 * MIB,
@@ -1285,6 +1355,12 @@ mod tests {
     fn the_side_budget_is_a_third_of_the_pool_less_buffers() {
         assert_eq!(side_budget(96 * MIB), 28 * MIB);
         assert_eq!(side_budget(0), 0);
+        // Shared among joins side by side, down to the floor.
+        assert_eq!(shared_side_budget(96 * MIB, 0, MIB), 28 * MIB);
+        assert_eq!(shared_side_budget(96 * MIB, 1, MIB), 28 * MIB);
+        assert_eq!(shared_side_budget(96 * MIB, 4, MIB), 7 * MIB);
+        assert_eq!(shared_side_budget(96 * MIB, 4, 10 * MIB), 10 * MIB);
+        assert_eq!(shared_side_budget(96 * MIB, 4, 40 * MIB), 28 * MIB);
         let node = JoinSideBudget::new(
             Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
                 schema(&[DataType::Int64]),
@@ -1587,6 +1663,29 @@ mod tests {
         assert_eq!(rows, 20_000);
     }
 
+    /// Two rewritten joins under a UNION ALL run at once: their four inputs
+    /// share what one join's two would get, and answer the hash joins' rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joins_side_by_side_share_the_side_budget() {
+        let pool = 512 << 10;
+        let small = session(pool).await;
+        let large = session(1 << 40).await;
+        let one = "SELECT count(*) FROM a JOIN b ON a.k = b.k";
+        let text = plan(&small, one).await;
+        assert!(
+            text.contains(&format!("JoinSideBudget: bytes={}", side_budget(pool))),
+            "{text}"
+        );
+        let two = "SELECT count(*), sum(id) FROM (\
+                   SELECT a.id FROM a JOIN b ON a.k = b.k \
+                   UNION ALL SELECT b.id FROM a JOIN b ON a.s = b.s)";
+        let text = plan(&small, two).await;
+        let shared = format!("JoinSideBudget: bytes={}", side_budget(pool) / 2);
+        assert_eq!(text.matches(&shared).count(), 4, "{text}");
+        assert_eq!(text.matches("JoinSideBudget").count(), 4, "{text}");
+        assert_eq!(rows(&small, two).await, rows(&large, two).await);
+    }
+
     /// Off by session: the planner keeps the hash join.
     #[tokio::test]
     async fn the_session_can_turn_it_off() {
@@ -1721,6 +1820,54 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert_eq!(engine.memory().reserved_bytes, 0);
+    }
+
+    /// A hash join inside an input of a rewritten join (its build side of
+    /// unknown size, ~15 MB, over the input's budget of ~9 MB but within the
+    /// 32 MiB pool) is bounded by the engine's pool, as before the rewrite,
+    /// not by the input's budget: the query completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hash_join_inside_an_input_is_bounded_by_the_pool_not_the_budget() {
+        const ROWS: i64 = 150_000;
+        let dir = tempfile::tempdir().unwrap();
+        let limit = crate::ByteSize::mib(32);
+        let engine = engine(dir.path(), limit);
+        let context = engine.context();
+        context
+            .register_table("l", keyed_table(200_000, 'x').await)
+            .unwrap();
+        context
+            .register_table("r", keyed_table(200_000, 'y').await)
+            .unwrap();
+        let sql = "SELECT count(*), sum(l.k), sum(length(x.s) + length(l.s)) FROM l JOIN (\
+                   SELECT r.k, g.s FROM (SELECT value AS k, lpad(CAST(value AS VARCHAR), 70, 'z') AS s \
+                                         FROM generate_series(1, 150000)) g \
+                   JOIN r ON g.k = r.k) x ON l.k = x.k";
+        let frame = engine.sql_with(&options(&engine, "true"), sql).await.unwrap();
+        let text = displayable(frame.clone().create_physical_plan().await.unwrap().as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            text.contains("SortMergeJoinExec") && text.contains("HashJoinExec"),
+            "{text}"
+        );
+        assert!(side_budget(limit.as_usize()) < 10 << 20);
+        engine.reset_memory_peak();
+        let batches = frame.collect().await.unwrap();
+        let row: Vec<String> = batches[0]
+            .columns()
+            .iter()
+            .map(|c| array_value_to_string(c, 0).unwrap())
+            .collect();
+        assert_eq!(
+            row,
+            [
+                ROWS.to_string(),
+                (ROWS * (ROWS + 1) / 2).to_string(),
+                (ROWS * 140).to_string()
+            ]
+        );
+        assert!(engine.memory_peak() <= limit.as_u64());
     }
 
     /// The watch: growth past the limit fails the streams it guards.

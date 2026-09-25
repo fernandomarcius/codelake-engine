@@ -99,7 +99,15 @@
   a budget of a third of the pool less the exchange slice (`JoinSideBudget`:
   the sort that finishes first merges its spilled runs with as many files as
   the pool has room for and left the other sort without a batch), and the
-  output spread again over the hash join's partitioning. The join trades
+  output spread again over the hash join's partitioning. Rewritten joins that
+  run side by side (a `UNION ALL` of two) share that budget, down to twice
+  the sort's merge headroom; a join inside an input of another already runs
+  within that input's budget. The budget bounds the sorts, merges and
+  aggregations of an input; the joins inside it (a hash join's build side,
+  which cannot spill) are bounded by the engine's pool only, as before the
+  rewrite (`join_spill::tests::a_hash_join_inside_an_input_is_bounded_by_the_pool_not_the_budget`:
+  a ~15 MB build under a 32 MiB pool completes; counted against the ~9 MB
+  budget it was refused). The join trades
   parallelism for a plan that fits.
   - Rows of one key value: the sort-merge join holds the rows of the current
     key value of its buffered side and spills them past what the pool
