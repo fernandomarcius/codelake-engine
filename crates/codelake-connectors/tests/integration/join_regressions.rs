@@ -348,7 +348,10 @@ pub(crate) fn sorted(mut rows: Rows) -> Rows {
 }
 
 /// A query, the operator line its plan must contain for the test to be about
-/// what it says, and whether that operator must have spilled.
+/// what it says, and whether that operator must have spilled. With the
+/// engine's guard (ADR 0014) a nested loop join over the limit is refused
+/// before it spills: the nested loop cases pass through that refusal, and
+/// check the rows only if the join ever runs within the pool.
 ///
 /// A case that must spill passes with Trino's rows, or when the engine refuses
 /// the query with a resources error (what `DataFusion` 53 did, having no
@@ -739,7 +742,7 @@ async fn wide_trino(shared: &Shared, name: &str) -> Trino {
 /// rows did not match, so a row is emitted once per partition, or as
 /// unmatched although another partition matched it.
 #[tokio::test]
-async fn spilling_left_nested_loop_join_emits_each_unmatched_row_once() {
+async fn left_nested_loop_join_over_the_limit_emits_each_unmatched_row_once() {
     let shared = shared().await;
     let trino = wide_trino(&shared, "nlj-left").await;
     let spill = tempfile::tempdir().unwrap();
@@ -799,7 +802,7 @@ const HUGE_SETUP: [&str; 8] = [
 /// the next load finds nothing and the join ends without emitting the probe
 /// rows that no chunk matched.
 #[tokio::test]
-async fn spilling_swapped_nested_loop_join_keeps_unmatched_probe_rows() {
+async fn swapped_nested_loop_join_over_the_limit_keeps_unmatched_probe_rows() {
     let shared = shared().await;
     let trino = Trino::start(&shared, "nlj-right").await;
     trino.batch(&HUGE_SETUP).await;
@@ -832,7 +835,7 @@ async fn spilling_swapped_nested_loop_join_keeps_unmatched_probe_rows() {
 /// hands the second execution only the files the first left unopened, and an
 /// exchange (below an aggregation) hands each partition out once.
 #[tokio::test]
-async fn spilling_nested_loop_join_reads_its_whole_build_side() {
+async fn nested_loop_join_over_the_limit_reads_its_whole_build_side() {
     let shared = shared().await;
     let trino = wide_trino(&shared, "nlj-once").await;
     let spill = tempfile::tempdir().unwrap();
