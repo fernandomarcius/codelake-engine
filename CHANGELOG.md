@@ -26,6 +26,16 @@ versioning: [SemVer](https://semver.org/).
 - Session-property registry: system properties plus catalog properties declared by connectors;
   undeclared names are rejected, performance-only Trino knobs are accepted with a warning.
 
+- Operations runbooks (`docs/operations/`): install (Compose, Kubernetes), configure, upgrade and
+  rollback, sizing, incidents, compaction, backup and restore, observability, migration from the
+  reference engine and back, go-live checklist.
+- Canary (`scripts/ops/canary.sh`): recorded answers (value, row count, sha256, rows, bounds) or
+  equality with a reference engine, latency and freshness objectives; one JSON line per run, exit
+  status for alerting, optional node_exporter textfile metrics. Self-test:
+  `scripts/ops/canary-selftest.sh`.
+- `deploy/compose/codelake.yml` (the engine alone on one host, ports on loopback) and a generic
+  production configuration example (`docs/examples/codelake.production.toml`).
+
 ### Changed
 - A hash join whose estimated build side does not fit its slice of the memory pool
   runs as a sort-merge join, which spills, instead of failing with
