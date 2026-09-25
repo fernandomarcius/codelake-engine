@@ -4,6 +4,8 @@
 //! - Configuration lives outside the artifact (a TOML file plus environment variables).
 //! - Secrets are never written in the file: sources reference *environment variable
 //!   names* and the values are resolved into [`SecretString`] at startup.
+//! - Non-secret string values may reference the environment as `${ENV:NAME}`,
+//!   resolved once when the file is loaded ([`crate::env_refs`]).
 //! - Validation reports **every** problem at once, so an operator fixes the file in
 //!   one pass instead of restarting the process once per mistake.
 
@@ -15,6 +17,7 @@ use secrecy::SecretString;
 use serde::Deserialize;
 
 use crate::bytes::ByteSize;
+use crate::env_refs;
 
 /// Root configuration document.
 #[derive(Debug, Clone, Deserialize)]
@@ -529,6 +532,12 @@ pub enum LoadError {
         path: PathBuf,
         source: Box<toml::de::Error>,
     },
+    /// `${ENV:NAME}` references that cannot be resolved.
+    #[error("config file {path}: {errors}")]
+    References { path: PathBuf, errors: ConfigErrors },
+    /// The document does not deserialize once its references are resolved.
+    #[error("cannot parse config file {path} (after resolving ${{ENV:…}} references): {message}")]
+    Resolved { path: PathBuf, message: String },
     #[error(transparent)]
     Invalid(#[from] ConfigErrors),
 }
@@ -585,18 +594,44 @@ fn check_sql_source(
 }
 
 impl Config {
-    /// Parses and validates a config file, resolving secrets from the process
+    /// Parses and validates a config file, resolving `${ENV:NAME}`
+    /// references ([`crate::env_refs`]) and secrets from the process
     /// environment.
     pub fn load(path: &Path) -> Result<ValidatedConfig, LoadError> {
         let raw = std::fs::read_to_string(path).map_err(|source| LoadError::Read {
             path: path.to_owned(),
             source,
         })?;
-        let config: Config = toml::from_str(&raw).map_err(|source| LoadError::Parse {
+        let env = |name: &str| std::env::var(name).ok();
+        let config = Self::parse(path, &raw, &env)?;
+        Ok(config.validate(&env, &|p| p.is_file())?)
+    }
+
+    /// Parses a document, resolving its `${ENV:NAME}` references with `env`
+    /// first. `path` only labels errors. A document without references is
+    /// parsed as written, so its errors keep their line numbers; with
+    /// references, errors name the key instead, and never quote a value that
+    /// came from the environment.
+    pub fn parse(path: &Path, raw: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<Self, LoadError> {
+        let parse_err = |source| LoadError::Parse {
             path: path.to_owned(),
             source: Box::new(source),
-        })?;
-        Ok(config.validate(&|name| std::env::var(name).ok(), &|p| p.is_file())?)
+        };
+        let mut document = toml::Value::Table(toml::from_str::<toml::Table>(raw).map_err(parse_err)?);
+        if !env_refs::has_references(&document) {
+            return toml::from_str(raw).map_err(parse_err);
+        }
+        let resolved =
+            env_refs::resolve_document(&mut document, env).map_err(|errors| LoadError::References {
+                path: path.to_owned(),
+                errors: ConfigErrors(errors),
+            })?;
+        document
+            .try_into()
+            .map_err(|err: toml::de::Error| LoadError::Resolved {
+                path: path.to_owned(),
+                message: resolved.redact(err.message()),
+            })
     }
 
     /// Validates the whole document. `env` and `file_exists` are injected so the
@@ -1004,6 +1039,133 @@ mod tests {
         let validated = parse(VALID).validate(&full_env, &|_| true).unwrap();
         let rendered = format!("{validated:?}");
         assert!(!rendered.contains("value-of-ERP_PG_PASSWORD"), "{rendered}");
+    }
+
+    const WITH_REFERENCES: &str = r#"
+        [server]
+        pg_listen = "${ENV:PG_LISTEN}"
+        http_listen = "127.0.0.1:8080"
+
+        [memory]
+        limit = "${ENV:MEMORY_LIMIT}"
+        spill_dir = "${ENV:DATA}/spill"
+        spill_limit = "20GiB"
+
+        [[source]]
+        name = "erp"
+        kind = "postgres"
+        host = "${ENV:ERP_HOST}"
+        database = "erp_${ENV:STAGE}"
+        user = "reader"
+        password_env = "ERP_PG_PASSWORD"
+
+        [[source]]
+        name = "lake"
+        kind = "hive"
+        warehouse = "${ENV:DATA}/warehouse"
+        timestamp_precision = "${ENV:PRECISION}"
+    "#;
+
+    fn reference_env(name: &str) -> Option<String> {
+        match name {
+            "PG_LISTEN" => Some("127.0.0.1:15432".to_owned()),
+            "MEMORY_LIMIT" => Some("1GiB".to_owned()),
+            "DATA" => Some("/srv/codelake".to_owned()),
+            "ERP_HOST" => Some("pg.hml.internal".to_owned()),
+            "STAGE" => Some("hml".to_owned()),
+            "PRECISION" => Some("MICROSECONDS".to_owned()),
+            "ERP_PG_PASSWORD" => Some("pw".to_owned()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn env_references_resolve_in_every_string_value_at_load() {
+        let config = Config::parse(Path::new("c.toml"), WITH_REFERENCES, &reference_env).unwrap();
+        assert_eq!(config.server.pg_listen.port(), 15432);
+        assert_eq!(config.memory.limit, ByteSize::gib(1));
+        assert_eq!(config.memory.spill_dir, PathBuf::from("/srv/codelake/spill"));
+        match &config.sources[0].kind {
+            SourceKind::Postgres { host, database, .. } => {
+                assert_eq!(host, "pg.hml.internal");
+                assert_eq!(database, "erp_hml");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &config.sources[1].kind {
+            SourceKind::Hive {
+                warehouse,
+                timestamp_precision,
+                ..
+            } => {
+                assert_eq!(warehouse, "/srv/codelake/warehouse");
+                assert_eq!(*timestamp_precision, HiveTimestampPrecision::Microseconds);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        config.validate(&reference_env, &|_| true).unwrap();
+    }
+
+    #[test]
+    fn missing_env_references_are_reported_together_with_their_keys() {
+        let env = |name: &str| {
+            if name == "ERP_HOST" || name == "DATA" {
+                None
+            } else {
+                reference_env(name)
+            }
+        };
+        let err = Config::parse(Path::new("c.toml"), WITH_REFERENCES, &env).unwrap_err();
+        let text = err.to_string();
+        for expected in [
+            "`memory.spill_dir` references environment variable DATA",
+            "`source[0].host` references environment variable ERP_HOST",
+            "`source[1].warehouse` references environment variable DATA",
+        ] {
+            assert!(text.contains(expected), "{expected}: {text}");
+        }
+        assert!(text.contains("c.toml"), "{text}");
+        assert!(matches!(err, LoadError::References { .. }));
+    }
+
+    #[test]
+    fn a_resolved_value_never_appears_in_a_parse_error() {
+        let doc = VALID.replace(
+            "http_listen = \"0.0.0.0:8080\"",
+            "http_listen = \"0.0.0.0:8080\"\nmax_connections = \"${ENV:CONNS}\"",
+        );
+        let env = |name: &str| (name == "CONNS").then(|| "Not-A-Number-Value".to_owned());
+        let err = Config::parse(Path::new("c.toml"), &doc, &env)
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("Not-A-Number-Value"), "{err}");
+        assert!(err.contains("${ENV:CONNS}"), "{err}");
+    }
+
+    #[test]
+    fn a_document_without_references_keeps_line_numbers_in_errors() {
+        let doc = VALID.replace("[memory]", "[memory]\nlimt = \"1GiB\"");
+        let err = Config::parse(Path::new("c.toml"), &doc, &|_| None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("line"), "{err}");
+        // `$` outside `${ENV:…}` is literal text, not a lookup.
+        let doc = VALID.replace("db.internal", "db$${HOST}");
+        let config = Config::parse(Path::new("c.toml"), &doc, &|_| None).unwrap();
+        match &config.sources[0].kind {
+            SourceKind::Postgres { host, .. } => assert_eq!(host, "db$${HOST}"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_reads_the_file_and_resolves_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("codelake.toml");
+        std::fs::write(&path, WITH_REFERENCES).unwrap();
+        // The test process does not define these variables.
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(err.contains("PG_LISTEN"), "{err}");
     }
 
     #[test]

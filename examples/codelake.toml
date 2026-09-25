@@ -1,5 +1,7 @@
 # Example configuration. Secrets are NEVER written here: each source names the
-# environment variable that holds its secret. Validate with:
+# environment variable that holds its secret. Any string value may reference
+# the environment as ${ENV:NAME}, resolved at load, e.g.
+# host = "${ENV:ERP_HOST}". Validate with:
 #   codelake check-config --config examples/codelake.toml
 
 [server]
