@@ -762,6 +762,7 @@ impl Engine {
         ctx.register_udf(crate::coercion::values_cell());
         ctx.register_udf(crate::timestamp_casts::try_arrow_cast());
         ctx.register_udf(crate::declared::trino_typed());
+        ctx.register_udf(crate::declared::trino_try_typed());
         ctx.register_udf(crate::coercion::named_cast());
         ctx.register_udf(crate::coercion::exact_cast());
         crate::trino_functions::install(&mut ctx)?;

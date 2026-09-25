@@ -146,6 +146,9 @@ versioning: [SemVer](https://semver.org/).
   them with other text; `TRY_CAST(x AS char(n))` fails with `NOT_SUPPORTED`. A value
   computed from a char value (`max(ch)`, `lag(ch)`, `coalesce(ch, …)`, `upper(ch)`,
   `ch || 'x'`) counts as one.
+- **Breaking:** `TRY_CAST(x AS varchar(n))` cuts to `n` characters and
+  `TRY_CAST(x AS timestamp(p))` rounds to `p` digits, as `CAST` does (`NULL` where `CAST`
+  fails); they returned the value as it was.
 - **Breaking:** text compared with a number (`varchar_col > 9`, `x IN ('1.0')`) fails with
   `TYPE_MISMATCH` on the engine's client protocols, as on Trino; cast explicitly
   (ADR 0014). It answered rows before, through DataFusion's coercion.
@@ -289,6 +292,9 @@ versioning: [SemVer](https://semver.org/).
   `SELECT max(ch) FROM t UNION SELECT s FROM v` held two rows where the reference holds
   one. Such values are followed through the plan and refused like the column (see
   Changed).
+- `max(ch)` over a char column of an in-memory table panicked (`Utf8`×`Utf8View`) and
+  `CAST(ch AS varchar)` failed ("expected Utf8View but found Utf8"): `INSERT` wrote
+  `Utf8` values into a `Utf8View` column. Values keep the column's Arrow type.
 - Tables of the in-memory catalog (`CREATE TABLE datafusion.…`) kept their rows outside
   the memory pool; they are reserved in it for as long as the table exists. `UPDATE` and
   `DELETE` of such a table run when the plan executes (they changed the rows while

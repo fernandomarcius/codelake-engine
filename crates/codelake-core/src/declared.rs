@@ -8,6 +8,7 @@
 //! - `CAST(x AS varchar(n))` of text keeps the first `n` characters; of
 //!   anything else fails when its text is longer (`Value 123 cannot be
 //!   represented as varchar(2)`); `CAST(x AS char(n))` pads with spaces;
+//!   `TRY_CAST` does the same, with `NULL` where `CAST` fails;
 //! - `INSERT` into a `varchar(n)` or `char(n)` column fails when a value has
 //!   more than `n` characters besides trailing spaces (`Cannot truncate
 //!   non-space characters when casting from varchar(13) to varchar(10) on
@@ -15,8 +16,9 @@
 //! - `timestamp(p)` holds `p` fraction digits, rounded half up.
 //!
 //! Before planning, [`rewrite_declared_casts`] turns such a cast into
-//! `codelake_trino_type(x, '<type>')` ([`TrinoTyped`]), which converts the
-//! value and names the type in the result field's metadata; the protocol,
+//! `codelake_trino_type(x, '<type>')` ([`TrinoTyped`]; a `TRY_CAST` into
+//! `codelake_trino_try_type`), which converts the value and names the type
+//! in the result field's metadata; the protocol,
 //! `information_schema` and `DESCRIBE` read it from there. A `timestamp(p)`
 //! is carried by the smallest Arrow unit holding `p` digits.
 //! [`declared_columns`] reads the declared types of a `CREATE TABLE`, which
@@ -24,7 +26,9 @@
 //! Trino's length check to an `INSERT` into such columns.
 //!
 //! A `char(n)` value is stored without its padding (comparisons ignore
-//! trailing spaces in Trino) and padded when sent to a client.
+//! trailing spaces in Trino) and padded when sent to a client. Text keeps
+//! the Arrow type it came with (`Utf8View` in, `Utf8View` out): a table's
+//! column and the values an `INSERT` writes into it must agree.
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -51,6 +55,9 @@ use crate::trino_types::Declared;
 /// Name of [`TrinoTyped`].
 pub(crate) const TRINO_TYPED: &str = "codelake_trino_type";
 
+/// Name of [`TrinoTyped`] for a `TRY_CAST`: `NULL` where the cast fails.
+pub(crate) const TRINO_TRY_TYPED: &str = "codelake_trino_try_type";
+
 /// How a [`TrinoTyped`] converts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Mode {
@@ -67,20 +74,28 @@ enum Mode {
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) struct TrinoTyped {
     mode: Mode,
+    /// A `TRY_CAST`: a value the cast refuses becomes `NULL`.
+    lenient: bool,
     signature: Signature,
 }
 
 impl TrinoTyped {
-    fn new(mode: Mode) -> Self {
+    fn new(mode: Mode, lenient: bool) -> Self {
         Self {
             mode,
+            lenient,
             signature: Signature::any(2, Volatility::Immutable),
         }
     }
 }
 
 pub(crate) fn trino_typed() -> ScalarUDF {
-    ScalarUDF::new_from_impl(TrinoTyped::new(Mode::Cast))
+    ScalarUDF::new_from_impl(TrinoTyped::new(Mode::Cast, false))
+}
+
+/// `codelake_trino_try_type`: [`TrinoTyped`] of a `TRY_CAST`.
+pub(crate) fn trino_try_typed() -> ScalarUDF {
+    ScalarUDF::new_from_impl(TrinoTyped::new(Mode::Cast, true))
 }
 
 fn declared_of(scalar: Option<&ScalarValue>) -> Result<Option<Declared>> {
@@ -114,6 +129,8 @@ fn unit_for(precision: u8) -> TimeUnit {
 fn result_type(declared: Option<Declared>, input: &DataType) -> Result<DataType> {
     Ok(match (declared, input) {
         (None, other) => other.clone(),
+        // Text keeps its Arrow type (see the module documentation).
+        (Some(Declared::Varchar(_) | Declared::Char(_)), text) if is_text(text) => text.clone(),
         (Some(Declared::Varchar(_) | Declared::Char(_)), _) => DataType::Utf8,
         (Some(Declared::Timestamp(p)), DataType::Timestamp(_, zone)) => {
             DataType::Timestamp(unit_for(p), zone.clone())
@@ -195,7 +212,11 @@ fn rounded_timestamps(array: &ArrayRef, precision: u8) -> Result<ArrayRef> {
 
 impl ScalarUDFImpl for TrinoTyped {
     fn name(&self) -> &'static str {
-        TRINO_TYPED
+        if self.lenient {
+            TRINO_TRY_TYPED
+        } else {
+            TRINO_TYPED
+        }
     }
 
     fn signature(&self) -> &Signature {
@@ -214,7 +235,7 @@ impl ScalarUDFImpl for TrinoTyped {
         let field = Field::new(
             self.name(),
             result_type(declared, input.data_type())?,
-            input.is_nullable(),
+            input.is_nullable() || self.lenient,
         );
         Ok(Arc::new(match declared {
             Some(declared) => field.with_metadata(declared.metadata()),
@@ -233,16 +254,23 @@ impl ScalarUDFImpl for TrinoTyped {
         let array = value.to_array(args.number_rows)?;
         let result: ArrayRef = match declared {
             None => array,
+            Some(Declared::Timestamp(p)) if self.lenient => rounded_timestamps_or_null(&array, p)?,
             Some(Declared::Timestamp(p)) => rounded_timestamps(&array, p)?,
             Some(declared @ (Declared::Varchar(n) | Declared::Char(n))) => {
                 let mut out = Vec::with_capacity(array.len());
                 for text in texts(&array)? {
                     out.push(match text {
                         None => None,
-                        Some(text) => Some(bounded(self.mode, &text, declared, n)?),
+                        Some(text) => match bounded(self.mode, &text, declared, n) {
+                            Ok(value) => Some(value),
+                            Err(_) if self.lenient => None,
+                            Err(err) => return Err(err.into()),
+                        },
                     });
                 }
-                Arc::new(StringArray::from(out))
+                let text: ArrayRef = Arc::new(StringArray::from(out));
+                let target = result_type(Some(declared), array.data_type())?;
+                cast(&text, &target)?
             }
         };
         Ok(match value {
@@ -250,6 +278,27 @@ impl ScalarUDFImpl for TrinoTyped {
             ColumnarValue::Array(_) => ColumnarValue::Array(result),
         })
     }
+}
+
+/// [`rounded_timestamps`] row by row, `NULL` where a value is out of range
+/// (`TRY_CAST`).
+fn rounded_timestamps_or_null(array: &ArrayRef, precision: u8) -> Result<ArrayRef> {
+    if let Ok(rounded) = rounded_timestamps(array, precision) {
+        return Ok(rounded);
+    }
+    let rows = (0..array.len())
+        .map(|row| {
+            let one = array.slice(row, 1);
+            if let Ok(value) = rounded_timestamps(&one, precision) {
+                Ok(value)
+            } else {
+                let target = result_type(Some(Declared::Timestamp(precision)), array.data_type())?;
+                Ok(datafusion::arrow::array::new_null_array(&target, 1))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let refs: Vec<&dyn Array> = rows.iter().map(AsRef::as_ref).collect();
+    Ok(datafusion::arrow::compute::concat(&refs)?)
 }
 
 fn is_text(data_type: &DataType) -> bool {
@@ -280,7 +329,7 @@ pub(crate) fn check_typed(expr: Expr, schema: &DFSchema) -> Result<Transformed<E
         return Ok(Transformed::no(expr));
     }
     let text = Expr::Cast(Cast::new(Box::new(value.clone()), DataType::Utf8));
-    let strict = ScalarUDF::new_from_impl(TrinoTyped::new(Mode::Strict));
+    let strict = ScalarUDF::new_from_impl(TrinoTyped::new(Mode::Strict, typed.lenient));
     Ok(Transformed::yes(strict.call(vec![text, name.clone()])))
 }
 
@@ -302,7 +351,7 @@ fn declared_type(data_type: &sql::DataType) -> Option<Declared> {
     }
 }
 
-fn typed_call(expr: sql::Expr, declared: Declared) -> sql::Expr {
+fn typed_call(function: &str, expr: sql::Expr, declared: Declared) -> sql::Expr {
     use sql::{
         Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident, ObjectName,
     };
@@ -313,7 +362,7 @@ fn typed_call(expr: sql::Expr, declared: Declared) -> sql::Expr {
     };
     let arg = |e: sql::Expr| FunctionArg::Unnamed(FunctionArgExpr::Expr(e));
     sql::Expr::Function(Function {
-        name: ObjectName::from(vec![Ident::new(TRINO_TYPED)]),
+        name: ObjectName::from(vec![Ident::new(function)]),
         uses_odbc_syntax: false,
         parameters: FunctionArguments::None,
         args: FunctionArguments::List(FunctionArgumentList {
@@ -331,10 +380,11 @@ fn typed_call(expr: sql::Expr, declared: Declared) -> sql::Expr {
     })
 }
 
-/// `CAST(x AS varchar(n) | char(n) | timestamp(p))` → `codelake_trino_type`
-/// (see the module documentation). A `timestamp(p)` is first read with nine
-/// digits, then rounded. `TRY_CAST(x AS char(n))` fails (`NOT_SUPPORTED`):
-/// the engine would hold it as text, compared unpadded
+/// `CAST(x AS varchar(n) | char(n) | timestamp(p))` → `codelake_trino_type`,
+/// `TRY_CAST` → `codelake_trino_try_type` (see the module documentation). A
+/// `timestamp(p)` is first read with nine digits (by the same kind of cast),
+/// then rounded. `TRY_CAST(x AS char(n))` fails (`NOT_SUPPORTED`): the
+/// engine would hold it as text, compared unpadded
 /// ([`crate::char_comparisons`]).
 pub(crate) fn rewrite_declared_casts(statement: &mut DFStatement) -> Result<()> {
     let DFStatement::Statement(inner) = statement else {
@@ -353,13 +403,13 @@ pub(crate) fn rewrite_declared_casts(statement: &mut DFStatement) -> Result<()> 
                 declared.name(&DataType::Utf8)
             )));
         }
-        if let sql::Expr::Cast {
-            kind: CastKind::Cast | CastKind::DoubleColon,
-            data_type,
-            ..
-        } = expr
+        if let sql::Expr::Cast { kind, data_type, .. } = expr
             && let Some(declared) = declared_type(data_type)
         {
+            let function = match kind {
+                CastKind::TryCast | CastKind::SafeCast => TRINO_TRY_TYPED,
+                CastKind::Cast | CastKind::DoubleColon => TRINO_TYPED,
+            };
             let mut cast = std::mem::replace(expr, sql::Expr::value(sql::Value::Null));
             if let (sql::Expr::Cast { data_type, .. }, Declared::Timestamp(_)) = (&mut cast, declared) {
                 let zone = match data_type {
@@ -367,9 +417,9 @@ pub(crate) fn rewrite_declared_casts(statement: &mut DFStatement) -> Result<()> 
                     _ => TimezoneInfo::None,
                 };
                 *data_type = sql::DataType::Timestamp(Some(9), zone);
-                *expr = typed_call(cast, declared);
+                *expr = typed_call(function, cast, declared);
             } else if let sql::Expr::Cast { expr: value, .. } = cast {
-                *expr = typed_call(*value, declared);
+                *expr = typed_call(function, *value, declared);
             }
         }
         ControlFlow::Continue(())
@@ -569,7 +619,7 @@ pub(crate) fn check_insert(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>
     if bounded.iter().all(Option::is_none) || input_schema.fields().len() != bounded.len() {
         return Ok(Transformed::no(LogicalPlan::Dml(dml)));
     }
-    let insert = ScalarUDF::new_from_impl(TrinoTyped::new(Mode::Insert));
+    let insert = ScalarUDF::new_from_impl(TrinoTyped::new(Mode::Insert, false));
     let exprs = input_schema
         .iter()
         .zip(&bounded)
@@ -631,6 +681,66 @@ mod tests {
         assert_eq!(bounded(Mode::Cast, "a  ", c3, 3).unwrap(), "a");
     }
 
+    /// `TRY_CAST` answers what `CAST` answers, `NULL` where `CAST` fails
+    /// (Trino 431: `TRY_CAST('abcdef' AS varchar(3))` is `abc`,
+    /// `TRY_CAST(12345 AS varchar(3))` is `NULL`); text keeps its Arrow
+    /// type.
+    #[test]
+    fn try_cast_to_declared_types() {
+        use datafusion::arrow::array::{StringViewArray, TimestampMillisecondArray};
+        use datafusion::arrow::datatypes::{Field, Int64Type};
+        let call = |udf: &ScalarUDF, value: ArrayRef, name: &str| -> Result<ArrayRef> {
+            let arg_fields = vec![
+                Arc::new(Field::new("x", value.data_type().clone(), true)),
+                Arc::new(Field::new("t", DataType::Utf8, false)),
+            ];
+            let name = ScalarValue::Utf8(Some(name.to_owned()));
+            let scalars = [None, Some(&name)];
+            let return_field = udf.return_field_from_args(ReturnFieldArgs {
+                arg_fields: &arg_fields,
+                scalar_arguments: &scalars,
+            })?;
+            let rows = value.len();
+            match udf.invoke_with_args(ScalarFunctionArgs {
+                args: vec![ColumnarValue::Array(value), ColumnarValue::Scalar(name)],
+                arg_fields,
+                number_rows: rows,
+                return_field,
+                config_options: Arc::default(),
+            })? {
+                ColumnarValue::Array(array) => Ok(array),
+                ColumnarValue::Scalar(scalar) => Ok(scalar.to_array()?),
+            }
+        };
+        let lenient = trino_try_typed();
+        let text: ArrayRef = Arc::new(StringViewArray::from(vec![Some("abcdef"), None, Some("ab")]));
+        let cut = call(&lenient, Arc::clone(&text), "varchar(3)").unwrap();
+        assert_eq!(cut.data_type(), &DataType::Utf8View);
+        let cut: Vec<Option<&str>> = cut.as_string_view().iter().collect();
+        assert_eq!(cut, [Some("abc"), None, Some("ab")]);
+        let char3 = call(&lenient, text, "char(3)").unwrap();
+        let char3: Vec<Option<&str>> = char3.as_string_view().iter().collect();
+        assert_eq!(char3, [Some("abc"), None, Some("ab")]);
+        // A number too long for the type: NULL, where CAST fails.
+        let numbers: ArrayRef = Arc::new(StringArray::from(vec!["12345", "12"]));
+        let strict = ScalarUDF::new_from_impl(TrinoTyped::new(Mode::Strict, true));
+        let answer = call(&strict, Arc::clone(&numbers), "varchar(3)").unwrap();
+        let answer: Vec<Option<&str>> = answer.as_string::<i32>().iter().collect();
+        assert_eq!(answer, [None, Some("12")]);
+        let failing = ScalarUDF::new_from_impl(TrinoTyped::new(Mode::Strict, false));
+        assert!(call(&failing, numbers, "varchar(3)").is_err());
+        // Timestamps round like CAST; one out of range is NULL.
+        let stamps: ArrayRef = Arc::new(TimestampMillisecondArray::from(vec![
+            Some(990),
+            Some(i64::MAX),
+            None,
+        ]));
+        let rounded = call(&lenient, stamps, "timestamp(1)").unwrap();
+        let rounded = cast(&rounded, &DataType::Int64).unwrap();
+        let rounded: Vec<Option<i64>> = rounded.as_primitive::<Int64Type>().iter().collect();
+        assert_eq!(rounded, [Some(1000), None, None]);
+    }
+
     #[test]
     fn trino_type_names_parse() {
         assert_eq!(
@@ -679,6 +789,23 @@ mod tests {
              codelake_trino_type(CAST(d AS TIMESTAMP(9)), 'timestamp(1)'), CAST(e AS TIMESTAMP(6)), \
              codelake_trino_type(CAST(f AS TIMESTAMP(9) WITH TIME ZONE), 'timestamp(2)')"
         );
+        let mut statement = DFParser::parse_sql(
+            "SELECT TRY_CAST(a AS VARCHAR(3)), TRY_CAST(d AS TIMESTAMP(1)), TRY_CAST(e AS VARCHAR)",
+        )
+        .unwrap()
+        .pop_front()
+        .unwrap();
+        rewrite_declared_casts(&mut statement).unwrap();
+        assert_eq!(
+            statement.to_string(),
+            "SELECT codelake_trino_try_type(a, 'varchar(3)'), \
+             codelake_trino_try_type(TRY_CAST(d AS TIMESTAMP(9)), 'timestamp(1)'), TRY_CAST(e AS VARCHAR)"
+        );
+        let mut refused = DFParser::parse_sql("SELECT TRY_CAST(b AS CHAR(2))")
+            .unwrap()
+            .pop_front()
+            .unwrap();
+        assert!(rewrite_declared_casts(&mut refused).is_err());
         let mut create =
             DFParser::parse_sql("CREATE TABLE t (a VARCHAR(10), b CHAR(3), c VARCHAR, d BIGINT)")
                 .unwrap()
