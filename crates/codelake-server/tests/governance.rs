@@ -687,3 +687,58 @@ async fn registry_lists_both_protocols(server: &Server) {
     let count = data.unwrap()[0][0].as_i64().unwrap();
     assert!(count >= 5, "PostgreSQL queries seen over HTTP: {count}");
 }
+
+// ------------------------------------------------------------ audit (F6) ---
+
+/// `(running, queued)` admission slots, from `/healthz`.
+async fn load(server: &Server) -> (u64, u64) {
+    let health = json(
+        reqwest::get(format!("http://127.0.0.1:{}/healthz", server.http))
+            .await
+            .unwrap(),
+    )
+    .await;
+    (
+        health["queries"]["running"].as_u64().unwrap(),
+        health["queries"]["queued"].as_u64().unwrap(),
+    )
+}
+
+/// A `DECLARE … CURSOR` (psycopg2 named cursors, pandas chunked reads) runs
+/// under governance like a suspended portal: its time limit stops it and its
+/// memory returns to the pool. Found by the F6 audit: the `DECLARE` statement
+/// finishes at once, and the cursor's stream then lives in the connection
+/// without a slot, a deadline or a registry entry anyone can kill, holding
+/// its reservations until `CLOSE`.
+#[tokio::test]
+async fn audit_declared_cursor_is_bounded_by_its_time_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start_server(dir.path());
+    server.wait_ready().await;
+    let client = server.connect("zed").await;
+    client
+        .batch_execute("SET statement_timeout = '5s'")
+        .await
+        .unwrap();
+    client.batch_execute("BEGIN").await.unwrap();
+    client
+        .batch_execute(
+            "DECLARE c1 CURSOR FOR SELECT a.value FROM generate_series(1, 2000000) a \
+             JOIN generate_series(1, 3000000000) b ON a.value = b.value",
+        )
+        .await
+        .unwrap();
+    assert_eq!(text_rows(&client, "FETCH 1 FROM c1").await.len(), 1);
+    let held = pool_fills(&server).await;
+    let slots = load(&server).await;
+    // Past the 5 s limit, idle: a suspended portal is stopped by now.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let observer = server.connect("observer").await;
+    let states = states_of(&observer, "zed").await;
+    let left = server.pool_drains().await;
+    assert_eq!(
+        left, 0,
+        "the cursor kept {left} bytes reserved past its time limit (held {held}; \
+         slots while it held them: {slots:?}; zed's queries: {states:?})"
+    );
+}
