@@ -2,13 +2,15 @@
 //! that Trino and SQL Server 2022 (`OPENROWSET`) read every value exactly
 //! (compare with `tests/fixtures/trino431/warehouse/pilot/t1`):
 //!
-//! - Hive `timestamp` as `INT96` (Julian day + nanoseconds of the day) holding
-//!   the wall-clock time as UTC, with `writer.time.zone = Etc/UTC` in the
-//!   footer as Trino writes it. Trino 431 converts `INT96` with its
-//!   `hive.parquet.time-zone` (UTC in the official image) and ignores the key;
-//!   SQL Server maps `INT96` to `datetime2` without conversion (ADR 0007). An
-//!   `INT64` timestamp without the legacy `TIMESTAMP_MILLIS` annotation
-//!   reaches SQL Server as `bigint`.
+//! - Hive `timestamp` as `INT96` (Julian day + nanoseconds of the day)
+//!   holding the instant of the wall-clock time in the catalog's Parquet time
+//!   zone (`codelake_core::parquet_time_zone`), with the zone's name under
+//!   `writer.time.zone` in the footer, as the reference engine writes them.
+//!   That engine converts `INT96` with its `hive.parquet.time-zone` (UTC in
+//!   its official image) and ignores the key; SQL Server maps `INT96` to
+//!   `datetime2` without conversion, so it shows the UTC time (ADR 0007). An `INT64`
+//!   timestamp without the legacy `TIMESTAMP_MILLIS` annotation reaches SQL
+//!   Server as `bigint`.
 //! - decimals as `FIXED_LEN_BYTE_ARRAY` of the smallest width for the precision;
 //! - root group `trino_schema`, no embedded Arrow schema.
 //!
@@ -38,9 +40,12 @@ use datafusion::parquet::file::properties::{EnabledStatistics, WriterProperties}
 use datafusion::parquet::file::writer::SerializedFileWriter;
 use datafusion::parquet::schema::types::{ColumnPath, SchemaDescriptor, Type, TypePtr};
 
+use codelake_core::parquet_time_zone::ParquetTimeZone;
+
 /// Root group name Trino gives its Parquet schema.
 const ROOT: &str = "trino_schema";
-/// Footer key Trino (and Hive 3) record the `INT96` time zone under.
+/// Footer key Trino (and Hive 3) record the `INT96` time zone under, and
+/// the zone recorded when none is given ([`TrinoParquetWriter::in_time_zone`]).
 const WRITER_TIME_ZONE: (&str, &str) = ("writer.time.zone", "Etc/UTC");
 /// Rows per Parquet row group. Bounded so the writer's buffer stays small.
 pub(crate) const ROW_GROUP_ROWS: usize = 128 * 1024;
@@ -194,7 +199,14 @@ impl Column {
         }
     }
 
-    fn write(&mut self, field: &datafusion::arrow::datatypes::Field, array: &ArrayRef) -> Result<()> {
+    /// Appends `array`; `zone` converts wall-clock timestamps to the
+    /// instants `INT96` stores (`None`: they are instants already).
+    fn write(
+        &mut self,
+        field: &datafusion::arrow::datatypes::Field,
+        array: &ArrayRef,
+        zone: Option<ParquetTimeZone>,
+    ) -> Result<()> {
         match self {
             Self::Arrow(writer) => {
                 for leaf in compute_leaves(field, array)? {
@@ -214,7 +226,17 @@ impl Column {
                         None => {}
                     }
                     if let Some(nanos) = value {
-                        values.push(int96_from_nanos(nanos)?);
+                        let instant = match zone {
+                            None => nanos,
+                            Some(zone) => zone.local_to_utc(nanos).ok_or_else(|| {
+                                DataFusionError::Execution(format!(
+                                    "timestamp {nanos} ns since 1970 in column `{}` is outside the range \
+                                     of time zone {zone}",
+                                    field.name()
+                                ))
+                            })?,
+                        };
+                        values.push(int96_from_nanos(instant)?);
                     }
                 }
             }
@@ -235,17 +257,17 @@ pub(crate) struct TrinoParquetWriter<W: AsyncFileWriter> {
     row_group_rows: usize,
     /// Bytes handed to `output` so far.
     written: usize,
+    /// Zone of the wall-clock timestamps written, unless UTC or already
+    /// instants.
+    zone: Option<ParquetTimeZone>,
+    /// Zone recorded under `writer.time.zone`.
+    zone_name: &'static str,
 }
 
 impl<W: AsyncFileWriter> TrinoParquetWriter<W> {
     pub(crate) fn try_new(output: W, schema: SchemaRef, row_group_rows: usize) -> Result<Self> {
         let descriptor = trino_parquet_schema(&schema)?;
-        let mut properties = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .set_key_value_metadata(Some(vec![KeyValue::new(
-                WRITER_TIME_ZONE.0.into(),
-                WRITER_TIME_ZONE.1.to_owned(),
-            )]));
+        let mut properties = WriterProperties::builder().set_compression(Compression::SNAPPY);
         for field in schema.fields().iter().filter(|f| is_int96(f.data_type())) {
             properties = properties.set_column_statistics_enabled(
                 ColumnPath::new(vec![field.name().clone()]),
@@ -273,7 +295,30 @@ impl<W: AsyncFileWriter> TrinoParquetWriter<W> {
             open_rows: 0,
             row_group_rows: row_group_rows.max(1),
             written: 0,
+            zone: None,
+            zone_name: WRITER_TIME_ZONE.1,
         })
+    }
+
+    /// Timestamps written are wall-clock times of `zone` (the catalog's
+    /// Parquet time zone): `INT96` stores them as UTC instants, as the
+    /// reference engine's `hive.parquet.time-zone` does. Without it,
+    /// timestamps are written as they are (compaction rewrites stored
+    /// instants).
+    #[must_use]
+    pub(crate) fn in_time_zone(mut self, zone: ParquetTimeZone) -> Self {
+        self.zone = Some(zone).filter(|zone| !zone.is_utc());
+        self.zone_name = zone.name();
+        self
+    }
+
+    /// Records `zone` under `writer.time.zone` without converting anything:
+    /// the timestamps written are instants already, stored in that zone
+    /// (compaction).
+    #[must_use]
+    pub(crate) fn recording_time_zone(mut self, zone: ParquetTimeZone) -> Self {
+        self.zone_name = zone.name();
+        self
     }
 
     /// Bytes of closed row groups already handed to the output.
@@ -329,7 +374,7 @@ impl<W: AsyncFileWriter> TrinoParquetWriter<W> {
                 for ((column, field), array) in
                     columns.iter_mut().zip(self.schema.fields()).zip(slice.columns())
                 {
-                    column.write(field, array)?;
+                    column.write(field, array, self.zone)?;
                 }
             }
             self.open_rows += rows;
@@ -380,6 +425,10 @@ impl<W: AsyncFileWriter> TrinoParquetWriter<W> {
     /// rows the footer records.
     pub(crate) async fn close(mut self) -> Result<i64> {
         self.flush().await?;
+        self.file.append_key_value_metadata(KeyValue::new(
+            WRITER_TIME_ZONE.0.into(),
+            self.zone_name.to_owned(),
+        ));
         let metadata = self.file.finish()?;
         self.drain().await?;
         self.output.complete().await?;

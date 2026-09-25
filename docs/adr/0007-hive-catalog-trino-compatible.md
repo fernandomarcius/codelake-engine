@@ -50,8 +50,9 @@ Server 2022, and each is the behavior of Trino 431 itself.
   (the field stays). Every other parameter is kept. Stale counts would mislead
   Trino's optimizer; an absent field makes Trino fail.
 - **Parquet laid out like Trino's.** Hive `timestamp` is written as `INT96`
-  (Julian day + nanoseconds of day) holding the wall-clock value, with
-  `writer.time.zone = Etc/UTC` in the footer, exactly as Trino 431 writes it.
+  (Julian day + nanoseconds of day) holding the instant of the wall-clock
+  value in the catalog's Parquet time zone, with that zone under
+  `writer.time.zone` in the footer, exactly as Trino 431 writes it.
   SQL Server 2022 `OPENROWSET` maps `INT96` to `datetime2`; an `INT64`
   timestamp without the legacy `TIMESTAMP_MILLIS` annotation reaches it as
   `bigint`. Decimals are `FIXED_LEN_BYTE_ARRAY` of the smallest width for the
@@ -76,15 +77,37 @@ Server 2022, and each is the behavior of Trino 431 itself.
   `"MixedCase"` is the table `mixedcase` in the directory, the metadata and
   every query, from both engines. Two columns that differ only in case are an
   error.
-- **`INT96` time zone: UTC, as the official Trino image.** Trino 431 converts
-  `INT96` values with `hive.parquet.time-zone` (default: the JVM zone, UTC in
-  the `trinodb/trino` image) on write and on read, and ignores the
+- **`INT96` time zone per catalog: `parquet_time_zone`** (amended
+  2026-09-25). Trino 431 converts `INT96` values with
+  `hive.parquet.time-zone` (default: the JVM zone, UTC in the
+  `trinodb/trino` image) on write and on read, and ignores the
   `writer.time.zone` footer key it writes itself (checked: a Trino 431 with
   `hive.parquet.time-zone=America/Sao_Paulo` shows its own fixture file and a
-  `CodeLake` file both 3 h earlier). `CodeLake` stores and reads the wall
-  clock as UTC, so it agrees with a Trino whose Parquet time zone is UTC. A
-  Trino configured with another zone needs the same setting in `CodeLake`
-  (not implemented): check the production Trino before the M2 canary.
+  `CodeLake` file both 3 h earlier). Each hive catalog has the same setting,
+  `parquet_time_zone`, an IANA zone name validated when the configuration
+  loads (default `America/Sao_Paulo`, owner decision): writes convert the
+  wall-clock time from it to UTC, reads convert back, with Joda-Time's rules
+  as Trino (a time the clocks skip moves forward; a repeated time is the
+  earlier instant west of Greenwich), over the IANA database
+  (`codelake_core::parquet_time_zone`). Only `INT96` columns convert: the
+  Parquet reader marks them (`coerce_int96_tz`) so `INT64` timestamps keep
+  their values, as in Trino. `OPTIMIZE` rewrites stored instants unconverted
+  (ADR 0009). Proven row by row against a Trino 431 whose catalogs set
+  `hive.parquet.time-zone=America/Sao_Paulo`
+  (`hive_redteam_w1::w1_parquet_time_zone_reads_and_writes_like_the_reference_engine`:
+  each engine reads what the other wrote, the instants stored agree through
+  UTC catalogs, including a repeated local time, the local mean time before
+  1914, nanoseconds through NANOSECONDS catalogs and `OPTIMIZE`; a skipped
+  local time written by `CodeLake` reads moved forward in both engines. Trino
+  itself fails to write a skipped time now and then: its Parquet writer
+  re-reads a sample of its files and the value comes back moved).
+  **Risk:** the zone must be the one every engine sharing the warehouse
+  uses. A file written in UTC (Trino with its default image zone, Spark,
+  pandas writing `INT96`) reads 3 h earlier in `America/Sao_Paulo`, silently,
+  as it does in a Trino set to that zone; SQL Server `OPENROWSET` shows the
+  stored instant (UTC), not the wall-clock time. Check the production
+  Trino's `hive.parquet.time-zone` (or its JVM zone) before the M2 canary
+  and set the catalog to it.
 
 ## Red-team corrections
 

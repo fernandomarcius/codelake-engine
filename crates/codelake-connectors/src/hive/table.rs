@@ -59,7 +59,7 @@ use tracing::field::Empty;
 use tracing::{Instrument, Span};
 
 use super::catalog::refuse_unsupported;
-use super::columns::HiveColumns;
+use super::columns::{HiveColumns, INT96_ZONE_MARKER};
 use super::exact_timestamps;
 use super::metastore::{ColumnMetadata, FileMetastore, TableMetadata};
 use super::optimize::MARKER;
@@ -75,7 +75,7 @@ fn round_down_to(value: i64, factor: i64) -> Option<i64> {
 }
 
 /// Units per second.
-fn per_second(unit: TimeUnit) -> i64 {
+pub(crate) fn per_second(unit: TimeUnit) -> i64 {
     match unit {
         TimeUnit::Second => 1,
         TimeUnit::Millisecond => 1_000,
@@ -492,11 +492,18 @@ impl HiveTable {
         };
         let mut options = TableParquetOptions::default();
         options.global.coerce_int96 = Some(int96.into());
+        // `INT96` instants read in the catalog's zone (`columns.rs`): the
+        // marker tells them from other timestamps, which keep their values.
+        let zone = Some(self.metastore.parquet_time_zone()).filter(|zone| !zone.is_utc());
+        if zone.is_some() {
+            options.global.coerce_int96_tz = Some(INT96_ZONE_MARKER.into());
+        }
         let source = ParquetSource::new(schema).with_table_parquet_options(options);
         let columns = HiveColumns {
             table: format!("{}.{}", self.schema_name, self.table),
             raw: reading != Reading::Table,
             nanos_only: reading == Reading::NanosOnly,
+            zone,
         };
         Ok(
             FileScanConfigBuilder::new(self.store_url.clone(), Arc::new(source))
@@ -710,7 +717,8 @@ impl HiveSink {
             ParquetObjectWriter::new(store, path.clone()),
             Arc::clone(&self.table.schema),
             ROW_GROUP_ROWS,
-        )?;
+        )?
+        .in_time_zone(self.table.metastore.parquet_time_zone());
         let reservation =
             MemoryConsumer::new(format!("HiveSink[{}]", self.table.table)).register(context.memory_pool());
         let mut rows = 0_u64;

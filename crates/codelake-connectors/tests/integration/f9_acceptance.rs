@@ -216,6 +216,7 @@ async fn wait_until(limit: Duration, mut condition: impl FnMut() -> bool) -> boo
 const HIVE: &str = "connector.name=hive\n\
                     hive.metastore=file\n\
                     hive.metastore.catalog.dir=file:/warehouse\n\
+                    hive.parquet.time-zone=America/Sao_Paulo\n\
                     hive.allow-add-column=true\n\
                     hive.allow-drop-column=true\n\
                     hive.allow-rename-column=true\n";
@@ -223,6 +224,7 @@ const HIVE: &str = "connector.name=hive\n\
 const HIVE_US: &str = "connector.name=hive\n\
                        hive.metastore=file\n\
                        hive.metastore.catalog.dir=file:/warehouse\n\
+                       hive.parquet.time-zone=America/Sao_Paulo\n\
                        hive.timestamp-precision=MICROSECONDS\n";
 /// Heap capped: the image default (80% of the container) gets the whole VM
 /// OOM-killed when several suites run in parallel.

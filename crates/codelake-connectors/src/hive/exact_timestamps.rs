@@ -20,7 +20,11 @@
 //! taken modulo 2^64: the wrapped nanoseconds differ from the true ones by a
 //! multiple of 2^64, and the true ones from the microseconds by less than
 //! 1000 nanoseconds (the coarse read may round or truncate a finer file).
-//! A value without a fine read was stored at microseconds or coarser.
+//! A value without a fine read was stored at microseconds or coarser. In a
+//! catalog whose Parquet time zone is not UTC, the coarse read of a
+//! NANOSECONDS catalog's scan shows `INT96` instants as wall-clock times
+//! (`columns.rs`), whole seconds away from the fine read: there only the
+//! difference below a second pairs the two reads.
 //!
 //! [`ExactTimestampsExec`] pairs the two reads row by row (their batches may
 //! be cut differently) and answers either nanoseconds (a NANOSECONDS
@@ -58,6 +62,8 @@ use datafusion::physical_plan::{
 use futures::StreamExt;
 
 use super::table::{HiveTable, Reading};
+
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
 /// Arrow type of exact nanoseconds since the epoch ([`Output::Exact`]).
 pub(crate) const EXACT: DataType = DataType::Decimal128(38, 0);
@@ -145,14 +151,11 @@ pub(crate) fn nanosecond_scan(
         .enumerate()
         .map(|(fine_index, (output, _))| (*output, fine_index))
         .collect();
-    Ok(Arc::new(ExactTimestampsExec::new(
-        coarse,
-        Some(fine),
-        pairs,
-        Output::Nanoseconds,
-        schema,
-        statistics,
-    )))
+    let zoned = !table.metastore.parquet_time_zone().is_utc();
+    Ok(Arc::new(
+        ExactTimestampsExec::new(coarse, Some(fine), pairs, Output::Nanoseconds, schema, statistics)
+            .with_zoned_coarse_read(zoned),
+    ))
 }
 
 /// Every column of `groups` as stored, the timestamps as exact nanoseconds
@@ -226,6 +229,8 @@ pub(crate) struct ExactTimestampsExec {
     /// in `fine`.
     pairs: Vec<(usize, usize)>,
     output: Output,
+    /// Whether the coarse read shows `INT96` instants in the catalog's zone.
+    zoned: bool,
     schema: SchemaRef,
     statistics: Arc<Statistics>,
     properties: Arc<PlanProperties>,
@@ -252,10 +257,18 @@ impl ExactTimestampsExec {
             fine,
             pairs,
             output,
+            zoned: false,
             schema,
             statistics: Arc::new(statistics),
             properties,
         }
+    }
+
+    /// The coarse read shows `INT96` instants in the catalog's zone, whole
+    /// seconds away from the fine read (see the module documentation).
+    fn with_zoned_coarse_read(mut self, zoned: bool) -> Self {
+        self.zoned = zoned;
+        self
     }
 }
 
@@ -318,6 +331,7 @@ impl ExecutionPlan for ExactTimestampsExec {
             fine_rest: None,
             pairs: self.pairs.clone(),
             output: self.output,
+            zoned: self.zoned,
             schema: Arc::clone(&self.schema),
         };
         let stream = futures::stream::try_unfold(pairing, |mut pairing| async move {
@@ -346,6 +360,7 @@ struct Pairing {
     fine_rest: Option<RecordBatch>,
     pairs: Vec<(usize, usize)>,
     output: Output,
+    zoned: bool,
     schema: SchemaRef,
 }
 
@@ -418,7 +433,7 @@ impl Pairing {
         let mut columns = coarse.columns().to_vec();
         for (output, fine_index) in &self.pairs {
             let fine_column = fine.map(|batch| batch.column(*fine_index));
-            let exact = exact_values(coarse.column(*output), fine_column)?;
+            let exact = exact_values(coarse.column(*output), fine_column, self.zoned)?;
             columns[*output] = match self.output {
                 Output::Exact => Arc::new(Decimal128Array::from(exact).with_precision_and_scale(38, 0)?),
                 Output::Nanoseconds => {
@@ -432,8 +447,10 @@ impl Pairing {
 
 /// Exact nanoseconds since the epoch of each row, from the coarse read (a
 /// timestamp in microseconds) and the fine one (nanoseconds, possibly
-/// wrapped; NULL for a value stored at microseconds or coarser).
-fn exact_values(coarse: &ArrayRef, fine: Option<&ArrayRef>) -> Result<Vec<Option<i128>>> {
+/// wrapped; NULL for a value stored at microseconds or coarser). `zoned`: the
+/// coarse read may be whole seconds away from the fine one (see the module
+/// documentation); the answer keeps the coarse read's seconds.
+fn exact_values(coarse: &ArrayRef, fine: Option<&ArrayRef>, zoned: bool) -> Result<Vec<Option<i128>>> {
     let micros = cast(coarse, &DataType::Int64)?;
     let micros = micros.as_primitive::<Int64Type>();
     let nanos = fine.map(|fine| cast(fine, &DataType::Int64)).transpose()?;
@@ -448,8 +465,15 @@ fn exact_values(coarse: &ArrayRef, fine: Option<&ArrayRef>) -> Result<Vec<Option
             match nanos.filter(|nanos| nanos.is_valid(row)) {
                 None => Ok(Some(scaled)),
                 Some(nanos) => {
-                    // The true nanoseconds minus `scaled`, modulo 2^64: small.
-                    let difference = nanos.value(row).wrapping_sub(micros.wrapping_mul(1_000));
+                    // The true nanoseconds minus `scaled`, modulo 2^64: small
+                    // (plus whole seconds when `zoned`).
+                    let mut difference = nanos.value(row).wrapping_sub(micros.wrapping_mul(1_000));
+                    if zoned {
+                        difference = difference.rem_euclid(NANOS_PER_SECOND);
+                        if difference > NANOS_PER_SECOND / 2 {
+                            difference -= NANOS_PER_SECOND;
+                        }
+                    }
                     if difference.unsigned_abs() >= 1_000 {
                         return Err(disagree());
                     }
@@ -524,7 +548,7 @@ mod tests {
     fn exact_values_recover_wrapped_nanoseconds() {
         let values = [FAR_PAST, FAR_FUTURE, 1_767_261_600_123_456_789, -1, 0];
         let (coarse, fine) = reads(&values);
-        let exact = exact_values(&coarse, Some(&fine)).unwrap();
+        let exact = exact_values(&coarse, Some(&fine), false).unwrap();
         assert_eq!(exact, values.iter().map(|v| Some(*v)).collect::<Vec<_>>());
     }
 
@@ -533,10 +557,13 @@ mod tests {
         let coarse: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![Some(-1), None]));
         let fine: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![None::<i64>, None]));
         assert_eq!(
-            exact_values(&coarse, Some(&fine)).unwrap(),
+            exact_values(&coarse, Some(&fine), false).unwrap(),
             vec![Some(-1_000), None]
         );
-        assert_eq!(exact_values(&coarse, None).unwrap(), vec![Some(-1_000), None]);
+        assert_eq!(
+            exact_values(&coarse, None, false).unwrap(),
+            vec![Some(-1_000), None]
+        );
     }
 
     #[test]
@@ -544,26 +571,47 @@ mod tests {
         // 1969-12-31 23:59:59.999999500 rounded half up to 0 µs.
         let coarse: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![0]));
         let fine: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![-500]));
-        assert_eq!(exact_values(&coarse, Some(&fine)).unwrap(), vec![Some(-500)]);
+        assert_eq!(
+            exact_values(&coarse, Some(&fine), false).unwrap(),
+            vec![Some(-500)]
+        );
+    }
+
+    #[test]
+    fn a_zoned_coarse_read_keeps_its_seconds_and_the_stored_nanoseconds() {
+        // 1500-06-01 00:00:00.000000001 local, stored as the instant
+        // 03:06:28.000000001 (Sao Paulo's local mean time), read wrapped.
+        let local = FAR_PAST;
+        let stored = FAR_PAST + 11_188 * 1_000_000_000;
+        let (_, fine) = reads(&[stored]);
+        let (coarse, _) = reads(&[local]);
+        assert_eq!(
+            exact_values(&coarse, Some(&fine), true).unwrap(),
+            vec![Some(local)]
+        );
+        assert!(exact_values(&coarse, Some(&fine), false).is_err());
+        let off: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![1_000_000_000 + 5_000]));
+        let zero: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![0]));
+        assert!(exact_values(&zero, Some(&off), true).is_err());
     }
 
     #[test]
     fn reads_that_disagree_are_an_error() {
         let coarse: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![0]));
         let fine: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![5_000]));
-        assert!(exact_values(&coarse, Some(&fine)).is_err());
+        assert!(exact_values(&coarse, Some(&fine), false).is_err());
     }
 
     #[test]
     fn nanoseconds_refuse_what_they_cannot_hold() {
         let (coarse, fine) = reads(&[FAR_PAST, 1_767_261_600_123_456_789]);
-        let exact = exact_values(&coarse, Some(&fine)).unwrap();
+        let exact = exact_values(&coarse, Some(&fine), false).unwrap();
         let field = Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true);
         let err = nanoseconds(&coarse, &exact, &field).unwrap_err().to_string();
         assert!(err.contains("1500-06-01"), "{err}");
         assert!(err.contains("column ts"), "{err}");
         let (coarse, fine) = reads(&[1_767_261_600_123_456_789]);
-        let exact = exact_values(&coarse, Some(&fine)).unwrap();
+        let exact = exact_values(&coarse, Some(&fine), false).unwrap();
         let read = nanoseconds(&coarse, &exact, &field).unwrap();
         assert_eq!(
             read.as_primitive::<datafusion::arrow::datatypes::TimestampNanosecondType>()

@@ -120,7 +120,14 @@ pub fn build(source: &SourceConfig, secrets: &Secrets) -> Result<Arc<dyn Connect
             secret_access_key_env,
             s3_path_style,
             timestamp_precision,
+            parquet_time_zone,
         } => {
+            let zone = parquet_time_zone
+                .parse()
+                .map_err(|reason: String| ConnectorError::Misconfigured {
+                    source_name: name.clone(),
+                    reason: format!("parquet_time_zone {reason}"),
+                })?;
             let credentials = match (access_key_id_env, secret_access_key_env) {
                 (Some(key), Some(secret_key)) => Some((secret(key)?, secret(secret_key)?)),
                 _ => None,
@@ -136,7 +143,8 @@ pub fn build(source: &SourceConfig, secrets: &Secrets) -> Result<Arc<dyn Connect
                         path_style: *s3_path_style,
                     },
                 )
-                .with_timestamp_precision(*timestamp_precision),
+                .with_timestamp_precision(*timestamp_precision)
+                .with_parquet_time_zone(zone),
             ))
         }
         // No Iceberg integration is published for the DataFusion train (ADR 0013).

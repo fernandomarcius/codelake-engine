@@ -24,6 +24,7 @@ mod memory_tables;
 pub mod operand_checks;
 pub mod output;
 pub mod overflow;
+pub mod parquet_time_zone;
 pub mod plain_views;
 pub mod pool;
 pub mod runtime;

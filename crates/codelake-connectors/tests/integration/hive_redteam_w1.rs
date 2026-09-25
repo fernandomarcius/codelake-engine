@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use codelake_connectors::hive::{HiveConnector, HiveParams};
 use codelake_core::config::{ExecutionConfig, HiveTimestampPrecision, MemoryConfig};
+use codelake_core::parquet_time_zone::ParquetTimeZone;
 use codelake_core::{ByteSize, Engine, QueryOptions};
 use datafusion::arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, TimestampNanosecondArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -47,12 +48,24 @@ fn params(warehouse: &Path) -> HiveParams {
     }
 }
 
-/// A fresh engine (a fresh "process": own locks) over `warehouse`.
+/// A fresh engine (a fresh "process": own locks) over `warehouse`, its
+/// catalog in the default Parquet time zone.
 async fn engine_at(
     warehouse: &Path,
     spill: &Path,
     limit: ByteSize,
     precision: HiveTimestampPrecision,
+) -> Engine {
+    engine_in(warehouse, spill, limit, precision, ParquetTimeZone::default()).await
+}
+
+/// [`engine_at`] with the catalog's Parquet time zone `zone`.
+async fn engine_in(
+    warehouse: &Path,
+    spill: &Path,
+    limit: ByteSize,
+    precision: HiveTimestampPrecision,
+    zone: ParquetTimeZone,
 ) -> Engine {
     let memory = MemoryConfig {
         limit,
@@ -61,7 +74,9 @@ async fn engine_at(
         metadata_cache_limit: ByteSize::mib(8),
     };
     let mut engine = Engine::new(&memory, &ExecutionConfig::default()).unwrap();
-    let connector = HiveConnector::new("hive".into(), params(warehouse)).with_timestamp_precision(precision);
+    let connector = HiveConnector::new("hive".into(), params(warehouse))
+        .with_timestamp_precision(precision)
+        .with_parquet_time_zone(zone);
     engine
         .attach(Arc::new(connector), true, Duration::from_secs(60))
         .await
@@ -832,11 +847,14 @@ fn cell(value: &Value) -> String {
 
 impl Trino {
     async fn start(name: &str, warehouse: &Path, mount: Mount) -> Self {
+        // Every catalog in `CodeLake`'s default Parquet time zone, but
+        // `hive_utc` (the official image's default, the JVM's zone).
         let base = format!(
             "connector.name=hive\nhive.metastore=file\nhive.metastore.catalog.dir=file:{}\n",
             warehouse.display()
         );
-        let catalog = |more: &str| format!("{base}{more}").into_bytes();
+        let catalog =
+            |more: &str| format!("{base}hive.parquet.time-zone=America/Sao_Paulo\n{more}").into_bytes();
         let container = GenericImage::new("trinodb/trino", "431")
             .with_wait_for(WaitFor::message_on_stderr("SERVER STARTED"))
             .with_container_name(name)
@@ -860,6 +878,10 @@ impl Trino {
             .with_copy_to(
                 "/etc/trino/catalog/hive_std.properties",
                 catalog("hive.security=sql-standard\n"),
+            )
+            .with_copy_to(
+                "/etc/trino/catalog/hive_utc.properties",
+                format!("{base}hive.parquet.time-zone=UTC\nhive.security=allow-all\n").into_bytes(),
             )
             .with_copy_to("/tmp/client.py", CLIENT.as_bytes().to_vec())
             .start()
@@ -965,6 +987,17 @@ impl Shared {
 
     async fn at(&self, precision: HiveTimestampPrecision) -> Engine {
         engine_at(&self.warehouse, self.spill.path(), ByteSize::mib(256), precision).await
+    }
+
+    async fn zoned(&self, precision: HiveTimestampPrecision, zone: &str) -> Engine {
+        engine_in(
+            &self.warehouse,
+            self.spill.path(),
+            ByteSize::mib(256),
+            precision,
+            zone.parse().unwrap(),
+        )
+        .await
     }
 }
 
@@ -1622,4 +1655,219 @@ async fn w1_optimize_keeps_the_nanoseconds_trino_wrote() {
         &before,
     );
     checks.assert_none();
+}
+
+// ---------------------------------------------------------------------------
+// Parquet time zone (`parquet_time_zone`, Trino's `hive.parquet.time-zone`)
+// ---------------------------------------------------------------------------
+
+const Z: &str = "w1_parquet_time_zone";
+
+/// Wall-clock times of `America/Sao_Paulo` that move differently: standard
+/// and daylight time, one the clocks repeated (2019-02-16 23:30), the local
+/// mean time before 1914, and the ends of the range (whose instants stay
+/// within years 1 to 9999). Times the clocks skipped are in [`GAP`].
+const ZONED: &str = "(1, TIMESTAMP '2026-01-01 10:00:00.123'), (2, TIMESTAMP '2018-11-04 01:30:00.000'), \
+                     (3, TIMESTAMP '2019-02-16 23:30:00.000'), (4, TIMESTAMP '2019-02-17 00:30:00.500'), \
+                     (5, TIMESTAMP '2016-01-15 12:00:00.000'), (6, TIMESTAMP '1500-06-01 00:00:00.000'), \
+                     (7, TIMESTAMP '1913-12-31 23:59:59.999'), (8, TIMESTAMP '1969-12-31 23:59:59.999'), \
+                     (9, TIMESTAMP '9999-12-31 20:59:59.999'), (10, TIMESTAMP '0001-01-01 12:00:00.000')";
+
+/// The same in nanoseconds, within what a NANOSECONDS catalog holds.
+const ZONED_NS: [&str; 4] = [
+    "(1, TIMESTAMP '2026-01-01 10:00:00.123456789')",
+    "(2, TIMESTAMP '2019-02-17 00:30:00.000000001')",
+    "(3, TIMESTAMP '2019-02-16 23:30:00.999999999')",
+    "(4, TIMESTAMP '1900-01-01 00:00:00.000000001')",
+];
+
+/// Times the clocks skipped on 2018-11-04 (00:00 became 01:00). The
+/// reference engine's writer re-reads a sample of its files and fails when a
+/// value comes back different, which such a time does (moved forward), so
+/// only `CodeLake` writes them.
+const GAP: &str = "(1, TIMESTAMP '2018-11-04 00:30:00.000'), (2, TIMESTAMP '2018-11-04 00:59:59.999')";
+
+fn ctas(table: &str, values: &str) -> String {
+    format!("CREATE TABLE {table} AS SELECT CAST(id AS bigint) AS id, ts FROM (VALUES {values}) v(id, ts)")
+}
+
+/// [`ctas`] for the reference engine, whose default storage format is ORC.
+fn parquet_ctas(table: &str, values: &str) -> String {
+    format!(
+        "CREATE TABLE {table} WITH (format = 'PARQUET') AS SELECT CAST(id AS bigint) AS id, ts \
+         FROM (VALUES {values}) v(id, ts)"
+    )
+}
+
+fn read_zoned(table: &str) -> String {
+    format!("SELECT id, CAST(ts AS varchar) FROM {table} ORDER BY id")
+}
+
+/// `writer.time.zone` of the data files of `schema.table`.
+fn footer_zones(s: &Shared, table: &str) -> Vec<Option<String>> {
+    use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+    let dir = s.warehouse.join("s").join(table);
+    data_files(&dir)
+        .into_iter()
+        .map(|name| {
+            let path = dir.join(&name);
+            let size = std::fs::metadata(&path).map(|m| m.len());
+            let reader = SerializedFileReader::new(std::fs::File::open(&path).unwrap())
+                .unwrap_or_else(|e| panic!("{} ({size:?} bytes): {e}", path.display()));
+            reader
+                .metadata()
+                .file_metadata()
+                .key_value_metadata()
+                .and_then(|pairs| pairs.iter().find(|kv| kv.key == "writer.time.zone"))
+                .and_then(|kv| kv.value.clone())
+        })
+        .collect()
+}
+
+/// A catalog in `America/Sao_Paulo` reads and writes `INT96` like the
+/// reference engine (431) with `hive.parquet.time-zone=America/Sao_Paulo`,
+/// rows compared one by one: what each engine writes, what each reads, the
+/// instants stored (read through UTC catalogs), what a UTC writer left, and
+/// nanoseconds through a NANOSECONDS catalog and `OPTIMIZE`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w1_parquet_time_zone_reads_and_writes_like_the_reference_engine() {
+    let s = Shared::new("codelake-w1-trino-tz").await;
+    let mut checks = Checks::new(Z);
+    s.trino.ok("CREATE SCHEMA hive.s").await;
+    let utc = s.zoned(HiveTimestampPrecision::Milliseconds, "UTC").await;
+
+    // Each engine writes the same wall-clock times in the zone.
+    s.trino.ok(&parquet_ctas("hive.s.by_trino", ZONED)).await;
+    cl(&s.engine, &ctas("hive.s.by_codelake", ZONED)).await;
+    for table in ["by_trino", "by_codelake"] {
+        let q = read_zoned(&format!("hive.s.{table}"));
+        checks.same(
+            "TZ1",
+            &format!("{table} read in the zone"),
+            &cl_try(&s.engine, &q).await,
+            &s.trino.sql(&q).await,
+        );
+    }
+    checks.same(
+        "TZ2",
+        "the same wall-clock times, whoever wrote them",
+        &s.trino.sql(&read_zoned("hive.s.by_codelake")).await,
+        &s.trino.sql(&read_zoned("hive.s.by_trino")).await,
+    );
+    // The instants stored, read without conversion: the writers agree.
+    checks.same(
+        "TZ3",
+        "instants CodeLake stored / instants Trino stored",
+        &cl_try(&utc, &read_zoned("hive.s.by_codelake")).await,
+        &s.trino.sql(&read_zoned("hive_utc.s.by_trino")).await,
+    );
+    let footer = |zones: Vec<Option<String>>| -> Result<Rows, String> {
+        Ok(zones
+            .into_iter()
+            .map(|z| vec![z.unwrap_or_else(|| "NULL".into())])
+            .collect())
+    };
+    checks.same(
+        "TZ4",
+        "writer.time.zone in the footer",
+        &footer(footer_zones(&s, "by_codelake")),
+        &footer(footer_zones(&s, "by_trino")),
+    );
+
+    skipped_times(&s, &mut checks).await;
+
+    // A table another engine wrote in UTC reads shifted, as in Trino.
+    s.trino.ok(&parquet_ctas("hive_utc.s.by_utc", ZONED)).await;
+    checks.same(
+        "TZ5",
+        "a UTC writer's table read in the zone",
+        &cl_try(&s.engine, &read_zoned("hive.s.by_utc")).await,
+        &s.trino.sql(&read_zoned("hive.s.by_utc")).await,
+    );
+    checks.same(
+        "TZ6",
+        "a UTC writer's table read in UTC",
+        &cl_try(&utc, &read_zoned("hive.s.by_utc")).await,
+        &s.trino.sql(&read_zoned("hive_utc.s.by_utc")).await,
+    );
+
+    nanoseconds_in_the_zone(&s, &mut checks).await;
+    checks.assert_none();
+}
+
+/// Times the clocks skipped ([`GAP`]), written by `CodeLake` in the zone.
+async fn skipped_times(s: &Shared, checks: &mut Checks) {
+    // Skipped times move forward by the gap, stored as the instant after it.
+    cl(&s.engine, &ctas("hive.s.gap", GAP)).await;
+    let moved = Ok(rows(&[
+        &["1", "2018-11-04 01:30:00.000"],
+        &["2", "2018-11-04 01:59:59.999"],
+    ]));
+    checks.same(
+        "TZ-GAP1",
+        "skipped times read by the reference engine",
+        &s.trino.sql(&read_zoned("hive.s.gap")).await,
+        &moved,
+    );
+    checks.same(
+        "TZ-GAP2",
+        "skipped times read by CodeLake",
+        &cl_try(&s.engine, &read_zoned("hive.s.gap")).await,
+        &moved,
+    );
+    checks.same(
+        "TZ-GAP3",
+        "instants of the skipped times",
+        &s.trino.sql(&read_zoned("hive_utc.s.gap")).await,
+        &Ok(rows(&[
+            &["1", "2018-11-04 03:30:00.000"],
+            &["2", "2018-11-04 03:59:59.999"],
+        ])),
+    );
+}
+
+/// NANOSECONDS catalogs in the zone, then `OPTIMIZE` from a MILLISECONDS
+/// catalog, which must keep every digit and instant.
+async fn nanoseconds_in_the_zone(s: &Shared, checks: &mut Checks) {
+    let nanos = s
+        .zoned(HiveTimestampPrecision::Nanoseconds, "America/Sao_Paulo")
+        .await;
+    s.trino
+        .ok("CREATE TABLE hive_ns.s.ns_trino (id bigint, ts timestamp(9)) WITH (format = 'PARQUET')")
+        .await;
+    for values in ZONED_NS {
+        s.trino
+            .ok(&format!("INSERT INTO hive_ns.s.ns_trino VALUES {values}"))
+            .await;
+    }
+    cl(&nanos, &ctas("hive.s.ns_codelake", &ZONED_NS.join(", "))).await;
+    let trino_ns = s.trino.sql(&read_zoned("hive_ns.s.ns_trino")).await;
+    checks.same(
+        "TZ7",
+        "NANOSECONDS read of Trino's table",
+        &cl_try(&nanos, &read_zoned("hive.s.ns_trino")).await,
+        &trino_ns,
+    );
+    checks.same(
+        "TZ8",
+        "NANOSECONDS: CodeLake's table read by Trino",
+        &s.trino.sql(&read_zoned("hive_ns.s.ns_codelake")).await,
+        &trino_ns,
+    );
+    let compacted = optimize(&s.engine, "hive.s.ns_trino").await;
+    note(Z, "OPTIMIZE of ns_trino (MILLISECONDS catalog)", &compacted);
+    checks.same(
+        "TZ9",
+        "NANOSECONDS read after OPTIMIZE",
+        &s.trino.sql(&read_zoned("hive_ns.s.ns_trino")).await,
+        &trino_ns,
+    );
+    checks.same(
+        "TZ10",
+        "OPTIMIZE left one file",
+        &Ok(rows(&[&["1"]])),
+        &Ok(vec![vec![
+            data_files(&s.warehouse.join("s/ns_trino")).len().to_string(),
+        ]]),
+    );
 }

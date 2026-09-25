@@ -25,6 +25,7 @@ use std::time::Duration;
 use crate::common;
 use codelake_connectors::hive::{HiveConnector, HiveParams};
 use codelake_core::Engine;
+use codelake_core::parquet_time_zone::ParquetTimeZone;
 use datafusion::arrow::array::{Array, RecordBatch};
 use datafusion::arrow::util::display::array_value_to_string;
 use testcontainers::bollard::Docker;
@@ -109,19 +110,27 @@ async fn shared() -> Shared {
 // ---------------------------------------------------------------------------
 
 async fn codelake(warehouse: &Path, spill: &Path) -> Engine {
+    codelake_in(warehouse, spill, ParquetTimeZone::default()).await
+}
+
+/// [`codelake`] with the catalog's Parquet time zone `zone`.
+async fn codelake_in(warehouse: &Path, spill: &Path, zone: ParquetTimeZone) -> Engine {
     let mut engine = common::engine(spill);
     common::attach(
         &mut engine,
-        Arc::new(HiveConnector::new(
-            "hive".into(),
-            HiveParams {
-                warehouse: warehouse.display().to_string(),
-                s3_endpoint: None,
-                s3_region: "us-east-1".into(),
-                credentials: None,
-                path_style: false,
-            },
-        )),
+        Arc::new(
+            HiveConnector::new(
+                "hive".into(),
+                HiveParams {
+                    warehouse: warehouse.display().to_string(),
+                    s3_endpoint: None,
+                    s3_region: "us-east-1".into(),
+                    credentials: None,
+                    path_style: false,
+                },
+            )
+            .with_parquet_time_zone(zone),
+        ),
     )
     .await;
     engine
@@ -180,6 +189,7 @@ impl Trino {
             "connector.name=hive\n\
              hive.metastore=file\n\
              hive.metastore.catalog.dir=file:{}\n\
+             hive.parquet.time-zone=America/Sao_Paulo\n\
              hive.allow-add-column=true\n\
              hive.allow-drop-table=true\n",
             shared.warehouse().display()
@@ -1149,7 +1159,10 @@ fn only_data_file(dir: &Path) -> PathBuf {
 async fn sqlserver_2022_openrowset_reads_codelake_parquet() {
     let shared = shared().await;
     let spill = tempfile::tempdir().unwrap();
-    let engine = codelake(&shared.warehouse(), spill.path()).await;
+    // SQL Server shows `INT96` as stored (the UTC instant): the wall-clock
+    // times it loads are those of a catalog in UTC, like the control file
+    // Trino wrote in UTC.
+    let engine = codelake_in(&shared.warehouse(), spill.path(), ParquetTimeZone::UTC).await;
     cl(&engine, "CREATE SCHEMA hive.sink").await;
     cl(
         &engine,
@@ -1270,7 +1283,8 @@ async fn sqlserver_2022_openrowset_reads_codelake_parquet() {
 async fn sqlserver_2022_openrowset_reads_every_codelake_type() {
     let shared = shared().await;
     let spill = tempfile::tempdir().unwrap();
-    let engine = codelake(&shared.warehouse(), spill.path()).await;
+    // As above: SQL Server shows the UTC instant `INT96` stores.
+    let engine = codelake_in(&shared.warehouse(), spill.path(), ParquetTimeZone::UTC).await;
     cl(&engine, "CREATE SCHEMA hive.sink").await;
     cl(
         &engine,

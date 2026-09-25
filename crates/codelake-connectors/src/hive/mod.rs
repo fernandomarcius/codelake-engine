@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use codelake_core::config::HiveTimestampPrecision;
+use codelake_core::parquet_time_zone::ParquetTimeZone;
 use codelake_core::{BoxError, Connector, ConnectorError, SessionProperty, WritableCatalog};
 use datafusion::catalog::CatalogProvider;
 use object_store::ObjectStore;
@@ -79,6 +80,8 @@ pub struct HiveConnector {
     params: HiveParams,
     /// Trino's `hive.timestamp-precision` for this catalog.
     precision: HiveTimestampPrecision,
+    /// The reference engine's `hive.parquet.time-zone` for this catalog.
+    zone: ParquetTimeZone,
     catalog: OnceCell<Arc<HiveCatalog>>,
 }
 
@@ -97,6 +100,7 @@ impl HiveConnector {
             name,
             params,
             precision: HiveTimestampPrecision::default(),
+            zone: ParquetTimeZone::default(),
             catalog: OnceCell::new(),
         }
     }
@@ -106,6 +110,16 @@ impl HiveConnector {
     #[must_use]
     pub fn with_timestamp_precision(mut self, precision: HiveTimestampPrecision) -> Self {
         self.precision = precision;
+        self
+    }
+
+    /// Sets the zone of the catalog's Parquet `INT96` timestamps (the
+    /// reference engine's `hive.parquet.time-zone`, default
+    /// `America/Sao_Paulo`): writes convert wall-clock times from it to UTC,
+    /// reads convert back.
+    #[must_use]
+    pub fn with_parquet_time_zone(mut self, zone: ParquetTimeZone) -> Self {
+        self.zone = zone;
         self
     }
 
@@ -152,7 +166,9 @@ impl HiveConnector {
                 (Arc::new(store), Path::from(prefix), None)
             }
         };
-        let metastore = FileMetastore::new(store, root).with_timestamp_precision(self.precision);
+        let metastore = FileMetastore::new(store, root)
+            .with_timestamp_precision(self.precision)
+            .with_parquet_time_zone(self.zone);
         Ok(match local {
             Some(dir) => metastore.with_local_dir(dir),
             None => metastore,

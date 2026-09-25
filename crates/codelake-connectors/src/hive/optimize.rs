@@ -291,7 +291,8 @@ impl Compactor<'_> {
             ParquetObjectWriter::new(Arc::clone(store(self.table)), file(self.table, &temporary)),
             Arc::clone(&self.file_schema),
             ROW_GROUP_ROWS,
-        )?;
+        )?
+        .recording_time_zone(self.table.metastore.parquet_time_zone());
         Ok(Open {
             writer,
             added: Added {

@@ -35,16 +35,20 @@ async fn engine_over(warehouse: &FsPath, spill: &FsPath, limit: ByteSize) -> Eng
         metadata_cache_limit: ByteSize::mib(8),
     };
     let mut engine = Engine::new(&memory, &ExecutionConfig::default()).unwrap();
-    let connector: Arc<dyn Connector> = Arc::new(HiveConnector::new(
-        "hive".into(),
-        HiveParams {
-            warehouse: warehouse.display().to_string(),
-            s3_endpoint: None,
-            s3_region: "us-east-1".into(),
-            credentials: None,
-            path_style: false,
-        },
-    ));
+    // In UTC: the reference engine that wrote the fixture ran in UTC.
+    let connector: Arc<dyn Connector> = Arc::new(
+        HiveConnector::new(
+            "hive".into(),
+            HiveParams {
+                warehouse: warehouse.display().to_string(),
+                s3_endpoint: None,
+                s3_region: "us-east-1".into(),
+                credentials: None,
+                path_style: false,
+            },
+        )
+        .with_parquet_time_zone(codelake_core::parquet_time_zone::ParquetTimeZone::UTC),
+    );
     engine
         .attach(connector, true, std::time::Duration::from_secs(30))
         .await

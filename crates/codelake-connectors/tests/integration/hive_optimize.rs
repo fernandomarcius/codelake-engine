@@ -23,6 +23,7 @@ use crate::common;
 const CATALOG: &str = "connector.name=hive\n\
                        hive.metastore=file\n\
                        hive.metastore.catalog.dir=file:/warehouse\n\
+                       hive.parquet.time-zone=America/Sao_Paulo\n\
                        hive.allow-add-column=true\n";
 
 /// Same warehouse, accepting metadata whose `writerVersion` is not `431`.
@@ -33,6 +34,7 @@ const CATALOG: &str = "connector.name=hive\n\
 const LENIENT: &str = "connector.name=hive\n\
                        hive.metastore=file\n\
                        hive.metastore.catalog.dir=file:/warehouse\n\
+                       hive.parquet.time-zone=America/Sao_Paulo\n\
                        hive.metastore.version-compatibility=UNSAFE_ASSUME_COMPATIBILITY\n";
 
 /// Same warehouse read and written at microsecond precision (a Trino catalog
@@ -40,6 +42,7 @@ const LENIENT: &str = "connector.name=hive\n\
 const MICROSECONDS: &str = "connector.name=hive\n\
                             hive.metastore=file\n\
                             hive.metastore.catalog.dir=file:/warehouse\n\
+                            hive.parquet.time-zone=America/Sao_Paulo\n\
                             hive.timestamp-precision=MICROSECONDS\n";
 
 /// Starts Trino 431 with a file-metastore `hive` catalog over `/warehouse`,

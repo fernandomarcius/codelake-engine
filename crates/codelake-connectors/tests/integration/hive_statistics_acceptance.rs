@@ -111,6 +111,7 @@ impl Trino {
             "connector.name=hive\n\
              hive.metastore=file\n\
              hive.metastore.catalog.dir=file:{}\n\
+             hive.parquet.time-zone=America/Sao_Paulo\n\
              hive.storage-format=PARQUET\n\
              hive.allow-drop-table=true\n",
             shared.warehouse().display()

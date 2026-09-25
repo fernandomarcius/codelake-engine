@@ -19,6 +19,13 @@
 //! `DataFusion`'s default adapter matches names exactly and casts whatever
 //! Arrow can cast. This one renames the table's columns to the file's
 //! spelling, checks the types, then hands over to the default adapter.
+//! `INT96` timestamps hold instants: in a catalog whose Parquet time zone is
+//! not UTC they read as the wall-clock time of that zone
+//! (`codelake_core::parquet_time_zone`), as the reference engine's
+//! `hive.parquet.time-zone` reads them; other timestamps keep their values.
+//! The Parquet reader marks `INT96` columns with the zone
+//! [`INT96_ZONE_MARKER`] so the adapter can tell them apart.
+//!
 //! A `raw` adapter (compaction) keeps stored values as they are. A
 //! `nanos_only` adapter reads only the timestamps a file stores in
 //! nanoseconds, every other column as NULL (see `exact_timestamps.rs`).
@@ -26,9 +33,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{AsArray, RecordBatch, StringArray};
-use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef, TimeUnit};
+use datafusion::arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch, StringArray};
+use datafusion::arrow::compute::{CastOptions, cast, cast_with_options};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Int64Type, Schema, SchemaRef, TimeUnit};
 use datafusion::common::ScalarValue;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::error::{DataFusionError, Result};
@@ -36,7 +43,9 @@ use datafusion::logical_expr::ColumnarValue;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{Column, Literal};
 
-use super::table::{finer, round_timestamps};
+use codelake_core::parquet_time_zone::ParquetTimeZone;
+
+use super::table::{finer, per_second, round_timestamps};
 use super::types::{char_column, declared_length};
 use datafusion::physical_expr_adapter::{
     DefaultPhysicalExprAdapter, PhysicalExprAdapter, PhysicalExprAdapterFactory,
@@ -51,6 +60,18 @@ pub(crate) struct HiveColumns {
     /// Only columns the file stores as nanosecond timestamps (`INT96` read
     /// in nanoseconds included); any other column reads as NULL.
     pub(crate) nanos_only: bool,
+    /// The catalog's Parquet time zone, unless UTC: `INT96` instants read as
+    /// its wall-clock time (not in a `raw` read).
+    pub(crate) zone: Option<ParquetTimeZone>,
+}
+
+/// Zone the Parquet reader gives `INT96` columns (`coerce_int96_tz`) when the
+/// catalog's zone is not UTC. The values stay UTC instants; the name only
+/// marks the column, and no writer names a zone with this alias of UTC.
+pub(crate) const INT96_ZONE_MARKER: &str = "Etc/Universal";
+
+fn is_int96(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Timestamp(_, Some(zone)) if zone.as_ref() == INT96_ZONE_MARKER)
 }
 
 /// How a column's stored values become the table's.
@@ -62,6 +83,9 @@ enum Read {
     Cut(usize),
     /// A `char(n)`: trailing spaces removed, cut to `n`, padded to `n`.
     Pad(usize),
+    /// `INT96` instants as the zone's wall-clock time, in this unit (the
+    /// stored one, or a finer one).
+    Local(ParquetTimeZone, TimeUnit),
 }
 
 /// A column read with [`Read`] applied (see the module documentation).
@@ -92,6 +116,7 @@ impl fmt::Display for HiveRead {
             Read::Round(unit, _) => write!(f, "hive_round({}, {unit:?})", self.child),
             Read::Cut(length) => write!(f, "hive_varchar({}, {length})", self.child),
             Read::Pad(length) => write!(f, "hive_char({}, {length})", self.child),
+            Read::Local(zone, _) => write!(f, "hive_local({}, {zone})", self.child),
         }
     }
 }
@@ -111,6 +136,7 @@ impl PhysicalExpr for HiveRead {
         let child = self.child.return_field(input_schema)?;
         let data_type = match &self.read {
             Read::Round(unit, zone) => DataType::Timestamp(*unit, zone.clone()),
+            Read::Local(_, unit) => DataType::Timestamp(*unit, None),
             Read::Cut(_) | Read::Pad(_) => DataType::Utf8,
         };
         Ok(Arc::new(child.as_ref().clone().with_data_type(data_type)))
@@ -120,6 +146,7 @@ impl PhysicalExpr for HiveRead {
         let values = self.child.evaluate(batch)?.into_array(batch.num_rows())?;
         let read = match &self.read {
             Read::Round(unit, zone) => round_timestamps(&values, *unit, zone.clone())?,
+            Read::Local(zone, unit) => local_timestamps(&values, *zone, *unit)?,
             Read::Cut(length) => {
                 let text = cast(&values, &DataType::Utf8)?;
                 let text = text.as_string::<i32>();
@@ -167,6 +194,49 @@ impl PhysicalExpr for HiveRead {
     fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.child.fmt_sql(f)
     }
+}
+
+/// `INT96` instants (UTC) as the wall-clock time of `zone`, in `unit` (the
+/// stored unit or a finer one).
+fn local_timestamps(array: &ArrayRef, zone: ParquetTimeZone, unit: TimeUnit) -> Result<ArrayRef> {
+    let DataType::Timestamp(stored, _) = array.data_type() else {
+        return Err(DataFusionError::Internal(format!(
+            "reading a {} as a timestamp",
+            array.data_type()
+        )));
+    };
+    let per = per_second(*stored);
+    let raw = cast(array, &DataType::Int64)?;
+    let local: Int64Array = raw
+        .as_primitive::<Int64Type>()
+        .iter()
+        .map(|value| {
+            value
+                .map(|v| {
+                    zone.offset_at(v.div_euclid(per))
+                        .and_then(|offset| offset.checked_mul(per))
+                        .and_then(|offset| v.checked_add(offset))
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(format!("timestamp out of range in time zone {zone}"))
+                        })
+                })
+                .transpose()
+        })
+        .collect::<Result<_>>()?;
+    let local: ArrayRef = Arc::new(local);
+    let local = cast(&local, &DataType::Timestamp(*stored, None))?;
+    if *stored == unit {
+        return Ok(local);
+    }
+    let checked = CastOptions {
+        safe: false,
+        ..CastOptions::default()
+    };
+    Ok(cast_with_options(
+        &local,
+        &DataType::Timestamp(unit, None),
+        &checked,
+    )?)
 }
 
 /// Whether values stored as `file` read as `table` without loss or invention.
@@ -237,10 +307,16 @@ impl PhysicalExprAdapterFactory for HiveColumns {
             };
             let read: Vec<Read> = match (stored.data_type(), field.data_type()) {
                 _ if self.raw => Vec::new(),
-                (DataType::Timestamp(from, _), DataType::Timestamp(to, zone)) => finer(*from, *to)
-                    .then(|| Read::Round(*to, zone.clone()))
-                    .into_iter()
-                    .collect(),
+                (DataType::Timestamp(from, _), DataType::Timestamp(to, zone)) => {
+                    let local = self
+                        .zone
+                        .filter(|_| is_int96(stored.data_type()))
+                        .map(|parquet_zone| {
+                            Read::Local(parquet_zone, if finer(*from, *to) { *from } else { *to })
+                        });
+                    let round = finer(*from, *to).then(|| Read::Round(*to, zone.clone()));
+                    local.into_iter().chain(round).collect()
+                }
                 _ => declared_length(field)
                     .map(Read::Cut)
                     .or_else(|| char_column(field).map(Read::Pad))
@@ -258,14 +334,19 @@ impl PhysicalExprAdapterFactory for HiveColumns {
                     field.data_type()
                 )
             }));
-            // A rounded column reaches the adapter below in its
+            // A rounded or zoned column reaches the adapter below in its
             // stored type, so it does not cast (cut) it first.
             let spelled = field.as_ref().clone().with_name(stored.name());
-            fields.push(if read.iter().any(|read| matches!(read, Read::Round(..))) {
-                spelled.with_data_type(stored.data_type().clone())
-            } else {
-                spelled
-            });
+            fields.push(
+                if read
+                    .iter()
+                    .any(|read| matches!(read, Read::Round(..) | Read::Local(..)))
+                {
+                    spelled.with_data_type(stored.data_type().clone())
+                } else {
+                    spelled
+                },
+            );
             reads.push(read);
         }
         let renamed = Arc::new(Schema::new_with_metadata(
@@ -405,6 +486,7 @@ mod tests {
             table: "s.t".into(),
             raw: false,
             nanos_only: false,
+            zone: None,
         };
         let adapter = factory.create(Arc::clone(&table), Arc::clone(&file)).unwrap();
         let nome: Arc<dyn PhysicalExpr> = Arc::new(Column::new("nome", 1));

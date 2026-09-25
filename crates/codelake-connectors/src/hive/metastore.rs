@@ -37,6 +37,7 @@ use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use serde::{Deserialize, Serialize};
 
 use codelake_core::config::HiveTimestampPrecision;
+use codelake_core::parquet_time_zone::ParquetTimeZone;
 use codelake_core::statement_policy::is_valid_object_name;
 
 use super::crc::{crc_name, hadoop_crc};
@@ -282,6 +283,8 @@ pub(crate) struct FileMetastore {
     local_dir: Option<PathBuf>,
     /// The catalog's `hive.timestamp-precision`.
     precision: HiveTimestampPrecision,
+    /// The catalog's `hive.parquet.time-zone`.
+    zone: ParquetTimeZone,
 }
 
 /// Removes a local directory tree; absent is fine. Retries briefly because an
@@ -338,6 +341,7 @@ impl FileMetastore {
             locks: Arc::default(),
             local_dir: None,
             precision: HiveTimestampPrecision::default(),
+            zone: ParquetTimeZone::default(),
         }
     }
 
@@ -349,6 +353,17 @@ impl FileMetastore {
 
     pub(crate) fn timestamp_precision(&self) -> HiveTimestampPrecision {
         self.precision
+    }
+
+    /// Sets the zone of the catalog's Parquet `INT96` timestamps.
+    pub(crate) fn with_parquet_time_zone(mut self, zone: ParquetTimeZone) -> Self {
+        self.zone = zone;
+        self
+    }
+
+    /// The zone of the catalog's Parquet `INT96` timestamps.
+    pub(crate) fn parquet_time_zone(&self) -> ParquetTimeZone {
+        self.zone
     }
 
     pub(crate) fn table_locks(&self, schema: &str, table: &str) -> Arc<TableLocks> {

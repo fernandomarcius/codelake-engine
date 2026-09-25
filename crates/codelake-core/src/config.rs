@@ -356,6 +356,15 @@ pub enum SourceKind {
         /// and DDL of another precision is refused, as in Trino.
         #[serde(default)]
         timestamp_precision: HiveTimestampPrecision,
+        /// IANA time zone of the catalog's Parquet `INT96` timestamps, the
+        /// reference engine's `hive.parquet.time-zone`: writes convert the
+        /// wall-clock time from it to UTC, reads convert back
+        /// ([`crate::parquet_time_zone`]).
+        /// Default `America/Sao_Paulo`. It must be the zone of every other
+        /// engine that writes or reads the warehouse: a file another engine
+        /// wrote in UTC reads shifted by the zone's offset.
+        #[serde(default = "default_parquet_time_zone")]
+        parquet_time_zone: String,
     },
     Iceberg {
         /// Iceberg REST catalog URI.
@@ -483,6 +492,10 @@ impl HiveTimestampPrecision {
             Self::Nanoseconds => "NANOSECONDS",
         }
     }
+}
+
+fn default_parquet_time_zone() -> String {
+    crate::parquet_time_zone::DEFAULT_PARQUET_TIME_ZONE.to_owned()
 }
 
 fn default_region() -> String {
@@ -797,8 +810,12 @@ impl Config {
                     warehouse,
                     access_key_id_env,
                     secret_access_key_env,
+                    parquet_time_zone,
                     ..
                 } => {
+                    if let Err(err) = parquet_time_zone.parse::<crate::parquet_time_zone::ParquetTimeZone>() {
+                        errors.push(format!("source `{name}`: parquet_time_zone {err}"));
+                    }
                     let local = warehouse.starts_with('/') || warehouse.starts_with("file:");
                     if !local && !warehouse.starts_with("s3://") {
                         errors.push(format!(
@@ -1149,6 +1166,40 @@ mod tests {
         );
         let cfg = parse(&doc);
         assert_eq!(cfg.sources.last().unwrap().kind.label(), "hive");
+    }
+
+    #[test]
+    fn hive_parquet_time_zone_is_an_iana_zone_per_catalog() {
+        let doc = format!(
+            "{VALID}\n[[source]]\nname = \"hive\"\nkind = \"hive\"\nwarehouse = \"/wh\"\n\
+             [[source]]\nname = \"hive_utc\"\nkind = \"hive\"\nwarehouse = \"/wh\"\nparquet_time_zone = \"UTC\"\n"
+        );
+        let zones: Vec<String> = parse(&doc)
+            .sources
+            .iter()
+            .filter_map(|source| match &source.kind {
+                SourceKind::Hive {
+                    parquet_time_zone, ..
+                } => Some(parquet_time_zone.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(zones, vec!["America/Sao_Paulo".to_owned(), "UTC".to_owned()]);
+        assert!(parse(&doc).validate(&full_env, &|_| true).is_ok());
+        let wrong = format!(
+            "{VALID}\n[[source]]\nname = \"hive\"\nkind = \"hive\"\nwarehouse = \"/wh\"\nparquet_time_zone = \"-03:00\"\n\
+             [[source]]\nname = \"hive_br\"\nkind = \"hive\"\nwarehouse = \"/wh\"\nparquet_time_zone = \"Brasilia\"\n"
+        );
+        let errors = errors_of(&wrong, &full_env);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            errors[0].contains("source `hive`: parquet_time_zone `-03:00` is not an IANA time zone name"),
+            "{errors:?}"
+        );
+        assert!(
+            errors[1].contains("source `hive_br`: parquet_time_zone `Brasilia`"),
+            "{errors:?}"
+        );
     }
 
     #[test]
