@@ -42,13 +42,16 @@ A JSON file; example: [docs/examples/canary.json](../examples/canary.json).
 
 | Key | Passes when |
 |---|---|
-| `value` | exactly one row, whose canonical text equals it (one column: the value, e.g. `"18342"`) |
+| `value` | exactly one row, whose canonical text equals it (one column: the value, e.g. `"18342"`; a string, number or boolean, a `NULL` cell is `"\\N"`) |
 | `row_count` | the number of rows |
 | `sha256` | sha256 of the canonical rows |
 | `rows` | the rows, e.g. `[["closed", 18000], ["returned", 342]]` |
 | `min`, `max` | one numeric value within the bounds |
 | `reference: true` | the same rows as the reference endpoint for the same SQL |
 | `ordered: true` | compare rows in the order returned (default: sorted, order-insensitive) |
+
+`--check-config` (and every run) refuses an expectation that could never
+fail: `value: null`, or `ordered`/`reference` that is not `true` or `false`.
 
 `freshness.max_lag_secs`: the query returns one number, the newest timestamp
 in **seconds since the epoch**, and the check fails when now minus it exceeds

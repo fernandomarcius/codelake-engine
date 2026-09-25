@@ -128,6 +128,16 @@ for pg_url in 'postgresql://u@h/db?password=secret' 'postgresql:///db?host=h&pas
     fail "password in the pg.url query reported, not echoed" "$(cat "$WORK/err")"
   fi
 done
+config "$WORK/loose.json" '[{"name": "null_value", "sql": "SELECT 42", "expect": {"value": null}},
+  {"name": "text_ordered", "sql": "SELECT rows", "expect": {"row_count": 3, "ordered": "yes"}},
+  {"name": "text_reference", "sql": "SELECT 42", "expect": {"reference": "yes"}}]'
+expect_run "expectations that would always pass are refused" 2 "$WORK/loose.json" --check-config
+if grep -q 'null_value.*expect.value must be' "$WORK/err" && grep -q 'text_ordered.*expect.ordered must be' "$WORK/err" \
+  && grep -q 'text_reference.*expect.reference must be' "$WORK/err"; then
+  pass "null value, non-boolean ordered and reference reported"
+else
+  fail "null value, non-boolean ordered and reference reported" "$(cat "$WORK/err")"
+fi
 expect_run "--check-config on a valid file" 0 "$WORK/ok.json" --check-config
 printf 'not json' >"$WORK/garbage.json"
 expect_run "configuration that is not JSON" 2 "$WORK/garbage.json"

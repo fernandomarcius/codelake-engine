@@ -167,6 +167,12 @@ PROBLEMS="$(jq -r '
             if ($c.expect | type) != "object" then "\($at): expect must be an object" else
               ($c.expect | keys - ["value", "row_count", "sha256", "rows", "min", "max", "reference", "ordered"]
                | if length > 0 then "\($at): unknown expect keys \(join(", "))" else empty end),
+              (if ($c.expect | has("value")) and (($c.expect.value | type) | IN("string", "number", "boolean") | not)
+               then "\($at): expect.value must be a string, number or boolean (a NULL cell is \"\\\\N\")" else empty end),
+              (if ($c.expect | has("ordered")) and (($c.expect.ordered | type) != "boolean")
+               then "\($at): expect.ordered must be true or false" else empty end),
+              (if ($c.expect | has("reference")) and (($c.expect.reference | type) != "boolean")
+               then "\($at): expect.reference must be true or false" else empty end),
               (if ($c.expect | has("row_count")) and (($c.expect.row_count | type) != "number" or $c.expect.row_count < 0)
                then "\($at): expect.row_count must be a number >= 0" else empty end),
               (if ($c.expect | has("sha256")) and (($c.expect.sha256 | tostring | test("^[0-9a-f]{64}$")) | not)
