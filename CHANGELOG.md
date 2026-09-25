@@ -39,10 +39,13 @@ versioning: [SemVer](https://semver.org/).
 - **Breaking:** text compared with a number (`varchar_col > 9`, `x IN ('1.0')`) fails with
   `TYPE_MISMATCH` on the engine's client protocols, as on Trino; cast explicitly
   (ADR 0014). It answered rows before, through DataFusion's coercion.
-- **Breaking:** on the PostgreSQL wire path the same comparisons keep DataFusion's
-  coercion, which DataFusion 54 changed: the text is converted to the number
-  (`'100' > 9` is true, `'a' > 9` fails at run time) where DataFusion 53 compared text.
-  Their answers changed.
+- **Breaking:** on the PostgreSQL wire, typed text compared with a number
+  (`varchar_col > 9`, `'7'::varchar = 7`, `varchar_col IN (1, 2)`) fails with SQLSTATE
+  `42883` ("operator does not exist: text > integer"), as on PostgreSQL, and
+  `time ± interval` with `0A000` (ADR 0014, ISS-006). It answered rows before, through
+  DataFusion's coercion, whose direction changed between DataFusion 53 (compared text) and
+  54 (converts the text to the number). An untyped quoted literal still takes the other
+  side's type (`int_col > '20'`), as on PostgreSQL.
 
 ### Removed
 - Experimental Iceberg connector and its `iceberg` feature, out of the build until an Iceberg
@@ -58,7 +61,8 @@ versioning: [SemVer](https://semver.org/).
   FALSE where SQL says UNKNOWN (DataFusion 53 and 54); when either side may be NULL it now
   fails with `NOT_SUPPORTED` (ADR 0014, defect 12).
 - Text compared with a number now fails with `TYPE_MISMATCH` and `time ± interval`
-  with `NOT_SUPPORTED` on the engine's client protocols, instead of answering rows.
+  with `NOT_SUPPORTED` on the engine's client protocols, and with `42883`/`0A000` on the
+  PostgreSQL wire, instead of answering rows.
 - A partition that panicked inside the output merge truncated the result in silence;
   the query now fails.
 - `CREATE SCHEMA` without a catalog used the engine's default catalog instead of the session's.

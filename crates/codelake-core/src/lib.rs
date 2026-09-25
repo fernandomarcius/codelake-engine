@@ -19,7 +19,7 @@ pub mod information_schema;
 pub mod join_guard;
 pub mod join_spill;
 mod literals;
-mod operand_checks;
+pub mod operand_checks;
 pub mod output;
 pub mod overflow;
 pub mod plain_views;

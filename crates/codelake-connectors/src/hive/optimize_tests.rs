@@ -563,19 +563,67 @@ async fn a_second_swap_waits_for_the_first_marker() {
     assert_recovers_to(&mut lake, &before, 5).await;
 }
 
+/// The one failure ADR 0009 allows a read racing a swap ("loud, not
+/// wrong"): planned before the swap, it opens a data file the swap removed.
+/// The error must name one of the files the table had before `OPTIMIZE`.
+fn is_missing_compacted_file(
+    err: &datafusion::error::DataFusionError,
+    compacted: &BTreeMap<String, u64>,
+) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if let Some(object_store::Error::NotFound { path, .. }) = e.downcast_ref::<object_store::Error>() {
+            return compacted.keys().any(|name| path.ends_with(&format!("/{name}")));
+        }
+        source = e.source();
+    }
+    false
+}
+
+/// Reads racing two `OPTIMIZE`s of the same table (ADR 0009): each read sees
+/// every row exactly once, or, planned before a swap, fails because a file it
+/// planned to read was compacted away. Any other error fails the test, as
+/// does any error of a read started after both `OPTIMIZE`s ended.
 #[tokio::test]
 async fn concurrent_optimize_and_reads_never_duplicate_rows() {
+    /// Successful reads required, so the test never passes on errors alone.
+    const MIN_OK: usize = 10;
     let mut lake = lake().await;
     let before = five_files(&lake).await;
+    let compacted = data_files(&lake.table_dir("t"));
     let sql = "ALTER TABLE hive.s.t EXECUTE optimize";
-    let (a, b, rows) = tokio::join!(
-        optimize(&lake.engine, sql),
-        optimize(&lake.engine, sql),
-        run(&lake.engine, ALL_ROWS)
-    );
+    let optimizing = std::cell::Cell::new(true);
+    let optimizes = async {
+        let both = tokio::join!(optimize(&lake.engine, sql), optimize(&lake.engine, sql));
+        optimizing.set(false);
+        both
+    };
+    let reads = async {
+        let (mut ok, mut racing_ok, mut missing) = (0_usize, 0_usize, 0_usize);
+        while optimizing.get() || ok < MIN_OK {
+            let racing = optimizing.get();
+            match run_with(&lake.engine, &QueryOptions::for_user("dbt"), ALL_ROWS).await {
+                Ok(rows) => {
+                    // Every row once: none duplicated, none lost.
+                    assert_eq!(rows, before, "read racing OPTIMIZE: {racing}");
+                    ok += 1;
+                    racing_ok += usize::from(racing);
+                }
+                Err(err) if racing && is_missing_compacted_file(&err, &compacted) => missing += 1,
+                Err(err) => panic!("read failed (racing OPTIMIZE: {racing}): {err:?}"),
+            }
+        }
+        (ok, racing_ok, missing)
+    };
+    let ((a, b), (ok, racing_ok, missing)) = tokio::join!(optimizes, reads);
+    eprintln!("reads: {ok} ok ({racing_ok} while OPTIMIZE ran), {missing} failed on a compacted file");
     a.unwrap();
     b.unwrap();
-    assert_eq!(rows, before);
+    assert!(ok >= MIN_OK, "{ok} successful reads");
+    assert!(
+        racing_ok + missing >= 1,
+        "no read ran while OPTIMIZE did: the race was not exercised"
+    );
     assert_recovers_to(&mut lake, &before, 1).await;
 }
 

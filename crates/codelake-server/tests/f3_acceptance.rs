@@ -1405,6 +1405,14 @@ async fn abandoned_query_is_canceled() {
     );
 }
 
+/// Holds a slot without using the CPU: its rows outrun a client that never
+/// pages, so it waits on its full output buffer (two batches) until it is
+/// deleted or the server stops. `SLOW` holds a slot too, but its cross join
+/// keeps the server's worker threads busy, and they also serve the protocol:
+/// in the coverage build the next request of this test got no answer within
+/// the client's 120 s timeout.
+const PARKED: &str = "SELECT value FROM generate_series(1, 1000000000)";
+
 /// Beyond `max_active_queries` unfinished queries, submissions fail with
 /// `QUERY_QUEUE_FULL`; a slot frees once a query ends.
 #[tokio::test]
@@ -1415,8 +1423,8 @@ async fn queue_limit_rejects_with_query_queue_full() {
     })
     .await;
     let base = server.base();
-    let a = post(&base, SLOW, &[]).await.json();
-    let _b = post(&base, SLOW, &[]).await.json();
+    let a = post(&base, PARKED, &[]).await.json();
+    let _b = post(&base, PARKED, &[]).await.json();
     let full = post(&base, "SELECT 1", &[]).await.json();
     assert!(full.get("nextUri").is_none(), "{full}");
     assert_eq!(full["error"]["errorName"], "QUERY_QUEUE_FULL", "{full}");
