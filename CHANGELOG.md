@@ -36,6 +36,13 @@ versioning: [SemVer](https://semver.org/).
   the pool past its limit.
 - DataFusion 54.1 train: `datafusion-federation` 0.5.5, per-connector
   `datafusion-table-providers` 0.13.1 crates, `datafusion-postgres` 0.18.0 (ADR 0002).
+- **Breaking:** text compared with a number (`varchar_col > 9`, `x IN ('1.0')`) fails with
+  `TYPE_MISMATCH` on the engine's client protocols, as on Trino; cast explicitly
+  (ADR 0014). It answered rows before, through DataFusion's coercion.
+- **Breaking:** on the PostgreSQL wire path the same comparisons keep DataFusion's
+  coercion, which DataFusion 54 changed: the text is converted to the number
+  (`'100' > 9` is true, `'a' > 9` fails at run time) where DataFusion 53 compared text.
+  Their answers changed.
 
 ### Removed
 - Experimental Iceberg connector and its `iceberg` feature, out of the build until an Iceberg

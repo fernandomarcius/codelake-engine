@@ -69,7 +69,13 @@ it, the canary fails and points here. The integration tests of
   rows on DataFusion 53 and 54. Write them with `EXISTS`, move the `NOT IN`
   to its own conjunct, or exclude the NULLs (`coalesce`) on both sides.
 - Clients of the engine that relied on comparing text with numbers now get
-  `TYPE_MISMATCH`, as on Trino. Cast explicitly.
+  `TYPE_MISMATCH`, as on Trino. Cast explicitly. This is a breaking change
+  (CHANGELOG), shipped as `fix(core)` in 9ef792e without the `!` marker.
+- The PostgreSQL wire path keeps DataFusion's coercion, and its answers to
+  text compared with a number changed with the train: DataFusion 54 converts
+  the text to the number where 53 compared text (`varchar_col > 9`). Listed
+  as breaking in the CHANGELOG; whether that path should refuse too is open
+  for the maintainers.
 - `time ± interval` is refused until the train reaches DataFusion 55.
 - Removing a guard needs the DataFusion release with the fix **and** the
   matching test of `join_regressions.rs` passing without it. Upstream reports
