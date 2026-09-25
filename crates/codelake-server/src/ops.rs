@@ -118,14 +118,24 @@ struct Health {
     version: &'static str,
     draining: bool,
     memory: codelake_core::MemoryStats,
+    queries: QueryLoad,
     sources: Vec<SourceStatus>,
 }
 
+/// Admission slots in use (see `codelake_core::governance`).
+#[derive(Debug, Serialize)]
+struct QueryLoad {
+    running: usize,
+    queued: usize,
+}
+
 async fn healthz(State(state): State<Arc<OpsState>>) -> Json<Health> {
+    let (running, queued) = state.engine.governance().admission().load();
     Json(Health {
         version: env!("CARGO_PKG_VERSION"),
         draining: state.is_draining(),
         memory: state.engine.memory(),
+        queries: QueryLoad { running, queued },
         sources: state.sources().await,
     })
 }

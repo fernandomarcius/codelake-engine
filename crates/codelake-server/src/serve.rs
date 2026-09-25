@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use crate::{hooks, ops, trino};
 
-/// How often abandoned Trino queries are canceled and old ones forgotten.
+/// How often abandoned queries are canceled and old ones forgotten.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
@@ -52,7 +52,12 @@ async fn serve(validated: ValidatedConfig, session_sampling: Option<f64>) -> Res
     let prometheus = PrometheusBuilder::new().install_recorder()?;
 
     std::fs::create_dir_all(&config.memory.spill_dir)?;
-    let mut engine = Engine::new(&config.memory, &config.execution)?;
+    let mut engine = Engine::with_governance(
+        &config.memory,
+        &config.execution,
+        &config.governance,
+        Some(config.query_history()),
+    )?;
     let timeout = Duration::from_secs(config.execution.source_startup_timeout_secs);
     for source in &config.sources {
         let connector = codelake_connectors::build(source, &secrets)?;
@@ -85,6 +90,7 @@ async fn serve(validated: ValidatedConfig, session_sampling: Option<f64>) -> Res
         .with_tls_cert_path(tls.map(|t| t.cert_path.display().to_string()))
         .with_tls_key_path(tls.map(|t| t.key_path.display().to_string()));
     let session = Arc::new(engine.context().clone());
+    spawn_sweeper(&engine, trino.clone(), &shutdown);
 
     tokio::select! {
         result = datafusion_postgres::serve_with_hooks(session, &options, hooks::all(session_sampling)) => {
@@ -113,8 +119,8 @@ async fn serve(validated: ValidatedConfig, session_sampling: Option<f64>) -> Res
     Ok(())
 }
 
-/// Starts the Trino protocol listener and its registry sweeper; exposes the
-/// registry as `system.runtime.queries`.
+/// Starts the HTTP statement protocol listener; its catalog `system` adds the
+/// protocol's metadata tables to the engine's `runtime.queries`.
 async fn start_trino(
     engine: &Arc<Engine>,
     settings: &TrinoProtocolConfig,
@@ -123,8 +129,6 @@ async fn start_trino(
     let limits = trino::Limits {
         max_active: settings.max_active_queries,
         client_timeout: Duration::from_secs(settings.client_timeout_secs),
-        history_retention: Duration::from_secs(settings.history_retention_secs),
-        history_size: settings.history_size,
         max_query_length: settings.max_query_length,
     };
     let state = trino::TrinoState::new(Arc::clone(engine), limits, settings.listen);
@@ -138,18 +142,28 @@ async fn start_trino(
             .with_graceful_shutdown(shutdown.clone().cancelled_owned())
             .into_future(),
     );
-    let sweeper = Arc::clone(&state);
+    Ok(state)
+}
+
+/// Periodically forgets old completed queries, and cancels the HTTP
+/// protocol's abandoned ones.
+fn spawn_sweeper(engine: &Arc<Engine>, http: Option<Arc<trino::TrinoState>>, shutdown: &CancellationToken) {
+    let engine = Arc::clone(engine);
     let stop = shutdown.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(SWEEP_INTERVAL);
         loop {
             tokio::select! {
                 () = stop.cancelled() => return,
-                _ = tick.tick() => sweeper.sweep(),
+                _ = tick.tick() => {
+                    if let Some(http) = &http {
+                        http.sweep();
+                    }
+                    engine.governance().sweep();
+                }
             }
         }
     });
-    Ok(state)
 }
 
 async fn shutdown_signal() {

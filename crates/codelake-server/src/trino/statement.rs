@@ -32,12 +32,14 @@ use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
+use codelake_core::governance::{self, Permit, Protocol, Ticket, TimeLimits};
 use codelake_core::output::ReservedOutputExec;
-use codelake_core::session_properties::parse_duration;
+use codelake_core::session_properties::{format_duration, parse_duration};
+use codelake_core::trace::QueryTrace;
 use codelake_core::{Engine, PropertyType, QueryOptions};
 use datafusion::arrow::array::{Array, AsArray, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef, UInt64Type};
-use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider};
+use datafusion::catalog::CatalogProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
@@ -55,7 +57,7 @@ use tokio::sync::mpsc::{self, error::TryRecvError};
 
 use super::errors::{Code, Everything, Namespace, QueryError};
 use super::prepared::{self, Command};
-use super::queries::{Info, Limits, QueriesTable, Query, Registry, Release, State as QueryState};
+use super::queries::{Info, Limits, Query, Registry, Release, State as QueryState};
 use super::rewrite;
 use super::session::{self, ClientSession, Control, SessionError};
 use super::types::{self, Column, Encoding};
@@ -443,7 +445,7 @@ impl Exec {
         let mut bytes = 0;
         loop {
             if let Err(error) = self.take_rows(query, &mut rows, &mut bytes) {
-                return self.fail(query, error);
+                return self.fail(query, &error);
             }
             if bytes >= PAGE_TARGET_BYTES || self.pending.is_some() || self.finished {
                 break;
@@ -466,10 +468,10 @@ impl Exec {
                 let error = query.error().unwrap_or_else(|| {
                     QueryError::new(Code::GenericInternalError, "Query execution ended unexpectedly")
                 });
-                return self.fail(query, error);
+                return self.fail(query, &error);
             };
             if let Err(error) = self.absorb(event) {
-                return self.fail(query, error);
+                return self.fail(query, &error);
             }
         }
         if !(self.finished && self.pending.is_none()) {
@@ -507,7 +509,7 @@ impl Exec {
         page
     }
 
-    fn fail(&mut self, query: &TrinoQuery, error: QueryError) -> Page {
+    fn fail(&mut self, query: &TrinoQuery, error: &QueryError) -> Page {
         self.release();
         query.fail(error);
         // The first recorded failure wins (a cancel racing an execution error).
@@ -631,16 +633,6 @@ fn stats(info: &Info) -> Value {
     })
 }
 
-/// airlift `Duration.toString()`: `1.00h`, `30.00m`, `250.00ms`.
-fn format_duration(duration: Duration) -> String {
-    let seconds = duration.as_secs_f64();
-    let (value, unit) = [(86_400.0, "d"), (3600.0, "h"), (60.0, "m"), (1.0, "s")]
-        .into_iter()
-        .find(|(size, _)| seconds >= *size)
-        .map_or((seconds * 1000.0, "ms"), |(size, unit)| (seconds / size, unit));
-    format!("{value:.2}{unit}")
-}
-
 fn warning(message: &str) -> Value {
     json!({"warningCode": {"code": 65_536, "name": "SESSION_PROPERTY_IGNORED"}, "message": message})
 }
@@ -681,25 +673,20 @@ impl std::fmt::Debug for TrinoState {
 impl TrinoState {
     pub(crate) fn new(engine: Arc<Engine>, limits: Limits, listen: SocketAddr) -> Arc<Self> {
         Arc::new(Self {
+            queries: Arc::new(Registry::new(Arc::clone(engine.governance().registry()), limits)),
             engine,
-            queries: Arc::new(Registry::new(limits)),
             fallback_host: listen.to_string(),
             started: Instant::now(),
             draining: AtomicBool::new(false),
         })
     }
 
-    /// Catalog `system` with `runtime.queries`, `metadata.*` and `jdbc.*`.
+    /// Catalog `system`: the engine's `runtime.queries` (every protocol's
+    /// queries) plus this protocol's `metadata.*` and `jdbc.*`.
     pub(crate) fn system_catalog(&self) -> datafusion::error::Result<Arc<dyn CatalogProvider>> {
-        let runtime = MemorySchemaProvider::new();
-        runtime.register_table(
-            "queries".into(),
-            Arc::new(QueriesTable::new(Arc::clone(&self.queries))),
-        )?;
-        let catalog = MemoryCatalogProvider::new();
-        catalog.register_schema("runtime", Arc::new(runtime))?;
+        let catalog = governance::system_catalog(self.engine.governance().registry())?;
         super::system_tables::register(&catalog, self.engine.connectors())?;
-        Ok(Arc::new(catalog))
+        Ok(catalog as Arc<dyn CatalogProvider>)
     }
 
     pub(crate) fn sweep(&self) {
@@ -802,22 +789,36 @@ fn body_limit(max_chars: usize) -> usize {
 fn refuse(
     state: &TrinoState,
     base: &str,
-    user: String,
-    source: Option<String>,
+    user: &str,
+    source: Option<&str>,
     sql: &str,
     error: QueryError,
 ) -> Response {
     let (_, receiver) = mpsc::channel(1);
-    let id = state.queries.next_id();
-    let exec = Exec::new(receiver, Encoding::MODERN, Vec::new(), &state.pool(), &id);
-    let query = Arc::new(Query::new(id, user, source, sql, exec));
+    let record = state
+        .engine
+        .governance()
+        .register(Protocol::Http, user, source, sql);
+    let exec = Exec::new(receiver, Encoding::MODERN, Vec::new(), &state.pool(), record.id());
+    let query = Arc::new(Query::new(record, exec));
     // A full registry reports its own error instead.
     let error = state.queries.insert(Arc::clone(&query)).err().unwrap_or(error);
-    query.fail(error.clone());
+    query.fail(&error);
     json_response(
         TrinoState::body(&query, base, &Page::failed(error), None, &[]),
         &[],
     )
+}
+
+/// Warnings for the session properties this engine accepts and ignores.
+fn ignored_properties(session: Option<&ClientSession>) -> Vec<Value> {
+    session.map_or_else(Vec::new, |s| {
+        s.properties
+            .ignored()
+            .iter()
+            .map(|name| warning(&format!("Session property {name} has no effect in CodeLake")))
+            .collect()
+    })
 }
 
 async fn submit(State(state): State<Arc<TrinoState>>, request: Request) -> Response {
@@ -846,7 +847,14 @@ async fn submit(State(state): State<Arc<TrinoState>>, request: Request) -> Respo
             .get(header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok());
-        return refuse(&state, &base, user, source, "", too_large(declared, max_length));
+        return refuse(
+            &state,
+            &base,
+            &user,
+            source.as_deref(),
+            "",
+            too_large(declared, max_length),
+        );
     };
     let Ok(sql) = std::str::from_utf8(&body) else {
         return (StatusCode::BAD_REQUEST, "SQL statement is not valid UTF-8").into_response();
@@ -861,8 +869,8 @@ async fn submit(State(state): State<Arc<TrinoState>>, request: Request) -> Respo
         return refuse(
             &state,
             &base,
-            user,
-            source,
+            &user,
+            source.as_deref(),
             &kept,
             too_large(Some(length), max_length),
         );
@@ -875,23 +883,17 @@ async fn submit(State(state): State<Arc<TrinoState>>, request: Request) -> Respo
         }
         Err(SessionError::Query(error)) => Err(error),
     };
-    let warnings = session
-        .as_ref()
-        .map(|s| {
-            s.properties
-                .ignored()
-                .iter()
-                .map(|name| warning(&format!("Session property {name} has no effect in CodeLake")))
-                .collect()
-        })
-        .unwrap_or_default();
+    let warnings = ignored_properties(session.as_ref().ok());
     let encoding = session.as_ref().map_or(Encoding::MODERN, |s| s.encoding);
     let (sender, receiver) = mpsc::channel(BUFFERED_BATCHES);
-    let id = state.queries.next_id();
-    let exec = Exec::new(receiver, encoding, warnings, &state.pool(), &id);
-    let query = Arc::new(Query::new(id, user, source, sql, exec));
+    let record = state
+        .engine
+        .governance()
+        .register(Protocol::Http, &user, source.as_deref(), sql);
+    let exec = Exec::new(receiver, encoding, warnings, &state.pool(), record.id());
+    let query = Arc::new(Query::new(record, exec));
     if let Err(error) = state.queries.insert(Arc::clone(&query)) {
-        query.fail(error.clone());
+        query.fail(&error);
         return json_response(
             TrinoState::body(&query, &base, &Page::failed(error), None, &[]),
             &[],
@@ -907,7 +909,7 @@ async fn submit(State(state): State<Arc<TrinoState>>, request: Request) -> Respo
             json_response(TrinoState::body(&query, &base, &page, next, &[]), &headers)
         }
         Err(error) => {
-            query.fail(error.clone());
+            query.fail(&error);
             json_response(
                 TrinoState::body(&query, &base, &Page::failed(error), None, &[]),
                 &[],
@@ -1012,13 +1014,20 @@ fn start(
             sql: sql.to_owned(),
         }
     };
-    let limit = session.properties.max_run_time();
+    let governance = state.engine.governance();
+    let limits = governance.session_limits(&session.properties);
+    // Refused here, the client gets the failure in this response.
+    let ticket = governance
+        .enter(query.record())
+        .map_err(|e| QueryError::from_governance(&e))?;
     let options = QueryOptions {
         catalog: session.catalog,
         schema: session.schema,
         time_zone: session.time_zone,
         properties: session.properties,
         functions: vec![super::system_tables::version_function(PROTOCOL_VERSION)],
+        // The query span carries the id clients see.
+        trace: QueryTrace::default().with_query_id(query.id.clone()),
         ..QueryOptions::for_user(&session.user)
     };
     tokio::spawn(execute(
@@ -1027,7 +1036,7 @@ fn start(
         options,
         work,
         sender,
-        limit,
+        (ticket, limits),
     ));
     Ok((Page::default(), Vec::new(), Some(1)))
 }
@@ -1151,19 +1160,30 @@ async fn describe(
         .map_err(|e| QueryError::from(&e))
 }
 
-async fn plan(engine: &Engine, options: &QueryOptions, work: Work) -> Result<DataFrame, QueryError> {
+async fn plan(
+    engine: &Engine,
+    options: &QueryOptions,
+    work: Work,
+    admission: &Info,
+) -> Result<DataFrame, QueryError> {
     let names = EngineNames(engine);
+    // The query span records where governance admitted the query.
+    let traced = |query: codelake_core::Query| {
+        query.record_admission(&admission.resource_group, admission.queued);
+        query.into_dataframe()
+    };
     match work {
         Work::Frame(frame) => Ok(*frame),
         Work::Describe(table, like) => describe(engine, options, &table, like.as_ref()).await,
         Work::Sql { sql, planned } => {
             let Some(planned) = planned else {
                 return engine
-                    .sql_with(options, &sql)
+                    .query(options, &sql)
                     .await
+                    .map(traced)
                     .map_err(|e| QueryError::from_engine(&e, &sql, &names));
             };
-            match engine.sql_with(options, &planned).await {
+            match engine.query(options, &planned).await.map(traced) {
                 Ok(frame) => Ok(frame),
                 // Report the error on the client's own text: its positions.
                 Err(error) => match engine.sql_with(options, &sql).await {
@@ -1200,7 +1220,7 @@ async fn run(
     let error = |e: DataFusionError| QueryError::from(&e);
     query.set_state(QueryState::Planning);
     let analysis = Instant::now();
-    let frame = plan(engine, &options, work).await?;
+    let frame = plan(engine, &options, work, &query.snapshot()).await?;
     let analysis = analysis.elapsed();
     let planning = Instant::now();
     let task = Arc::new(frame.task_ctx());
@@ -1236,46 +1256,67 @@ async fn run(
     Ok(())
 }
 
-/// Runs `work`, failing with `EXCEEDED_TIME_LIMIT` once `(limit, remaining)` runs out.
+/// Runs `work` until the query's deadline; past it, `work` is dropped (its
+/// streams with it, which stops the operators and frees their memory) and the
+/// query fails with `EXCEEDED_TIME_LIMIT`.
 async fn within(
-    deadline: Option<(Duration, Duration)>,
+    engine: &Engine,
+    query: &TrinoQuery,
+    limits: &TimeLimits,
     work: impl Future<Output = Result<(), QueryError>>,
 ) -> Result<(), QueryError> {
-    let Some((limit, remaining)) = deadline else {
-        return work.await;
-    };
-    tokio::time::timeout(remaining, work).await.unwrap_or_else(|_| {
-        Err(QueryError::new(
-            Code::ExceededTimeLimit,
-            format!("Query exceeded maximum time limit of {}", format_duration(limit)),
-        ))
-    })
+    let (deadline, limit) = limits.deadline(&query.snapshot());
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), work)
+        .await
+        .unwrap_or_else(|_| {
+            let error = engine.governance().time_limit_exceeded(query.record(), limit);
+            Err(QueryError::from_governance(&error))
+        })
 }
 
+/// Waits for an admission slot, then runs the query holding it; the slot is
+/// freed as soon as execution ends, before the client has fetched the last
+/// buffered rows.
 async fn execute(
     engine: Arc<Engine>,
     query: Arc<TrinoQuery>,
     options: QueryOptions,
     work: Work,
     sender: mpsc::Sender<Event>,
-    limit: Option<Duration>,
+    (ticket, limits): (Ticket, TimeLimits),
 ) {
-    let cancel = query.cancellation();
-    let deadline = limit.map(|limit| (limit, limit.saturating_sub(query.snapshot().created_at.elapsed())));
-    let work = within(deadline, run(&engine, &query, options, work, &sender));
+    let cancel = query.record().cancellation();
+    let permit: Permit = match engine.governance().admit(ticket, query.record(), &limits).await {
+        Ok(permit) => permit,
+        Err(error) => {
+            let error = query
+                .error()
+                .unwrap_or_else(|| QueryError::from_governance(&error));
+            query.fail(&error);
+            let _ = sender.send(Event::Failed(error)).await;
+            return;
+        }
+    };
+    let work = within(
+        &engine,
+        &query,
+        &limits,
+        run(&engine, &query, options, work, &sender),
+    );
     // Dropping `work` drops the plan's streams, which abort the tasks they spawned.
     let outcome = tokio::select! {
         biased;
         () = cancel.cancelled() => return,
         outcome = work => outcome,
     };
+    drop(permit);
     match outcome {
         Ok(()) => {
             query.set_state(QueryState::Finishing);
             let _ = sender.send(Event::Done).await;
         }
         Err(error) => {
-            query.fail(error.clone());
+            query.fail(&error);
             let _ = sender.send(Event::Failed(error)).await;
         }
     }
@@ -1367,7 +1408,7 @@ async fn cancel_statement(
 ) -> StatusCode {
     match find(&state, &id, &slug) {
         Some(query) => {
-            query.fail(user_canceled());
+            query.fail(&user_canceled());
             StatusCode::NO_CONTENT
         }
         None => StatusCode::NOT_FOUND,
@@ -1390,7 +1431,7 @@ async fn kill_query(
     if user != Some(query.snapshot().user.as_str()) {
         return StatusCode::FORBIDDEN;
     }
-    query.fail(user_canceled());
+    query.fail(&user_canceled());
     StatusCode::NO_CONTENT
 }
 
@@ -1484,10 +1525,6 @@ mod tests {
 
     #[test]
     fn durations_format_like_airlift() {
-        assert_eq!(format_duration(Duration::from_hours(1)), "1.00h");
-        assert_eq!(format_duration(Duration::from_secs(90)), "1.50m");
-        assert_eq!(format_duration(Duration::from_millis(250)), "250.00ms");
-        assert_eq!(format_duration(Duration::from_hours(48)), "2.00d");
         assert_eq!(property_text(PropertyType::Duration, "100d"), "100.00d");
         assert_eq!(property_text(PropertyType::Boolean, "true"), "true");
     }

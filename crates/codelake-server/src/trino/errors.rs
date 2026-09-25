@@ -14,6 +14,9 @@
 //! it. Errors this module would call `GENERIC_INTERNAL_ERROR` take the
 //! library's classification ([`trino_error_name`]) when it knows better.
 
+use std::sync::Arc;
+
+use codelake_core::governance::{Failure, GovernanceError};
 use codelake_core::subquery::SubqueryMultipleRows;
 use codelake_core::trino_functions::trino_error_name;
 use datafusion::arrow::error::ArrowError;
@@ -155,9 +158,39 @@ impl QueryError {
         self.0.error_type
     }
 
-    #[cfg(test)]
     pub(crate) fn message(&self) -> &str {
         &self.0.message
+    }
+
+    /// This error as the query registry records it, keeping the error itself
+    /// so the protocol answers with it again.
+    pub(crate) fn failure(&self) -> Failure {
+        Failure::new(self.name(), self.kind(), self.message()).with_detail(Arc::new(self.clone()))
+    }
+
+    /// The error of a failure recorded in the registry: the protocol's own
+    /// error when this protocol recorded it, else one built from its name
+    /// (governance failures, a query failed elsewhere).
+    pub(crate) fn from_failure(failure: &Failure) -> Self {
+        if let Some(error) = failure.detail::<Self>() {
+            return error.clone();
+        }
+        let code = match failure.name.as_str() {
+            "QUERY_QUEUE_FULL" => Code::QueryQueueFull,
+            "EXCEEDED_TIME_LIMIT" => Code::ExceededTimeLimit,
+            "USER_CANCELED" => Code::UserCanceled,
+            "ABANDONED_QUERY" => Code::AbandonedQuery,
+            name => named(name).unwrap_or(if failure.kind == "USER_ERROR" {
+                Code::GenericUserError
+            } else {
+                Code::GenericInternalError
+            }),
+        };
+        Self::new(code, failure.message.clone())
+    }
+
+    pub(crate) fn from_governance(error: &GovernanceError) -> Self {
+        Self::from_failure(&error.failure())
     }
 
     #[cfg(test)]
@@ -479,6 +512,32 @@ impl From<&DataFusionError> for QueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failures_round_trip_through_the_registry() {
+        let error = QueryError::new(Code::SyntaxError, "bad").at(Some(ErrorLocation {
+            line_number: 1,
+            column_number: 2,
+        }));
+        let failure = error.failure();
+        assert_eq!(failure.name, "SYNTAX_ERROR");
+        assert_eq!(QueryError::from_failure(&failure), error, "the detail is kept");
+        let queue = QueryError::from_failure(&Failure::new(
+            "QUERY_QUEUE_FULL",
+            "INSUFFICIENT_RESOURCES",
+            "full",
+        ));
+        assert_eq!(
+            (queue.name(), queue.kind(), queue.message()),
+            ("QUERY_QUEUE_FULL", "INSUFFICIENT_RESOURCES", "full")
+        );
+        let time =
+            QueryError::from_governance(&GovernanceError::TimeLimit(std::time::Duration::from_secs(2)));
+        assert_eq!(time.name(), "EXCEEDED_TIME_LIMIT");
+        assert_eq!(time.message(), "Query exceeded maximum time limit of 2.00s");
+        let other = QueryError::from_failure(&Failure::new("SOMETHING", "USER_ERROR", "x"));
+        assert_eq!(other.name(), "GENERIC_USER_ERROR");
+    }
 
     fn map(sql: &str) -> QueryError {
         let error = datafusion::sql::parser::DFParser::parse_sql(sql).unwrap_err();

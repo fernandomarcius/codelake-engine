@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use codelake_core::ByteSize;
 
 use super::ceiling::{Probe, partitions, released, settle};
-use super::{Limits, Outcome, harness, harness_config, harness_with, limits, path_of};
+use super::{Limits, Outcome, harness, harness_config, harness_governed, harness_with, limits, path_of};
 
 // ---------------------------------------------------------------- session ---
 
@@ -439,11 +439,16 @@ async fn rt11_submit_cost_does_not_grow_with_history_text() {
 /// limit — each keeping its SQL text.
 #[tokio::test]
 async fn rt12_registry_is_bounded_between_sweeps() {
-    let h = harness_with(Limits {
-        max_active: 5,
-        history_size: 10,
-        ..limits()
-    });
+    let h = harness_governed(
+        Limits {
+            max_active: 5,
+            ..limits()
+        },
+        &codelake_core::config::GovernanceConfig {
+            history_size: 10,
+            ..codelake_core::config::GovernanceConfig::default()
+        },
+    );
     for _ in 0..200 {
         let out = h.run("SELECT 1 +", &[]).await;
         assert_eq!(out.error_name(), Some("SYNTAX_ERROR"));

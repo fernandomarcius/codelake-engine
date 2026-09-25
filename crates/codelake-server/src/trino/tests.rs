@@ -6,7 +6,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
-use codelake_core::config::{ExecutionConfig, MemoryConfig};
+use codelake_core::config::{ExecutionConfig, GovernanceConfig, MemoryConfig};
 use codelake_core::{ByteSize, Engine};
 use http_body_util::BodyExt;
 use serde_json::Value;
@@ -25,8 +25,6 @@ fn limits() -> Limits {
     Limits {
         max_active: 50,
         client_timeout: Duration::from_mins(5),
-        history_retention: Duration::from_mins(15),
-        history_size: 100,
         max_query_length: 1_000_000,
     }
 }
@@ -37,6 +35,25 @@ fn harness_with(limits: Limits) -> Harness {
 
 /// A harness with its own memory limit and execution settings.
 fn harness_config(limits: Limits, memory_limit: ByteSize, execution: &ExecutionConfig) -> Harness {
+    harness_full(limits, memory_limit, execution, &GovernanceConfig::default())
+}
+
+/// A harness with its own governance settings.
+fn harness_governed(limits: Limits, governance: &GovernanceConfig) -> Harness {
+    harness_full(
+        limits,
+        ByteSize::mib(256),
+        &ExecutionConfig::default(),
+        governance,
+    )
+}
+
+fn harness_full(
+    limits: Limits,
+    memory_limit: ByteSize,
+    execution: &ExecutionConfig,
+    governance: &GovernanceConfig,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let memory = MemoryConfig {
         limit: memory_limit,
@@ -44,7 +61,7 @@ fn harness_config(limits: Limits, memory_limit: ByteSize, execution: &ExecutionC
         spill_limit: ByteSize::mib(256),
         metadata_cache_limit: ByteSize::mib(1),
     };
-    let engine = Arc::new(Engine::new(&memory, execution).unwrap());
+    let engine = Arc::new(Engine::with_governance(&memory, execution, governance, None).unwrap());
     let state = TrinoState::new(Arc::clone(&engine), limits, "127.0.0.1:8081".parse().unwrap());
     engine
         .context()
@@ -692,4 +709,5 @@ async fn submit_cost_does_not_grow_with_history_text() {
 }
 
 mod ceiling;
+mod governance;
 mod redteam;

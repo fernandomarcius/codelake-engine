@@ -17,6 +17,7 @@ pub mod engine;
 pub mod federation_guard;
 pub mod federation_policy;
 pub mod functions;
+pub mod governance;
 pub mod information_schema;
 pub mod join_guard;
 pub mod join_spill;
@@ -47,7 +48,10 @@ mod trino_sql_checks;
 pub mod trino_types;
 
 pub use bytes::ByteSize;
-pub use config::{Config, SourceConfig, SourceKind, TrinoProtocolConfig, ValidatedConfig};
+pub use config::{
+    Config, GovernanceConfig, ResourceGroupConfig, SourceConfig, SourceKind, TrinoProtocolConfig,
+    ValidatedConfig,
+};
 pub use connector::{
     BoxError, COLUMN_COMMENT, Connector, ConnectorError, DECLARED_TYPE, ViewDefinition, ViewSecurity,
     WritableCatalog,
@@ -55,6 +59,7 @@ pub use connector::{
 pub use ddl::{RelationKind, update_type as ddl_update_type};
 pub use declared::trino_type_syntax;
 pub use engine::{Attach, Engine, EngineError, Query, QueryOptions, SourceStatus};
+pub use governance::Governance;
 pub use runtime::MemoryStats;
 pub use session_properties::{
     CatalogSession, Effect, PropertyRegistry, PropertyType, SessionProperties, SessionProperty,

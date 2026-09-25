@@ -19,6 +19,25 @@ spill_limit = "40GiB"
 batch_size = 8192
 source_startup_timeout_secs = 60
 
+# Query governance (docs/adr/0016-query-governance.md), for every client
+# protocol, with the user each client names. Defaults shown.
+# [governance]
+# max_running_queries = 32
+# max_queued_queries = 1000        # beyond it: QUERY_QUEUE_FULL / SQLSTATE 53400
+# max_running_per_user = 16
+# max_queued_per_user = 500
+# queue_timeout_secs = 600
+# query_max_run_time = "100d"      # session default; from submission
+# query_max_execution_time = "100d" # session default; from admission
+# history_size = 100               # completed queries in system.runtime.queries
+# history_retention_secs = 900
+#
+# [[governance.resource_group]]
+# name = "etl"
+# users = ["dbt"]                  # or user_pattern / source_pattern (regex)
+# max_running = 4
+# max_queued = 100
+
 # Distributed tracing (docs/adr/0010-observability-otlp.md). Off unless
 # otlp_endpoint is set. OTLP/HTTP protobuf to a collector agent on the node or
 # in the pod (plain http://; the agent handles TLS upstream).

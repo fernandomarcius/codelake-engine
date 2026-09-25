@@ -364,7 +364,6 @@ mod tests {
     use super::*;
     use crate::trino::errors::Everything;
     use axum::http::HeaderValue;
-    use std::time::Duration;
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
@@ -396,7 +395,7 @@ mod tests {
         assert_eq!(session.catalog.as_deref(), Some("hive"));
         assert_eq!(session.schema.as_deref(), Some("streaming"));
         assert_eq!(session.source.as_deref(), Some("dbt-trino-1.8"));
-        assert_eq!(session.properties.max_run_time(), Some(Duration::from_mins(30)));
+        assert_eq!(session.properties.get("query_max_execution_time"), Some("30m"));
         assert_eq!(session.properties.ignored(), ["scale_writers"]);
     }
 

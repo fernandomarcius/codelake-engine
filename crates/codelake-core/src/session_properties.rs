@@ -117,6 +117,16 @@ pub fn parse_duration(text: &str) -> Option<Duration> {
     Duration::try_from_secs_f64(number * seconds).ok()
 }
 
+/// airlift `Duration.toString()`: `1.00h`, `30.00m`, `250.00ms`.
+pub fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs_f64();
+    let (value, unit) = [(86_400.0, "d"), (3600.0, "h"), (60.0, "m"), (1.0, "s")]
+        .into_iter()
+        .find(|(size, _)| seconds >= *size)
+        .map_or((seconds * 1000.0, "ms"), |(size, unit)| (seconds / size, unit));
+    format!("{value:.2}{unit}")
+}
+
 /// airlift `DataSize`, as Trino parses session and procedure sizes: a decimal
 /// number and a case-sensitive unit (`B kB MB GB TB PB`), powers of 1024.
 /// `"100MB"` is 104 857 600 bytes. Errors carry airlift's messages.
@@ -335,6 +345,18 @@ impl Default for PropertyRegistry {
 }
 
 impl PropertyRegistry {
+    /// Changes the default of a system property (a configured default, such
+    /// as `query_max_run_time`), after checking it. Unknown names fail.
+    pub fn set_system_default(&mut self, name: &str, value: &str) -> Result<(), PropertyError> {
+        let property = self
+            .system
+            .iter_mut()
+            .find(|p| p.name == name)
+            .ok_or_else(|| PropertyError(format!("Session property '{name}' does not exist")))?;
+        property.default = property.parse(value).map_err(PropertyError)?;
+        Ok(())
+    }
+
     pub fn add_catalog(&mut self, catalog: &str, properties: Vec<SessionProperty>) {
         if !properties.is_empty() {
             self.catalogs.insert(catalog.to_owned(), properties);
@@ -424,14 +446,6 @@ impl SessionProperties {
     pub fn ignored(&self) -> &[String] {
         &self.ignored
     }
-
-    /// Smallest of `query_max_run_time` and `query_max_execution_time`.
-    pub fn max_run_time(&self) -> Option<Duration> {
-        [QUERY_MAX_RUN_TIME, QUERY_MAX_EXECUTION_TIME]
-            .iter()
-            .filter_map(|name| self.get(name).and_then(parse_duration))
-            .min()
-    }
 }
 
 /// One catalog's session properties as seen by its connector, without the
@@ -503,6 +517,23 @@ mod tests {
     }
 
     #[test]
+    fn configured_defaults_replace_the_declared_ones() {
+        let mut registry = registry();
+        registry.set_system_default(QUERY_MAX_RUN_TIME, " 1h ").unwrap();
+        assert_eq!(registry.lookup(QUERY_MAX_RUN_TIME).unwrap().default, "1h");
+        assert!(registry.set_system_default(QUERY_MAX_RUN_TIME, "soon").is_err());
+        assert!(registry.set_system_default("nope", "1h").is_err());
+    }
+
+    #[test]
+    fn durations_format_like_airlift() {
+        assert_eq!(format_duration(Duration::from_hours(1)), "1.00h");
+        assert_eq!(format_duration(Duration::from_secs(90)), "1.50m");
+        assert_eq!(format_duration(Duration::from_millis(250)), "250.00ms");
+        assert_eq!(format_duration(Duration::from_hours(48)), "2.00d");
+    }
+
+    #[test]
     fn session_reports_ignored_and_limits() {
         let registry = registry();
         let session = registry
@@ -512,7 +543,7 @@ mod tests {
                 ("scale_writers".to_owned(), "false".to_owned()),
             ]))
             .unwrap();
-        assert_eq!(session.max_run_time(), Some(Duration::from_mins(30)));
+        assert_eq!(session.get(QUERY_MAX_EXECUTION_TIME), Some("30m"));
         assert_eq!(session.ignored(), ["scale_writers"]);
         assert!(
             registry

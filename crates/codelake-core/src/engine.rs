@@ -28,16 +28,19 @@ use tracing::field::Empty;
 use tracing::{Instrument, Span, info, warn};
 
 use crate::computed_batches::ComputedBatches;
-use crate::config::{ExecutionConfig, MemoryConfig};
+use crate::config::{ExecutionConfig, GovernanceConfig, MemoryConfig};
 use crate::connector::{Connector, ConnectorError, ViewDefinition, WritableCatalog};
 use crate::ddl::{self, Prepared, RelationKind, Rewrite, TableExecute, ViewSecurity};
 use crate::federation_guard::FederationFilterGuard;
+use crate::governance::Governance;
 use crate::information_schema::CatalogList;
 use crate::join_guard::{JoinQueryPlanner, NestedLoopJoinSpillGuard, NullAwareAntiJoinGuard};
 use crate::output::AccountedOutput;
 use crate::plain_views::PlainViews;
 use crate::runtime::{EngineRuntime, MemoryStats};
-use crate::session_properties::{PropertyRegistry, SessionProperties};
+use crate::session_properties::{
+    PropertyRegistry, QUERY_MAX_EXECUTION_TIME, QUERY_MAX_RUN_TIME, SessionProperties,
+};
 use crate::statement_policy::{self, ObjectKind, check_object_name};
 use crate::statistics_guard::guard_aggregate_statistics;
 use crate::table_procedure::{self, ArgumentValue, RawArgument};
@@ -123,6 +126,16 @@ impl Query {
     /// The query span, for protocols that add their own children.
     pub fn span(&self) -> &Span {
         &self.span
+    }
+
+    /// Records on the query span where governance admitted it: its resource
+    /// group and how long it waited in the queue.
+    pub fn record_admission(&self, resource_group: &str, queued: Duration) {
+        self.span.record("codelake.resource_group", resource_group);
+        self.span.record(
+            "codelake.queued_ms",
+            u64::try_from(queued.as_millis()).unwrap_or(u64::MAX),
+        );
     }
 
     pub fn dataframe(&self) -> &DataFrame {
@@ -523,6 +536,8 @@ fn query_span(query_id: &str, options: &QueryOptions, sql: &str) -> Span {
         codelake.sql.hash = Empty,
         db.response.returned_rows = Empty,
         codelake.cancelled = Empty,
+        codelake.resource_group = Empty,
+        codelake.queued_ms = Empty,
     );
     if let Some(parent) = &options.trace.parent {
         trace::set_remote_parent(&span, parent, options.trace.tracestate.as_deref());
@@ -659,6 +674,7 @@ pub struct Engine {
     sources: Vec<(Arc<dyn Connector>, bool)>,
     writable: HashMap<String, Arc<dyn WritableCatalog>>,
     properties: PropertyRegistry,
+    governance: Arc<Governance>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -669,12 +685,29 @@ impl std::fmt::Debug for Engine {
             .field("sources", &self.sources)
             .field("writable", &self.writable.keys().collect::<Vec<_>>())
             .field("properties", &self.properties)
+            .field("governance", &self.governance)
             .finish()
     }
 }
 
 impl Engine {
+    /// An engine with the default governance (see [`Engine::with_governance`]).
     pub fn new(memory: &MemoryConfig, execution: &ExecutionConfig) -> Result<Self, EngineError> {
+        Self::with_governance(memory, execution, &GovernanceConfig::default(), None)
+    }
+
+    /// An engine whose queries are governed by `governance` (admission, time
+    /// limits, registry); `history` overrides the registry's history size and
+    /// retention (see [`crate::Config::query_history`]). The registry is the
+    /// table `system.runtime.queries`, and the configured time limits are the
+    /// defaults of the `query_max_run_time` and `query_max_execution_time`
+    /// session properties.
+    pub fn with_governance(
+        memory: &MemoryConfig,
+        execution: &ExecutionConfig,
+        governance: &GovernanceConfig,
+        history: Option<(usize, u64)>,
+    ) -> Result<Self, EngineError> {
         trace::install_task_propagation();
         let runtime = EngineRuntime::new(memory)?;
         // `information_schema` is provided per catalog by `CatalogList`.
@@ -710,13 +743,33 @@ impl Engine {
         ctx.register_udf(crate::declared::trino_typed());
         ctx.register_udf(crate::coercion::named_cast());
         crate::trino_functions::install(&mut ctx)?;
+        let mut properties = PropertyRegistry::default();
+        for (name, value) in [
+            (QUERY_MAX_RUN_TIME, &governance.query_max_run_time),
+            (QUERY_MAX_EXECUTION_TIME, &governance.query_max_execution_time),
+        ] {
+            properties
+                .set_system_default(name, value)
+                .map_err(|e| DataFusionError::Configuration(e.to_string()))?;
+        }
+        let governance = Arc::new(Governance::new(governance, history));
+        ctx.register_catalog(
+            "system",
+            crate::governance::system_catalog(governance.registry())?,
+        );
         Ok(Self {
             ctx,
             runtime,
             sources: Vec::new(),
             writable: HashMap::new(),
-            properties: PropertyRegistry::default(),
+            properties,
+            governance,
         })
+    }
+
+    /// Admission, time limits and the query registry of this node.
+    pub fn governance(&self) -> &Arc<Governance> {
+        &self.governance
     }
 
     /// Runs a statement as the engine's own user. See [`Engine::sql_as`].

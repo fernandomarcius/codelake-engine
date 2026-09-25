@@ -27,6 +27,10 @@ pub struct Config {
     /// Distributed tracing over OTLP. Off unless `otlp_endpoint` is set.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    /// Query governance: admission queue, per-user and resource-group
+    /// concurrency, time limits and the query registry.
+    #[serde(default)]
+    pub governance: GovernanceConfig,
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
 }
@@ -68,11 +72,11 @@ pub struct TrinoProtocolConfig {
     /// (`ABANDONED_QUERY`), as with Trino's `query.client.timeout`.
     #[serde(default = "default_trino_client_timeout_secs")]
     pub client_timeout_secs: u64,
-    /// Completed queries kept in `system.runtime.queries`.
-    #[serde(default = "default_trino_history_size")]
-    pub history_size: usize,
-    #[serde(default = "default_trino_history_retention_secs")]
-    pub history_retention_secs: u64,
+    /// Deprecated: the query registry moved to the core, configure
+    /// `[governance] history_size`. When set here, it still applies.
+    pub history_size: Option<usize>,
+    /// Deprecated: see `history_size`; `[governance] history_retention_secs`.
+    pub history_retention_secs: Option<u64>,
     /// Longest SQL text accepted, in characters; longer statements fail with
     /// `QUERY_TEXT_TOO_LARGE`, as with Trino's `query.max-length`.
     #[serde(default = "default_trino_max_query_length")]
@@ -87,16 +91,130 @@ const fn default_trino_client_timeout_secs() -> u64 {
     300
 }
 
-const fn default_trino_history_size() -> usize {
+/// Trino's `query.max-length` default.
+const fn default_trino_max_query_length() -> usize {
+    1_000_000
+}
+
+/// `[governance]`: how many queries run and wait, per node, per user and per
+/// resource group, and for how long (see [`crate::governance`]). It applies
+/// to every client protocol, with the user each client names (no
+/// authentication is assumed).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernanceConfig {
+    /// Queries executing at once on this node; more wait in the queue.
+    #[serde(default = "default_max_running_queries")]
+    pub max_running_queries: usize,
+    /// Queries waiting for a slot; more are refused (`QUERY_QUEUE_FULL`).
+    /// `0` refuses whatever cannot run at once.
+    #[serde(default = "default_max_queued_queries")]
+    pub max_queued_queries: usize,
+    /// Queries one user runs at once, across resource groups.
+    #[serde(default = "default_max_running_per_user")]
+    pub max_running_per_user: usize,
+    /// Queries one user has waiting.
+    #[serde(default = "default_max_queued_per_user")]
+    pub max_queued_per_user: usize,
+    /// Longest a query waits for a slot before it fails (`EXCEEDED_TIME_LIMIT`).
+    #[serde(default = "default_queue_timeout_secs")]
+    pub queue_timeout_secs: u64,
+    /// Default of the `query_max_run_time` session property: wall time from
+    /// submission, queueing included. Duration text (`1h`, `30m`).
+    #[serde(default = "default_query_time")]
+    pub query_max_run_time: String,
+    /// Default of `query_max_execution_time`: time from admission.
+    #[serde(default = "default_query_time")]
+    pub query_max_execution_time: String,
+    /// Completed queries kept in `system.runtime.queries`.
+    #[serde(default = "default_history_size")]
+    pub history_size: usize,
+    /// Seconds a completed query stays listed.
+    #[serde(default = "default_history_retention_secs")]
+    pub history_retention_secs: u64,
+    /// Longest SQL text the registry keeps per query, in characters; longer
+    /// texts are recorded truncated (the query itself is not refused).
+    #[serde(default = "default_max_recorded_query_length")]
+    pub max_recorded_query_length: usize,
+    /// Resource groups, matched in order; a query that matches none only
+    /// counts against the node and per-user limits.
+    #[serde(default, rename = "resource_group")]
+    pub resource_groups: Vec<ResourceGroupConfig>,
+}
+
+impl Default for GovernanceConfig {
+    fn default() -> Self {
+        Self {
+            max_running_queries: default_max_running_queries(),
+            max_queued_queries: default_max_queued_queries(),
+            max_running_per_user: default_max_running_per_user(),
+            max_queued_per_user: default_max_queued_per_user(),
+            queue_timeout_secs: default_queue_timeout_secs(),
+            query_max_run_time: default_query_time(),
+            query_max_execution_time: default_query_time(),
+            history_size: default_history_size(),
+            history_retention_secs: default_history_retention_secs(),
+            max_recorded_query_length: default_max_recorded_query_length(),
+            resource_groups: Vec::new(),
+        }
+    }
+}
+
+/// `[[governance.resource_group]]`: a named share of the node. A query
+/// belongs to the first group whose selectors all match: its user is in
+/// `users` or matches `user_pattern` (when either is given), and its source
+/// (the HTTP protocol's source header, PostgreSQL's `application_name`)
+/// matches `source_pattern` (when given).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceGroupConfig {
+    pub name: String,
+    #[serde(default)]
+    pub users: Vec<String>,
+    /// Regular expression matched against the whole user name.
+    pub user_pattern: Option<String>,
+    /// Regular expression matched against the whole source.
+    pub source_pattern: Option<String>,
+    pub max_running: usize,
+    #[serde(default)]
+    pub max_queued: usize,
+}
+
+const fn default_max_running_queries() -> usize {
+    32
+}
+
+const fn default_max_queued_queries() -> usize {
+    1000
+}
+
+const fn default_max_running_per_user() -> usize {
+    16
+}
+
+const fn default_max_queued_per_user() -> usize {
+    500
+}
+
+const fn default_queue_timeout_secs() -> u64 {
+    600
+}
+
+/// The default of both time limits: effectively none, as the session
+/// properties' own default.
+fn default_query_time() -> String {
+    "100d".to_owned()
+}
+
+const fn default_history_size() -> usize {
     100
 }
 
-const fn default_trino_history_retention_secs() -> u64 {
+const fn default_history_retention_secs() -> u64 {
     900
 }
 
-/// Trino's `query.max-length` default.
-const fn default_trino_max_query_length() -> usize {
+const fn default_max_recorded_query_length() -> usize {
     1_000_000
 }
 
@@ -611,6 +729,7 @@ impl Config {
         self.validate_memory(&mut errors);
         self.validate_execution(&mut errors);
         self.validate_telemetry(&mut errors);
+        self.validate_governance(&mut errors);
         let secrets = self.validate_sources(env, &mut errors);
         if errors.is_empty() {
             Ok(ValidatedConfig {
@@ -675,6 +794,79 @@ impl Config {
         }
         if trino.max_query_length == 0 {
             errors.push("server.trino.max_query_length must be > 0".into());
+        }
+    }
+
+    /// Completed queries kept by the registry and for how long: the
+    /// deprecated `[server.trino]` values win when set, so configurations
+    /// written before the registry moved keep their meaning.
+    pub fn query_history(&self) -> (usize, u64) {
+        let trino = self.server.trino.as_ref();
+        (
+            trino
+                .and_then(|t| t.history_size)
+                .unwrap_or(self.governance.history_size),
+            trino
+                .and_then(|t| t.history_retention_secs)
+                .unwrap_or(self.governance.history_retention_secs),
+        )
+    }
+
+    fn validate_governance(&self, errors: &mut Vec<String>) {
+        let governance = &self.governance;
+        for (field, value) in [
+            ("max_running_queries", governance.max_running_queries),
+            ("max_running_per_user", governance.max_running_per_user),
+            ("max_recorded_query_length", governance.max_recorded_query_length),
+        ] {
+            if value == 0 {
+                errors.push(format!("governance.{field} must be > 0"));
+            }
+        }
+        if governance.queue_timeout_secs == 0 {
+            errors.push("governance.queue_timeout_secs must be > 0".into());
+        }
+        for (field, value) in [
+            ("query_max_run_time", &governance.query_max_run_time),
+            ("query_max_execution_time", &governance.query_max_execution_time),
+        ] {
+            if crate::session_properties::parse_duration(value).is_none_or(|d| d.is_zero()) {
+                errors.push(format!(
+                    "governance.{field} `{value}` is not a positive duration (e.g. `1h`, `30m`)"
+                ));
+            }
+        }
+        let mut names = HashSet::new();
+        for group in &governance.resource_groups {
+            let name = group.name.trim();
+            if name.is_empty() || name.eq_ignore_ascii_case(crate::governance::GLOBAL_GROUP) {
+                errors.push(format!(
+                    "governance.resource_group name `{}` is empty or reserved",
+                    group.name
+                ));
+            } else if !names.insert(name) {
+                errors.push(format!("governance.resource_group `{name}` is defined twice"));
+            }
+            if group.users.is_empty() && group.user_pattern.is_none() && group.source_pattern.is_none() {
+                errors.push(format!(
+                    "governance.resource_group `{name}` needs users, user_pattern or source_pattern"
+                ));
+            }
+            if group.max_running == 0 {
+                errors.push(format!(
+                    "governance.resource_group `{name}`: max_running must be > 0"
+                ));
+            }
+            for (field, pattern) in [
+                ("user_pattern", &group.user_pattern),
+                ("source_pattern", &group.source_pattern),
+            ] {
+                if let Some(pattern) = pattern
+                    && let Err(err) = crate::governance::whole_match(pattern)
+                {
+                    errors.push(format!("governance.resource_group `{name}`: {field}: {err}"));
+                }
+            }
         }
     }
 
@@ -1078,6 +1270,64 @@ mod tests {
 
         let doc = doc.replace("[server]", "[server]\nallow_unauthenticated_network = true");
         assert!(parse(&doc).validate(&full_env, &|_| true).is_ok());
+    }
+
+    #[test]
+    fn governance_defaults_and_validation() {
+        let validated = parse(VALID).validate(&full_env, &|_| true).unwrap();
+        let governance = &validated.config.governance;
+        assert_eq!(governance.max_running_queries, 32);
+        assert_eq!(governance.max_queued_queries, 1000);
+        assert_eq!(governance.max_running_per_user, 16);
+        assert_eq!(governance.queue_timeout_secs, 600);
+        assert_eq!(governance.query_max_run_time, "100d");
+        assert_eq!(validated.config.query_history(), (100, 900));
+
+        let with = |section: &str| VALID.replace("[memory]", &format!("{section}\n\n[memory]"));
+        let ok = with(
+            "[governance]\nmax_queued_queries = 0\nquery_max_run_time = \"1h\"\n\
+             [[governance.resource_group]]\nname = \"etl\"\nusers = [\"dbt\"]\nmax_running = 2",
+        );
+        let validated = parse(&ok).validate(&full_env, &|_| true).unwrap();
+        let group = &validated.config.governance.resource_groups[0];
+        assert_eq!((group.max_running, group.max_queued), (2, 0));
+
+        let errors = errors_of(
+            &with(
+                "[governance]\nmax_running_queries = 0\nmax_running_per_user = 0\nqueue_timeout_secs = 0\n\
+                 query_max_execution_time = \"soon\"\n\
+                 [[governance.resource_group]]\nname = \"global\"\nmax_running = 0\n\
+                 [[governance.resource_group]]\nname = \"a\"\nuser_pattern = \"(\"\nmax_running = 1\n\
+                 [[governance.resource_group]]\nname = \"a\"\nusers = [\"x\"]\nmax_running = 1",
+            ),
+            &full_env,
+        );
+        for expected in [
+            "governance.max_running_queries must be > 0",
+            "governance.max_running_per_user must be > 0",
+            "governance.queue_timeout_secs must be > 0",
+            "governance.query_max_execution_time `soon` is not a positive duration",
+            "name `global` is empty or reserved",
+            "`global` needs users, user_pattern or source_pattern",
+            "`global`: max_running must be > 0",
+            "`a`: user_pattern:",
+            "`a` is defined twice",
+        ] {
+            assert!(
+                errors.iter().any(|e| e.contains(expected)),
+                "{expected} not in {errors:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deprecated_trino_history_settings_still_apply() {
+        let doc = VALID.replace(
+            "[memory]",
+            "[server.trino]\nlisten = \"127.0.0.1:8081\"\nhistory_size = 7\n\n[governance]\nhistory_retention_secs = 60\n\n[memory]",
+        );
+        let validated = parse(&doc).validate(&full_env, &|_| true).unwrap();
+        assert_eq!(validated.config.query_history(), (7, 60));
     }
 
     #[test]
