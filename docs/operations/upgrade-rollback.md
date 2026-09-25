@@ -40,8 +40,8 @@ kubectl diff -k . && kubectl apply -k .
 kubectl -n <ns> rollout status deploy/codelake --timeout=10m
 ```
 
-Compose (the node stops serving for the restart, typically under a second to
-ready plus the time to attach sources):
+Compose (one node: it refuses new work for the whole restart; plan a
+window, see below):
 
 ```bash
 export CODELAKE_IMAGE=<registry>/codelake@sha256:<new-digest>
@@ -51,7 +51,14 @@ docker compose -f deploy/compose/codelake.yml --project-directory /srv/codelake 
 
 On SIGTERM the old process fails readiness, stops accepting connections and
 gives running queries `shutdown_grace_secs` to finish; queries still running
-after that fail and clients retry them.
+after that fail and clients retry them. The old process always waits the
+**whole** grace period, even when nothing is running, and the new container
+cannot bind the ports before it exits. On Compose, an upgrade or a rollback
+therefore refuses new queries for `shutdown_grace_secs` (30 s by default)
+plus the new process's startup (attaching every source, up to
+`source_startup_timeout_secs` for a slow one). Schedule it outside the
+pipelines' windows and tell the clients. Kubernetes keeps serving from the
+other replicas during the roll.
 
 ## Verify
 
