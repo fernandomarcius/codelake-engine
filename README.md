@@ -69,6 +69,14 @@ anything; every problem is reported at once:
 scripts/dev.sh cargo run -p codelake-server -- check-config --config examples/codelake.toml
 ```
 
+## Operations
+
+Runbooks for production (install, configure, upgrade and rollback, sizing,
+incidents, compaction, backup, observability, migration, go-live):
+[docs/operations](docs/operations/README.md). The canary
+([`scripts/ops/canary.sh`](scripts/ops/canary.sh)) checks answers, latency and
+freshness of an installation and exits non-zero on any failure.
+
 ## Quality gates
 
 Every PR must pass all gates **before** human review; a human never overrides a
@@ -121,6 +129,7 @@ Report vulnerabilities privately: [SECURITY.md](SECURITY.md).
 | `deploy/k8s`, `deploy/compose` | Kubernetes manifests, local stack |
 | `docs/adr` | architecture decisions |
 | `docs/requirements` | what replacing Trino actually requires |
+| `docs/operations`, `scripts/ops` | runbooks, canary |
 
 ## License
 

@@ -1,0 +1,48 @@
+# CodeLake on one host with Docker Compose. This is the engine alone; the
+# docker-compose.yml next to it is the disposable development stack of
+# sources. Runbook: docs/operations/install.md.
+#
+#   export CODELAKE_IMAGE=<registry>/codelake@sha256:<digest>
+#   docker compose -f deploy/compose/codelake.yml --project-directory /srv/codelake up -d
+#
+# Relative paths resolve against the project directory, which holds
+# codelake.toml, codelake.env (secrets, mode 0600, never committed) and the
+# spill and warehouse directories (owned by uid 65532).
+name: codelake
+services:
+  codelake:
+    image: ${CODELAKE_IMAGE:?set CODELAKE_IMAGE to the release image, by digest}
+    command: ["serve", "--config", "/etc/codelake/codelake.toml"]
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # memory.limit in codelake.toml stays at ~75% of this; no swap, so the
+    # ceiling is the real one.
+    mem_limit: ${CODELAKE_MEMORY_LIMIT:-4g}
+    memswap_limit: ${CODELAKE_MEMORY_LIMIT:-4g}
+    cpus: ${CODELAKE_CPUS:-4}
+    env_file: [codelake.env]
+    environment:
+      RUST_LOG: ${CODELAKE_RUST_LOG:-info}
+    # The query listeners have no client authentication yet: publish on the
+    # host's loopback by default (the config binds 0.0.0.0 inside the container
+    # and sets allow_unauthenticated_network = true because of this). For
+    # clients on other hosts set CODELAKE_QUERY_BIND to the private interface's
+    # address, never 0.0.0.0, and filter in the DOCKER-USER chain: published
+    # ports bypass the host's INPUT rules (ufw, firewalld). See
+    # docs/operations/install.md.
+    ports:
+      - "${CODELAKE_QUERY_BIND:-127.0.0.1}:${CODELAKE_PG_PORT:-5432}:5432"    # PostgreSQL wire
+      - "${CODELAKE_QUERY_BIND:-127.0.0.1}:${CODELAKE_HTTP_PORT:-8081}:8081"  # client HTTP protocol ([server.trino] listen)
+      - "${CODELAKE_OPS_BIND:-127.0.0.1}:${CODELAKE_OPS_PORT:-8080}:8080"     # /livez /readyz /healthz /metrics
+    volumes:
+      - ./codelake.toml:/etc/codelake/codelake.toml:ro
+      - ./spill:/var/lib/codelake/spill
+      - ${CODELAKE_WAREHOUSE:-./warehouse}:/data/warehouse
+    # Longer than server.shutdown_grace_secs, so running queries can finish.
+    stop_grace_period: 45s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "5" }

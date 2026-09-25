@@ -88,6 +88,7 @@ Blocking items, in order:
   Before it: set each hive catalog's `parquet_time_zone` to the production
   Trino's `hive.parquet.time-zone` (or its JVM zone), or every `INT96`
   timestamp reads shifted (ADR 0007, ISS-003).
+  The tooling is ready (F10, below); running it in production is the human gate.
 - ✅ Compaction without `docker exec` (R9, F9): Trino's `ALTER TABLE … EXECUTE
   optimize`, rewriting with the same Trino 431 Parquet writer (INT96) as
   `INSERT`, preserving row count and columns, crash-safe (ADR 0009).
@@ -99,9 +100,27 @@ Blocking items, in order:
   checkpoint after a compaction. Since red-team W1 (W1-3/W1-7), `OPTIMIZE`
   keeps every stored instant to the nanosecond, whatever the catalog's
   precision (ADR 0009).
-- Runbooks: memory tuning, spill disk sizing, source outage, rollback to Trino.
+- ✅ Runbooks and canary (F10): [docs/operations](docs/operations/README.md)
+  covers installation (Compose and Kubernetes), configuration (memory ceiling,
+  spill, catalogs, listeners without client authentication), upgrade and
+  rollback, sizing from the benchmark reports, incidents (stuck query,
+  `EXCEEDED_LOCAL_MEMORY_LIMIT` and OOM kills, spill full, source down, missing
+  file during `OPTIMIZE`, queue full, latency), compaction with one compacting
+  engine per warehouse, backup and restore of the file metastore and
+  warehouse, observability, migration from Trino with cut-over and the way
+  back, and the go-live checklist. `scripts/ops/canary.sh` checks recorded
+  answers (value, row count, sha256, rows, bounds) or equality with a
+  reference engine, latency and freshness objectives, prints one JSON line per
+  run and exits ≠ 0 on any failure. Evidence: `scripts/ops/canary-selftest.sh`
+  24/24 (bash 3.2 and 5.2); one run against a local engine: 7 checks ok, a
+  deliberate mismatch and a timeout reported (exit 1), the timed-out query
+  `USER_CANCELED` on the server and the pool back to 0 bytes. Pending
+  (human): review of the runbooks, deployment in HML/PRD, the cut-over window
+  and the DoD period below.
 
-**DoD:** 14 days serving production with zero wrong-result incidents and SLO met.
+**DoD:** 14 days serving production with zero wrong-result incidents and SLO met
+(procedure and evidence: [go-live checklist](docs/operations/go-live.md);
+production only, not done by CI).
 
 ## M3 — Lakehouse (Iceberg) and dbt merge
 

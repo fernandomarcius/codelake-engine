@@ -1,0 +1,64 @@
+{
+  "name": "prod-canary",
+  "user": "canary",
+  "http": {
+    "url": "http://127.0.0.1:8081",
+    "catalog": "lake",
+    "schema": "sales",
+    "time_zone": "UTC"
+  },
+  "pg": {
+    "url": "postgresql://canary@127.0.0.1:5432/codelake"
+  },
+  "reference": {
+    "url": "http://reference-engine.internal:8080",
+    "user": "canary"
+  },
+  "defaults": {
+    "protocol": "http",
+    "max_latency_ms": 300000,
+    "timeout_secs": 600
+  },
+  "checks": [
+    {
+      "name": "orders_closed_day_count",
+      "sql": "SELECT count(*) FROM lake.sales.orders WHERE order_date = DATE '2026-01-15'",
+      "expect": { "value": "18342" },
+      "max_latency_ms": 5000
+    },
+    {
+      "name": "orders_closed_day_checksum",
+      "sql": "SELECT checksum(order_id), checksum(total_amount) FROM lake.sales.orders WHERE order_date = DATE '2026-01-15'",
+      "expect": { "sha256": "0000000000000000000000000000000000000000000000000000000000000000" }
+    },
+    {
+      "name": "status_breakdown",
+      "sql": "SELECT status, count(*) FROM lake.sales.orders WHERE order_date = DATE '2026-01-15' GROUP BY status",
+      "expect": { "rows": [["closed", 18000], ["returned", 342]] }
+    },
+    {
+      "name": "orders_grow",
+      "sql": "SELECT count(*) FROM lake.sales.orders",
+      "expect": { "min": 1000000 }
+    },
+    {
+      "name": "daily_totals_match_reference",
+      "sql": "SELECT order_date, count(*), CAST(sum(total_amount) AS varchar) FROM lake.sales.orders WHERE order_date BETWEEN DATE '2026-01-01' AND DATE '2026-01-31' GROUP BY order_date",
+      "expect": { "reference": true },
+      "timeout_secs": 900
+    },
+    {
+      "name": "orders_freshness",
+      "sql": "SELECT to_unixtime(with_timezone(max(updated_at), 'UTC')) FROM lake.sales.orders",
+      "freshness": { "max_lag_secs": 300 },
+      "max_latency_ms": 10000
+    },
+    {
+      "name": "source_reachable_over_pg_wire",
+      "protocol": "pg",
+      "sql": "SELECT count(*) FROM erp.dbo.customers WHERE customer_id = 1",
+      "expect": { "value": "1" },
+      "max_latency_ms": 5000
+    }
+  ]
+}
