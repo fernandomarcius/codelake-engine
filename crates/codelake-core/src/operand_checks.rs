@@ -193,9 +193,16 @@ fn expression_schema(node: &LogicalPlan) -> DFSchema {
 }
 
 /// Refuses the operand types of the module documentation anywhere in
-/// `plan`, its subqueries included.
+/// `plan`, its subqueries and the bodies of the views it reads included (a
+/// view stored before these checks, or through another path, is checked
+/// when it is read).
 pub(crate) fn check_plan(plan: &LogicalPlan) -> Result<()> {
     plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::TableScan(scan) = node
+            && let Some(body) = scan.source.get_logical_plan()
+        {
+            check_plan(&body)?;
+        }
         let schema = expression_schema(node);
         node.apply_expressions(|expr| {
             expr.apply(|e| {

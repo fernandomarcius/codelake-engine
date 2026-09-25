@@ -661,6 +661,54 @@ async fn text_and_numbers_are_not_comparable() {
     .await;
 }
 
+/// A view whose body compares text with a number, stored without the
+/// engine's checks (by an older build, or straight through `DataFusion`),
+/// is refused when a statement reads it.
+#[tokio::test]
+async fn a_stored_view_comparing_text_with_a_number_is_refused_when_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    let body = engine
+        .context()
+        .sql("SELECT x FROM (VALUES ('10'), ('9')) t(x) WHERE x > 9")
+        .await
+        .unwrap()
+        .into_unoptimized_plan();
+    engine
+        .context()
+        .register_table(
+            "text_view",
+            std::sync::Arc::new(datafusion::datasource::ViewTable::new(body, None)),
+        )
+        .unwrap();
+    assert_error(&engine, "SELECT count(*) FROM text_view", "TYPE_MISMATCH").await;
+    assert_error(
+        &engine,
+        "SELECT count(*) FROM text_view",
+        "Cannot apply operator: varchar > ",
+    )
+    .await;
+    // A view whose body is well typed still answers.
+    let body = engine
+        .context()
+        .sql("SELECT x FROM (VALUES ('10'), ('9')) t(x) WHERE x > '9'")
+        .await
+        .unwrap()
+        .into_unoptimized_plan();
+    engine
+        .context()
+        .register_table(
+            "typed_view",
+            std::sync::Arc::new(datafusion::datasource::ViewTable::new(body, None)),
+        )
+        .unwrap();
+    assert_same(
+        &engine,
+        &[("SELECT count(*) FROM typed_view", answer(&["bigint"], &[&["0"]]))],
+    )
+    .await;
+}
+
 /// `time ± interval` is refused: `DataFusion` 54 answers an interval
 /// (`24 hours 30 mins`) where Trino 431 answers the time `00:30:00`.
 #[tokio::test]
