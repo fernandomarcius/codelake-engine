@@ -50,7 +50,7 @@ use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet, Sp
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties, SpillManager,
 };
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use tokio::sync::mpsc;
 
 /// Name of [`AccountedOutput`]; a plan planned inside another one (a view)
@@ -192,7 +192,7 @@ impl ExecutionPlan for AccountedMergeExec {
         let (sender, receiver) = mpsc::channel(inputs.max(1));
         let tasks = (0..inputs)
             .map(|input_partition| {
-                SpawnedTask::spawn(pull(
+                SpawnedTask::spawn(pull_or_fail(
                     Arc::clone(&self.input),
                     input_partition,
                     Arc::clone(&context),
@@ -280,6 +280,34 @@ fn compact_views(batch: &RecordBatch) -> Result<RecordBatch> {
         })
         .collect();
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
+}
+
+/// [`pull`], turning a panic of the input into an error of the merge: a task
+/// that ended without a word would end the merged stream as if every
+/// partition had finished, and the query would return part of its rows.
+async fn pull_or_fail(
+    input: Arc<dyn ExecutionPlan>,
+    partition: usize,
+    context: Arc<TaskContext>,
+    sender: mpsc::Sender<Result<Held>>,
+    reservation: MemoryReservation,
+    spill: SpillManager,
+) {
+    let report = sender.clone();
+    let pulled = std::panic::AssertUnwindSafe(pull(input, partition, context, sender, reservation, spill))
+        .catch_unwind()
+        .await;
+    if let Err(payload) = pulled {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(ToString::to_string)
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "no message".to_owned());
+        let error = DataFusionError::Execution(format!(
+            "partition {partition} of {MERGE_CONSUMER} panicked: {message}"
+        ));
+        let _ = report.send(Err(error)).await;
+    }
 }
 
 /// Runs one input partition into the channel.
@@ -673,5 +701,75 @@ mod tests {
         );
         assert!(error.to_string().contains("ClientOutput[0]"), "{error}");
         assert_eq!(engine.memory().reserved_bytes, 0);
+    }
+
+    /// Two partitions of one row each; the second panics after its row.
+    #[derive(Debug)]
+    struct PanicsAfterOneRow {
+        properties: Arc<PlanProperties>,
+    }
+
+    impl PanicsAfterOneRow {
+        fn new() -> Self {
+            use datafusion::arrow::datatypes::{DataType, Field, Schema};
+            use datafusion::physical_plan::empty::EmptyExec;
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+            Self {
+                properties: Arc::clone(EmptyExec::new(schema).with_partitions(2).properties()),
+            }
+        }
+    }
+
+    impl DisplayAs for PanicsAfterOneRow {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "PanicsAfterOneRow")
+        }
+    }
+
+    impl ExecutionPlan for PanicsAfterOneRow {
+        fn name(&self) -> &'static str {
+            "PanicsAfterOneRow"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(&self, partition: usize, _context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
+            use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+            let schema = self.schema();
+            let value = i64::try_from(partition).unwrap();
+            let batch =
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(vec![value]))])?;
+            let row = futures::stream::iter(vec![Ok(batch)]);
+            let stream = if partition == 1 {
+                row.chain(futures::stream::poll_fn(
+                    |_| -> Poll<Option<Result<RecordBatch>>> { panic!("boom") },
+                ))
+                .boxed()
+            } else {
+                row.boxed()
+            };
+            Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        }
+    }
+
+    /// A partition whose task panics fails the merged stream: it used to end
+    /// the stream as if every partition had finished (rows lost in silence).
+    #[tokio::test]
+    async fn a_partition_that_panics_fails_the_merge() {
+        let merge = AccountedMergeExec::new(Arc::new(PanicsAfterOneRow::new()));
+        let stream = merge.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let error = datafusion::physical_plan::common::collect(stream)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("panicked: boom"), "{error}");
     }
 }
