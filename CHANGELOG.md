@@ -8,7 +8,7 @@ versioning: [SemVer](https://semver.org/).
 ### Added
 - Engine core with hard memory ceiling (`FairSpillPool`) and bounded spill.
 - Fail-fast configuration validation reporting every problem at once; secrets via environment variables only.
-- Connectors: PostgreSQL and MySQL (federated pushdown), MongoDB; Iceberg REST (experimental, not shipped).
+- Connectors: PostgreSQL and MySQL (federated pushdown), MongoDB.
 - Server: PostgreSQL wire protocol, `/livez`, `/readyz`, `/healthz`, `/metrics`, graceful drain on SIGTERM.
 - Quality gates: clippy pedantic, nextest, Testcontainers integration, architecture and version-train checks,
   coverage, mutation testing, criterion regression gate, cargo-deny, CodeQL, Trivy, fuzzing, signed releases with SBOM.
