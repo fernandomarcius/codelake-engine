@@ -1,7 +1,7 @@
 # ISS-009 — Two unstable tests fixed to match their ADRs
 
-- Kind: test change · Accepted by: Fernando Farias, 2026-09-25 · Status: open (to implement)
-- `hive::optimize_tests::concurrent_optimize_and_reads_never_duplicate_rows` failed ~3 in 20 runs with a missing-file error that ADR 0009 allows ("loud, not wrong"). Accepted: the test accepts only that error and still requires zero duplicated rows.
-- `f3_acceptance::queue_limit_rejects_with_query_queue_full` takes 60–116 s and times out under coverage. Accepted: rework it with controllably blocking queries so it runs in seconds; the timeout is not raised.
+- Kind: test change · Accepted by: Fernando Farias, 2026-09-25 · Status: closed
+- `hive::optimize_tests::concurrent_optimize_and_reads_never_duplicate_rows` failed ~3 in 20 runs with a missing-file error that ADR 0009 allows ("loud, not wrong"). Accepted: the test accepts only that error and still requires zero duplicated rows. Done (984466f): reads loop while two `OPTIMIZE`s run; a read started during them may fail only with `object_store` `NotFound` naming a pre-`OPTIMIZE` data file, every successful read returns every row once, at least 10 succeed. 30/30 runs green (the allowed error occurred in 1).
+- `f3_acceptance::queue_limit_rejects_with_query_queue_full` takes 60–116 s and times out under coverage. Accepted: rework it with controllably blocking queries so it runs in seconds; the timeout is not raised. Cause: its two `SLOW` cross joins kept the server's worker threads busy, which also serve the protocol; under the coverage build the next request got no answer within the client's 120 s timeout (3/3 runs). Done (c686902): the slots are held by queries parked on their full output buffer (a client that never pages); same assertions, about 0.2 s with and without coverage.
 - Risk: none if the rewrite keeps the assertions; the reviewer must check no assertion is loosened.
-- References: ADR 0009, ADR 0012.
+- References: ADR 0009, ADR 0012, commits 984466f, c686902.
