@@ -22,6 +22,7 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod hooks;
 mod ops;
+mod pg;
 mod serve;
 mod trino;
 

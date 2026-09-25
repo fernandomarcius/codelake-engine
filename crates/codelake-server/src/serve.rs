@@ -10,7 +10,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::{hooks, ops, trino};
+use crate::{hooks, ops, pg, trino};
 
 /// How often abandoned queries are canceled and old ones forgotten.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
@@ -90,10 +90,15 @@ async fn serve(validated: ValidatedConfig, session_sampling: Option<f64>) -> Res
         .with_tls_cert_path(tls.map(|t| t.cert_path.display().to_string()))
         .with_tls_key_path(tls.map(|t| t.key_path.display().to_string()));
     let session = Arc::new(engine.context().clone());
+    let handlers = Arc::new(pg::Handlers::new(
+        Arc::clone(&engine),
+        session,
+        hooks::all(session_sampling),
+    ));
     spawn_sweeper(&engine, trino.clone(), &shutdown);
 
     tokio::select! {
-        result = datafusion_postgres::serve_with_hooks(session, &options, hooks::all(session_sampling)) => {
+        result = datafusion_postgres::serve_with_handlers(handlers, &options) => {
             shutdown.cancel();
             let reason = result.err().map_or_else(|| "exited".to_owned(), |e| e.to_string());
             return Err(ServeError::PgListener(reason));

@@ -11,6 +11,7 @@ mod statement;
 mod system_tables;
 mod types;
 
+pub(crate) use errors::{Everything, QueryError};
 pub(crate) use queries::Limits;
 pub(crate) use statement::{TrinoState, router};
 
