@@ -47,10 +47,15 @@ changes a correct answer.
 | 11 | A partition task that panics sends an error into the merge (`catch_unwind`) | `codelake_core::output` |
 | 12 | `UnknownMembershipGuard` (logical, right before `decorrelate_predicate_subquery`, after `NullSafeNotIn`): an `IN (subquery)` whose value or subquery column may be NULL is refused (`NOT_SUPPORTED`) unless it sits where FALSE and UNKNOWN filter the same rows: a conjunct of a filter (a semi or null-aware anti join), or inside a filter under `AND`/`OR` with an even number of negations above an `IN` (odd above a `NOT IN`). Non-nullable sides answer everywhere | `codelake_core::join_guard` |
 
-Each upstream defect has a canary unit test that asserts the defect is still
-there without the guard (`upstream_*` in `join_guard.rs`); when upstream fixes
-it, the canary fails and points here. The integration tests of
-`join_regressions.rs` check the rows against Trino 431.
+Defects 1, 3, 4, 6 and 12 have a canary unit test that asserts the defect is
+still there without the guard (`upstream_*` in `join_guard.rs`); when upstream
+fixes it, the canary fails and points here. Defects 2, 5, 7 and 8 have none
+yet: 2 shares its guard (and its effect) with 1, 5 is covered by
+`semantics_tests` and the rows of `join_regressions.rs`, and 7 and 8 need a
+spilled build side over a multi-file scan or an exchange, which only the
+integration suite builds. Their guards stay until a release notes the fix and
+the matching `join_regressions.rs` test passes without them. The integration
+tests of `join_regressions.rs` check the rows against Trino 431.
 
 ## Consequences
 
