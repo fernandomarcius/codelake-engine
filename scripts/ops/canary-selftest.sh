@@ -83,11 +83,14 @@ expect_run "SLO breaches fail" 1 "$WORK/slo.json"
 expect_jq "stale and slow reported" '[.checks[].status] == ["stale", "slow"] and .checks[1].latency_ms >= 1500'
 
 config "$WORK/errors.json" '[{"name": "missing", "sql": "SELECT fail"},
-  {"name": "hang", "sql": "SELECT hang", "timeout_secs": 1}]'
+  {"name": "hang", "sql": "SELECT hang", "timeout_secs": 1},
+  {"name": "stall", "sql": "SELECT stall", "timeout_secs": 1}]'
 expect_run "query errors fail" 1 "$WORK/errors.json"
 expect_jq "engine error name kept" '.checks[0].status == "error" and (.checks[0].message | startswith("TABLE_NOT_FOUND"))'
-expect_jq "timeout reported" '.checks[1].status == "error" and (.checks[1].message | test("timeout"))'
-if [ -s "$WORK/cancels" ]; then pass "timed-out query canceled on the server"; else fail "timed-out query canceled on the server"; fi
+expect_jq "timeout between pages reported" '.checks[1].status == "error" and (.checks[1].message | test("^timeout after 1s"))'
+expect_jq "timeout inside a page reported" '.checks[2].status == "error" and (.checks[2].message | test("^timeout after 1s"))'
+if [ "$(wc -l <"$WORK/cancels" 2>/dev/null | tr -d ' ')" = 2 ]; then pass "timed-out queries canceled on the server"; else
+  fail "timed-out queries canceled on the server" "$(cat "$WORK/cancels" 2>/dev/null)"; fi
 
 config "$WORK/drift.json" '[{"name": "drift", "sql": "SELECT drift", "expect": {"reference": true}}]' \
   "$(jq -nc --arg ref "$URL/ref" '{reference: {url: $ref}}')"

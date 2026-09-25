@@ -316,7 +316,12 @@ http_query() {
           sleep 1 ;;
         000)
           curl_with_auth "$pw_var" "$user" -sS -o /dev/null --max-time 10 -X DELETE "${headers[@]}" "$next" 2>/dev/null
-          HTTP_ERROR="paging failed: $(tr '\n' ' ' <"$WORK/curl.err" | head -c 300)"; return 1 ;;
+          if [ "$(now_ms)" -ge "$deadline" ]; then
+            HTTP_ERROR="timeout after ${timeout}s; query canceled"
+          else
+            HTTP_ERROR="paging failed: $(tr '\n' ' ' <"$WORK/curl.err" | head -c 300)"
+          fi
+          return 1 ;;
         *) HTTP_ERROR="HTTP $code while paging: $(head -c 300 "$body" | tr '\n' ' ')"; return 1 ;;
       esac
     done

@@ -7,7 +7,7 @@ run against anything real.
 Usage: mock_statement_server.py <port-file> <cancel-log>
 Writes the port it listens on to <port-file>; appends the id of every canceled
 query to <cancel-log>. A base path of /ref serves the "reference engine"
-variant (see DRIFT).
+variant (see `SELECT drift`).
 """
 
 import json
@@ -43,6 +43,8 @@ def answer(sql, reference):
         return None, [], error, 0
     if sql == "SELECT hang":
         return one, None, None, 0
+    if sql == "SELECT stall":  # a page that takes longer than the client waits
+        return one, None, None, 5
     if sql == "SELECT drift":
         return one, [[[7 if reference else 8]]], None, 0
     return None, [], {"errorName": "SYNTAX_ERROR", "message": "unknown statement"}, 0
