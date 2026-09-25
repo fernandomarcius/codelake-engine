@@ -1029,14 +1029,17 @@ impl Checks {
         }
     }
 
-    /// Same rows. Two errors are a difference too: a check that expects
-    /// both engines to refuse says so with [`Checks::both_refuse`].
-    fn same(&mut self, id: &str, what: &str, codelake: &Result<Rows, String>, trino: &Result<Rows, String>) {
-        note(self.probe, &format!("{id} {what}"), (codelake, trino));
-        let same = matches!((codelake, trino), (Ok(a), Ok(b)) if a == b);
+    /// Same rows as `reference`. Two errors are a difference too: a check
+    /// that expects both engines to refuse says so with
+    /// [`Checks::both_refuse`]. `got` is usually `CodeLake`'s answer and
+    /// `reference` Trino's, but either can be another read or a literal
+    /// (`what` says which), so the difference names neither engine.
+    fn same(&mut self, id: &str, what: &str, got: &Result<Rows, String>, reference: &Result<Rows, String>) {
+        note(self.probe, &format!("{id} {what}"), (got, reference));
+        let same = matches!((got, reference), (Ok(a), Ok(b)) if a == b);
         if !same {
             self.diffs
-                .push(format!("{id} {what}: CodeLake {codelake:?} / Trino {trino:?}"));
+                .push(format!("{id} {what}: got {got:?} / expected {reference:?}"));
         }
     }
 
