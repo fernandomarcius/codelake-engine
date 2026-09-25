@@ -27,6 +27,7 @@ confirmed in the published 54.1.0 source (checksum as in `Cargo.lock`).
 | 9 | Text compared with a number: 53 compared as text, 54 converts the text to the number; Trino 431 refuses both ("Cannot apply operator") | type coercion | by design upstream | changed |
 | 10 | `time ± interval` answers an interval (`24 hours 30 mins`) instead of a time of day | type coercion | changed in DataFusion 55 | yes |
 | 11 | `AccountedMergeExec` (engine): a partition task that panics ends the merged stream as if it had finished; the query returns part of its rows | `crates/codelake-core/src/output.rs` | — | yes |
+| 12 | `x [NOT] IN (subquery)` outside a conjunct of a `WHERE`/`HAVING` (under `OR`, in a `CASE`, a function argument, a projection) is answered by a mark join whose mark is FALSE where SQL says UNKNOWN: `x NOT IN (…NULL…) OR x = 99` keeps rows Trino filters out | `decorrelate_predicate_subquery.rs` `mark_join` | none known (draft 3 in `docs/upstream/datafusion-54-joins.md`) | yes |
 
 ## Decision
 
@@ -44,6 +45,7 @@ changes a correct answer.
 | 6, 7, 8 | `NestedLoopJoinSpillGuard` (physical, after every rule that rebuilds joins): runs each `NestedLoopJoinExec` with a runtime that cannot write temporary files (the fallback's precondition) and gives its inputs the engine's runtime back, so sorts and aggregations below still spill. Over the limit the join fails with `Resources exhausted`, as in DataFusion 53 | `codelake_core::join_guard` |
 | 9, 10 | `operand_checks::check_plan` in `Engine::sql` before analysis: text compared with a number (`=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT] DISTINCT FROM`, `IN` lists, `IN (subquery)`, `BETWEEN`, `CASE x WHEN`) fails with `TYPE_MISMATCH`; `time ± interval` fails with `NOT_SUPPORTED`. The PostgreSQL wire path keeps DataFusion's coercion (an untyped literal takes the other side's type there) | `codelake_core::operand_checks` |
 | 11 | A partition task that panics sends an error into the merge (`catch_unwind`) | `codelake_core::output` |
+| 12 | `UnknownMembershipGuard` (logical, right before `decorrelate_predicate_subquery`, after `NullSafeNotIn`): an `IN (subquery)` whose value or subquery column may be NULL is refused (`NOT_SUPPORTED`) unless it sits where FALSE and UNKNOWN filter the same rows: a conjunct of a filter (a semi or null-aware anti join), or inside a filter under `AND`/`OR` with an even number of negations above an `IN` (odd above a `NOT IN`). Non-nullable sides answer everywhere | `codelake_core::join_guard` |
 
 Each upstream defect has a canary unit test that asserts the defect is still
 there without the guard (`upstream_*` in `join_guard.rs`); when upstream fixes
@@ -61,6 +63,11 @@ it, the canary fails and points here. The integration tests of
   nested loop join.
 - A session with `prefer_hash_join = false` still gets a hash join for a
   query holding `NOT IN (subquery)`.
+- `x NOT IN (subquery) OR …`, `CASE WHEN x [NOT] IN (subquery) …`,
+  `coalesce(x IN (subquery), …)` and `(x IN (subquery)) IS NULL` fail with
+  `NOT_SUPPORTED` when either side may be NULL, where they answered wrong
+  rows on DataFusion 53 and 54. Write them with `EXISTS`, move the `NOT IN`
+  to its own conjunct, or exclude the NULLs (`coalesce`) on both sides.
 - Clients of the engine that relied on comparing text with numbers now get
   `TYPE_MISMATCH`, as on Trino. Cast explicitly.
 - `time ± interval` is refused until the train reaches DataFusion 55.

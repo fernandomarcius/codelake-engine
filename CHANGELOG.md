@@ -39,10 +39,14 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
-- DataFusion 54 correctness guards (ADR 0014): `NOT IN (subquery)` keeps its NULL
-  semantics (dynamic filter, filter inference, sort-merge join, constant and
-  correlated forms); nested loop joins over the memory limit fail instead of
-  running the spill fallback that repeated, dropped or lost rows.
+- DataFusion 54 correctness guards (ADR 0014): `NOT IN (subquery)` as a condition of
+  `WHERE`/`HAVING` joined by `AND` keeps its NULL semantics (dynamic filter, filter
+  inference, sort-merge join, constant and correlated forms); nested loop joins over the
+  memory limit fail instead of running the spill fallback that repeated, dropped or lost
+  rows.
+- `x [NOT] IN (subquery)` elsewhere (under `OR`, in `CASE`, `coalesce`, `IS NULL`) answered
+  FALSE where SQL says UNKNOWN (DataFusion 53 and 54); when either side may be NULL it now
+  fails with `NOT_SUPPORTED` (ADR 0014, defect 12).
 - Text compared with a number now fails with `TYPE_MISMATCH` and `time ± interval`
   with `NOT_SUPPORTED` on the engine's client protocols, instead of answering rows.
 - A partition that panicked inside the output merge truncated the result in silence;

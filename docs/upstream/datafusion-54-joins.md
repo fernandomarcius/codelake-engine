@@ -79,3 +79,37 @@ WHERE id NOT IN (SELECT i FROM (VALUES (1, 1), (NULL, 2), (5, 3)) n(i, g) WHERE 
 Workaround used downstream: rewrite such a conjunct, before decorrelation,
 as `NOT EXISTS (SELECT … WHERE <correlation> AND (x = y OR x IS NULL OR
 y IS NULL))`.
+
+## Draft 3 — A mark join answers `x IN (subquery)` as FALSE where it is UNKNOWN
+
+**Title:** `IN (subquery)` outside a top-level conjunct loses its UNKNOWN
+(mark join)
+
+**Body:**
+
+Outside a top-level conjunct of a filter, `decorrelate_predicate_subquery`
+replaces `x [NOT] IN (subquery)` with the mark column of a `LeftMark` join.
+The mark is TRUE or FALSE; SQL requires UNKNOWN when nothing matches and `x`
+or a value of the subquery is NULL. Wherever UNKNOWN and FALSE differ, the
+answer is wrong.
+
+```sql
+SELECT count(*) FROM (VALUES (1), (2), (3)) t(x)
+WHERE x NOT IN (SELECT y FROM (VALUES (1), (NULL)) u(y)) OR x = 99;
+-- expected 0; DataFusion 53 and 54.1.0: 2
+
+SELECT count(*) FROM (VALUES (1), (2), (3)) t(x)
+WHERE CASE WHEN x NOT IN (SELECT y FROM (VALUES (1), (NULL)) u(y)) THEN true ELSE false END;
+-- expected 0; DataFusion 53 and 54.1.0: 2
+```
+
+(Reproduced in CodeLake:
+`join_guard::tests::upstream_mark_join_still_reads_unknown_as_false`.)
+
+Suggested fix: a null-aware mark (NULL when unmatched and the probe value
+or any build value is NULL), or plan such a membership only when both sides
+are non-nullable.
+
+Workaround used downstream: refuse the statement when a NULL is possible and
+the position is not one where FALSE and UNKNOWN filter the same rows (under
+`AND`/`OR` in a filter, with the right parity of negations).

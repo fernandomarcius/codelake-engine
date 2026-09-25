@@ -13,6 +13,10 @@
 //!   - with `datafusion.optimizer.prefer_hash_join = false` the planner routes
 //!     it to `SortMergeJoinExec`, which is not null-aware
 //!     (apache/datafusion#22810, not in 54.1.0).
+//! - `x [NOT] IN (subquery)` outside a conjunct of the `WHERE` is a mark join,
+//!   which answers FALSE where SQL says UNKNOWN: the engine must answer
+//!   Trino's rows where FALSE and UNKNOWN filter the same rows, and refuse
+//!   the other forms.
 //! - `NestedLoopJoinExec` over a memory limit falls back to spilling its build
 //!   side (new in `DataFusion` 54), and the fallback:
 //!   - emits a LEFT / LEFT ANTI join's unmatched rows once per probe partition,
@@ -584,6 +588,93 @@ async fn not_in_keeps_null_semantics_when_hash_join_is_not_preferred() {
     // The rows must match whichever join the planner picks.
     let failures = compare(&engine, &trino, &NOT_IN_CASES).await;
     assert!(failures.is_empty(), "rows differ:\n{}", failures.join("\n"));
+}
+
+/// `x [NOT] IN (subquery)` outside a conjunct of the `WHERE`: planned as a
+/// mark join, which answers FALSE where SQL says UNKNOWN. Where FALSE and
+/// UNKNOWN filter the same rows the engine answers, and the rows must be
+/// Trino's; elsewhere, with a NULL possible on either side, it refuses.
+const MEMBERSHIP_CASES: [Case; 6] = [
+    Case {
+        label: "IN under OR, NULL in the subquery",
+        sql: "SELECT id, k FROM hive.jr.outer_rows \
+              WHERE k IN (SELECT n FROM hive.jr.sub_null_file) OR id > 2990",
+        operator: "",
+        must_spill: false,
+    },
+    Case {
+        label: "NOT IN under NOT and OR, NULL in the subquery",
+        sql: "SELECT id, k FROM hive.jr.outer_rows \
+              WHERE NOT (k NOT IN (SELECT n FROM hive.jr.sub_null_row) OR id < 2990)",
+        operator: "",
+        must_spill: false,
+    },
+    Case {
+        label: "NOT IN joined by AND, with a condition under OR",
+        sql: "SELECT count(*) FROM hive.jr.outer_rows \
+              WHERE k NOT IN (SELECT n FROM hive.jr.sub_keys) AND (id < 100 OR id > 2900)",
+        operator: "",
+        must_spill: false,
+    },
+    Case {
+        label: "NOT (k IN …), NULL in the subquery",
+        sql: "SELECT count(*) FROM hive.jr.outer_rows WHERE NOT (k IN (SELECT n FROM hive.jr.sub_null_file))",
+        operator: "",
+        must_spill: false,
+    },
+    Case {
+        label: "NOT over OR (a conjunction once simplified), NULL in the subquery",
+        sql: "SELECT count(*) FROM hive.jr.outer_rows \
+              WHERE NOT (k IN (SELECT n FROM hive.jr.sub_null_file) OR id > 2990)",
+        operator: "",
+        must_spill: false,
+    },
+    Case {
+        label: "NOT IN in HAVING, NULL in the subquery",
+        sql: "SELECT k, count(*) FROM hive.jr.outer_rows GROUP BY k \
+              HAVING k NOT IN (SELECT n FROM hive.jr.sub_null_row)",
+        operator: "",
+        must_spill: false,
+    },
+];
+
+/// Forms whose mark join answered rows Trino filters out: refused.
+const REFUSED_MEMBERSHIPS: [&str; 3] = [
+    "SELECT count(*) FROM hive.jr.outer_rows WHERE k NOT IN (SELECT n FROM hive.jr.sub_null_file) OR id > 2990",
+    "SELECT count(*) FROM hive.jr.outer_rows \
+     WHERE CASE WHEN k NOT IN (SELECT n FROM hive.jr.sub_null_row) THEN true ELSE false END",
+    "SELECT count(*) FROM hive.jr.outer_rows WHERE (k IN (SELECT n FROM hive.jr.sub_keys)) IS NULL",
+];
+
+#[tokio::test]
+async fn in_subquery_answers_trinos_rows_or_is_refused() {
+    let shared = shared().await;
+    let trino = Trino::start(&shared, "member").await;
+    trino.batch(&NOT_IN_SETUP).await;
+    let spill = tempfile::tempdir().unwrap();
+    let engine = open(
+        &shared.warehouse(),
+        spill.path(),
+        ByteSize::mib(256),
+        &ExecutionConfig::default(),
+        &[],
+    )
+    .await;
+    let mut failures = compare(&engine, &trino, &MEMBERSHIP_CASES).await;
+    // Trino answers the refused forms; what the engine would have answered
+    // differs from them, so it must not answer at all.
+    let references = trino.batch(&REFUSED_MEMBERSHIPS).await;
+    for (sql, reference) in REFUSED_MEMBERSHIPS.iter().zip(references) {
+        match try_cl(&engine, sql).await {
+            Err(error) if error.contains("NOT_SUPPORTED") && error.contains("may be NULL") => {
+                note("refused", format!("trino={reference:?}: {sql}"));
+            }
+            other => failures.push(format!(
+                "expected a refusal, got {other:?} (trino={reference:?}): {sql}"
+            )),
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 // ---------------------------------------------------------------------------

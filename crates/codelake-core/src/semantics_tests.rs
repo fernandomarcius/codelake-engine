@@ -688,8 +688,10 @@ async fn time_plus_interval_is_refused_instead_of_answering_an_interval() {
 /// `NOT IN` with a NULL in the subquery (or a NULL value) is UNKNOWN: the
 /// row is filtered out. Every answer below is Trino 431's; `DataFusion`
 /// answered the constant and correlated forms without the NULL semantics.
+/// The forms that could read UNKNOWN as FALSE are refused instead
+/// (`in_subquery_is_refused_where_unknown_would_read_as_false`).
 #[tokio::test]
-async fn not_in_keeps_null_semantics_in_every_form() {
+async fn not_in_keeps_null_semantics_where_it_answers() {
     let dir = tempfile::tempdir().unwrap();
     let engine = engine(dir.path());
     assert_same(
@@ -722,6 +724,101 @@ async fn not_in_keeps_null_semantics_in_every_form() {
                 "SELECT id FROM (VALUES (1, CAST(NULL AS integer)), (2, 5)) o(id, k) \
                  WHERE k NOT IN (SELECT i FROM (VALUES (1, 7)) n(g, i) WHERE n.g = o.id) ORDER BY id",
                 answer(&["integer"], &[&["2"]]),
+            ),
+            // A negated membership joined by AND, spelled NOT (x IN …), over
+            // a computed value, in HAVING, over an outer join's NULLs.
+            (
+                "SELECT count(*) FROM (VALUES 1, 2, 3) t(x) \
+                 WHERE x NOT IN (SELECT y FROM (VALUES 1, NULL) u(y)) AND x > 1",
+                answer(&["bigint"], &[&["0"]]),
+            ),
+            (
+                "SELECT count(*) FROM (VALUES 1, 2, 3) t(x) WHERE NOT (x IN (SELECT y FROM (VALUES 1, NULL) u(y)))",
+                answer(&["bigint"], &[&["0"]]),
+            ),
+            (
+                "SELECT count(*) FROM (VALUES 1, 2, 3) t(x) WHERE (x + 0) NOT IN (SELECT y FROM (VALUES 1, NULL) u(y))",
+                answer(&["bigint"], &[&["0"]]),
+            ),
+            (
+                "SELECT g FROM (VALUES 1, 2) t(g) GROUP BY g HAVING g NOT IN (SELECT y FROM (VALUES 1, NULL) u(y))",
+                (Vec::new(), Vec::new()),
+            ),
+            (
+                "SELECT count(*) FROM (VALUES 1, 2, 3) t(x) LEFT JOIN (VALUES 2) w(v) ON t.x = w.v \
+                 WHERE w.v NOT IN (SELECT y FROM (VALUES 7) u(y))",
+                answer(&["bigint"], &[&["1"]]),
+            ),
+            // Where FALSE and UNKNOWN filter the same rows the mark join
+            // answers: a membership under OR, or a NOT IN under two NOTs.
+            (
+                "SELECT x FROM (VALUES 1, 2, 3) t(x) \
+                 WHERE x IN (SELECT y FROM (VALUES 1, NULL) u(y)) OR x = 3 ORDER BY x",
+                answer(&["integer"], &[&["1"], &["3"]]),
+            ),
+            (
+                "SELECT x FROM (VALUES 1, 2, 3) t(x) \
+                 WHERE NOT (x NOT IN (SELECT y FROM (VALUES 1, NULL) u(y)) AND x < 3) ORDER BY x",
+                answer(&["integer"], &[&["1"], &["3"]]),
+            ),
+            // NOT over OR is a conjunction once simplified: `x NOT IN … AND x <> 99`.
+            (
+                "SELECT count(*) FROM (VALUES 1, 2, 3) t(x) \
+                 WHERE NOT (x IN (SELECT y FROM (VALUES 1, NULL) u(y)) OR x = 99)",
+                answer(&["bigint"], &[&["0"]]),
+            ),
+        ],
+    )
+    .await;
+}
+
+/// Outside a conjunct of a `WHERE` or `HAVING`, `DataFusion` answers
+/// `x [NOT] IN (subquery)` with a mark join, which reads UNKNOWN as FALSE:
+/// the first two statements answered 2 where Trino 431 answers 0. Every form
+/// where that matters is refused when a NULL is possible on either side
+/// (`join_guard`, guard 5); without a possible NULL it answers.
+#[tokio::test]
+async fn in_subquery_is_refused_where_unknown_would_read_as_false() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    let with_null = "(SELECT y FROM (VALUES 1, NULL) u(y))";
+    for sql in [
+        format!("SELECT count(*) FROM (VALUES 1, 2, 3) t(x) WHERE x NOT IN {with_null} OR x = 99"),
+        format!(
+            "SELECT count(*) FROM (VALUES 1, 2, 3) t(x) WHERE CASE WHEN x NOT IN {with_null} THEN true ELSE false END"
+        ),
+        format!("SELECT x, x NOT IN {with_null} FROM (VALUES 1, 2) t(x)"),
+        format!("SELECT x, x IN {with_null} FROM (VALUES 1, 2) t(x)"),
+        format!("SELECT count(*) FROM (VALUES 1, 2, 3) t(x) WHERE coalesce(x NOT IN {with_null}, false)"),
+        format!("SELECT count(*) FROM (VALUES 1, 2, 3) t(x) WHERE (x IN {with_null}) IS NULL"),
+        // A NULL value of `x` is UNKNOWN too, whatever the subquery holds.
+        "SELECT count(*) FROM (VALUES 1, CAST(NULL AS integer)) t(x) \
+         WHERE x NOT IN (SELECT y FROM (VALUES 5) u(y)) OR x = 99"
+            .to_owned(),
+        // Inside a subquery as well.
+        format!(
+            "SELECT count(*) FROM (VALUES 1, 2) o(x) \
+             WHERE EXISTS (SELECT 1 FROM (VALUES 5) i(z) WHERE i.z > 0 AND (o.x NOT IN {with_null} OR i.z = 9))"
+        ),
+    ] {
+        assert_error(&engine, &sql, "NOT_SUPPORTED").await;
+        assert_error(&engine, &sql, "may be NULL").await;
+    }
+    // No NULL possible on either side (VALUES columns may hold one; coalesce
+    // cannot): the mark join is right.
+    assert_same(
+        &engine,
+        &[
+            (
+                "SELECT count(*) FROM (VALUES 1, 2, 3) t(x) \
+                 WHERE coalesce(x, 0) NOT IN (SELECT coalesce(y, 0) FROM (VALUES 1, 2) u(y)) OR x = 1",
+                answer(&["bigint"], &[&["2"]]),
+            ),
+            (
+                "SELECT count(*) FROM (VALUES 1, 2, 3) t(x) \
+                 WHERE CASE WHEN coalesce(x, 0) NOT IN (SELECT coalesce(y, 0) FROM (VALUES 1, 2) u(y)) \
+                       THEN true ELSE false END",
+                answer(&["bigint"], &[&["1"]]),
             ),
         ],
     )

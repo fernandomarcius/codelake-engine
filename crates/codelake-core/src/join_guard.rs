@@ -47,6 +47,19 @@
 //!    cannot and gives its inputs the engine's runtime back
 //!    ([`JoinInputRuntime`]). Over the limit the join fails with a resources
 //!    error, as in `DataFusion` 53.
+//! 5. **`IN (subquery)` is refused where a mark join would lose its
+//!    UNKNOWN.** Outside a conjunct of a `WHERE` or `HAVING`, `DataFusion`
+//!    answers `x [NOT] IN (subquery)` with a mark join, whose mark is FALSE
+//!    where SQL says UNKNOWN (no match, and `x` or a value of the subquery
+//!    is NULL): `x NOT IN (SELECT 1 UNION ALL SELECT NULL) OR x = 99` kept
+//!    every `x` other than 1, `CASE WHEN x NOT IN (…) THEN …` took the wrong
+//!    branch (`DataFusion` 53 and 54). The mark is right wherever FALSE and
+//!    UNKNOWN filter the same rows: inside a `WHERE`/`HAVING` under `AND`
+//!    and `OR`, with an even number of negations above a positive `IN` (an
+//!    odd number above a `NOT IN`). [`UnknownMembershipGuard`] refuses every
+//!    other `IN (subquery)` whose value or subquery column may be NULL
+//!    (`NOT_SUPPORTED`), before decorrelation; `NOT EXISTS` and a conjunct
+//!    `NOT IN` keep answering.
 //!
 //! Remove a guard only when a `DataFusion` release carries the upstream fix
 //! **and** the matching test of
@@ -67,7 +80,9 @@ use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
 use datafusion::logical_expr::expr::{Exists, InSubquery};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
-use datafusion::logical_expr::{Expr, Filter, Join, LogicalPlan, LogicalPlanBuilder, Subquery};
+use datafusion::logical_expr::{
+    Expr, ExprSchemable, Filter, Join, LogicalPlan, LogicalPlanBuilder, Operator, Subquery,
+};
 use datafusion::optimizer::extract_equijoin_predicate::ExtractEquijoinPredicate;
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
@@ -442,7 +457,8 @@ impl OptimizerRule for NullSafeNotIn {
     }
 }
 
-/// `rules` with [`NullSafeNotIn`] right before `decorrelate_predicate_subquery`.
+/// `rules` with [`NullSafeNotIn`], then [`UnknownMembershipGuard`], right
+/// before `decorrelate_predicate_subquery`.
 pub fn with_null_safe_not_in(
     mut rules: Vec<Arc<dyn OptimizerRule + Send + Sync>>,
 ) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
@@ -450,6 +466,7 @@ pub fn with_null_safe_not_in(
         .iter()
         .position(|r| r.name() == DECORRELATE_PREDICATE_SUBQUERY)
         .unwrap_or(0);
+    rules.insert(position, Arc::new(UnknownMembershipGuard));
     rules.insert(position, Arc::new(NullSafeNotIn));
     rules
 }
@@ -650,6 +667,138 @@ impl ExecutionPlan for JoinInputRuntime {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 5. `IN (subquery)` whose UNKNOWN a mark join would answer as FALSE.
+// ---------------------------------------------------------------------------
+
+/// Name of [`UnknownMembershipGuard`].
+pub const UNKNOWN_MEMBERSHIP_GUARD: &str = "codelake_unknown_membership_guard";
+
+/// Logical rule, right before `decorrelate_predicate_subquery`: see the
+/// module documentation. Changes nothing; fails the statement when an
+/// `IN (subquery)` would be answered by a mark join where its UNKNOWN matters.
+#[derive(Debug, Default)]
+pub struct UnknownMembershipGuard;
+
+/// Where an `IN (subquery)` sits in a statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Position {
+    /// A conjunct of a filter (`WHERE`, `HAVING`), possibly negated: planned
+    /// as a semi join or a null-aware anti join, which keep UNKNOWN.
+    Conjunct,
+    /// Inside a filter under `AND`, `OR` and `NOT` only; `positive` when an
+    /// even number of negations lies above it.
+    Condition { positive: bool },
+    /// Anywhere else: a projection, a `CASE`, a function argument, a
+    /// comparison, `IS [NOT] …`, an aggregate.
+    Value,
+}
+
+/// `x IN (subquery)` can be UNKNOWN: `x` or the subquery's column may be NULL.
+fn may_be_unknown(in_subquery: &InSubquery, schema: &DFSchema) -> bool {
+    in_subquery.expr.nullable(schema).unwrap_or(true)
+        || in_subquery
+            .subquery
+            .subquery
+            .schema()
+            .fields()
+            .first()
+            .is_none_or(|field| field.is_nullable())
+}
+
+/// `x IN (subquery)` at `position` is answered as SQL does: as a semi or
+/// anti join, or through a mark join (which answers FALSE for UNKNOWN) where
+/// FALSE and UNKNOWN filter the same rows.
+fn keeps_unknown(position: Position, negated: bool) -> bool {
+    match position {
+        Position::Conjunct => true,
+        Position::Condition { positive } => positive != negated,
+        Position::Value => false,
+    }
+}
+
+fn refusal(negated: bool) -> DataFusionError {
+    let form = if negated { "NOT IN" } else { "IN" };
+    DataFusionError::NotImplemented(format!(
+        "NOT_SUPPORTED: {form} (subquery) whose value or subquery may be NULL is supported only as a \
+         condition of WHERE or HAVING (NOT IN joined by AND to the other conditions); write it with \
+         EXISTS, or exclude the NULLs"
+    ))
+}
+
+/// Checks every `IN (subquery)` of `expr` at `position`.
+fn check_membership(expr: &Expr, position: Position, schema: &DFSchema) -> Result<()> {
+    let inside = match position {
+        Position::Conjunct => Position::Condition { positive: true },
+        other => other,
+    };
+    match expr {
+        Expr::BinaryExpr(binary) if position != Position::Value && binary.op == Operator::And => {
+            check_membership(&binary.left, position, schema)?;
+            check_membership(&binary.right, position, schema)
+        }
+        Expr::BinaryExpr(binary) if position != Position::Value && binary.op == Operator::Or => {
+            check_membership(&binary.left, inside, schema)?;
+            check_membership(&binary.right, inside, schema)
+        }
+        // `NOT (x IN …)` as a conjunct is `x NOT IN …`, an anti join.
+        Expr::Not(negated)
+            if position == Position::Conjunct && matches!(negated.as_ref(), Expr::InSubquery(_)) =>
+        {
+            check_membership(negated, Position::Conjunct, schema)
+        }
+        Expr::Not(negated) => match inside {
+            Position::Condition { positive } => {
+                check_membership(negated, Position::Condition { positive: !positive }, schema)
+            }
+            _ => check_membership(negated, Position::Value, schema),
+        },
+        Expr::InSubquery(in_subquery) => {
+            if !keeps_unknown(position, in_subquery.negated) && may_be_unknown(in_subquery, schema) {
+                return Err(refusal(in_subquery.negated));
+            }
+            check_membership(&in_subquery.expr, Position::Value, schema)
+        }
+        other => other
+            .apply_children(|child| {
+                check_membership(child, Position::Value, schema)?;
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .map(|_| ()),
+    }
+}
+
+/// Checks every `IN (subquery)` of `node`'s own expressions.
+fn check_node(node: &LogicalPlan) -> Result<()> {
+    if let LogicalPlan::Filter(filter) = node {
+        return check_membership(&filter.predicate, Position::Conjunct, filter.input.schema());
+    }
+    let inputs = node.inputs();
+    let schema = match inputs.as_slice() {
+        [input] => input.schema(),
+        _ => node.schema(),
+    };
+    node.apply_expressions(|expr| {
+        check_membership(expr, Position::Value, schema)?;
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .map(|_| ())
+}
+
+impl OptimizerRule for UnknownMembershipGuard {
+    fn name(&self) -> &str {
+        UNKNOWN_MEMBERSHIP_GUARD
+    }
+
+    fn rewrite(&self, plan: LogicalPlan, _config: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
+        plan.apply_with_subqueries(|node| {
+            check_node(node)?;
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(Transformed::no(plan))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -832,6 +981,138 @@ mod tests {
                 > 0,
             "upstream behaviour changed: see the module documentation before removing the guard"
         );
+    }
+
+    // -- 5. IN (subquery) answered by a mark join ---------------------------
+
+    const MARKED_NOT_IN: &str = "SELECT count(*) FROM (VALUES (1), (2), (3)) t(x) \
+         WHERE x NOT IN (SELECT y FROM (VALUES (1), (NULL)) u(y)) OR x = 99";
+
+    /// Documents that `DataFusion` answers a membership outside a conjunct
+    /// with a mark join that reads UNKNOWN as FALSE (Trino 431: 0 rows).
+    /// When this starts failing, upstream fixed it: see the module
+    /// documentation before removing the guard.
+    #[tokio::test]
+    async fn upstream_mark_join_still_reads_unknown_as_false() {
+        let ctx = session(SessionConfig::new(), None, false);
+        assert_eq!(
+            count(&ctx, MARKED_NOT_IN).await,
+            2,
+            "upstream behaviour changed: see the module documentation before removing the guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_membership_whose_unknown_matters_is_refused() {
+        let ctx = session(SessionConfig::new(), None, true);
+        let error = rows(&ctx, MARKED_NOT_IN).await.unwrap_err();
+        assert!(
+            matches!(error.find_root(), DataFusionError::NotImplemented(m) if m.starts_with("NOT_SUPPORTED: NOT IN")),
+            "{error}"
+        );
+        let error = rows(
+            &ctx,
+            "SELECT count(*) FROM (VALUES (1), (2)) t(x) WHERE (x IN (SELECT y FROM (VALUES (1), (NULL)) u(y))) IS NOT TRUE",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error.find_root(), DataFusionError::NotImplemented(m) if m.starts_with("NOT_SUPPORTED: IN")),
+            "{error}"
+        );
+        // The same conditions over values that cannot be NULL (VALUES
+        // columns may be) answer.
+        assert_eq!(
+            count(
+                &ctx,
+                "SELECT count(*) FROM (VALUES (1), (2), (3)) t(x) \
+                 WHERE coalesce(x, 0) NOT IN (SELECT coalesce(y, 0) FROM (VALUES (1), (2)) u(y)) OR x = 1"
+            )
+            .await,
+            2
+        );
+        assert_eq!(
+            count(
+                &ctx,
+                "SELECT count(*) FROM (VALUES (1), (2)) t(x) \
+                 WHERE (coalesce(x, 0) IN (SELECT coalesce(y, 0) FROM (VALUES (1), (5)) u(y))) IS NOT TRUE"
+            )
+            .await,
+            1
+        );
+    }
+
+    /// Positions, polarities and nullability, one at a time.
+    #[test]
+    fn a_membership_keeps_its_unknown_where_false_filters_the_same_rows() {
+        use Position::{Condition, Conjunct, Value};
+        assert!(keeps_unknown(Conjunct, false));
+        assert!(keeps_unknown(Conjunct, true));
+        assert!(keeps_unknown(Condition { positive: true }, false));
+        assert!(!keeps_unknown(Condition { positive: true }, true));
+        assert!(!keeps_unknown(Condition { positive: false }, false));
+        assert!(keeps_unknown(Condition { positive: false }, true));
+        assert!(!keeps_unknown(Value, false));
+        assert!(!keeps_unknown(Value, true));
+
+        let schema = DFSchema::try_from(Schema::new(vec![
+            Field::new("n", DataType::Int64, true),
+            Field::new("v", DataType::Int64, false),
+        ]))
+        .unwrap();
+        let member = |column: &str, nullable_subquery: bool, negated: bool| {
+            let values = Schema::new(vec![Field::new("y", DataType::Int64, nullable_subquery)]);
+            let plan = datafusion::logical_expr::table_scan(Some("u"), &values, None)
+                .unwrap()
+                .build()
+                .unwrap();
+            let subquery = Subquery {
+                subquery: Arc::new(plan),
+                outer_ref_columns: Vec::new(),
+                spans: datafusion::common::Spans::new(),
+            };
+            Expr::InSubquery(InSubquery::new(
+                Box::new(Expr::Column(Column::from_name(column))),
+                subquery,
+                negated,
+            ))
+        };
+        for (column, nullable_subquery, unknown) in
+            [("v", false, false), ("n", false, true), ("v", true, true)]
+        {
+            let Expr::InSubquery(in_subquery) = member(column, nullable_subquery, false) else {
+                unreachable!()
+            };
+            assert_eq!(
+                may_be_unknown(&in_subquery, &schema),
+                unknown,
+                "{column} {nullable_subquery}"
+            );
+        }
+        let other = Expr::Column(Column::from_name("v")).gt(Expr::Literal(ScalarValue::Int64(Some(0)), None));
+        let ok = |expr: &Expr| check_membership(expr, Conjunct, &schema).is_ok();
+        // Conjuncts, negated or not.
+        assert!(ok(&member("n", true, true).and(other.clone())));
+        assert!(ok(&Expr::Not(Box::new(member("n", true, false)))));
+        // Under OR: a positive IN answers, a NOT IN does not; NOT flips.
+        assert!(ok(&member("n", true, false).or(other.clone())));
+        assert!(!ok(&member("n", true, true).or(other.clone())));
+        assert!(!ok(&Expr::Not(Box::new(
+            member("n", true, false).or(other.clone())
+        ))));
+        assert!(ok(&Expr::Not(Box::new(
+            member("n", true, true).or(other.clone())
+        ))));
+        assert!(ok(&Expr::Not(Box::new(Expr::Not(Box::new(
+            member("n", true, false).or(other.clone())
+        ))))));
+        // Anywhere else only without a possible NULL.
+        assert!(!ok(&member("n", true, false).is_not_true()));
+        assert!(!ok(&member("v", true, false).eq(other.clone())));
+        assert!(ok(&member("v", false, true).is_not_true()));
+        assert!(ok(&member("v", false, true).or(other)));
+        assert!(check_membership(&member("v", false, false), Value, &schema).is_ok());
+        assert!(check_membership(&member("v", true, false), Value, &schema).is_err());
     }
 
     #[test]
