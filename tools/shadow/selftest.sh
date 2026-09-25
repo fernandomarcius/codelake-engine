@@ -10,13 +10,18 @@
 # 2. Two shadow-run cycles of the fixture dbt project, with CDC changes
 #    between them: both must report zero divergences.
 # 3. Mutations injected into a copy of the candidate's output (a row more, a
-#    row less, a decimal, a timestamp +3h, a trailing space, NULL -> ''):
-#    each must be detected, on the right column; a layout-only rewrite must not.
+#    row less, a decimal, a timestamp +3h, a trailing space, NULL -> '', a
+#    declared type): each must be detected, on the right column; a
+#    layout-only rewrite must not, and a documented type difference is
+#    reported as expected only with the rule file.
 #
 # Heavy (three engines): run it under the lock, from the repository root:
 #   CODELAKE_TARGET_VOLUME=… /path/to/heavy.sh tools/shadow/selftest.sh
 # It builds `codelake` with scripts/dev.sh into CODELAKE_TARGET_VOLUME
 # (SHADOW_SELFTEST_SKIP_BUILD=1 reuses the binary there).
+# SHADOW_SELFTEST_STRICT=1 runs the fixture without the workarounds for the
+# candidate's known findings (docs/shadow-run.md, "Findings"): it fails until
+# they are fixed.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -127,12 +132,14 @@ grep -q '^src .*imported.*secrets: MSSQL_SA_PASSWORD' "$WORK/import-report.txt" 
   || fail "src is not imported with its password as a reference"
 grep -q '^password_env = "MSSQL_SA_PASSWORD"$' "$WORK/candidate-config/codelake.toml" \
   || fail "codelake.toml does not reference MSSQL_SA_PASSWORD"
+grep -q '^parquet_time_zone = "America/Sao_Paulo"$' "$WORK/candidate-config/codelake.toml" \
+  || fail "codelake.toml does not carry hive.parquet.time-zone"
 if grep -rqF -- "$(secret_value)" "$WORK/import-report.txt" "$WORK/candidate-config"; then
   fail "a secret value reached the import report or its files"
 fi
 mode="$(stat -f '%Lp' "$WORK/candidate-config/codelake.env" 2>/dev/null || stat -c '%a' "$WORK/candidate-config/codelake.env")"
 [ "$mode" = 600 ] || fail "env file mode $mode, expected 600"
-pass "config import: 2 catalogs imported, thrift skipped with reason, no secret value written, env file 0600"
+pass "config import: 2 catalogs imported (time zone carried over), thrift skipped with reason, no secret value written, env file 0600"
 
 docker run --rm --user "$(id -u):$(id -g)" --env-file "$SECRETS" -e CODELAKE_MEMORY_LIMIT=640MiB \
   -v "$TARGET_VOLUME":/opt/target:ro -v "$WORK/candidate-config":/cfg:ro \
@@ -191,12 +198,18 @@ SHADOW_CUTOFF_SQL=SELECT max(start_lsn) FROM src.cdc.lsn_time_mapping
 SHADOW_IGNORE_COLUMNS=shadow_pilot.orders.id,shadow_pilot.orders.loaded_at
 SHADOW_DOCKER_NETWORK=$NET
 EOF
+# Strict: the fixture exactly as the acceptance pipelines write it, without
+# the workarounds for the candidate's known findings (docs/shadow-run.md).
+if [ -n "${SHADOW_SELFTEST_STRICT:-}" ]; then
+  echo 'SHADOW_DBT_VARS={"shadow_workarounds": false}' >> "$CONFIG"
+  log "strict: fixture without workarounds (findings F8-1..F8-3 expected to diverge)"
+fi
 
 log "harness unit tests"
 "$ROOT/scripts/shadow-run.sh" "$CONFIG" test >&2 || fail "harness unit tests"
 pass "harness unit tests"
 
-show_cycle() { sed -n '1,/^## Tables/p;/^| `/p' "$WORK/out/cycle-000$1.md" >&2; }
+show_cycle() { cat "$WORK/out/cycle-000$1.md" >&2; }
 log "cycle 1"
 "$ROOT/scripts/shadow-run.sh" "$CONFIG" run || { show_cycle 1 || true; fail "cycle 1 diverged"; }
 show_cycle 1
@@ -230,8 +243,9 @@ pass "2 cycles, 5 tables each, 0 divergences; CDC changes appended in cycle 2; R
 
 # --- Mutations -----------------------------------------------------------------
 TABLE="shadow_pilot.orders"
-mutation() { # name column expected-exit expected-text
+mutation() { # name column expected-exit expected-text [compare args]
   local name="$1" column="$2" expect="$3" text="$4" status
+  shift 4
   local col=(); [ -n "$column" ] && col=(--column "$column")
   "$ROOT/scripts/shadow-run.sh" "$CONFIG" mutate --from "$WORK/candidate-wh" --to "$WORK/out/mutations/$name" \
     --table "$TABLE" --mutation "$name" ${col[@]+"${col[@]}"} 2>&1 | tail -n 1 >&2
@@ -239,7 +253,7 @@ mutation() { # name column expected-exit expected-text
   "$ROOT/scripts/shadow-run.sh" "$CONFIG" compare --reference-warehouse "$WORK/reference-wh" \
     --candidate-warehouse "$WORK/out/mutations/$name" --table "$TABLE" \
     --ignore-column "$TABLE.id" --ignore-column "$TABLE.loaded_at" \
-    --work "$WORK/out/mutations/tmp" --out "$WORK/out/mutations/$name.json" > "$WORK/out/mutations/$name.txt"
+    --work "$WORK/out/mutations/tmp" --out "$WORK/out/mutations/$name.json" "$@" > "$WORK/out/mutations/$name.txt"
   status=$?
   set -e
   cat "$WORK/out/mutations/$name.txt" >&2
@@ -254,6 +268,10 @@ mutation decimal        amount       1 "$TABLE: divergent (checksum) columns: am
 mutation timestamp_3h   created_at   1 "$TABLE: divergent (checksum) columns: created_at"
 mutation trailing_space note         1 "$TABLE: divergent (checksum) columns: note"
 mutation null_to_empty  note         1 "$TABLE: divergent (checksum) columns: note"
+# A declared type that differs (varchar(20) -> string) diverges; the shipped
+# rule file classifies it as ISS-019, expected and documented.
+mutation declared_type  status       1 "$TABLE: divergent (declared_types)"
+mutation declared_type  status       0 "$TABLE: equal expected: ISS-019" --expected default
 
 log "summary"
 printf '  %s\n' "${CHECKS[@]}" >&2

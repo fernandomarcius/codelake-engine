@@ -15,8 +15,9 @@ from urllib.parse import urlparse
 from . import expected
 
 # Differences the candidate declares against the reference engine
-# (docs/issues), shipped with the harness. ``SHADOW_EXPECTED_DIFFERENCES``
-# names another file, or ``none``.
+# (docs/issues), shipped with the harness as a rule file to opt into:
+# ``SHADOW_EXPECTED_DIFFERENCES=default`` uses it, a path names another
+# file; unset or ``none``, no rule applies.
 DEFAULT_EXPECTED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "expected-differences.json")
 
 
@@ -78,7 +79,7 @@ class Config:
     s3_endpoint: str = ""
     s3_region: str = ""
     s3_path_style: bool = False
-    expected_differences: str = DEFAULT_EXPECTED
+    expected_differences: str = ""
     expected: list[expected.Rule] = dataclasses.field(default_factory=list)
 
 
@@ -121,10 +122,14 @@ def _warehouse(value: str, name: str) -> str:
 
 
 def expected_path(value: str) -> str:
-    """The rule file: the shipped one by default, none with ``none``."""
-    if value.strip().lower() == "none":
+    """The rule file: none when unset or ``none``, the shipped one with
+    ``default``, else the path given."""
+    choice = value.strip()
+    if choice.lower() in {"", "none"}:
         return ""
-    return value or DEFAULT_EXPECTED
+    if choice.lower() == "default":
+        return DEFAULT_EXPECTED
+    return choice
 
 
 def load(env: Mapping[str, str] | None = None) -> Config:

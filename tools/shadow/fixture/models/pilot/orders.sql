@@ -9,7 +9,7 @@ WITH src AS (
         ltm.tran_end_time                     AS lsn_time,
         ROW_NUMBER() OVER (
             PARTITION BY ct."__$start_lsn"
-            ORDER BY ct."__$seqval" ASC
+            ORDER BY {{ binary_order_key('ct."__$seqval"') }} ASC
         )                                     AS seq_within_lsn,
         ct.order_id, ct.status, ct.amount, ct.created_at, ct.note, ct.code, ct.qty
     FROM {{ ref('dbo_orders_ct') }} ct

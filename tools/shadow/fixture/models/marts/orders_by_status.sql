@@ -3,7 +3,7 @@
 SELECT
     status,
     COUNT(*)                                        AS orders,
-    CAST(SUM(amount) AS decimal(18, 6))             AS total_amount,
+    CAST(SUM(amount) AS decimal(38, 6))             AS total_amount,
     MAX(created_at)                                 AS last_created_at,
     COUNT(*) FILTER (WHERE note IS NULL)            AS without_note,
     COUNT(*) FILTER (WHERE note = '')               AS empty_note

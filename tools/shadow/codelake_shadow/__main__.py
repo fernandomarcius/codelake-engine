@@ -221,7 +221,7 @@ def cmd_compare(argv: list[str]) -> int:
     parser.add_argument(
         "--expected",
         default="",
-        help="expected-differences file (default: the shipped one; `none` for no rule)",
+        help="expected-differences file; `default` for the shipped one (default: no rule)",
     )
     args = parser.parse_args(argv)
     rules = expected.load(expected_path(args.expected))

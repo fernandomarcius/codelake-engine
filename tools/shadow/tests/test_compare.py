@@ -329,6 +329,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((c.reference.host, c.reference.port), ("ref", 8080))
         self.assertEqual(c.reference.target, "reference")
         self.assertEqual(c.cycles, 1)
+        # No rule unless asked: a rule is a decision, not a default.
+        self.assertEqual((c.expected_differences, c.expected), ("", []))
+        c = config.load(dict(self.ENV, SHADOW_EXPECTED_DIFFERENCES="default"))
         self.assertEqual(c.expected_differences, config.DEFAULT_EXPECTED)
         self.assertTrue(c.expected)
         c = config.load(dict(self.ENV, SHADOW_EXPECTED_DIFFERENCES="none"))

@@ -13,6 +13,7 @@ one row (or adds/removes one) and must be detected.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -31,6 +32,9 @@ MUTATIONS = {
     "timestamp_3h": "SELECT * EXCLUDE (__rn) REPLACE (CASE WHEN __rn = __pick THEN {col} + INTERVAL 3 HOUR ELSE {col} END AS {col}) FROM t",
     "trailing_space": "SELECT * EXCLUDE (__rn) REPLACE (CASE WHEN __rn = __pick THEN {col} || ' ' ELSE {col} END AS {col}) FROM t",
     "null_to_empty": "SELECT * EXCLUDE (__rn) REPLACE (CASE WHEN __rn = __pick THEN '' ELSE {col} END AS {col}) FROM t",
+    # Data as it is; the column's declared type in the metastore file
+    # becomes unbounded `string` (what finding F8-2 looks like).
+    "declared_type": "SELECT * EXCLUDE (__rn) FROM t",
 }
 
 # Which row a mutation changes: one where the column is set (or NULL).
@@ -57,6 +61,19 @@ def mutate(source: str, dest: str, table: str, mutation: str, column: str | None
     for meta in (METASTORE_FILE, f".{METASTORE_FILE}.crc"):
         if os.path.isfile(os.path.join(src.path, meta)):
             shutil.copyfile(os.path.join(src.path, meta), os.path.join(out_dir, meta))
+    if mutation == "declared_type":
+        path = os.path.join(out_dir, METASTORE_FILE)
+        with open(path, encoding="utf-8") as f:
+            metadata = json.load(f)
+        changed = [c for c in metadata.get("dataColumns", []) if c.get("name", "").lower() == (column or "").lower()]
+        if not changed:
+            raise SystemExit(f"{table}: no declared column {column}")
+        changed[0]["type"] = "string"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f)
+        crc = os.path.join(out_dir, f".{METASTORE_FILE}.crc")
+        if os.path.exists(crc):
+            os.remove(crc)
     con = duckdb.connect()
     listed = ", ".join("'" + f.replace("'", "''") + "'" for f in files)
     con.execute(
@@ -84,7 +101,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--mutation", required=True, choices=sorted(MUTATIONS))
     parser.add_argument("--column")
     args = parser.parse_args(argv)
-    if "{col}" in MUTATIONS[args.mutation] and not args.column:
+    if ("{col}" in MUTATIONS[args.mutation] or args.mutation == "declared_type") and not args.column:
         parser.error(f"--mutation {args.mutation} needs --column")
     mutate(args.source, args.dest, args.table, args.mutation, args.column)
     return 0
