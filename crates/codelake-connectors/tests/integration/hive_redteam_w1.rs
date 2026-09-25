@@ -1994,3 +1994,57 @@ async fn w1t_optimize_keeps_int64_timestamps_like_trino_431() {
     );
     checks.assert_none();
 }
+
+/// In-memory tables keep their rows inside the pool (W1-5): an `UPDATE` that
+/// makes the rows larger must not take the table past the ceiling, and an
+/// `UPDATE` answered with an error must not have changed the rows.
+#[tokio::test]
+#[ignore = "DEFECT-W1T-3: UPDATE of an in-memory table grows it past the pool ceiling, and changes the rows even when it answers an error"]
+async fn w1t_in_memory_update_never_escapes_the_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let spill = tempfile::tempdir().unwrap();
+    let limit = ByteSize::mib(48);
+    let engine = engine_at(
+        dir.path(),
+        spill.path(),
+        limit,
+        HiveTimestampPrecision::Milliseconds,
+    )
+    .await;
+    cl(
+        &engine,
+        "CREATE TABLE datafusion.public.grow AS SELECT CAST(value AS BIGINT) AS id, \
+         array_join(repeat('x', 1000), '') AS s FROM generate_series(1, 4000)",
+    )
+    .await;
+    let created = engine.memory().reserved_bytes;
+    let mut steps = Vec::new();
+    for _ in 0..5 {
+        let updated = cl_try(&engine, "UPDATE datafusion.public.grow SET s = concat(s, s)").await;
+        // The table's reservation once the statement answered.
+        let reserved = engine.memory().reserved_bytes;
+        steps.push((updated, reserved));
+    }
+    note(
+        "w1t_in_memory_update",
+        "updates (answer, reserved bytes), limit",
+        (&steps, limit.as_u64()),
+    );
+    let mut wrong = Vec::new();
+    let mut held = created;
+    for (updated, reserved) in &steps {
+        if *reserved > limit.as_u64() {
+            wrong.push(format!(
+                "{reserved} bytes reserved in a {} byte pool",
+                limit.as_u64()
+            ));
+        }
+        if updated.is_err() && *reserved != held {
+            wrong.push(format!(
+                "an UPDATE answered {updated:?} but the rows went from {held} to {reserved} bytes"
+            ));
+        }
+        held = *reserved;
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
