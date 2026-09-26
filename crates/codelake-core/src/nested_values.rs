@@ -12,20 +12,30 @@
 //! type compares them. [`NestedTest`] (`codelake_nested_test(a, b, mode)`)
 //! answers that; `crate::char_semantics` plans it, and writes in `mode`
 //! which values are char ones.
+//!
+//! [`NestedPad`] (`codelake_nested_pad(x, spec)`) pads the char values
+//! inside a row or an array to a common `char(n)` (an array of `char(3)`
+//! values output with one of `char(5)` ones holds `char(5)` values).
 
 use std::cmp::Ordering;
 use std::sync::{Arc, LazyLock};
 
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray};
+use datafusion::arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, FixedSizeListArray, LargeListArray, ListArray, StringArray,
+    StructArray,
+};
+use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, FieldRef};
 use datafusion::common::{Result, ScalarValue, exec_err, plan_err};
 use datafusion::logical_expr::type_coercion::binary::comparison_coercion;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 
 /// Name of [`NestedTest`].
 pub(crate) const NESTED_TEST: &str = "codelake_nested_test";
+/// Name of [`NestedPad`].
+pub(crate) const NESTED_PAD: &str = "codelake_nested_pad";
 
 /// What [`NestedTest`] answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,16 +409,165 @@ impl ScalarUDFImpl for NestedTest {
     }
 }
 
+/// The lengths [`NestedPad`] pads the values of a nested type to, in the
+/// order of [`leaves`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Pad {
+    Leaf(Option<u32>),
+    Row(Vec<Pad>),
+    List(Box<Pad>),
+}
+
+fn pad_of(data_type: &DataType, lengths: &mut impl Iterator<Item = Option<u32>>) -> Pad {
+    match data_type {
+        DataType::Struct(fields) => Pad::Row(fields.iter().map(|f| pad_of(f.data_type(), lengths)).collect()),
+        other => match element(other) {
+            Some(field) => Pad::List(Box::new(pad_of(field.data_type(), lengths))),
+            None => Pad::Leaf(lengths.next().flatten()),
+        },
+    }
+}
+
+/// The spec argument of [`NestedPad`]: for each value (see [`leaves`]) the
+/// char length it is padded to, `-` for one left as it is.
+pub(crate) fn pad_spec(lengths: &[Option<u32>]) -> String {
+    lengths
+        .iter()
+        .map(|l| l.map_or_else(|| "-".to_owned(), |n| n.to_string()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The lengths a spec names.
+pub(crate) fn spec_lengths(spec: &str) -> Vec<Option<u32>> {
+    spec.split(',').map(|t| t.parse::<u32>().ok()).collect()
+}
+
+fn padded_text(array: &ArrayRef, length: u32) -> Result<ArrayRef> {
+    let target = array.data_type().clone();
+    if !matches!(target, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) {
+        return Ok(Arc::clone(array));
+    }
+    let text = cast(array, &DataType::Utf8)?;
+    let out: StringArray = text
+        .as_string::<i32>()
+        .iter()
+        .map(|v| v.map(|t| crate::char_semantics::padded(t, length)))
+        .collect();
+    Ok(cast(&(Arc::new(out) as ArrayRef), &target)?)
+}
+
+fn pad_nested(array: &ArrayRef, pad: &Pad) -> Result<ArrayRef> {
+    Ok(match pad {
+        Pad::Leaf(None) => Arc::clone(array),
+        Pad::Leaf(Some(n)) => padded_text(array, *n)?,
+        Pad::Row(pads) => {
+            let row = array.as_struct();
+            let columns = row
+                .columns()
+                .iter()
+                .zip(pads)
+                .map(|(c, p)| pad_nested(c, p))
+                .collect::<Result<Vec<_>>>()?;
+            Arc::new(StructArray::try_new(
+                row.fields().clone(),
+                columns,
+                row.nulls().cloned(),
+            )?)
+        }
+        Pad::List(p) => match array.data_type() {
+            DataType::List(field) => {
+                let list = array.as_list::<i32>();
+                Arc::new(ListArray::try_new(
+                    Arc::clone(field),
+                    list.offsets().clone(),
+                    pad_nested(list.values(), p)?,
+                    list.nulls().cloned(),
+                )?)
+            }
+            DataType::LargeList(field) => {
+                let list = array.as_list::<i64>();
+                Arc::new(LargeListArray::try_new(
+                    Arc::clone(field),
+                    list.offsets().clone(),
+                    pad_nested(list.values(), p)?,
+                    list.nulls().cloned(),
+                )?)
+            }
+            DataType::FixedSizeList(field, size) => {
+                let list = array.as_fixed_size_list();
+                Arc::new(FixedSizeListArray::try_new(
+                    Arc::clone(field),
+                    *size,
+                    pad_nested(list.values(), p)?,
+                    list.nulls().cloned(),
+                )?)
+            }
+            other => return exec_err!("{NESTED_PAD}: not an array: {other}"),
+        },
+    })
+}
+
+/// `codelake_nested_pad(x, spec)`: see the module documentation.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct NestedPad {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for NestedPad {
+    fn name(&self) -> &'static str {
+        NESTED_PAD
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        arg_types.first().map_or_else(
+            || plan_err!("{NESTED_PAD} expects two arguments"),
+            |t| Ok(t.clone()),
+        )
+    }
+
+    fn return_field_from_args(&self, args: ReturnFieldArgs<'_>) -> Result<FieldRef> {
+        args.arg_fields.first().map_or_else(
+            || plan_err!("{NESTED_PAD} expects two arguments"),
+            |field| Ok(Arc::new(field.as_ref().clone().with_name(NESTED_PAD))),
+        )
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let [value, spec] = args.args.as_slice() else {
+            return exec_err!("{NESTED_PAD} expects two arguments");
+        };
+        let spec = mode_argument(spec)?;
+        let array = value.to_array(args.number_rows)?;
+        let pad = pad_of(array.data_type(), &mut spec_lengths(&spec).into_iter());
+        let out = pad_nested(&array, &pad)?;
+        Ok(match value {
+            ColumnarValue::Scalar(_) => ColumnarValue::Scalar(ScalarValue::try_from_array(&out, 0)?),
+            ColumnarValue::Array(_) => ColumnarValue::Array(out),
+        })
+    }
+}
+
 pub(crate) static NESTED_TEST_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     Arc::new(ScalarUDF::new_from_impl(NestedTest {
         signature: Signature::user_defined(Volatility::Immutable),
     }))
 });
 
+pub(crate) static NESTED_PAD_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
+    Arc::new(ScalarUDF::new_from_impl(NestedPad {
+        signature: Signature::any(2, Volatility::Immutable),
+    }))
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Int64Array, StringArray, StructArray};
+    use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::datatypes::Field;
 
     fn rows(a: Vec<Option<i64>>, b: Vec<Option<&str>>) -> ArrayRef {
@@ -449,7 +608,9 @@ mod tests {
     }
 
     #[test]
-    fn modes_list_the_char_values() {
+    fn specs_round_trip() {
+        assert_eq!(pad_spec(&[Some(5), None]), "5,-");
+        assert_eq!(spec_lengths("5,-"), [Some(5), None]);
         assert_eq!(test_mode(Test::Equal, &[true, false]), "ecv");
     }
 }

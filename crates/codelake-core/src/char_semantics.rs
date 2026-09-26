@@ -421,6 +421,7 @@ pub(crate) fn functions() -> Vec<ScalarUDF> {
         &CHAR_COMPARE_UDF,
         &VARCHAR_OF_UDF,
         &crate::nested_values::NESTED_TEST_UDF,
+        &crate::nested_values::NESTED_PAD_UDF,
     ]
     .into_iter()
     .map(|udf| udf.as_ref().clone())
@@ -1057,6 +1058,13 @@ fn function_type(name: &str, args: &[Expr], scope: &Scope<'_>, whole: &Expr) -> 
     if let Some(text) = computed_length(name, args, scope) {
         return scope.is_text(whole).then_some(text);
     }
+    if matches!(
+        name,
+        crate::nested_values::NESTED_PAD | "flatten" | "array_intersect" | "array_union" | "array_except"
+    ) && let Some(array) = function_shape(name, args, scope, whole).and_then(|s| array_text(&s))
+    {
+        return Some(array);
+    }
     if let ControlFlow::Break(text) = container_type(name, args, scope, whole) {
         return text;
     }
@@ -1330,6 +1338,17 @@ fn fits(shape: &Shape, data_type: &DataType) -> bool {
     }
 }
 
+/// The array of char values a shape describes (see [`Text::Array`]).
+fn array_text(shape: &Shape) -> Option<Text> {
+    match shape {
+        Shape::Array(element) => match element.as_ref() {
+            Shape::Value(Some(Text::Char(n))) => Some(Text::Array(*n)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// The common shape of values of `shapes`; `None` when one is not known or
 /// they do not have one structure.
 fn common_shape(shapes: &[Option<Shape>]) -> Option<Shape> {
@@ -1393,6 +1412,31 @@ fn element_shape(shape: Option<Shape>) -> Option<Shape> {
     }
 }
 
+/// `shape` with the char lengths of a [`crate::nested_values`] pad spec.
+fn with_lengths(
+    shape: Shape,
+    data_type: &DataType,
+    lengths: &mut impl Iterator<Item = Option<u32>>,
+) -> Shape {
+    match (shape, data_type) {
+        (Shape::Row(fields), DataType::Struct(types)) => Shape::Row(
+            fields
+                .into_iter()
+                .zip(types.iter())
+                .map(|(s, f)| with_lengths(s, f.data_type(), lengths))
+                .collect(),
+        ),
+        (Shape::Array(element), other) => match crate::nested_values::element(other) {
+            Some(f) => Shape::Array(Box::new(with_lengths(*element, f.data_type(), lengths))),
+            None => Shape::Array(element),
+        },
+        (value, _) => match lengths.next().flatten() {
+            Some(n) => Shape::Value(Some(Text::Char(Some(n)))),
+            None => value,
+        },
+    }
+}
+
 /// The shape of a function's result, where this rule follows it.
 fn function_shape(name: &str, args: &[Expr], scope: &Scope<'_>, whole: &Expr) -> Option<Shape> {
     let arg = |i: usize| args.get(i).map(|a| shape(a, scope));
@@ -1448,6 +1492,12 @@ fn function_shape(name: &str, args: &[Expr], scope: &Scope<'_>, whole: &Expr) ->
         | crate::trino_functions::TRY
         | crate::trino_functions::GUARDED_TRY
         | crate::trino_functions::BARRIER => arg(0),
+        crate::nested_values::NESTED_PAD => {
+            let (_, spec) = literal_text(args.get(1)?)?;
+            let data_type = args[0].get_type(scope.schema.as_ref()).ok()?;
+            let mut lengths = crate::nested_values::spec_lengths(spec).into_iter();
+            Some(with_lengths(arg(0)?, &data_type, &mut lengths))
+        }
         _ => None,
     }
 }
@@ -1612,6 +1662,135 @@ fn holds_null(expr: Expr, scope: &Scope<'_>) -> Expr {
     }
     let chars = vec![false; values.len()];
     nested_test(expr.clone(), expr, crate::nested_values::Test::HoldsNull, &chars)
+}
+
+/// For each value of `data_type` (see [`char_flags`]), the char length it
+/// is padded to so a value of shape `from` has shape `to`.
+fn pad_lengths(data_type: &DataType, from: Option<&Shape>, to: &Shape, out: &mut Vec<Option<u32>>) {
+    match (data_type, to) {
+        (DataType::Struct(fields), Shape::Row(targets)) => {
+            for (k, (f, t)) in fields.iter().zip(targets).enumerate() {
+                pad_lengths(f.data_type(), row_field(from, k), t, out);
+            }
+        }
+        (other, Shape::Array(target)) if crate::nested_values::element(other).is_some() => {
+            if let Some(f) = crate::nested_values::element(other) {
+                pad_lengths(f.data_type(), array_element(from), target, out);
+            }
+        }
+        (other, target) => {
+            let mut leaves = Vec::new();
+            crate::nested_values::leaves(other, &mut leaves);
+            let wanted = match (target, from) {
+                (_, Some(Shape::Value(Some(Text::Null)))) => None,
+                (Shape::Value(Some(Text::Char(Some(n)))), Some(Shape::Value(Some(Text::Char(Some(m))))))
+                    if n == m =>
+                {
+                    None
+                }
+                (Shape::Value(Some(Text::Char(Some(n)))), _) => Some(*n),
+                _ => None,
+            };
+            out.extend(std::iter::repeat_n(wanted, leaves.len().max(1)));
+        }
+    }
+}
+
+/// Whether a shape holds char values of a length this rule does not know.
+fn unknown_char_length(shape: &Shape) -> bool {
+    match shape {
+        Shape::Value(t) => *t == Some(Text::Char(None)),
+        Shape::Row(fields) => fields.iter().any(unknown_char_length),
+        Shape::Array(element) => unknown_char_length(element),
+    }
+}
+
+/// `expr` (of shape `from`) as a value of shape `to`: its char values
+/// padded to the common lengths, inside a row or an array written out, or
+/// by [`crate::nested_values`]'s pad.
+fn conform(expr: Expr, from: Option<&Shape>, to: &Shape, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
+    if let Some(kind) = built(&expr)
+        && matches!(
+            (kind, to),
+            (Built::Array, Shape::Array(_)) | (Built::Row | Built::Named, Shape::Row(_))
+        )
+    {
+        let (func, mut args) = constructor_args(expr);
+        let positions = value_positions(kind, args.len());
+        let mut changed = false;
+        for (k, i) in positions.into_iter().enumerate() {
+            let target = match to {
+                Shape::Array(e) => e.as_ref(),
+                Shape::Row(fields) => match fields.get(k) {
+                    Some(f) => f,
+                    None => continue,
+                },
+                Shape::Value(_) => continue,
+            };
+            let value = std::mem::take(&mut args[i]);
+            let own = shape(&value, scope);
+            let done = conform(value, Some(&own), target, scope)?;
+            changed |= done.transformed;
+            args[i] = done.data;
+        }
+        return Ok(Transformed::new_transformed(func.call(args), changed));
+    }
+    let Some(data_type) = nested_type(&expr, scope) else {
+        return Ok(match (to, from) {
+            (Shape::Value(Some(Text::Char(Some(n)))), Some(Shape::Value(t)))
+                if *t != Some(Text::Char(Some(*n))) =>
+            {
+                if *t == Some(Text::Null) {
+                    Transformed::no(expr)
+                } else {
+                    Transformed::yes(pad(expr, *n))
+                }
+            }
+            _ => Transformed::no(expr),
+        });
+    };
+    let mut lengths = Vec::new();
+    pad_lengths(&data_type, from, to, &mut lengths);
+    if lengths.iter().all(Option::is_none) {
+        return Ok(Transformed::no(expr));
+    }
+    Ok(Transformed::yes(Expr::ScalarFunction(ScalarFunction::new_udf(
+        Arc::clone(&crate::nested_values::NESTED_PAD_UDF),
+        vec![
+            expr,
+            Expr::Literal(
+                ScalarValue::Utf8(Some(crate::nested_values::pad_spec(&lengths))),
+                None,
+            ),
+        ],
+    ))))
+}
+
+/// Rows or arrays output in their common shape: the char values in each
+/// padded to their common length (`CASE … THEN ARRAY[c3] ELSE ARRAY[ch]
+/// END` holds `char(5)` values).
+fn unify_nested(exprs: Vec<Expr>, scope: &Scope<'_>, what: &str) -> Result<Transformed<Vec<Expr>>> {
+    let shapes: Vec<Option<Shape>> = exprs.iter().map(|e| Some(shape(e, scope))).collect();
+    let Some(target) = common_shape(&shapes) else {
+        return Ok(Transformed::no(exprs));
+    };
+    if shapes
+        .iter()
+        .all(|s| s.as_ref() == Some(&target) || s == &Some(Shape::Value(Some(Text::Null))))
+    {
+        return Ok(Transformed::no(exprs));
+    }
+    if unknown_char_length(&target) {
+        return Err(refusal(what));
+    }
+    let mut changed = false;
+    let mut out = Vec::with_capacity(exprs.len());
+    for (e, s) in exprs.into_iter().zip(&shapes) {
+        let done = conform(e, s.as_ref(), &target, scope)?;
+        changed |= done.transformed;
+        out.push(done.data);
+    }
+    Ok(Transformed::new_transformed(out, changed))
 }
 
 // ---------------------------------------------------------------- rewrites
@@ -2124,6 +2303,9 @@ fn binary(left: Expr, op: Operator, right: Expr) -> Expr {
 /// `exprs`, output in their common type: each padded to its length when
 /// one is char. `what` names the construct in a refusal.
 fn unify_values(exprs: Vec<Expr>, scope: &Scope<'_>, what: &str) -> Result<Transformed<Vec<Expr>>> {
+    if exprs.iter().any(|e| nested_type(e, scope).is_some()) {
+        return unify_nested(exprs, scope, what);
+    }
     let types: Vec<Option<Text>> = exprs.iter().map(|e| infer(e, scope)).collect();
     if !needs_char_coercion(&types) {
         return Ok(Transformed::no(exprs));
@@ -2647,6 +2829,11 @@ fn scalar_function(function: ScalarFunction, scope: &Scope<'_>) -> Result<Transf
         }
         "concat" | CONCAT_OPERATOR => Ok(concat_args(args, scope)?.update_data(|args| func.call(args))),
         "array_remove" if args.len() == 2 => remove_from_array(&func, args, scope),
+        // The elements of both arrays in their common type
+        // (`arrays_overlap(ARRAY[ch], ARRAY[c3])` compares `char(5)` values).
+        "arrays_overlap" | "array_intersect" | "array_union" | "array_except" if args.len() == 2 => {
+            Ok(unify_nested(args, scope, &name)?.update_data(|args| func.call(args)))
+        }
         "element_at" | crate::trino_functions::SUBSCRIPT if args.len() == 2 => look_up(&func, args, scope),
         "make_array" | "array" | "make_list" => {
             Ok(unify_values(args, scope, "ARRAY")?.update_data(|args| func.call(args)))
@@ -2919,21 +3106,37 @@ fn common_lengths(columns: &[Vec<Option<Text>>], what: &str) -> Result<Vec<Optio
 }
 
 /// A `UNION` of char values: every input's column padded to the common
-/// char type.
+/// char type; the char values in rows and arrays too.
 fn union(union: Union, outer: &[&LogicalPlan]) -> Result<Transformed<LogicalPlan>> {
     let width = union.schema.fields().len();
+    let nested: Vec<bool> = union
+        .schema
+        .fields()
+        .iter()
+        .map(|f| crate::nested_values::is_nested(f.data_type()))
+        .collect();
     let columns: Vec<Vec<Option<Text>>> = (0..width)
         .map(|j| {
             union
                 .inputs
                 .iter()
-                .map(|input| column_type(input, j, outer))
+                .map(|input| {
+                    if nested[j] {
+                        None
+                    } else {
+                        column_type(input, j, outer)
+                    }
+                })
                 .collect()
         })
         .collect();
     let lengths = common_lengths(&columns, "UNION")?;
     let chars = char_lengths(&columns, &lengths);
-    if lengths.iter().all(Option::is_none) && records(&union.schema, &chars) {
+    let shapes = nested_targets(&union.inputs, &nested, outer)?;
+    if lengths.iter().all(Option::is_none)
+        && shapes.iter().all(Option::is_none)
+        && records(&union.schema, &chars)
+    {
         return Ok(Transformed::no(LogicalPlan::Union(union)));
     }
     let inputs = union
@@ -2946,13 +3149,86 @@ fn union(union: Union, outer: &[&LogicalPlan]) -> Result<Transformed<LogicalPlan
                 .enumerate()
                 .map(|(j, length)| length.filter(|n| columns[j][i] != Some(Text::Char(Some(*n)))))
                 .collect();
-            pad_columns(input, &own)
+            let padded = pad_columns(input, &own)?;
+            let targets: Vec<Option<(Shape, Option<Shape>)>> = shapes
+                .iter()
+                .map(|t| t.as_ref().map(|(target, from)| (target.clone(), from[i].clone())))
+                .collect();
+            conform_columns(padded, &targets, outer)
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Transformed::yes(LogicalPlan::Union(Union {
         inputs,
         schema: recorded(&union.schema, &chars)?,
     })))
+}
+
+/// The common shape of a nested column and each input's.
+type NestedTarget = (Shape, Vec<Option<Shape>>);
+
+/// For each nested column (rows, arrays) of a set of inputs whose char
+/// values differ in length, their common shape and each input's.
+fn nested_targets(
+    inputs: &[Arc<LogicalPlan>],
+    nested: &[bool],
+    outer: &[&LogicalPlan],
+) -> Result<Vec<Option<NestedTarget>>> {
+    nested
+        .iter()
+        .enumerate()
+        .map(|(j, is_nested)| {
+            if !is_nested {
+                return Ok(None);
+            }
+            let shapes: Vec<Option<Shape>> = inputs
+                .iter()
+                .map(|input| column_typed::<Shape>(input, j, outer))
+                .collect();
+            let Some(target) = common_shape(&shapes) else {
+                return Ok(None);
+            };
+            if shapes.iter().all(|s| s.as_ref() == Some(&target)) {
+                return Ok(None);
+            }
+            if unknown_char_length(&target) {
+                return Err(refusal("UNION"));
+            }
+            Ok(Some((target, shapes)))
+        })
+        .collect()
+}
+
+/// `plan` with each column `j` that has a target in `targets` conformed to
+/// it ([`conform`]).
+fn conform_columns(
+    plan: Arc<LogicalPlan>,
+    targets: &[Option<(Shape, Option<Shape>)>],
+    outer: &[&LogicalPlan],
+) -> Result<Arc<LogicalPlan>> {
+    if targets.iter().all(Option::is_none) {
+        return Ok(plan);
+    }
+    let scope = Scope::over(plan.as_ref(), outer);
+    let mut changed = false;
+    let mut exprs = Vec::with_capacity(targets.len());
+    for ((qualifier, field), target) in plan.schema().iter().zip(targets) {
+        let column = Expr::Column(Column::from((qualifier, field)));
+        match target {
+            Some((to, from)) => {
+                let done = conform(column, from.as_ref(), to, &scope)?;
+                changed |= done.transformed;
+                exprs.push(done.data.alias_qualified(qualifier.cloned(), field.name()));
+            }
+            None => exprs.push(column),
+        }
+    }
+    if !changed {
+        return Ok(plan);
+    }
+    Ok(Arc::new(LogicalPlan::Projection(Projection::try_new(
+        exprs,
+        Arc::clone(&plan),
+    )?)))
 }
 
 /// A `VALUES` list: each column's values in their common type, the column
@@ -3806,6 +4082,70 @@ mod tests {
                 &["3", "true", "NULL"],
             ],
         ),
+        // Rows and arrays of char values of different lengths are output in
+        // their common type (padded), and compared in it.
+        (
+            "SELECT id, arrays_overlap(ARRAY[ch], ARRAY[c]), array_intersect(ARRAY[c], ARRAY[ch]), \
+             cardinality(array_union(ARRAY[ch], ARRAY[c])), array_except(ARRAY[ch], ARRAY[c]) \
+             FROM cht JOIN c3 USING (id) ORDER BY 1",
+            &[
+                &["1", "true", "[ab   ]", "1", "[]"],
+                &["2", "false", "[]", "2", "[zz   ]"],
+                &["3", "NULL", "[]", "2", "[NULL]"],
+            ],
+        ),
+        (
+            "SELECT cardinality(array_intersect(array_agg(ch), array_agg(c))) FROM cht JOIN c3 USING (id)",
+            &[&["2"]],
+        ),
+        (
+            "SELECT id, flatten(ARRAY[ARRAY[ch], ARRAY[c]])[2] || '|', flatten(ARRAY[ARRAY[ch], ARRAY[c]])[2] = 'a' \
+             FROM cht JOIN c3 USING (id) ORDER BY id",
+            &[
+                &["1", "ab   |", "false"],
+                &["2", "a    |", "true"],
+                &["3", "zz   |", "false"],
+            ],
+        ),
+        (
+            "SELECT id, coalesce(ARRAY[c], ARRAY[ch])[1] || '|', CASE WHEN id > 1 THEN ARRAY[c] ELSE ARRAY[ch] END[1] || '|' \
+             FROM cht JOIN c3 USING (id) ORDER BY id",
+            &[
+                &["1", "ab   |", "ab   |"],
+                &["2", "a    |", "a    |"],
+                &["3", "zz   |", "zz   |"],
+            ],
+        ),
+        (
+            "SELECT id, coalesce(ROW(c), ROW(ch)) = ROW('ab'), CASE WHEN id > 1 THEN ROW(c) ELSE ROW(ch) END = ROW('a') \
+             FROM cht JOIN c3 USING (id) ORDER BY id",
+            &[
+                &["1", "true", "false"],
+                &["2", "false", "true"],
+                &["3", "false", "false"],
+            ],
+        ),
+        (
+            "SELECT count(*), count(DISTINCT r) FROM (SELECT ROW(c) AS r FROM c3 UNION ALL SELECT ROW(ch) FROM cht \
+             WHERE ch IS NOT NULL)",
+            &[&["6", "3"]],
+        ),
+        (
+            "SELECT count(*) FROM (SELECT DISTINCT r FROM (SELECT ROW(c) AS r FROM c3 UNION ALL SELECT ROW(ch) FROM cht))",
+            &[&["4"]],
+        ),
+        (
+            "SELECT count(*) FROM (SELECT a FROM (SELECT ARRAY[c] AS a FROM c3 UNION ALL SELECT ARRAY[ch] FROM cht) GROUP BY a)",
+            &[&["4"]],
+        ),
+        (
+            "SELECT a[1] || '|' FROM (SELECT ARRAY[c] AS a FROM c3 WHERE id = 2 UNION ALL SELECT ARRAY[ch] FROM cht WHERE id = 4)",
+            &[&["a    |"], &["a    |"]],
+        ),
+        (
+            "SELECT count(*) FROM (SELECT ARRAY[ch] FROM cht UNION SELECT ARRAY['ab'])",
+            &[&["4"]],
+        ),
         // `INTERSECT ALL` / `EXCEPT ALL` of char values of two Arrow text
         // types (a `VALUES` list and an in-memory table) stay multiset
         // operations.
@@ -4460,10 +4800,6 @@ mod tests {
             (
                 "UPDATE cht SET ch = 'abcdefg' WHERE id = 1",
                 "Cannot truncate non-space characters when casting from varchar(7) to char(5) on INSERT",
-            ),
-            (
-                "SELECT count(*) FROM (SELECT ARRAY[ch] FROM cht UNION SELECT ARRAY['ab'])",
-                "UNION of an array of char(n) values with another array is not supported yet",
             ),
             (
                 "SELECT CAST(ARRAY[s] AS array(char(3))) FROM vct",
