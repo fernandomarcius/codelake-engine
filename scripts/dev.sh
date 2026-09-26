@@ -30,18 +30,46 @@ else
   CACHE_FLAGS=(-v codelake-cargo:/usr/local/cargo/registry -v "${CODELAKE_TARGET_VOLUME:-codelake-target}":/work/target)
 fi
 
+# Compilation cache (sccache), shared by every checkout on this machine. Unlike
+# the target, it is safe to share: an entry is keyed by the hash of the
+# compiler, its arguments and the content of every input file (never mtime), so
+# two worktrees that changed the same file differently get different entries.
+# On by default locally; off in CI (the target is cached there) unless
+# CODELAKE_SCCACHE=1. CODELAKE_SCCACHE=0 turns it off. docs/gates.md.
+SCCACHE_FLAGS=()
+if [ -n "${CODELAKE_CACHE_DIR:-}" ]; then SCCACHE_DEFAULT=0; else SCCACHE_DEFAULT=1; fi
+if [ "${CODELAKE_SCCACHE:-$SCCACHE_DEFAULT}" = 1 ]; then
+  if [ -n "${CODELAKE_CACHE_DIR:-}" ]; then
+    mkdir -p "$CODELAKE_CACHE_DIR/sccache"
+    SCCACHE_FLAGS=(-v "$CODELAKE_CACHE_DIR/sccache":/sccache)
+  else
+    SCCACHE_FLAGS=(-v "${CODELAKE_SCCACHE_VOLUME:-codelake-sccache}":/sccache)
+  fi
+  SCCACHE_FLAGS+=(-e CODELAKE_SCCACHE=1 -e SCCACHE_DIR=/sccache
+                  -e SCCACHE_CACHE_SIZE="${CODELAKE_SCCACHE_SIZE:-20G}")
+fi
+
 ENV_FLAGS=()
 for var in MUTANTS_BASE GITHUB_ACTIONS CI; do
   [ -n "${!var:-}" ] && ENV_FLAGS+=(-e "$var")
 done
 
+# Wraps rustc in sccache when asked and the image has it; an image built before
+# sccache was added keeps working, uncached.
+IN_CONTAINER='if [ "${CODELAKE_SCCACHE:-0}" = 1 ]; then
+  if command -v sccache >/dev/null 2>&1; then export RUSTC_WRAPPER=sccache
+  else echo "dev.sh: no sccache in this image, building uncached (docs/gates.md: rebuild the image)" >&2; fi
+fi
+exec "$@"'
+
 # Docker socket is forwarded so integration tests can start Testcontainers.
 exec docker run --rm ${TTY_FLAGS[@]+"${TTY_FLAGS[@]}"} \
   -v "$ROOT":/work \
   "${CACHE_FLAGS[@]}" \
+  ${SCCACHE_FLAGS[@]+"${SCCACHE_FLAGS[@]}"} \
   ${ENV_FLAGS[@]+"${ENV_FLAGS[@]}"} \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-auto}" \
   -e TESTCONTAINERS_HOST_OVERRIDE="${TESTCONTAINERS_HOST_OVERRIDE:-host.docker.internal}" \
   --add-host=host.docker.internal:host-gateway \
-  -w /work "$IMAGE" "$@"
+  -w /work "$IMAGE" bash -c "$IN_CONTAINER" dev.sh "$@"

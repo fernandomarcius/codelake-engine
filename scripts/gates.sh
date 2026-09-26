@@ -65,6 +65,14 @@ gate_fast() {
   for g in fmt clippy typos arch train test doc deny machete; do
     echo "::group::gate ${g}"; "gate_${g}"; echo "::endgroup::"
   done
+  sccache_stats
+}
+
+# Hits and misses of the shared compilation cache in this run (scripts/dev.sh).
+sccache_stats() {
+  if [ "${RUSTC_WRAPPER:-}" = sccache ]; then
+    echo "::group::sccache"; sccache --show-stats; echo "::endgroup::"
+  fi
 }
 
 gate="${1:-fast}"

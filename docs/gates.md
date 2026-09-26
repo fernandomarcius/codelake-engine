@@ -13,6 +13,34 @@ All gates run through one script, locally and in CI:
 scripts/dev.sh scripts/gates.sh <gate>
 ```
 
+## Build caches
+
+`scripts/dev.sh` keeps two caches in named Docker volumes:
+
+| Volume | Shared | Holds | Why |
+|---|---|---|---|
+| `codelake-target` (`CODELAKE_TARGET_VOLUME`) | **no**, one per checkout | cargo's `target/` | cargo decides freshness by mtime; two worktrees sharing a target (both mounted at `/work`) reused each other's binaries and tested code that was not on disk (a false green) |
+| `codelake-sccache` (`CODELAKE_SCCACHE_VOLUME`) | yes, every checkout | [sccache](https://github.com/mozilla/sccache) compiler outputs | an entry is keyed by the hash of the compiler, its arguments, its environment and the **content** of every input file, never by mtime; a new worktree compiles its dependencies from the cache |
+
+sccache wraps `rustc` for library crates (dependencies and workspace libraries);
+binaries, test harnesses and incremental builds are not cached (`CARGO_INCREMENTAL=0`
+in the image). Proof that the cache keys by content:
+`scripts/dev.sh scripts/sccache-check.sh` builds two versions of the same file at the
+same path, each in its own target, and fails if the second reuses the first's
+output (it also checks that the same content, with a new mtime, is a hit). `gates.sh
+fast` ends by printing the run's hits and misses.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CODELAKE_SCCACHE` | `1` locally, `0` in CI (`CODELAKE_CACHE_DIR` set) | `0` builds without the cache |
+| `CODELAKE_SCCACHE_VOLUME` | `codelake-sccache` | volume holding the cache (`$CODELAKE_CACHE_DIR/sccache` in CI) |
+| `CODELAKE_SCCACHE_SIZE` | `20G` | ceiling; sccache evicts least recently used entries past it |
+
+Clean it with `docker volume rm codelake-sccache` (nothing may be running with it);
+its size: `docker system df -v | grep codelake-sccache`. An image built before
+sccache was added keeps working, uncached, with a warning on stderr; rebuild it with
+`docker build -f docker/dev.Dockerfile -t codelake-dev:local docker`.
+
 ## Gates and thresholds
 
 | Gate | Command | Threshold | When |
