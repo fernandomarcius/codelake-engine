@@ -73,6 +73,14 @@ gives char values Trino 431's semantics (every rule below observed on
    and `NULL` when none differs but a pair is `NULL` (a `NULL` field never
    makes rows equal, char or not); `<>` is its negation; `IS DISTINCT FROM`
    holds when a pair is distinct; arrays of different lengths differ.
+   Rows and arrays not written out (a subquery's or a CTE's column, a
+   table's, `array_agg`, a `CASE` of rows) are compared the same way at run
+   time, char or not (`codelake_nested_test`, module `nested_values`): the
+   rule follows the type of every value inside rows and arrays through the
+   plan (a `Shape`) and marks the pairs holding a char value, compared
+   without trailing spaces. So are join conditions on such values (a join
+   on rows or arrays is planned as a nested-loop join), their `IN` lists
+   (a constant list of several items looked up as a set, as below).
    `x IN (a, b)` is `x = a OR x = b`, except that a constant list of
    several items without `NULL`s is a set lookup in Trino 431: a row
    holding a `NULL` is then `NULL` (`(s, id) IN (('ab', 1), ('cd', 3))` for
@@ -83,7 +91,12 @@ gives char values Trino 431's semantics (every rule below observed on
    `concat`, and the elements and value of `array_remove`), the columns of `UNION`, `INTERSECT`,
    `EXCEPT`, `VALUES` and the key of a `USING` join (Trino outputs the
    `USING` column in the common type: `char(65536)` against unbounded
-   `varchar`, padded to 65536 characters).
+   `varchar`, padded to 65536 characters). Char values inside rows and
+   arrays are padded to the common type of the rows or arrays too: the
+   branches of `CASE`, `coalesce` and the like, the elements of an array of
+   arrays (`flatten`), both arrays of `arrays_overlap`, `array_intersect`,
+   `array_union` and `array_except`, and the columns of `UNION`
+   (`codelake_nested_pad` where they are not written out).
 6. **Concatenation** of a char value is `char(total)`, every other operand
    padded to its own length (`char(3) || varchar(2)` is `char(5)`).
 7. **Functions** see the padded text: `upper`/`lower` are `char(n)`,
@@ -91,7 +104,10 @@ gives char values Trino 431's semantics (every rule below observed on
    `length` counts it. The trims (`ltrim`, `rtrim`, `trim`, with or without
    the characters to remove) are `varchar(n)` of the value without its
    padding: `ltrim(CAST(' ab' AS char(5)))` is `'ab'`, `ltrim(ch, 'a')` of
-   `'ab'` is `'b'`. Functions Trino has no char version of (`strpos`,
+   `'ab'` is `'b'`; trimming other characters from its end drops the spaces
+   that end up last too (`rtrim(CAST('a b' AS char(5)), 'b')` is `'a'`).
+   `typeof` of a constant answers its type (`typeof('a')` is
+   `varchar(1)`, `typeof(CAST('ab' AS char(3)))` `char(3)`). Functions Trino has no char version of (`strpos`,
    `replace`, …; Trino refuses them) see the padded text, as
    `CAST(ch AS varchar)` gives it.
 8. **Scans** never refuse a filter on a char column any more: the filter is
@@ -133,8 +149,8 @@ error naming a way around it):
   past 2147483646 is unbounded `varchar`;
 - a char value searched in, or removed from, an array of text not written
   out, text other than a literal searched in an array of char values not
-  written out, and an array of char values compared with, concatenated to,
-  or put in a `UNION` with, an array of another element type: the element
+  written out, and an array of char values not written out concatenated to
+  an array of another element type: the element
   type of an array is followed through `ARRAY[…]`, `array_agg`, `||` and
   `concat` of arrays, the functions that keep the elements (`array_sort`,
   `array_distinct`, `array_remove`, `slice`, `reverse`, …) and those that
@@ -145,7 +161,10 @@ error naming a way around it):
   session as `DataFusion` plans them, without the engine's preparation, so
   the column would be unbounded text for every protocol and the cast would
   not pad. A `char(n)` table created through the Trino protocol reads padded
-  on the wire (reported as `text`);
+  on the wire (reported as `text`). `varchar(n)` keeps its length there
+  (`codelake_core::PostgresStatement`): a cast to it is rewritten as the
+  engine does, and a `CREATE TABLE` records its `varchar(n)` columns, whose
+  `INSERT`s are then checked on both protocols;
 - a cast to an array, map or row of `char(n)` or `varchar(n)`
   (`CAST(ARRAY[v] AS array(char(3)))`): Trino pads or cuts each value, the
   conversion does not;
@@ -177,6 +196,16 @@ error naming a way around it):
 
 ## Verification
 
+- Differential (round 5): the verifier's probes s1–s7 (HTTP and PostgreSQL
+  wire, hive and in-memory origins) rerun against `trinodb/trino:431` answer
+  no other rows, but for ties of `ORDER BY … LIMIT` and `ROWS` frames and
+  the rows of statements refused in the probes' own setup (an `INSERT` of a
+  `ROW(…)` into a `row(x …, y …)` column; the same queries over the table
+  written with `CAST(ROW(…) AS row(…))` answer Trino's rows); types of arrays
+  and rows of char values are still reported as `varchar`. Where Trino 431
+  fails comparing stored rows or arrays that hold a `NULL` ("ROW comparison
+  not supported for fields with null elements"), the engine answers with
+  the semantics above.
 - Unit (`char_semantics::tests`): 100 queries over in-memory tables, each with
   the rows Trino 431 answers to the same SQL in its memory catalog; the
   engine's own storage (in-memory `INSERT`/`UPDATE`, CTAS, views); the

@@ -62,3 +62,4 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-050](ISS-050-float-zeros-are-one-value.md) | `0.0` and `-0.0` are one value everywhere (joins diverge from Trino 431) | deliberate divergence | 2026-09-26 | open |
 | [ISS-024](ISS-024-char-semantics.md) | char(n) semantics instead of refusals | removed limitation | 2026-09-25 | closed |
 | [ISS-025](ISS-025-char-wrong-results-merged.md) | Known char(n) wrong results merged into main | known defect | 2026-09-25 | closed |
+| [ISS-030](ISS-030-char-round5-by-recommendation.md) | char(n) round 5: choices applied by recommendation | behavior | 2026-09-26 | awaiting-confirmation |

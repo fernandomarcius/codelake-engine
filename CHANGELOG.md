@@ -291,6 +291,32 @@ versioning: [SemVer](https://semver.org/).
   the pool, before sending the first; the statement then ended (slot freed, time limit over)
   while its client had read nothing. Rows now stream to the client as they are produced, so
   the statement holds its slot and its time limit until they are read (ADR 0016).
+- Rows and arrays not written out (a subquery's or a CTE's column, `array_agg`, a `CASE`
+  of rows) were compared by DataFusion as one value: `ROW(1, NULL) = ROW(1, NULL)` was
+  true where Trino 431 answers `NULL`, a join on such keys matched `NULL` with `NULL`, and
+  char values inside were compared unpadded. They are now compared value by value (a
+  join on them runs as a nested-loop join), and char values inside rows and arrays of
+  different lengths are padded to their common type (`arrays_overlap`, `array_intersect`,
+  `array_union`, `array_except`, `flatten`, `CASE`/`coalesce`/`if` of rows or arrays,
+  `UNION` columns) (ADR 0015). A row column compared with a row of other field names
+  (`r = ROW(1, 'a')` over `row(x bigint, y varchar)`) failed ("Unsupported CAST"); rows
+  compare by position.
+- `rtrim(ch, x)`, `trim(ch, x)` and `trim(TRAILING|BOTH x FROM ch)` of a `char(n)` value
+  kept the spaces that ended up last; `typeof` of a constant answered `varchar`
+  (`typeof('a')` is `varchar(1)`, `typeof(CAST('ab' AS char(3)))` `char(3)`).
+- `INTERSECT ALL` and `EXCEPT ALL` between a hive column and an in-memory one (Arrow
+  `Utf8` and `Utf8View`) kept, or dropped, every copy of a row again: the multiset rewrite
+  did not see the set operation behind type coercion's cast.
+- Floats: `WHERE x = 0` of a `double` dropped `-0.0` and `x < 0` kept it (Trino 431:
+  `-0.0 = 0.0`); a window partitioned by a float column under a filter `x = <constant>`
+  failed ("Expects PARTITION BY expression to be ordered"), also in `INTERSECT ALL`
+  (ADR 0008).
+- On the PostgreSQL wire `varchar(n)` was unbounded text: `CAST(v AS varchar(1))` did not
+  cut, a `varchar(2)` column created there took `'abcdef'`, and `CREATE TABLE … AS SELECT
+  CAST(v AS varchar(2))` kept whole values. Casts now cut and the column's `INSERT`s are
+  checked, as on the Trino protocol (ADR 0015).
+- `INSERT INTO t SELECT id, s, s FROM u` failed ("Projections require unique expression
+  names"); it inserts by position, as Trino 431.
 - `char(n)` values still answered other rows than Trino 431 in shapes the matrix did not
   cover (ADR 0015): a view over a char column dropped a trailing tab or line feed before
   padding; `ltrim(ch)` kept the padding; rows written out (`ROW(ch, c3) = ROW('ab',
