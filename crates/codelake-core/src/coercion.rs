@@ -239,7 +239,7 @@ pub(crate) fn mark_values(statement: &mut DFStatement) {
 // ---------------------------------------------------------------- cast names
 
 /// Name of the identity that names a cast in an aggregate's arguments.
-const NAMED_CAST: &str = "codelake_named_cast";
+pub(crate) const NAMED_CAST: &str = "codelake_named_cast";
 
 /// `codelake_named_cast(CAST(x AS T), 'T')`: the cast, named with its type.
 ///

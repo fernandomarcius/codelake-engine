@@ -1037,6 +1037,7 @@ fn function_type(name: &str, args: &[Expr], scope: &Scope<'_>, whole: &Expr) -> 
             _ => None,
         }),
         crate::coercion::VALUES_CELL
+        | crate::coercion::NAMED_CAST
         | "nullif"
         | crate::trino_functions::TRY
         | crate::trino_functions::GUARDED_TRY
@@ -1793,6 +1794,29 @@ fn is_constant(expr: &Expr) -> bool {
     }
 }
 
+/// Whether `expr` is computed from literals alone (no column, subquery,
+/// aggregate or window function).
+fn is_constant_expression(expr: &Expr) -> bool {
+    !expr
+        .exists(|e| {
+            Ok(!matches!(
+                e,
+                Expr::Literal(..)
+                    | Expr::Alias(_)
+                    | Expr::Cast(_)
+                    | Expr::TryCast(_)
+                    | Expr::ScalarFunction(_)
+                    | Expr::BinaryExpr(_)
+                    | Expr::Case(_)
+                    | Expr::Not(_)
+                    | Expr::Negative(_)
+                    | Expr::IsNull(_)
+                    | Expr::IsNotNull(_)
+            ))
+        })
+        .unwrap_or(true)
+}
+
 /// Whether a row or array written out holds a `NULL`, at any depth.
 fn indeterminate(values: &[Expr]) -> Option<Expr> {
     values
@@ -2189,39 +2213,57 @@ fn scalar_function(function: ScalarFunction, scope: &Scope<'_>) -> Result<Transf
             Ok(unify_values(args, scope, "ARRAY")?.update_data(|args| func.call(args)))
         }
         _ if searches_array(&name) => search_array(&func, args, scope),
-        // `typeof` reads the type from its argument's field.
-        "typeof" if args.len() == 1 => {
-            let recorded = args[0]
-                .to_field(scope.schema.as_ref())
-                .ok()
-                .and_then(|(_, field)| declared(&field));
-            match infer(&args[0], scope) {
-                Some(Text::Char(Some(n))) if recorded != Some(Declared::Char(n)) => {
-                    let mut args = args;
-                    let value = args.pop().unwrap_or_default();
-                    Ok(Transformed::yes(func.call(vec![pad(value, n)])))
-                }
-                Some(Text::Varchar(_)) if matches!(recorded, Some(Declared::Char(_))) => {
-                    let mut args = args;
-                    let value = args.pop().unwrap_or_default();
-                    Ok(Transformed::yes(func.call(vec![untyped(value)])))
-                }
-                // Text computed from a char value: `varchar(n)` (see
-                // `record_types`).
-                Some(Text::Varchar(Bound::Known(k)))
-                    if recorded.is_none() && computed_from_char(&args[0], scope)? =>
-                {
-                    let mut args = args;
-                    let value = args.pop().unwrap_or_default();
-                    Ok(Transformed::yes(func.call(vec![varchar_of(value, k)])))
-                }
-                _ => Ok(Transformed::no(func.call(args))),
-            }
-        }
+        "typeof" if args.len() == 1 => type_of(&func, args, scope),
         _ => Ok(Transformed::no(Expr::ScalarFunction(ScalarFunction {
             func,
             args,
         }))),
+    }
+}
+
+/// `typeof(x)`: it reads the type from its argument's field.
+fn type_of(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
+    // A constant is folded before it runs, and a folded literal
+    // keeps no type: its type is answered here (`typeof('a')` is
+    // `varchar(1)`, `typeof(CAST('ab' AS char(3)))` `char(3)`).
+    if is_constant_expression(&args[0]) {
+        let name = match infer(&args[0], scope) {
+            Some(Text::Char(Some(n))) => Some(Declared::Char(n)),
+            Some(Text::Varchar(Bound::Known(k))) => Some(Declared::Varchar(k)),
+            _ => None,
+        };
+        if let Some(name) = name {
+            return Ok(Transformed::yes(Expr::Literal(
+                ScalarValue::Utf8(Some(name.name(&DataType::Utf8))),
+                None,
+            )));
+        }
+    }
+    let recorded = args[0]
+        .to_field(scope.schema.as_ref())
+        .ok()
+        .and_then(|(_, field)| declared(&field));
+    match infer(&args[0], scope) {
+        Some(Text::Char(Some(n))) if recorded != Some(Declared::Char(n)) => {
+            let mut args = args;
+            let value = args.pop().unwrap_or_default();
+            Ok(Transformed::yes(func.call(vec![pad(value, n)])))
+        }
+        Some(Text::Varchar(_)) if matches!(recorded, Some(Declared::Char(_))) => {
+            let mut args = args;
+            let value = args.pop().unwrap_or_default();
+            Ok(Transformed::yes(func.call(vec![untyped(value)])))
+        }
+        // Text computed from a char value: `varchar(n)` (see
+        // `record_types`).
+        Some(Text::Varchar(Bound::Known(k)))
+            if recorded.is_none() && computed_from_char(&args[0], scope)? =>
+        {
+            let mut args = args;
+            let value = args.pop().unwrap_or_default();
+            Ok(Transformed::yes(func.call(vec![varchar_of(value, k)])))
+        }
+        _ => Ok(Transformed::no(func.call(args))),
     }
 }
 
@@ -3236,6 +3278,24 @@ mod tests {
              rtrim(CAST('a b' AS char(5)), 'b'), trim(CAST(' xa' AS char(5)), 'a'), \
              rtrim(CAST('xa  a' AS char(6)), 'a') || '|', length(rtrim(CAST('b a' AS char(4)), 'a'))",
             &[&["", " b", "a", " x", "xa|", "1"]],
+        ),
+        // The type of a constant (folded before `typeof` runs).
+        (
+            "SELECT typeof('a'), typeof('ab'), typeof(''), typeof(CAST('ab' AS char(3))), typeof(CAST(NULL AS char(3))), \
+             typeof(CAST('ab' AS varchar(3))), typeof(coalesce(CAST('a' AS char(3)), 'abcd'))",
+            &[&[
+                "varchar(1)",
+                "varchar(2)",
+                "varchar(0)",
+                "char(3)",
+                "char(3)",
+                "varchar(3)",
+                "char(4)",
+            ]],
+        ),
+        (
+            "SELECT typeof(ch), typeof('a') FROM cht WHERE id = 1",
+            &[&["char(5)", "varchar(1)"]],
         ),
         (
             "SELECT id, ch, length(ch), typeof(ch) FROM cht ORDER BY id",
