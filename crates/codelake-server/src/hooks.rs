@@ -190,6 +190,14 @@ pub(crate) async fn plan_checked(session_context: &SessionContext, sql: &str) ->
     let mut statement = state.sql_to_statement(sql, &dialect).map_err(api_error)?;
     codelake_core::regroup_distinct_from(&mut statement);
     let plan = state.statement_to_plan(statement).await.map_err(api_error)?;
+    run_checked(session_context, plan).await
+}
+
+/// Runs `plan` as [`plan_checked`] runs the plan it makes.
+pub(crate) async fn run_checked(
+    session_context: &SessionContext,
+    plan: LogicalPlan,
+) -> PgWireResult<DataFrame> {
     SQLOptions::new().verify_plan(&plan).map_err(api_error)?;
     check_operands(&plan)?;
     session_context

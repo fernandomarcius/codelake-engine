@@ -388,8 +388,11 @@ where
 pub(crate) struct CursorHook;
 
 impl CursorHook {
+    /// `bound` is the statement's plan and its parameters' values, on the
+    /// extended protocol.
     async fn observe(
         statement: &Statement,
+        bound: Option<(&LogicalPlan, &ParamValues)>,
         session_context: &SessionContext,
         client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
@@ -422,7 +425,7 @@ impl CursorHook {
             Statement::Commit { .. } => cursors.end_transaction(Some(client.portal_store()), true),
             Statement::Rollback { .. } => cursors.end_transaction(Some(client.portal_store()), false),
             Statement::Declare { stmts } => {
-                return Some(declare(&cursors, stmts, session_context, client).await);
+                return Some(declare(&cursors, stmts, bound, session_context, client).await);
             }
             _ => {}
         }
@@ -438,29 +441,44 @@ impl QueryHook for CursorHook {
         session_context: &SessionContext,
         client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
-        Self::observe(statement, session_context, client).await
+        Self::observe(statement, None, session_context, client).await
     }
 
     /// `DISCARD`, which `DataFusion` does not plan, is answered here when
-    /// it runs.
+    /// it runs. A `DECLARE` of one cursor is planned as its query, whose
+    /// parameters (`$1`) the client then binds, as `PostgreSQL` plans it
+    /// (psycopg3's server-side cursors send them); it is described with no
+    /// columns ([`declares_one`]).
     async fn handle_extended_parse_query(
         &self,
         statement: &Statement,
-        _session_context: &SessionContext,
+        session_context: &SessionContext,
         _client: &(dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<LogicalPlan>> {
+        if let Some(query) = declares_one(statement) {
+            let query = datafusion::sql::parser::Statement::Statement(Box::new(Statement::Query(Box::new(
+                query.clone(),
+            ))));
+            return Some(
+                session_context
+                    .state()
+                    .statement_to_plan(query)
+                    .await
+                    .map_err(|error| PgWireError::ApiError(Box::new(error))),
+            );
+        }
         matches!(statement, Statement::Discard { .. }).then(|| Ok(empty_plan()))
     }
 
     async fn handle_extended_query(
         &self,
         statement: &Statement,
-        _logical_plan: &LogicalPlan,
-        _params: &ParamValues,
+        logical_plan: &LogicalPlan,
+        params: &ParamValues,
         session_context: &SessionContext,
         client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
-        Self::observe(statement, session_context, client).await
+        Self::observe(statement, Some((logical_plan, params)), session_context, client).await
     }
 }
 
@@ -487,18 +505,42 @@ fn cursor_name(name: &Ident) -> String {
     name
 }
 
+/// The query of a `DECLARE` of one cursor, planned on the extended protocol
+/// with its parameters ([`CursorHook`]).
+pub(super) fn declares_one(statement: &Statement) -> Option<&datafusion::sql::sqlparser::ast::Query> {
+    match statement {
+        Statement::Declare { stmts } => match stmts.as_slice() {
+            [declare] => declare.for_query.as_deref(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether `params` holds any value.
+fn has_values(params: &ParamValues) -> bool {
+    match params {
+        ParamValues::List(values) => !values.is_empty(),
+        ParamValues::Map(values) => !values.is_empty(),
+    }
+}
+
 /// `DECLARE … CURSOR`: each cursor checked ([`Cursors::declare`]), its
 /// query planned as a query of the session is (operands checked,
 /// [`crate::hooks::plan_checked`]) and its stream kept in a portal of the
 /// connection, rows encoded in text as a query's are, for `FETCH` to read.
+/// On the extended protocol (`bound`), a query with parameters runs the
+/// plan made when it was parsed, with the values bound to them.
 async fn declare(
     cursors: &Cursors,
     declares: &[Declare],
+    bound: Option<(&LogicalPlan, &ParamValues)>,
     session_context: &SessionContext,
     client: &mut dyn HookClient,
 ) -> PgWireResult<Response> {
     let made = cursors.declare(declares, Some(client.portal_store()))?;
     let options = Arc::new(FormatOptions::from_client_metadata(client.metadata()));
+    let bound = bound.filter(|(_, params)| declares.len() == 1 && has_values(params));
     for ((name, _), declare) in made.iter().zip(declares) {
         let outcome = async {
             let query = declare
@@ -506,7 +548,16 @@ async fn declare(
                 .as_ref()
                 .ok_or_else(|| user_error("42601", "DECLARE CURSOR requires a FOR query"))?
                 .to_string();
-            let df = crate::hooks::plan_checked(session_context, &query).await?;
+            let df = match bound {
+                Some((plan, params)) => {
+                    let plan = plan
+                        .clone()
+                        .replace_params_with_values(params)
+                        .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
+                    crate::hooks::run_checked(session_context, plan).await?
+                }
+                None => crate::hooks::plan_checked(session_context, &query).await?,
+            };
             let rows = encode_dataframe(df, &Format::UnifiedText, Some(Arc::clone(&options))).await?;
             let statement = StoredStatement::new(name.clone(), (query, None), Vec::new());
             let portal = Portal::new_cursor(name.clone(), Arc::new(statement));

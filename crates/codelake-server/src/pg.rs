@@ -1039,7 +1039,15 @@ impl ExtendedQueryHandler for Governed {
         {
             return Ok(DescribeStatementResponse::new(Vec::new(), fields?));
         }
-        ExtendedQueryHandler::do_describe_statement(&*self.inner, client, target).await
+        let described = ExtendedQueryHandler::do_describe_statement(&*self.inner, client, target).await?;
+        // A DECLARE is planned as its query, for its parameters: it returns
+        // no rows, as PostgreSQL describes it.
+        if let (_, Some((statement, _))) = &target.statement
+            && cursor::declares_one(statement).is_some()
+        {
+            return Ok(DescribeStatementResponse::new(described.parameters, Vec::new()));
+        }
+        Ok(described)
     }
 
     async fn do_describe_portal<C>(
@@ -1058,6 +1066,11 @@ impl ExtendedQueryHandler for Governed {
                 cursor::fetch_fields(&*client, sql, statement, &target.result_column_format).await
         {
             return Ok(DescribePortalResponse::new(fields?));
+        }
+        if let (_, Some((statement, _))) = &target.statement.statement
+            && cursor::declares_one(statement).is_some()
+        {
+            return Ok(DescribePortalResponse::new(Vec::new()));
         }
         ExtendedQueryHandler::do_describe_portal(&*self.inner, client, target).await
     }

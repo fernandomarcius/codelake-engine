@@ -864,6 +864,21 @@ impl Wire {
         self.bind_portal("", statement, format);
     }
 
+    /// Binds `statement` to the unnamed portal with `params` as text,
+    /// results in text.
+    fn bind_params(&mut self, statement: &str, params: &[&str]) {
+        let mut body = [cstr(""), cstr(statement)].concat();
+        body.extend(0_i16.to_be_bytes());
+        body.extend(i16::try_from(params.len()).unwrap().to_be_bytes());
+        for param in params {
+            body.extend(i32::try_from(param.len()).unwrap().to_be_bytes());
+            body.extend(param.as_bytes());
+        }
+        body.extend(1_i16.to_be_bytes());
+        body.extend(0_i16.to_be_bytes());
+        self.send(b'B', &body);
+    }
+
     /// Binds `statement` to `portal`, results in `format`.
     fn bind_portal(&mut self, portal: &str, statement: &str, format: i16) {
         let tail = [
@@ -1716,6 +1731,9 @@ fn beside_cursors_script() -> Vec<(String, Want)> {
 enum Step {
     Simple(String),
     Extended(String),
+    /// On the extended protocol with parameters bound as text, the portal
+    /// described before it runs (psycopg3's server-side cursors).
+    Bound(String, Vec<&'static str>),
 }
 
 /// What a client sees of one step: its command tags, the text of its rows
@@ -1744,8 +1762,25 @@ async fn exchanged(
                         wire.execute();
                         wire.sync()
                     }
+                    Step::Bound(sql, params) => {
+                        wire.parse("", sql);
+                        wire.bind_params("", params);
+                        wire.describe(b'P', "");
+                        wire.execute();
+                        wire.sync()
+                    }
                 };
-                (tags(&messages), data_rows(&messages), error_code(&messages))
+                // How a bound portal was described: no rows (NoData) or rows.
+                let described = messages
+                    .iter()
+                    .find_map(|(kind, _)| match kind {
+                        b'n' => Some("NoData".to_owned()),
+                        b'T' => Some("RowDescription".to_owned()),
+                        _ => None,
+                    })
+                    .filter(|_| matches!(step, Step::Bound(..)));
+                let tags = described.into_iter().chain(tags(&messages)).collect();
+                (tags, data_rows(&messages), error_code(&messages))
             })
             .collect()
     })
@@ -1832,6 +1867,7 @@ fn extended_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
     .into_iter()
     .chain(session_scripts())
     .chain(move_scripts())
+    .chain(parameter_scripts())
     .collect()
 }
 
@@ -1909,6 +1945,55 @@ fn move_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
         script(vec![Extended("MOVE -1 IN m".into())], vec![failed("55000")]),
         script(vec![Simple("MOVE 2147483648 IN m".into())], vec![failed("42601")]),
     ]
+}
+
+/// A `DECLARE` with parameters on the extended protocol (psycopg3's
+/// server-side cursors): described with no rows, its query run with the
+/// values bound. (Found by the third F6 verification: XX000, the query
+/// planned without its values.)
+fn parameter_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
+    use Step::{Bound, Extended, Simple};
+    let ok = |tag: &str| (vec![tag.to_owned()], Vec::new(), None);
+    let rows = |tag: &str, values: &[i64]| {
+        (
+            vec![tag.to_owned()],
+            values.iter().map(|v| vec![v.to_string()]).collect(),
+            None,
+        )
+    };
+    let declare = |name: &str, how: &str| format!("DECLARE {name} {how} FOR {TEN}");
+    vec![(
+        vec![
+            Simple("BEGIN".into()),
+            Bound(
+                format!("{} WHERE x > $1 AND x < $2", declare("pc", "CURSOR")),
+                vec!["2", "5"],
+            ),
+            Extended("FETCH ALL FROM pc".into()),
+            Bound(
+                format!("{} WHERE x = $1", declare("pd", "NO SCROLL CURSOR")),
+                vec!["9"],
+            ),
+            Simple("FETCH 2 FROM pd".into()),
+            Simple("ROLLBACK".into()),
+        ],
+        vec![
+            ok("BEGIN"),
+            (
+                vec!["NoData".to_owned(), "DECLARE CURSOR".to_owned()],
+                Vec::new(),
+                None,
+            ),
+            rows("FETCH 2", &[3, 4]),
+            (
+                vec!["NoData".to_owned(), "DECLARE CURSOR".to_owned()],
+                Vec::new(),
+                None,
+            ),
+            rows("FETCH 1", &[9]),
+            ok("ROLLBACK"),
+        ],
+    )]
 }
 
 /// Wire scripts of the statements that end or reset a session's
