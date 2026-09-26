@@ -2233,10 +2233,11 @@ fn type_of(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result<Trans
             _ => None,
         };
         if let Some(name) = name {
-            return Ok(Transformed::yes(Expr::Literal(
+            // `typeof` is unbounded `varchar`, not the literal's `varchar(n)`.
+            return Ok(Transformed::yes(untyped(Expr::Literal(
                 ScalarValue::Utf8(Some(name.name(&DataType::Utf8))),
                 None,
-            )));
+            ))));
         }
     }
     let recorded = args[0]
@@ -3873,6 +3874,20 @@ mod tests {
             ),
         ] {
             assert_eq!(rows(&engine, sql).await, Ok(expected(answer)), "{sql}");
+        }
+    }
+
+    /// `typeof` answers unbounded `varchar` (Trino 431), also of a constant.
+    #[tokio::test]
+    async fn typeof_is_unbounded_varchar() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path()).await;
+        let frame = engine
+            .sql("SELECT typeof('a'), typeof(CAST('ab' AS char(3))), typeof(ch) FROM cht WHERE id = 1")
+            .await
+            .unwrap();
+        for field in frame.schema().fields() {
+            assert_eq!(declared(field), None, "{field:?}");
         }
     }
 
