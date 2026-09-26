@@ -26,7 +26,7 @@ use codelake_core::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::{CatalogProvider, SchemaProvider, Session, TableProvider};
-use datafusion::common::Column;
+use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SessionStateBuilder;
@@ -329,9 +329,16 @@ impl TableProvider for HiveView {
                 let field = &fields[*index];
                 let value = cast(Expr::Column(columns[*index].clone()), field.data_type().clone());
                 // A char(n) column holds its values padded, as Trino shows
-                // them (`codelake_core::char_semantics`).
+                // them (`codelake_core::char_semantics`): only trailing
+                // spaces are padding, a trailing tab or line feed is text.
                 let value = match char_column(field).and_then(|n| u32::try_from(n).ok()) {
-                    Some(length) => codelake_core::char_semantics::pad(expr_fn::rtrim(vec![value]), length),
+                    Some(length) => codelake_core::char_semantics::pad(
+                        expr_fn::rtrim(vec![
+                            value,
+                            Expr::Literal(ScalarValue::Utf8(Some(" ".into())), None),
+                        ]),
+                        length,
+                    ),
                     None => value,
                 };
                 value.alias(field.name())

@@ -2418,3 +2418,5 @@ async fn w1t_parquet_time_zone_east_of_greenwich_like_trino_431() {
 
 #[path = "char_matrix.rs"]
 mod char_matrix;
+#[path = "char_whitespace.rs"]
+mod char_whitespace;
