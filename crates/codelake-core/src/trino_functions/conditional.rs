@@ -66,9 +66,12 @@ pub(crate) fn typeof_function() -> ScalarUDF {
             let field = call.fields.first();
             let name = if field.is_some_and(|f| super::support::is_json_field(f)) {
                 "json".to_owned()
-            } else if let Some(Declared::Char(n)) = field.and_then(|f| declared(f)) {
-                // Recorded in the field (`crate::char_semantics`).
-                Declared::Char(n).name(&DataType::Utf8)
+            } else if let Some(bounded @ (Declared::Char(_) | Declared::Varchar(_))) =
+                field.and_then(|f| declared(f))
+            {
+                // Recorded in the field (`crate::char_semantics`,
+                // `crate::declared`).
+                bounded.name(&DataType::Utf8)
             } else {
                 trino_type_name(call.arg(0)?.data_type())
             };

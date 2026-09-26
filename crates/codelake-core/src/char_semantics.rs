@@ -2197,6 +2197,15 @@ fn scalar_function(function: ScalarFunction, scope: &Scope<'_>) -> Result<Transf
                     let value = args.pop().unwrap_or_default();
                     Ok(Transformed::yes(func.call(vec![untyped(value)])))
                 }
+                // Text computed from a char value: `varchar(n)` (see
+                // `record_types`).
+                Some(Text::Varchar(Bound::Known(k)))
+                    if recorded.is_none() && computed_from_char(&args[0], scope)? =>
+                {
+                    let mut args = args;
+                    let value = args.pop().unwrap_or_default();
+                    Ok(Transformed::yes(func.call(vec![varchar_of(value, k)])))
+                }
                 _ => Ok(Transformed::no(func.call(args))),
             }
         }
@@ -2288,6 +2297,26 @@ fn rewrite_expressions(plan: LogicalPlan, scope: &Scope<'_>) -> Result<Transform
     })
 }
 
+/// Whether `expr` is text computed from a char value (not the value
+/// itself).
+fn computed_from_char(expr: &Expr, scope: &Scope<'_>) -> Result<bool> {
+    if matches!(expr.clone().unalias(), Expr::Column(_) | Expr::Literal(..)) {
+        return Ok(false);
+    }
+    expr.exists(|e| Ok(matches!(infer(e, scope), Some(Text::Char(_)))))
+}
+
+/// `expr` with `varchar(length)` recorded in its field ([`VarcharOf`]).
+fn varchar_of(expr: Expr, length: u32) -> Expr {
+    Expr::ScalarFunction(ScalarFunction::new_udf(
+        Arc::clone(&VARCHAR_OF_UDF),
+        vec![
+            expr,
+            Expr::Literal(ScalarValue::Int64(Some(i64::from(length))), None),
+        ],
+    ))
+}
+
 /// `expr` without the char type a cast copied into its field from its
 /// argument's.
 fn untyped(expr: Expr) -> Expr {
@@ -2313,18 +2342,10 @@ fn record_types(projection: Projection, scope: &Scope<'_>) -> Result<Transformed
         // the field, the value as it is.
         if let Some(Text::Varchar(Bound::Known(k))) = wanted
             && recorded.is_none()
-            && !matches!(expr.clone().unalias(), Expr::Column(_) | Expr::Literal(..))
-            && expr.exists(|e| Ok(matches!(infer(e, scope), Some(Text::Char(_)))))?
+            && computed_from_char(&expr, scope)?
         {
             changed = true;
-            let typed = Expr::ScalarFunction(ScalarFunction::new_udf(
-                Arc::clone(&VARCHAR_OF_UDF),
-                vec![
-                    expr.unalias(),
-                    Expr::Literal(ScalarValue::Int64(Some(i64::from(k))), None),
-                ],
-            ));
-            exprs.push(typed.alias_qualified(qualifier, field.name()));
+            exprs.push(varchar_of(expr.unalias(), k).alias_qualified(qualifier, field.name()));
             continue;
         }
         let value = match wanted {
@@ -3122,6 +3143,17 @@ mod tests {
         (
             "SELECT x = y, x IN (y, 'b') FROM (VALUES (CAST('a' || chr(10) AS char(3)), 'a' || chr(10) || ' ')) t(x, y)",
             &[&["true", "true"]],
+        ),
+        (
+            "SELECT typeof(rtrim(ch)), typeof(substr(ch, 2)), typeof(ltrim(ch)), typeof(trim(ch)), typeof(nullif(s, ch)) \
+             FROM cht JOIN v3 USING (id) WHERE cht.id = 1",
+            &[&[
+                "varchar(5)",
+                "varchar(5)",
+                "varchar(5)",
+                "varchar(5)",
+                "varchar(3)",
+            ]],
         ),
         // The trims work on the value without its padding.
         (
