@@ -1,0 +1,87 @@
+# CodeLake's PostgreSQL wire (simple and extended protocol) against Trino 431 answering
+# the same SQL over HTTP, values compared as PostgreSQL text; and fixed-value cases.
+
+oracle = "trino"
+setup = [
+  "CREATE SCHEMA {c}.pgw",
+  "CREATE TABLE {c}.pgw.t (id bigint, v varchar, d double, b boolean)",
+  "INSERT INTO {c}.pgw.t VALUES (1, 'a', 1.5E0, true), (2, 'b', 0.0E0, false), (3, NULL, 2.25E0, NULL), (4, 'a', -0.0E0, true)",
+]
+
+[[case]]
+id = "PG1"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT id, v, d FROM {c}.pgw.t ORDER BY id"
+compare = "ordered"
+protocol = "pg"
+
+[[case]]
+id = "PG2"
+sql = "SELECT count(*), sum(id), min(v), max(d) FROM {c}.pgw.t"
+protocol = "pg"
+
+[[case]]
+id = "PG3"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT id FROM {c}.pgw.t WHERE d = 0 ORDER BY id"
+compare = "ordered"
+protocol = "pg"
+
+[[case]]
+id = "PG4"
+sql = "SELECT id, b, d > 1 FROM {c}.pgw.t ORDER BY id"
+compare = "ordered"
+protocol = "pg"
+
+[[case]]
+id = "PG5-param-text"
+sql = "SELECT id FROM {c}.pgw.t WHERE v = $1 ORDER BY id"
+params = [
+  "a",
+]
+oracle_sql = "SELECT id FROM {c}.pgw.t WHERE v = 'a' ORDER BY id"
+protocol = "pg"
+
+[[case]]
+id = "PG6-param-int8"
+sql = "SELECT v FROM {c}.pgw.t WHERE id = $1"
+params = [
+  "2",
+]
+param_types = [
+  20,
+]
+oracle_sql = "SELECT v FROM {c}.pgw.t WHERE id = 2"
+protocol = "pg"
+
+[[case]]
+id = "PG7-param-null"
+sql = "SELECT count(*) FROM {c}.pgw.t WHERE v IS NOT DISTINCT FROM $1"
+params = [
+  "b",
+]
+oracle_sql = "SELECT count(*) FROM {c}.pgw.t WHERE v IS NOT DISTINCT FROM 'b'"
+protocol = "pg"
+
+[[case]]
+id = "PG8-negative-zero"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT d FROM {c}.pgw.t WHERE id = 4"
+protocol = "pg"
+
+[[case]]
+id = "VAL1-zero-equal"
+expect = "WRONG"
+known = "ISS-032"
+oracle = "value"
+sql = "SELECT -0.0E0 = 0.0E0, -0.0E0 IS DISTINCT FROM 0.0E0"
+rows_json = "[[true, false]]"
+
+[[case]]
+id = "VAL2-null-count"
+oracle = "value"
+sql = "SELECT count(v), count(*) FROM {c}.pgw.t"
+rows_json = "[[3, 4]]"

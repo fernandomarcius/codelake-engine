@@ -56,6 +56,7 @@ sccache was added keeps working, uncached, with a warning on stderr; rebuild it 
 | msrv | `gates.sh msrv` | compiles on Rust 1.94 | every PR |
 | deny | `gates.sh deny` | no RustSec advisory (vulnerable, unmaintained, yanked), only allowed licenses, crates.io only | every PR + weekly |
 | machete | `gates.sh machete` | no unused dependency | every PR |
+| differential | `gates.sh differential` (containers through the Docker socket; under `heavy.sh` on a shared machine) | every case as its file expects; known defects listed, never green ([differential.md](differential.md)) | before delivering a front (DoD, below) |
 | shadow-run harness | `tools/shadow/test.sh` (Docker: the harness image; not in `gates.sh`, which runs inside the toolbelt) | 100% pass | every PR |
 | coverage | `gates.sh coverage` | lines ≥ 75% | every PR |
 | mutation | `gates.sh mutants` | by criticality, below | PR (changed code), nightly (full) |
@@ -83,6 +84,21 @@ Score = (caught + timeout) / (caught + missed + timeout). Unviable mutants do no
 A crash is loud; a wrong answer is silent. Any change to planning, pushdown or a
 connector needs an integration test that asserts **rows**, not only plans. The
 federation guard exists because such a test caught a lost `WHERE` clause.
+
+## Differential cases in the Definition of Done
+
+A front that touches planning, pushdown, a connector, a client protocol or SQL
+semantics runs, before delivering:
+
+```bash
+heavy.sh scripts/dev.sh scripts/gates.sh differential
+```
+
+It adds a case to `tools/differential/cases/` for every wrong result it finds or
+fixes, drops the `known` marker of the cases its fix turns `OK` (the gate fails
+until it does) and never marks a divergence `known`/`accepted` without the issue or
+ADR that records it. The implementer pastes the gate's summary in the delivery; the
+verifier reruns it. Format and outcomes: [differential.md](differential.md).
 
 ## Supply chain
 

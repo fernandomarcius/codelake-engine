@@ -9,3 +9,4 @@ lcov.info
 .env
 .DS_Store
 __pycache__/
+/tools/differential/out

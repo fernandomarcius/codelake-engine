@@ -1,0 +1,591 @@
+# char(n) values against Trino 431: the CH red-team probes (hive tables Trino wrote),
+# the wrong-result shapes of ISS-025 and the W1 verdict probes (in-memory tables).
+# main refuses many char comparisons until ISS-024 lands: those are known, not green.
+
+oracle = "trino"
+setup = [
+  "CREATE SCHEMA {c}.chp",
+  "CREATE TABLE {c}.chp.t (id bigint, ch char(5), c3 char(3), v varchar, v3 varchar(3))",
+  "INSERT INTO {c}.chp.t VALUES (1, 'ab', 'ab', 'ab', 'ab'), (2, 'ab  ', 'a', 'ab  ', 'a  '), (3, NULL, NULL, NULL, NULL), (4, 'zz', 'zz ', 'zz', 'z'), (5, 'a', 'a', 'a' || chr(9), 'a'), (6, 'é', 'é', 'é', 'é'), (7, '', '', '', '')",
+  "CREATE TABLE {c}.chp.u (k char(4), n bigint)",
+  "INSERT INTO {c}.chp.u VALUES ('ab', 10), ('a', 20), ('zz', 30), (NULL, 40), ('x', 50)",
+  "CREATE TABLE {c}.chp.u2 (k varchar, n bigint)",
+  "INSERT INTO {c}.chp.u2 VALUES ('ab', 10), ('a', 20), ('zz', 30)",
+]
+setup_trino = [
+  "CREATE SCHEMA hive.chs",
+  "CREATE TABLE hive.chs.cht (id bigint, ch char(5)) WITH (format = 'PARQUET')",
+  "INSERT INTO hive.chs.cht VALUES (1, 'ab'), (2, 'zz')",
+  "CREATE TABLE hive.chs.vct (id bigint, ch varchar) WITH (format = 'PARQUET')",
+  "INSERT INTO hive.chs.vct VALUES (1, 'ab'), (3, 'cd')",
+]
+
+[[case]]
+id = "CH1"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT count(*) FROM hive.chs.cht JOIN hive.chs.vct USING (ch)"
+
+[[case]]
+id = "CH2"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT count(*) FROM (SELECT ch FROM hive.chs.cht INTERSECT SELECT ch FROM hive.chs.vct)"
+
+[[case]]
+id = "CH3"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT count(*) FROM (SELECT ch FROM hive.chs.cht EXCEPT SELECT ch FROM hive.chs.vct)"
+
+[[case]]
+id = "CH4"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT count(*) FROM (SELECT ch FROM hive.chs.cht UNION SELECT ch FROM hive.chs.vct)"
+
+[[case]]
+id = "CH5"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT id FROM hive.chs.cht WHERE nullif(ch, 'ab') IS NULL ORDER BY 1"
+
+[[case]]
+id = "CH6"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT count(DISTINCT c) FROM (SELECT ch AS c FROM hive.chs.cht UNION ALL SELECT CAST('ab' AS char(5)))"
+
+[[case]]
+id = "CH7"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT id FROM hive.chs.cht WHERE (ch, id) = ('ab', 1) ORDER BY 1"
+
+[[case]]
+id = "CH8"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT id FROM hive.chs.cht WHERE ch = ANY (SELECT ch FROM hive.chs.vct) ORDER BY 1"
+
+[[case]]
+id = "CH9"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT count(*) FROM (SELECT 'ab ' UNION SELECT CAST('ab' AS char(5)))"
+
+[[case]]
+id = "CH10"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT CAST('ab' AS char(5)) = 'ab '"
+
+[[case]]
+id = "CH11"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT count(DISTINCT x) FROM (VALUES ('ab '), (CAST('ab' AS char(5)))) AS t(x)"
+
+[[case]]
+id = "CH12"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT TRY_CAST('ab' AS char(5)) = 'ab '"
+
+[[case]]
+id = "CH13"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT count(*) FROM (SELECT max(ch) FROM hive.chs.cht UNION SELECT ch FROM hive.chs.vct)"
+
+[[case]]
+id = "CH14"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT count(*) FROM (SELECT coalesce(ch, 'x') FROM hive.chs.cht UNION SELECT ch FROM hive.chs.vct)"
+
+[[case]]
+id = "CH15"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT id FROM (SELECT id, max(ch) AS m FROM hive.chs.cht GROUP BY id) WHERE m = 'ab' ORDER BY 1"
+
+[[case]]
+id = "CH16"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT id FROM hive.chs.cht WHERE upper(ch) = 'AB ' ORDER BY 1"
+
+[[case]]
+id = "P-in-subquery"
+expect = "RECUSA"
+known = "front/w1-df54"
+sql = "SELECT id FROM {c}.chp.t WHERE v IN (SELECT ch FROM {c}.chp.t) ORDER BY 1"
+
+[[case]]
+id = "P-not-in-subquery"
+expect = "RECUSA"
+known = "front/w1-df54"
+sql = "SELECT id FROM {c}.chp.t WHERE v NOT IN (SELECT ch FROM {c}.chp.t WHERE ch IS NOT NULL) ORDER BY 1"
+
+[[case]]
+id = "P-any-subquery"
+expect = "RECUSA"
+known = "front/w1-df54"
+sql = "SELECT id FROM {c}.chp.t WHERE v = ANY (SELECT c3 FROM {c}.chp.t) ORDER BY 1"
+
+[[case]]
+id = "P-in-subquery-hive"
+expect = "WRONG"
+known = "ISS-025 (front/w1-df54)"
+sql = "SELECT id FROM hive.chs.vct WHERE ch IN (SELECT ch FROM hive.chs.cht) ORDER BY 1"
+
+[[case]]
+id = "P-scalar-subquery"
+expect = "RECUSA"
+known = "front/w1-df54"
+sql = "SELECT id FROM {c}.chp.t WHERE v = (SELECT ch FROM {c}.chp.t WHERE id = 1) ORDER BY 1"
+
+[[case]]
+id = "P-scalar-subquery-select"
+expect = "RECUSA"
+known = "front/w1-df54"
+sql = "SELECT (SELECT ch FROM {c}.chp.t WHERE id = 1) = 'ab'"
+
+[[case]]
+id = "P-case-mix"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT id, CASE WHEN id < 3 THEN ch ELSE v END = 'ab' FROM {c}.chp.t ORDER BY 1"
+
+[[case]]
+id = "P-coalesce-mix"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT id, coalesce(ch, v) = 'ab' FROM {c}.chp.t ORDER BY 1"
+
+[[case]]
+id = "P-coalesce-length"
+expect = "WRONG"
+known = "ISS-025 (front/w1-df54)"
+sql = "SELECT id, length(coalesce(ch, v)) FROM {c}.chp.t ORDER BY 1"
+
+[[case]]
+id = "P-cast-char-length"
+expect = "WRONG"
+known = "ISS-025 (front/w1-df54)"
+sql = "SELECT length(CAST('ab' AS char(5))), CAST('ab' AS char(5)) || 'x'"
+
+[[case]]
+id = "P-cast-char-hex"
+expect = "WRONG"
+known = "ISS-025 (front/w1-df54)"
+sql = "SELECT to_hex(to_utf8(CAST(CAST('ab' AS char(5)) AS varchar)))"
+
+[[case]]
+id = "P-try-cast-varchar-n"
+expect = "WRONG"
+known = "ISS-025 (front/w1-df54)"
+sql = "SELECT TRY_CAST('abcdef' AS varchar(3))"
+
+[[case]]
+id = "P-cast-varchar-n"
+sql = "SELECT CAST('abcdef' AS varchar(3))"
+
+[[case]]
+id = "P-max-char-memory"
+expect = "RECUSA"
+known = "front/w1-df54"
+sql = "SELECT max(ch), min(c3) FROM {c}.chp.t"
+
+[[case]]
+id = "P-max-char-hive"
+expect = "TIPO"
+known = "front/w1-df54"
+sql = "SELECT max(ch) FROM hive.chs.cht"
+
+[[case]]
+id = "P-char-join-varchar"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT a.id FROM hive.chs.cht a JOIN hive.chs.vct b ON a.ch = b.ch ORDER BY 1"
+
+[[case]]
+id = "V1"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT CAST(' 1.5' AS char(6)) AS a, CAST(CAST(' 1.5' AS char(6)) AS double) AS b"
+
+[[case]]
+id = "V2"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT CAST(CAST('12' AS char(5)) AS bigint) AS a"
+
+[[case]]
+id = "V3"
+expect = "ERRO"
+known = "ISS-032"
+sql = "SELECT DISTINCT ARRAY[ch] AS r FROM {c}.chp.t ORDER BY 1"
+
+[[case]]
+id = "V4"
+expect = "RECUSA"
+known = "ISS-032"
+sql = "SELECT array_agg(ch ORDER BY id) AS a FROM {c}.chp.t"
+
+[[case]]
+id = "V5"
+expect = "RECUSA"
+known = "front/w1-df54"
+sql = "SELECT ch AS a, c3 AS b, count(*) AS n FROM {c}.chp.t GROUP BY ROLLUP (ch, c3) ORDER BY 1, 2"
+
+[[case]]
+id = "V6"
+expect = "RECUSA"
+known = "front/w1-df54"
+sql = "SELECT coalesce(element_at(array_agg(c3 ORDER BY id), 2), CAST('x' AS char(7))) AS a FROM {c}.chp.t"
+
+[[case]]
+id = "V7"
+expect = "RECUSA"
+known = "front/w1-df54"
+sql = "SELECT contains(array_agg(ch), 'ab') AS a FROM {c}.chp.t"
+
+[[case]]
+id = "V8"
+expect = "RECUSA"
+known = "front/w1-df54"
+sql = "SELECT element_at(array_agg(ch ORDER BY id), 1) = 'ab' AS a, array_agg(c3 ORDER BY id)[2] = 'a' AS b FROM {c}.chp.t"
+
+[[case]]
+id = "V9"
+expect = "WRONG"
+known = "ISS-025"
+sql = "SELECT histogram(c3) AS a FROM {c}.chp.t"
+
+[[case]]
+id = "V10"
+sql = "SELECT histogram(c3)[CAST('a' AS char(3))] AS a, element_at(map_agg(id, ch), 1) = 'ab' AS b FROM {c}.chp.t"
+
+[[case]]
+id = "V11"
+expect = "RECUSA"
+known = "ISS-032"
+sql = "SELECT id AS i FROM {c}.chp.t WHERE ch = ANY (VALUES 'ab', 'zz') ORDER BY 1"
+
+[[case]]
+id = "V12"
+expect = "RECUSA"
+known = "ISS-032"
+sql = "SELECT id AS i, EXISTS (SELECT 1 FROM {c}.chp.u WHERE n = x.id * 10) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V13"
+expect = "RECUSA"
+known = "ISS-032"
+sql = "SELECT id AS i, ch AS r FROM {c}.chp.t ORDER BY ch DESC LIMIT 3"
+
+[[case]]
+id = "V14"
+expect = "RECUSA"
+known = "ISS-032"
+sql = "SELECT id AS i, lag(c3, 1, ch) OVER (ORDER BY id) AS a, lead(v3, 1, ch) OVER (ORDER BY id) AS b FROM {c}.chp.t ORDER BY id"
+
+[[case]]
+id = "V15"
+expect = "RECUSA"
+known = "ISS-032"
+sql = "SELECT id AS i, lag(v3, 1, v) OVER (ORDER BY id) AS a FROM {c}.chp.t ORDER BY id"
+
+[[case]]
+id = "V16"
+expect = "WRONG"
+known = "ISS-025"
+sql = "SELECT id AS i, min(c3) OVER (ORDER BY ch ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS a FROM {c}.chp.t ORDER BY id"
+
+[[case]]
+id = "V17"
+expect = "RECUSA"
+known = "ISS-032"
+sql = "SELECT id, ARRAY[ch, c3] AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V18"
+expect = "RECUSA"
+known = "front/w1-df54"
+sql = "SELECT id, ARRAY[ch, c3][2] = 'a' AS a, element_at(ARRAY[ch], 1) = 'ab' AS b, ARRAY[ch, v3][1] || 'x' AS c FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V19"
+expect = "RECUSA"
+known = "ISS-032"
+sql = "SELECT id, ARRAY[ch, v3] AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V20"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT id, CAST(ch AS json) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V21"
+expect = "RECUSA"
+known = "ISS-024"
+error = "is not supported yet"
+sql = "SELECT id, EXISTS (SELECT 1 FROM {c}.chp.u WHERE k = x.ch) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V22"
+expect = "RECUSA"
+known = "front/w1-df54"
+sql = "SELECT id, ROW(ch) = ROW(c3) AS a, ROW(ch, 1) <> ROW('ab', 1) AS b, ROW(ch) IS DISTINCT FROM ROW(v3) AS c FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V23"
+expect = "RECUSA"
+known = "front/w1-df54"
+sql = "SELECT id, ROW(ch, c3) = ROW('ab', 'ab') AS a, ROW(ch, id) = ROW(v, id) AS b, (ch, id) IN (('ab', 1), ('zz', 4)) AS c FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V24"
+expect = "RECUSA"
+known = "front/w1-df54"
+sql = "SELECT id, ROW(ch, c3) = ROW('ab', 'ab') AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V25"
+expect = "ERRO"
+known = "ISS-032"
+sql = "SELECT id, c3 LIKE v3 AS a, v LIKE ch AS b, ch LIKE c3 AS c FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V26"
+expect = "ERRO"
+known = "ISS-032"
+sql = "SELECT id, checksum(ch) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V27"
+expect = "RECUSA"
+known = "front/w1-df54"
+sql = "SELECT id, coalesce(element_at(ARRAY[c3], 1), CAST('x' AS char(7))) AS a FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V28"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT id, concat(c3, 'x', c3) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V29"
+expect = "RECUSA"
+known = "front/w1-df54"
+sql = "SELECT id, element_at(ARRAY[ch], 1) IN ('ab', 'zz') AS a, ARRAY[c3][1] BETWEEN 'a' AND 'ab' AS b FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V30"
+expect = "RECUSA"
+known = "ISS-032"
+sql = "SELECT id, format('%s|', ch) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V31"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT id, from_utf8(to_utf8(ch)) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V32"
+expect = "ERRO"
+known = "ISS-032"
+sql = "SELECT id, json_format(CAST(ARRAY[ch] AS json)) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V33"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT id, levenshtein_distance(ch, v) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V34"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT id, lpad(ch, 7, '*') AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V35"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT id, ltrim(ch) = 'ab' AS a, length(ltrim(ch)) AS b, ltrim(ch) || 'x' AS c FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V36"
+expect = "TIPO"
+known = "front/w1-df54"
+sql = "SELECT id, ltrim(ch) AS a, ltrim(c3) AS b, ltrim(CAST('  ab' AS char(6))) AS c FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V37"
+expect = "TIPO"
+known = "front/w1-df54"
+sql = "SELECT id, ltrim(ch) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V38"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT id, md5(to_utf8(ch)) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V39"
+expect = "RECUSA"
+known = "ISS-024 (front/w1-df54)"
+error = "is not supported yet"
+sql = "SELECT id, nullif(v3, ch) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V40"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT id, position(' ' IN ch) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V41"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT id, regexp_like(ch, 'b +$') AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V42"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT id, replace(ch, ' ', '_') AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V43"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT id, reverse(ch) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V44"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT id, rpad(c3, 6, '*') AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V45"
+expect = "TIPO"
+known = "front/w1-df54"
+sql = "SELECT id, rtrim(ch) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V46"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT id, split(ch, ' ') AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V47"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT id, starts_with(ch, 'ab ') AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V48"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT id, strpos(ch, ' ') AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V49"
+expect = "WRONG"
+known = "ISS-025 (front/w1-df54)"
+sql = "SELECT id, substr(ch, 1, 3) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V50"
+expect = "WRONG"
+known = "ISS-025 (front/w1-df54)"
+sql = "SELECT id, substr(ch, 2) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V51"
+expect = "WRONG"
+known = "ISS-025 (front/w1-df54)"
+sql = "SELECT id, substring(ch FROM 4) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V52"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT id, to_hex(to_utf8(ch)) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V53"
+expect = "TIPO"
+known = "front/w1-df54"
+sql = "SELECT id, trim(ch) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V54"
+expect = "RECUSA"
+known = "ISS-032"
+sql = "SELECT id, typeof(ch || c3) AS a, typeof(coalesce(c3, v3)) AS b, typeof(ARRAY[ch, v3]) AS c FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V55"
+expect = "RECUSA"
+known = "front/w1-df54"
+sql = "SELECT id, typeof(substr(ch, 2)) AS a, typeof(trim(c3)) AS b, typeof(upper(ch)) AS c FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V56"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT id, xxhash64(to_utf8(ch)) AS r FROM {c}.chp.t x ORDER BY id"
+
+[[case]]
+id = "V57"
+expect = "RECUSA"
+known = "ISS-032"
+sql = "SELECT k AS r FROM (SELECT c3 AS k FROM {c}.chp.t) JOIN {c}.chp.u USING (k) ORDER BY 1"
+
+[[case]]
+id = "V58"
+expect = "RECUSA"
+known = "ISS-032"
+sql = "SELECT k AS r FROM (SELECT ch AS k FROM {c}.chp.t) JOIN (SELECT k FROM {c}.chp.u) USING (k) ORDER BY 1"
+
+[[case]]
+id = "V59"
+expect = "RECUSA"
+known = "ISS-032"
+sql = "SELECT k AS r FROM (SELECT v AS k FROM {c}.chp.t) JOIN (SELECT CAST(k AS varchar) AS k FROM {c}.chp.u) USING (k) ORDER BY 1"
+
+[[case]]
+id = "V60"
+expect = "RECUSA"
+known = "ISS-032"
+sql = "SELECT k AS r FROM (SELECT v AS k FROM {c}.chp.t) JOIN {c}.chp.u2 USING (k) ORDER BY 1"
