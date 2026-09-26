@@ -40,12 +40,17 @@
 //! - a cancel request (`psql`'s Ctrl-C, JDBC `Statement.cancel`,
 //!   `tokio-postgres`' `cancel_query`), which names the connection by its
 //!   process id and secret key: while the connection executes a message (a
-//!   query, an `Execute`), every governed statement of that connection
-//!   fails with `57014`, whether it waits in the queue, is planned, or sends
-//!   rows — open cursors and suspended portals too, which `PostgreSQL`'s
-//!   aborted transaction would close. Between messages, as in `PostgreSQL`,
-//!   a cancel request does nothing: an open cursor or a portal suspended by
-//!   a row limit reads on;
+//!   query, an `Execute`), the governed statements that message runs fail
+//!   with `57014`, whether they wait in the queue, are planned, or send
+//!   rows — the statements it admits, and those whose rows it reads: the
+//!   cursor a `FETCH` reads (which cannot be read again, as `PostgreSQL`'s
+//!   failed portal), the portal an `Execute` resumes ([`Running`]). The
+//!   connection's other open cursors and suspended portals read on, as in
+//!   `PostgreSQL`, where a canceled statement fails only itself (and the
+//!   transaction block it runs in, whose end then closes its cursors): a
+//!   `WITH HOLD` cursor outside a transaction block outlives the cancel of
+//!   a query beside it. Between messages, as in `PostgreSQL`, a cancel
+//!   request does nothing;
 //! - `CALL system.runtime.kill_query(query_id => '…', message => '…')` from
 //!   a connection of the query's owner, for a query of any protocol (its id
 //!   is listed in `system.runtime.queries`); it answers without taking a
@@ -54,7 +59,7 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -219,15 +224,45 @@ fn connection_key(client: &(impl ClientInfo + ?Sized)) -> ConnectionKey {
     (pid, secret.to_bytes().to_vec())
 }
 
-/// The governed statements alive on each connection, so a cancel request
-/// (which names a connection, not a statement) reaches them, the
-/// connections executing a message, the only ones a cancel request stops,
-/// and the admission slot each connection holds, with its resource group.
+/// The connections executing a message, the only ones a cancel request
+/// stops, each with the governed statements its message runs, so a cancel
+/// request (which names a connection, not a statement) reaches them; and
+/// the admission slot each connection holds, with its resource group.
 #[derive(Default)]
 struct Connections {
-    live: Mutex<HashMap<ConnectionKey, Vec<Weak<QueryRecord>>>>,
-    executing: Mutex<HashMap<ConnectionKey, usize>>,
+    executing: Mutex<HashMap<ConnectionKey, (usize, Arc<Running>)>>,
     slots: Mutex<HashMap<ConnectionKey, HeldSlot>>,
+}
+
+/// The governed statements the message a connection executes runs: those
+/// it admits, and those whose rows it reads ([`GovernedRows`] adds its
+/// statement when a message first reads it) — the only ones a cancel
+/// request stops. Kept in the connection's session extensions.
+#[derive(Default)]
+struct Running {
+    /// The message being executed, counted from the connection's first.
+    message: AtomicU64,
+    records: Mutex<Vec<Weak<QueryRecord>>>,
+}
+
+impl Running {
+    fn of(client: &(impl ClientInfo + ?Sized)) -> Arc<Self> {
+        client.session_extensions().get_or_insert_with(Self::default)
+    }
+
+    /// A message starts: it runs no statement yet.
+    fn start(&self) {
+        self.message.fetch_add(1, Ordering::SeqCst);
+        lock(&self.records).clear();
+    }
+
+    fn add(&self, record: &Arc<QueryRecord>) {
+        lock(&self.records).push(Arc::downgrade(record));
+    }
+
+    fn records(&self) -> Vec<Arc<QueryRecord>> {
+        lock(&self.records).iter().filter_map(Weak::upgrade).collect()
+    }
 }
 
 /// A connection's admission slot, while a statement holds it, and the
@@ -243,7 +278,7 @@ struct Executing {
 impl Drop for Executing {
     fn drop(&mut self) {
         let mut executing = lock(&self.connections.executing);
-        if let Some(count) = executing.get_mut(&self.key) {
+        if let Some((count, _)) = executing.get_mut(&self.key) {
             *count -= 1;
             if *count == 0 {
                 executing.remove(&self.key);
@@ -253,8 +288,15 @@ impl Drop for Executing {
 }
 
 impl Connections {
-    fn execute(self: &Arc<Self>, key: ConnectionKey) -> Executing {
-        *lock(&self.executing).entry(key.clone()).or_default() += 1;
+    /// The connection starts executing a message, whose statements
+    /// `running` gathers.
+    fn execute(self: &Arc<Self>, key: ConnectionKey, running: &Arc<Running>) -> Executing {
+        let mut executing = lock(&self.executing);
+        let (count, _) = executing.entry(key.clone()).or_insert_with(|| {
+            running.start();
+            (0, Arc::clone(running))
+        });
+        *count += 1;
         Executing {
             key,
             connections: Arc::clone(self),
@@ -263,23 +305,6 @@ impl Connections {
 
     fn executing(&self, key: &ConnectionKey) -> bool {
         lock(&self.executing).contains_key(key)
-    }
-
-    fn add(&self, key: &ConnectionKey, record: &Arc<QueryRecord>) {
-        lock(&self.live)
-            .entry(key.clone())
-            .or_default()
-            .push(Arc::downgrade(record));
-    }
-
-    fn remove(&self, key: &ConnectionKey, record: &QueryRecord) {
-        let mut live = lock(&self.live);
-        if let Some(records) = live.get_mut(key) {
-            records.retain(|r| r.strong_count() > 0 && !std::ptr::eq(r.as_ptr(), record));
-            if records.is_empty() {
-                live.remove(key);
-            }
-        }
     }
 
     /// The admission slot a statement of the connection holds, if any, and
@@ -311,22 +336,23 @@ impl Connections {
         lock(&self.slots).insert(key.clone(), (Arc::downgrade(permit), group));
     }
 
+    /// The statements the message the connection executes runs.
     fn records(&self, key: &ConnectionKey) -> Vec<Arc<QueryRecord>> {
-        lock(&self.live)
+        lock(&self.executing)
             .get(key)
-            .map(|records| records.iter().filter_map(Weak::upgrade).collect())
+            .map(|(_, running)| running.records())
             .unwrap_or_default()
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        lock(&self.live).len() + lock(&self.slots).len()
+        lock(&self.executing).len() + lock(&self.slots).len()
     }
 }
 
-/// Cancel requests: when the connection executes a message, fail its
-/// governed statements (their watchers then drop their streams), then let
-/// `datafusion-postgres` stop what it is planning.
+/// Cancel requests: when the connection executes a message, fail the
+/// governed statements it runs (their watchers then drop their streams),
+/// then let `datafusion-postgres` stop what it is planning.
 struct CancelRequests {
     connections: Arc<Connections>,
     inner: DefaultCancelHandler,
@@ -591,7 +617,6 @@ impl Drop for Execution {
             self.record
                 .fail(Failure::new(USER_CANCELED, "USER_ERROR", CANCELED));
         }
-        self.connections.remove(&self.connection, &self.record);
         lock(&self.permit).take();
         self.connections.release(&self.connection);
         self.done.notify_one();
@@ -632,6 +657,11 @@ struct GovernedRows {
     slot: Slot,
     execution: Option<Arc<Execution>>,
     rows: u64,
+    /// The connection's messages: a message that reads the rows runs the
+    /// statement, for cancel requests.
+    running: Arc<Running>,
+    /// The last message that read them.
+    message: u64,
 }
 
 impl GovernedRows {
@@ -659,6 +689,11 @@ impl Stream for GovernedRows {
         let Some(execution) = this.execution.clone() else {
             return Poll::Ready(None);
         };
+        let message = this.running.message.load(Ordering::SeqCst);
+        if message != this.message {
+            this.message = message;
+            this.running.add(&execution.record);
+        }
         // A failed query (time limit, cancel) stops here, even when its
         // stream still has rows ready.
         let failed = execution.record.state() == QueryState::Failed;
@@ -704,8 +739,9 @@ impl Stream for GovernedRows {
 }
 
 /// Moves `query`'s rows into a slot the deadline watcher can empty, and
-/// hands `query` governed rows that read them.
-fn govern(execution: &Arc<Execution>, query: &mut QueryResponse) -> Slot {
+/// hands `query` governed rows that read them; the connection's `running`
+/// statements take it in when a message reads them.
+fn govern(execution: &Arc<Execution>, query: &mut QueryResponse, running: &Arc<Running>) -> Slot {
     let rows = std::mem::replace(&mut query.data_rows, Box::pin(futures::stream::empty()));
     let slot: Slot = Arc::new(Mutex::new(SlotState {
         rows: Some(rows),
@@ -715,6 +751,8 @@ fn govern(execution: &Arc<Execution>, query: &mut QueryResponse) -> Slot {
         slot: Arc::clone(&slot),
         execution: Some(Arc::clone(execution)),
         rows: 0,
+        running: Arc::clone(running),
+        message: running.message.load(Ordering::SeqCst),
     });
     slot
 }
@@ -735,7 +773,7 @@ impl Governed {
         let source = metadata(client, METADATA_APPLICATION_NAME).filter(|s| !s.is_empty());
         let record = governance.register(Protocol::Postgres, user, source, sql);
         let connection = connection_key(client);
-        self.connections.add(&connection, &record);
+        Running::of(client).add(&record);
         let execution = Arc::new(Execution {
             record: Arc::clone(&record),
             permit: Mutex::new(None),
@@ -830,6 +868,7 @@ impl Governed {
         admitted: Admitted,
         responses: Vec<Response>,
         cursors: &mut [OwnedMutexGuard<PortalExecutionState>],
+        running: &Arc<Running>,
     ) -> Vec<Response> {
         let Admitted {
             execution,
@@ -841,14 +880,14 @@ impl Governed {
         let mut slots = Vec::new();
         for cursor in cursors.iter_mut() {
             if let PortalExecutionState::Suspended(query) = &mut **cursor {
-                slots.push(govern(&execution, query));
+                slots.push(govern(&execution, query, running));
             }
         }
         let responses = responses
             .into_iter()
             .map(|response| match response {
                 Response::Query(mut query) => {
-                    slots.push(govern(&execution, &mut query));
+                    slots.push(govern(&execution, &mut query, running));
                     Response::Query(query)
                 }
                 Response::Error(info) => {
@@ -909,7 +948,9 @@ impl SimpleQueryHandler for Governed {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let _executing = self.connections.execute(connection_key(client));
+        let _executing = self
+            .connections
+            .execute(connection_key(client), &Running::of(client));
         self._on_query(client, query).await
     }
 
@@ -1029,7 +1070,7 @@ impl Governed {
         let responses = declared.settle(client, responses)?;
         declared.attach(&*client, &admitted.execution.record);
         let mut cursors = declared.states(client).await;
-        Ok(self.run(admitted, responses, &mut cursors))
+        Ok(self.run(admitted, responses, &mut cursors, &Running::of(&*client)))
     }
 }
 
@@ -1063,7 +1104,9 @@ impl ExtendedQueryHandler for Governed {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let _executing = self.connections.execute(connection_key(client));
+        let _executing = self
+            .connections
+            .execute(connection_key(client), &Running::of(client));
         let portal = client
             .portal_store()
             .get_portal(message.name.as_deref().unwrap_or(DEFAULT_NAME));
@@ -1188,7 +1231,7 @@ impl ExtendedQueryHandler for Governed {
         declared.attach(&*client, &admitted.execution.record);
         let mut cursors = declared.states(client).await;
         Ok(self
-            .run(admitted, vec![response], &mut cursors)
+            .run(admitted, vec![response], &mut cursors, &Running::of(&*client))
             .pop()
             .unwrap_or(Response::EmptyQuery))
     }
@@ -1273,27 +1316,33 @@ mod tests {
         };
         let mine = QueryRecord::detached("q1", Protocol::Postgres, "u", "SELECT 1");
         let other = QueryRecord::detached("q2", Protocol::Postgres, "u", "SELECT 2");
+        let held = QueryRecord::detached("q3", Protocol::Postgres, "u", "DECLARE h CURSOR WITH HOLD");
         let key = (7, vec![1, 2, 3, 4]);
         let other_key = (7, vec![9, 9, 9, 9]);
-        connections.add(&key, &mine);
-        connections.add(&other_key, &other);
+        let (running, other_running) = (Arc::new(Running::default()), Arc::new(Running::default()));
+        // A statement of an earlier message (the held cursor's).
+        let earlier = connections.execute(key.clone(), &running);
+        running.add(&held);
+        drop(earlier);
         // Between messages a cancel request does nothing.
         assert_eq!(requests.cancel(&key), 0);
-        assert!(mine.failure().is_none());
-        let executing = connections.execute(key.clone());
-        let _other_executing = connections.execute(other_key.clone());
+        let executing = connections.execute(key.clone(), &running);
+        let other_executing = connections.execute(other_key.clone(), &other_running);
+        running.add(&mine);
+        other_running.add(&other);
         // Same process id, another secret key: nothing is canceled.
         assert_eq!(requests.cancel(&(7, vec![0, 0, 0, 0])), 0);
+        // Only what the message runs: not the cursor an earlier one opened.
         assert_eq!(requests.cancel(&key), 1);
         drop(executing);
         assert!(!connections.executing(&key), "the message is done");
         assert!(connections.executing(&other_key));
         assert_eq!(mine.failure().map(|f| f.message), Some(CANCELED.to_owned()));
         assert!(mine.cancellation().is_cancelled());
+        assert!(held.failure().is_none(), "the held cursor was canceled");
         assert!(other.failure().is_none());
-        connections.remove(&key, &mine);
-        connections.remove(&other_key, &other);
-        assert_eq!(connections.len(), 0, "entries go away with their statements");
+        drop(other_executing);
+        assert_eq!(connections.len(), 0, "entries go away with their messages");
     }
 
     #[test]

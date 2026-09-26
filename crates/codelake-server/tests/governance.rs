@@ -2462,6 +2462,73 @@ async fn cancel_requests_reach_the_extended_protocol() {
     assert_eq!(error_code(&ended), None, "{ended:?}");
     server.slots_free().await;
     canceled_fetches_leave_their_cursor_unreadable(&server).await;
+    cancel_spares_the_cursors_the_message_does_not_read(&server).await;
+}
+
+/// A cancel request stops the statement the connection executes, not its
+/// cursors: a `WITH HOLD` cursor outside a transaction block reads on after
+/// a query beside it was canceled, on either protocol, as in PostgreSQL; in
+/// a transaction block the cancel aborts the transaction (`25P02`). (Found
+/// by the third F6 verification: the cancel failed every statement of the
+/// connection, and the cursor's next FETCH got 57014.)
+async fn cancel_spares_the_cursors_the_message_does_not_read(server: &Server) {
+    let client = server.connect("ext-cancel").await;
+    client
+        .batch_execute(&format!("DECLARE hc CURSOR WITH HOLD FOR {TEN}"))
+        .await
+        .unwrap();
+    let mut read = numbers(&text_rows(&client, "FETCH 1 FROM hc").await);
+    // What the open cursor holds: the canceled query's memory returns to it.
+    let cursor_holds = server.reserved().await;
+    for extended in [false, true] {
+        let token = client.cancel_token();
+        let beside = async {
+            if extended {
+                client.query(HOLDS_MEMORY, &[]).await.map(|_| ())
+            } else {
+                client.simple_query(HOLDS_MEMORY).await.map(|_| ())
+            }
+        };
+        let cancel = async {
+            let reserved = pool_fills(server).await;
+            token.cancel_query(NoTls).await.unwrap();
+            reserved
+        };
+        let (outcome, reserved) = tokio::join!(beside, cancel);
+        let error = outcome.unwrap_err();
+        assert_eq!(error.code(), Some(&SqlState::QUERY_CANCELED), "{error:?}");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while server.reserved().await > cursor_holds {
+            assert!(
+                Instant::now() < deadline,
+                "reservations left (held {reserved}, the cursor {cursor_holds})"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        read.extend(numbers(&text_rows(&client, "FETCH 1 FROM hc").await));
+    }
+    assert_eq!(read, [1, 2, 3], "the held cursor did not read on");
+    client.batch_execute("CLOSE hc").await.unwrap();
+
+    client
+        .batch_execute(&format!("BEGIN; DECLARE tc CURSOR FOR {TEN}"))
+        .await
+        .unwrap();
+    let token = client.cancel_token();
+    let (outcome, ()) = tokio::join!(client.simple_query(HOLDS_MEMORY), async {
+        pool_fills(server).await;
+        token.cancel_query(NoTls).await.unwrap();
+    });
+    assert_eq!(outcome.unwrap_err().code(), Some(&SqlState::QUERY_CANCELED));
+    let error = client.simple_query("FETCH 1 FROM tc").await.unwrap_err();
+    assert_eq!(
+        error.code(),
+        Some(&SqlState::IN_FAILED_SQL_TRANSACTION),
+        "{error:?}"
+    );
+    client.batch_execute("ROLLBACK").await.unwrap();
+    server.slots_free().await;
+    assert_eq!(server.pool_drains().await, 0);
 }
 
 /// A `FETCH` canceled while it executes (simple protocol): in a transaction
