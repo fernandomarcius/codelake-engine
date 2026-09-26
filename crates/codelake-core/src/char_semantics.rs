@@ -54,8 +54,10 @@
 //!   value output with their result gets the reference's common type.
 //!
 //! A column's type is followed through the plan (a subquery, an aggregate
-//! such as `max(ch)`, a window function, a scalar subquery, one computed
-//! ahead by `crate::subquery`), and a projection records the char type of
+//! such as `max(ch)`, `min_by`, `max_by`, `array_agg`, `map_agg`,
+//! `histogram`, `try`, a window function, a scalar subquery, one computed
+//! ahead by `crate::subquery`); a key looked up in a map keyed by char
+//! values is compared as that char. A projection records the char type of
 //! each column it computes, so a client, `typeof` and a `CREATE TABLE … AS`
 //! see `char(n)`. A cast to text the statement wrote is marked
 //! (`crate::declared`); any other cast between Arrow's text types is type
@@ -402,11 +404,50 @@ enum Text {
     Char(Option<u32>),
     /// An array of `char(n)` values.
     Array(Option<u32>),
+    /// A map whose keys, or values, are char values.
+    Map {
+        keys: Entries,
+        values: Entries,
+    },
+}
+
+/// The keys, or the values, of a map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Entries {
+    /// `char(n)` values; `None` when `n` is not known.
+    Char(Option<u32>),
+    /// Other values.
+    Other,
 }
 
 impl Text {
     fn is_char(self) -> bool {
         matches!(self, Self::Char(_))
+    }
+
+    /// An array or a map of char values.
+    fn is_container(self) -> bool {
+        matches!(self, Self::Array(_) | Self::Map { .. })
+    }
+
+    /// A container of char values some of whose lengths are not known.
+    fn has_unknown_length(self) -> bool {
+        match self {
+            Self::Array(None) => true,
+            Self::Map { keys, values } => keys == Entries::Char(None) || values == Entries::Char(None),
+            _ => false,
+        }
+    }
+
+    /// A map of `keys` and `values` (their types), `None` when neither is
+    /// char.
+    fn map(keys: Option<Text>, values: Option<Text>) -> Option<Self> {
+        let char_of = |t: Option<Text>| match t {
+            Some(Self::Char(n)) => Entries::Char(n),
+            _ => Entries::Other,
+        };
+        let (keys, values) = (char_of(keys), char_of(values));
+        (keys != Entries::Other || values != Entries::Other).then_some(Self::Map { keys, values })
     }
 
     /// The length a value of this type has in a common char type.
@@ -416,7 +457,7 @@ impl Text {
             Self::Char(n) => n,
             Self::Varchar(Bound::Known(k)) => Some(k.min(MAX_CHAR)),
             Self::Varchar(Bound::Unbounded) => Some(MAX_CHAR),
-            Self::Varchar(Bound::Uncertain) | Self::Array(_) => None,
+            Self::Varchar(Bound::Uncertain) | Self::Array(_) | Self::Map { .. } => None,
         }
     }
 }
@@ -446,12 +487,8 @@ fn common(types: &[Option<Text>]) -> Option<Text> {
     if known.is_empty() {
         return Some(Text::Null);
     }
-    if let Some(Text::Array(n)) = known.iter().find(|t| matches!(t, Text::Array(_))) {
-        let n = *n;
-        return known
-            .iter()
-            .all(|t| *t == Text::Array(n))
-            .then_some(Text::Array(n));
+    if let Some(container) = known.iter().copied().find(|t| t.is_container()) {
+        return known.iter().all(|t| *t == container).then_some(container);
     }
     if known.iter().any(|t| t.is_char()) {
         let mut length = Some(0);
@@ -722,7 +759,8 @@ fn argument_length(arg: Option<&Expr>, scope: &Scope<'_>) -> Length {
         Some(Text::Null) => Length::Known(0),
         Some(Text::Varchar(Bound::Known(k)) | Text::Char(Some(k))) => Length::Known(u64::from(k)),
         Some(Text::Varchar(Bound::Unbounded)) => Length::Unbounded,
-        Some(Text::Varchar(Bound::Uncertain) | Text::Char(None) | Text::Array(_)) | None => Length::Uncertain,
+        Some(Text::Varchar(Bound::Uncertain) | Text::Char(None) | Text::Array(_) | Text::Map { .. })
+        | None => Length::Uncertain,
     }
 }
 
@@ -862,38 +900,79 @@ fn unbounded_result(name: &str) -> bool {
     )
 }
 
-fn function_type(name: &str, args: &[Expr], scope: &Scope<'_>, whole: &Expr) -> Option<Text> {
-    if let Some(text) = computed_length(name, args, scope) {
-        return scope.is_text(whole).then_some(text);
-    }
+/// The type of an array or map function's result, or of an element of an
+/// array or map, where it holds char values; `Continue` when `name` is not
+/// one.
+fn container_type(name: &str, args: &[Expr], scope: &Scope<'_>, whole: &Expr) -> ControlFlow<Option<Text>> {
     let first = || args.first().and_then(|a| infer(a, scope));
-    if picks_an_element(name)
-        && let Some(Text::Array(n)) = first()
-    {
-        return Some(Text::Char(n));
+    if picks_an_element(name) {
+        match first() {
+            Some(Text::Array(n)) => return ControlFlow::Break(Some(Text::Char(n))),
+            Some(Text::Map {
+                values: Entries::Char(n),
+                ..
+            }) if name != "array_max" && name != "array_min" => {
+                return ControlFlow::Break(Some(Text::Char(n)));
+            }
+            _ => {}
+        }
     }
     if keeps_elements(name)
         && let Some(array @ Text::Array(_)) = first()
     {
-        return Some(array);
+        return ControlFlow::Break(Some(array));
     }
-    match name {
-        crate::declared::TRINO_TYPED | crate::declared::TRINO_TRY_TYPED => typed_as(args, scope),
+    let array_of = |t: Option<Text>| match t {
+        Some(Text::Char(n)) => Some(Text::Array(n)),
+        _ => None,
+    };
+    ControlFlow::Break(match name {
         "concat" | CONCAT_OPERATOR if is_text_array(whole, scope) => {
-            match common(&concatenated_elements(args, scope)) {
-                Some(Text::Char(n)) => Some(Text::Array(n)),
-                _ => None,
-            }
+            array_of(common(&concatenated_elements(args, scope)))
         }
-        "repeat" => match first()? {
-            Text::Char(n) => Some(Text::Array(n)),
+        "make_array" | "array" | "make_list" => {
+            let types: Vec<Option<Text>> = args.iter().map(|a| infer(a, scope)).collect();
+            array_of(common(&types))
+        }
+        "repeat" => array_of(first()),
+        // `map(keys, values)` of arrays; the keys and values of a map.
+        "map" if args.len() == 2 => {
+            let elements = |a: &Expr| match infer(a, scope) {
+                Some(Text::Array(n)) => Some(Text::Char(n)),
+                _ => None,
+            };
+            Text::map(elements(&args[0]), elements(&args[1]))
+        }
+        "map_keys" | "map_values" => match first() {
+            Some(Text::Map { keys, values }) => match if name == "map_keys" { keys } else { values } {
+                Entries::Char(n) => Some(Text::Array(n)),
+                Entries::Other => None,
+            },
             _ => None,
         },
+        _ => return ControlFlow::Continue(()),
+    })
+}
+
+fn function_type(name: &str, args: &[Expr], scope: &Scope<'_>, whole: &Expr) -> Option<Text> {
+    if let Some(text) = computed_length(name, args, scope) {
+        return scope.is_text(whole).then_some(text);
+    }
+    if let ControlFlow::Break(text) = container_type(name, args, scope, whole) {
+        return text;
+    }
+    let first = || args.first().and_then(|a| infer(a, scope));
+    match name {
+        crate::declared::TRINO_TYPED | crate::declared::TRINO_TRY_TYPED => typed_as(args, scope),
         CHAR_PAD => args.get(1).and_then(|n| match n {
             Expr::Literal(value, _) => length_argument(Some(value)).ok().map(|n| Text::Char(Some(n))),
             _ => None,
         }),
-        crate::coercion::VALUES_CELL | "nullif" => first(),
+        crate::coercion::VALUES_CELL
+        | "nullif"
+        | crate::trino_functions::TRY
+        | crate::trino_functions::GUARDED_TRY
+        | crate::trino_functions::BARRIER => first(),
         // A char value without its padding: `varchar(n)`.
         CHAR_KEY => match first()? {
             Text::Char(n) => Some(Text::Varchar(n.map_or(Bound::Uncertain, Bound::Known))),
@@ -909,13 +988,6 @@ fn function_type(name: &str, args: &[Expr], scope: &Scope<'_>, whole: &Expr) -> 
         }
         "concat" | CONCAT_OPERATOR if scope.is_text(whole) => Some(concat_type(args, scope)),
         "chr" => Some(Text::Varchar(Bound::Known(1))),
-        "make_array" | "array" | "make_list" => {
-            let types: Vec<Option<Text>> = args.iter().map(|a| infer(a, scope)).collect();
-            match common(&types) {
-                Some(Text::Char(n)) => Some(Text::Array(n)),
-                _ => None,
-            }
-        }
         _ if keeps_char(name) => match first()? {
             Text::Null => Some(Text::Null),
             other => Some(other),
@@ -953,6 +1025,32 @@ fn picks_a_value(name: &str) -> bool {
             | "lag"
             | "lead"
     )
+}
+
+/// The reference engine's type of an aggregate, if it is text.
+fn aggregate_type(aggregate: &AggregateFunction, scope: &Scope<'_>, expr: &Expr) -> Option<Text> {
+    let AggregateFunction { func, params } = aggregate;
+    let arg = |i: usize| params.args.get(i).and_then(|a| infer(a, scope));
+    match (func.name(), params.args.len()) {
+        // `max_by(x, y, n)`: an array of `x` values.
+        ("array_agg", _) | ("min_by" | "max_by", 3) => {
+            return match arg(0) {
+                Some(Text::Char(n)) => Some(Text::Array(n)),
+                _ => None,
+            };
+        }
+        ("min_by" | "max_by", _) => return arg(0),
+        ("map_agg", _) => return Text::map(arg(0), arg(1)),
+        ("histogram", _) => return Text::map(arg(0), None),
+        _ => {}
+    }
+    if picks_a_value(func.name()) {
+        params.args.first().and_then(|a| infer(a, scope))
+    } else if unbounded_result(func.name()) {
+        scope.is_text(expr).then_some(Text::Varchar(Bound::Unbounded))
+    } else {
+        scope.unknown(expr)
+    }
 }
 
 /// The reference engine's type of `expr`, if it is text.
@@ -1022,21 +1120,7 @@ fn infer(expr: &Expr, scope: &Scope<'_>) -> Option<Text> {
             scope,
         )),
         Expr::ScalarFunction(ScalarFunction { func, args }) => function_type(func.name(), args, scope, expr),
-        Expr::AggregateFunction(AggregateFunction { func, params }) => {
-            if func.name() == "array_agg" {
-                return match params.args.first().and_then(|a| infer(a, scope)) {
-                    Some(Text::Char(n)) => Some(Text::Array(n)),
-                    _ => None,
-                };
-            }
-            if picks_a_value(func.name()) {
-                params.args.first().and_then(|a| infer(a, scope))
-            } else if unbounded_result(func.name()) {
-                scope.is_text(expr).then_some(Text::Varchar(Bound::Unbounded))
-            } else {
-                scope.unknown(expr)
-            }
-        }
+        Expr::AggregateFunction(aggregate) => aggregate_type(aggregate, scope, expr),
         Expr::WindowFunction(window) => {
             let WindowFunction { fun, params } = window.as_ref();
             let args = &params.args;
@@ -1089,7 +1173,7 @@ fn is_ordering(op: Operator) -> bool {
 fn needs_char_coercion(types: &[Option<Text>]) -> bool {
     if !types.iter().flatten().any(|t| t.is_char())
         || types.iter().any(Option::is_none)
-        || types.iter().flatten().any(|t| matches!(t, Text::Array(_)))
+        || types.iter().flatten().any(|t| t.is_container())
     {
         return false;
     }
@@ -1104,10 +1188,10 @@ fn needs_char_coercion(types: &[Option<Text>]) -> bool {
 /// another array: its elements would have to be converted, which this rule
 /// does not do but for arrays written out.
 fn mixes_char_arrays(types: &[Option<Text>]) -> bool {
-    let Some(array) = types.iter().flatten().find(|t| matches!(t, Text::Array(_))) else {
+    let Some(array) = types.iter().flatten().find(|t| t.is_container()) else {
         return false;
     };
-    if *array == Text::Array(None) {
+    if array.has_unknown_length() {
         return true;
     }
     !types
@@ -1434,6 +1518,40 @@ fn remove_from_array(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Re
     }
 }
 
+/// `element_at(map, key)` / `map[key]`: a key of a map keyed by `char(n)`
+/// values looked up as that char (`histogram(c3)['a']` finds `'a  '`).
+fn look_up(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
+    let keys = match infer(&args[0], scope) {
+        Some(Text::Map { keys, .. }) => keys,
+        _ if args[0]
+            .get_type(scope.schema.as_ref())
+            .is_ok_and(|t| matches!(t, DataType::Map(..))) =>
+        {
+            Entries::Other
+        }
+        _ => return Ok(Transformed::no(func.call(args))),
+    };
+    let key = infer(&args[1], scope);
+    match (keys, key) {
+        (_, Some(Text::Null)) => Ok(Transformed::no(func.call(args))),
+        (Entries::Char(Some(n)), Some(Text::Char(Some(m)))) if n == m => Ok(Transformed::no(func.call(args))),
+        (Entries::Char(Some(n)), _) if fitted_literal(&args[1], n, true).is_some() => {
+            let mut args = args;
+            args[1] = fitted_literal(&args[1], n, true).unwrap_or_default();
+            Ok(Transformed::yes(func.call(args)))
+        }
+        (Entries::Char(_), _) | (Entries::Other, Some(Text::Char(_))) => {
+            Err(DataFusionError::NotImplemented(format!(
+                "{}: looking up a map keyed by char(n) values with a key other than a literal or a char(n) value \
+             of the same length, or a map keyed by other values with a char(n) value, is not supported yet; \
+             cast the char values to varchar",
+                func.name()
+            )))
+        }
+        (Entries::Other, _) => Ok(Transformed::no(func.call(args))),
+    }
+}
+
 /// `||` / `concat` of arrays (and elements) of char values: every element
 /// in their common type (`ARRAY[ch] || ARRAY[v3]` is `array(char(5))`).
 fn concat_arrays(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
@@ -1495,7 +1613,7 @@ fn compare(left: Expr, op: Operator, right: Expr, scope: &Scope<'_>) -> Result<T
         return compare_built(left, op, right, scope);
     }
     let types = [infer(&left, scope), infer(&right, scope)];
-    if types.iter().flatten().any(|t| matches!(t, Text::Array(_)))
+    if types.iter().flatten().any(|t| t.is_container())
         && (mixes_char_arrays(&types) || types.contains(&None))
     {
         return Err(char_array_refusal("a comparison"));
@@ -1666,7 +1784,7 @@ fn in_list(list: InList, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
     }
     let mut types = vec![infer(&expr, scope)];
     types.extend(list.iter().map(|e| infer(e, scope)));
-    if types.iter().flatten().any(|t| matches!(t, Text::Array(_)))
+    if types.iter().flatten().any(|t| t.is_container())
         && (mixes_char_arrays(&types) || types.contains(&None))
     {
         return Err(char_array_refusal("IN"));
@@ -1989,6 +2107,7 @@ fn scalar_function(function: ScalarFunction, scope: &Scope<'_>) -> Result<Transf
         }
         "concat" | CONCAT_OPERATOR => Ok(concat_args(args, scope)?.update_data(|args| func.call(args))),
         "array_remove" if args.len() == 2 => remove_from_array(&func, args, scope),
+        "element_at" | crate::trino_functions::SUBSCRIPT if args.len() == 2 => look_up(&func, args, scope),
         "make_array" | "array" | "make_list" => {
             Ok(unify_values(args, scope, "ARRAY")?.update_data(|args| func.call(args)))
         }
@@ -2767,6 +2886,37 @@ mod tests {
             "SELECT cht.id FROM cht CROSS JOIN (SELECT array_agg(ch) AS a FROM cht) x WHERE contains(x.a, 'ab') ORDER BY 1",
             &[&["1"], &["2"], &["3"], &["4"]],
         ),
+        // Aggregates, maps and `try` keep the char type of their values.
+        (
+            "SELECT min_by(ch, id) = 'ab', max_by(ch, id) = 'a', element_at(array_agg(ch ORDER BY id), 1) = 'ab', \
+             array_agg(ch ORDER BY id)[4] = 'a', element_at(map_agg(id, ch), 1) = 'ab', try(max(ch)) = 'zz' FROM cht",
+            &[&["true", "true", "true", "true", "true", "true"]],
+        ),
+        (
+            "SELECT id, try(ch) = 'ab', typeof(try(ch)) FROM cht ORDER BY id",
+            &[
+                &["1", "true", "char(5)"],
+                &["2", "false", "char(5)"],
+                &["3", "NULL", "char(5)"],
+                &["4", "false", "char(5)"],
+            ],
+        ),
+        (
+            "SELECT r, count(*) FROM (SELECT min_by(ch, id) AS r FROM cht UNION ALL SELECT 'ab') GROUP BY r",
+            &[&["ab   ", "2"]],
+        ),
+        (
+            "SELECT typeof(min_by(ch, id)), typeof(max_by(ch, id)) FROM cht",
+            &[&["char(5)", "char(5)"]],
+        ),
+        (
+            "SELECT histogram(c)['a'], histogram(c)[CAST('a' AS char(3))], element_at(histogram(c), 'a') FROM c3",
+            &[&["1", "1", "1"]],
+        ),
+        (
+            "SELECT map_agg(id, ch)[1] = 'ab', element_at(map_agg(ch, id), 'ab') FROM cht",
+            &[&["true", "1"]],
+        ),
         // The trims work on the value without its padding.
         (
             "SELECT id, ltrim(ch), length(ltrim(ch)), ltrim(ch) = 'ab' FROM cht ORDER BY id",
@@ -3365,6 +3515,10 @@ mod tests {
             (
                 "SELECT cht.id FROM cht CROSS JOIN (SELECT array_agg(s) AS a FROM vct) x WHERE array_remove(x.a, ch) = x.a",
                 "removing a char(n) value from an array that is not written out",
+            ),
+            (
+                "SELECT element_at(x.m, v3.s) FROM (SELECT map_agg(ch, id) AS m FROM cht) x CROSS JOIN v3",
+                "looking up a map keyed by char(n) values",
             ),
             (
                 "SELECT CAST(ARRAY[s] AS array(char(3))) FROM vct",

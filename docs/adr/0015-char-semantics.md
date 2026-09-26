@@ -42,7 +42,8 @@ gives char values Trino 431's semantics (every rule below observed on
    statement wrote (marked `codelake_trino_type(…, '')`, so the casts type
    coercion adds between Arrow's text types keep their argument's type and
    a plan analyzed twice is rewritten once), aggregates (`max`, `min`,
-   `first_value`, `array_agg`, …), window functions, `CASE` and the functions
+   `first_value`, `min_by`, `max_by`, `array_agg`, the keys and values of
+   `map_agg`, the keys of `histogram`, …), `try`, window functions, `CASE` and the functions
    whose result length Trino derives from their arguments (`upper`, `rtrim`,
    `substr`, `concat`, …). A projection records `char(n)` in the field of
    each char column it computes (a client, `typeof`, `CREATE TABLE … AS` and
@@ -59,6 +60,8 @@ gives char values Trino 431's semantics (every rule below observed on
    trailing spaces (`codelake_char_key`), ordering with
    `codelake_char_compare` (character by character, the shorter padded with
    spaces), a text literal short enough padded to the char's length instead.
+   A key looked up in a map keyed by char values (`histogram(c3)['a']`,
+   `element_at(map_agg(ch, id), 'ab')`) is compared as that char.
    `x op ANY/ALL (subquery)` becomes the `EXISTS` tests it means, `NULL`
    alike: DataFusion 54 cannot plan the mark join it makes of a quantified
    comparison over a computed column.
