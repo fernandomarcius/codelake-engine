@@ -1812,7 +1812,84 @@ fn extended_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
     ]
     .into_iter()
     .chain(session_scripts())
+    .chain(move_scripts())
     .collect()
+}
+
+/// FETCH and MOVE in the forms the SQL parser does not read, on both
+/// protocols, and counts beyond PostgreSQL's `int4`.
+fn move_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
+    use Step::{Extended, Simple};
+    let ok = |tag: &str| (vec![tag.to_owned()], Vec::new(), None);
+    let rows = |tag: &str, values: &[i64]| {
+        (
+            vec![tag.to_owned()],
+            values.iter().map(|v| vec![v.to_string()]).collect(),
+            None,
+        )
+    };
+    let failed = |code: &str| (Vec::new(), Vec::new(), Some(code.to_owned()));
+    let begin = || {
+        vec![
+            Simple("BEGIN".into()),
+            Simple(format!("DECLARE m NO SCROLL CURSOR FOR {TEN}")),
+        ]
+    };
+    let declared = || vec![ok("BEGIN"), ok("DECLARE CURSOR")];
+    let script = |steps: Vec<Step>, answers: Vec<Exchange>| {
+        let mut all = begin();
+        all.extend(steps);
+        all.push(Simple("ROLLBACK".into()));
+        let mut want = declared();
+        want.extend(answers);
+        want.push(ok("ROLLBACK"));
+        (all, want)
+    };
+    vec![
+        script(
+            vec![
+                Simple("MOVE 0 IN m".into()),
+                Extended("MOVE 2 IN m".into()),
+                Simple("MOVE 0 FROM m".into()),
+                Extended("FETCH FROM m".into()),
+                Extended("FETCH m".into()),
+                Extended("FETCH NEXT m".into()),
+                Extended("FETCH 2 m".into()),
+                Extended("MOVE m".into()),
+                Simple("MOVE ALL IN m".into()),
+                Simple("MOVE 0 IN m".into()),
+                Extended("FETCH 1 FROM m".into()),
+                Extended("FETCH -1 FROM m".into()),
+            ],
+            vec![
+                ok("MOVE 0"),
+                ok("MOVE 2"),
+                ok("MOVE 1"),
+                rows("FETCH 1", &[3]),
+                rows("FETCH 1", &[4]),
+                rows("FETCH 1", &[5]),
+                rows("FETCH 2", &[6, 7]),
+                ok("MOVE 1"),
+                ok("MOVE 2"),
+                ok("MOVE 0"),
+                rows("FETCH 0", &[]),
+                failed("55000"),
+            ],
+        ),
+        script(
+            vec![
+                Extended("FETCH 2147483647 FROM m".into()),
+                Extended("FETCH 2147483648 FROM m".into()),
+            ],
+            vec![rows("FETCH 10", &(1..=10).collect::<Vec<_>>()), failed("42601")],
+        ),
+        script(
+            vec![Simple("FETCH 9223372036854775807 FROM m".into())],
+            vec![failed("42601")],
+        ),
+        script(vec![Extended("MOVE -1 IN m".into())], vec![failed("55000")]),
+        script(vec![Simple("MOVE 2147483648 IN m".into())], vec![failed("42601")]),
+    ]
 }
 
 /// Wire scripts of the statements that end or reset a session's
@@ -1935,9 +2012,8 @@ async fn cursors_answer_like_postgresql() {
             .unwrap_or_else(|_| panic!("engine: {sql} did not answer at once"));
         assert_eq!(answered, want, "engine: {sql}");
     }
-    // MOVE is not supported: refused at once, not queued. A BINARY cursor
-    // neither: its rows would be read as binary, and are text.
-    assert_eq!(seen(&engine, "MOVE 1 IN c").await, Err("0A000".to_owned()));
+    // A BINARY cursor is not supported: its rows would be read as binary,
+    // and are text.
     let binary = format!("BEGIN; DECLARE b BINARY CURSOR FOR {TEN}");
     assert_eq!(seen(&engine, &binary).await, Err("0A000".to_owned()));
     assert_eq!(seen(&engine, "ROLLBACK").await, Ok(Vec::new()));
@@ -1991,6 +2067,9 @@ async fn cursors_answer_like_postgresql() {
         let answered = exchanged("127.0.0.1".to_owned(), server.pg, "pgcursors", "codelake", &steps).await;
         assert_eq!(answered, want, "engine: {steps:?}");
     }
+    for client in [&postgres, &engine] {
+        moves_through_a_driver(client).await;
+    }
     // On the extended protocol too, a DECLARE needs a transaction block.
     let declare = format!("DECLARE x CURSOR FOR {TEN}");
     for client in [&postgres, &engine] {
@@ -2003,6 +2082,26 @@ async fn cursors_answer_like_postgresql() {
     }
     server.slots_free().await;
     assert_eq!(server.pool_drains().await, 0);
+}
+
+/// `MOVE` through a driver's execute (Parse, Describe, Bind, Execute): its
+/// count, and the next `FETCH` reads on after it.
+async fn moves_through_a_driver(client: &Client) {
+    client
+        .batch_execute(&format!("BEGIN; DECLARE mv NO SCROLL CURSOR FOR {TEN}"))
+        .await
+        .unwrap();
+    assert_eq!(client.execute("MOVE 3 IN mv", &[]).await.unwrap(), 3);
+    assert_eq!(client.execute("MOVE FORWARD ALL IN mv", &[]).await.unwrap(), 7);
+    assert!(text_rows(client, "FETCH 1 FROM mv").await.is_empty());
+    client.batch_execute("ROLLBACK").await.unwrap();
+    client
+        .batch_execute(&format!("BEGIN; DECLARE mv NO SCROLL CURSOR FOR {TEN}"))
+        .await
+        .unwrap();
+    assert_eq!(client.execute("MOVE 3 IN mv", &[]).await.unwrap(), 3);
+    assert_eq!(numbers(&text_rows(client, "FETCH 2 FROM mv").await), [4, 5]);
+    client.batch_execute("ROLLBACK").await.unwrap();
 }
 
 /// A cancel request stops a statement executing on the extended protocol

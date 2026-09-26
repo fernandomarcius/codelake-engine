@@ -422,7 +422,10 @@ struct Governed {
 }
 
 /// The extended protocol's parser: `datafusion-postgres`'s, reading too
-/// what the SQL parser does not (`ABORT`, [`cursor::abort_as_rollback`]).
+/// what the SQL parser does not, as the simple protocol does: `ABORT`
+/// ([`cursor::abort_as_rollback`]), and the `FETCH` and `MOVE` forms
+/// [`cursor::unparsed`] reads, kept with their text (which tells a `MOVE`
+/// from a `FETCH`) and answered when they run.
 struct Statements {
     inner: Arc<<DfSessionService as ExtendedQueryHandler>::QueryParser>,
 }
@@ -437,7 +440,14 @@ impl QueryParser for Statements {
     {
         let rewritten = cursor::abort_as_rollback(sql);
         let sql = rewritten.as_deref().unwrap_or(sql);
-        self.inner.parse_sql(client, sql, types).await
+        match self.inner.parse_sql(client, sql, types).await {
+            Ok(statement) => Ok(statement),
+            Err(error) => match cursor::unparsed(sql, &error) {
+                Some(Ok(statement)) => Ok((sql.to_owned(), Some((statement, cursor::empty_plan())))),
+                Some(Err(refused)) => Err(refused),
+                None => Err(error),
+            },
+        }
     }
 
     fn get_parameter_types(&self, statement: &DfStatement) -> PgWireResult<Vec<Type>> {
@@ -955,7 +965,7 @@ impl Governed {
         }
         client.metadata_mut().remove(QUERY_ID);
         if let [statement] = statements.as_slice()
-            && let Some(response) = cursor::fetch(&*client, statement, &Format::UnifiedText).await
+            && let Some(response) = cursor::fetch(&*client, query, statement, &Format::UnifiedText).await
         {
             return Ok(vec![response?]);
         }
@@ -1023,8 +1033,8 @@ impl ExtendedQueryHandler for Governed {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        if let Some((statement, _)) = &target.statement.1
-            && let Some(fields) = cursor::fetch_fields(&*client, statement, &Format::UnifiedText).await
+        if let (sql, Some((statement, _))) = &target.statement
+            && let Some(fields) = cursor::fetch_fields(&*client, sql, statement, &Format::UnifiedText).await
         {
             return Ok(DescribeStatementResponse::new(Vec::new(), fields?));
         }
@@ -1042,9 +1052,9 @@ impl ExtendedQueryHandler for Governed {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        if let Some((statement, _)) = &target.statement.statement.1
+        if let (sql, Some((statement, _))) = &target.statement.statement
             && let Some(fields) =
-                cursor::fetch_fields(&*client, statement, &target.result_column_format).await
+                cursor::fetch_fields(&*client, sql, statement, &target.result_column_format).await
         {
             return Ok(DescribePortalResponse::new(fields?));
         }
@@ -1073,7 +1083,8 @@ impl ExtendedQueryHandler for Governed {
             return self.kill(client, request);
         }
         if let Some((statement, _)) = parsed
-            && let Some(response) = cursor::fetch(&*client, statement, &portal.result_column_format).await
+            && let Some(response) =
+                cursor::fetch(&*client, sql, statement, &portal.result_column_format).await
         {
             return response;
         }

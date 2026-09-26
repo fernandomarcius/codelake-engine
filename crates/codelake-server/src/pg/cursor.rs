@@ -407,6 +407,7 @@ impl CursorHook {
                     &cursor_name(name),
                     direction,
                     &Format::UnifiedText,
+                    false,
                 )
                 .await;
                 let pool = &session_context.runtime_env().memory_pool;
@@ -615,10 +616,12 @@ impl Declared {
 }
 
 /// `FETCH` from a cursor, its rows sent as the cursor's stream yields them,
-/// in the result `format` its client asked for; `None` when `statement` is
-/// not a `FETCH`.
+/// in the result `format` its client asked for, or `MOVE` when `sql`, the
+/// statement's text, is one ([`moves`]); `None` when `statement` is not a
+/// `FETCH`.
 pub(super) async fn fetch<C>(
     client: &C,
+    sql: &str,
     statement: &Statement,
     format: &Format,
 ) -> Option<PgWireResult<Response>>
@@ -639,8 +642,36 @@ where
         return Some(Err(into_error()));
     }
     let cursors = Cursors::of(client);
-    let fetch = open(&cursors, portals(client), &cursor_name(name), direction, format).await;
-    Some(fetch.map(Fetch::streamed))
+    let moving = moves(sql);
+    let fetch = open(
+        &cursors,
+        portals(client),
+        &cursor_name(name),
+        direction,
+        format,
+        moving,
+    )
+    .await;
+    Some(match fetch {
+        Ok(fetch) if moving => fetch.moved().await,
+        Ok(fetch) => Ok(fetch.streamed()),
+        Err(error) => Err(error),
+    })
+}
+
+/// Whether `sql` is a `MOVE`: [`unparsed`] reads it as the `FETCH` of the
+/// same direction, and its text tells them apart (a `FETCH` the SQL parser
+/// reads has the text it writes, `FETCH …`).
+pub(super) fn moves(sql: &str) -> bool {
+    Tokenizer::new(&PostgreSqlDialect {}, sql)
+        .tokenize()
+        .ok()
+        .and_then(|tokens| {
+            tokens
+                .into_iter()
+                .find(|token| !matches!(token, Token::Whitespace(_)))
+        })
+        .is_some_and(|token| is(&token, "MOVE"))
 }
 
 /// `FETCH … INTO`, which `PostgreSQL`'s SQL does not have (`PL/pgSQL` does).
@@ -687,6 +718,25 @@ impl Fetch {
             FetchRows::Read { state, max, cursor } => cursor_rows(state, max, cursor).boxed(),
         };
         (self.columns, rows)
+    }
+
+    /// `MOVE`: the cursor moved as this `FETCH` would move it, the rows it
+    /// reads dropped at once; answers how many rows it moved over (`MOVE n`,
+    /// `1` for the current row).
+    async fn moved(self) -> PgWireResult<Response> {
+        let count = match self.rows {
+            FetchRows::Current(row) => usize::from(row.is_some()),
+            FetchRows::Read { state, max, cursor } => {
+                let mut rows = std::pin::pin!(cursor_rows(state, max, cursor));
+                let mut count = 0;
+                while let Some(row) = rows.next().await {
+                    row?;
+                    count += 1;
+                }
+                count
+            }
+        };
+        Ok(Response::Execution(Tag::new("MOVE").with_rows(count)))
     }
 
     /// The rows, sent as the cursor's stream yields them.
@@ -783,14 +833,17 @@ fn out_of_memory(rows: usize) -> PgWireError {
     )
 }
 
-/// Prepares a `FETCH` of the cursor `name`: checked (count, cursor, result
-/// format) before any row is read.
+/// Prepares a `FETCH` of the cursor `name`, or a `MOVE` when `moving`:
+/// checked (count, cursor, result format) before any row is read. A `MOVE`
+/// sends no row: no result format to check, and it may stand again on the
+/// current row of a `NO SCROLL` cursor, as in `PostgreSQL`.
 async fn open(
     cursors: &Cursors,
     store: Option<&Store>,
     name: &str,
     direction: &FetchDirection,
     format: &Format,
+    moving: bool,
 ) -> PgWireResult<Fetch> {
     let count = fetch_count(direction)?;
     let portal = store
@@ -810,11 +863,13 @@ async fn open(
             columns
         }
     };
-    text_only(format, columns.len())?;
+    if !moving {
+        text_only(format, columns.len())?;
+    }
     let rows = match count {
         Count::Current => {
             let current = lock(&cursor.current).clone();
-            if current.is_some() && !cursor.scroll {
+            if current.is_some() && !cursor.scroll && !moving {
                 return Err(user_error("55000", "cursor can only scan forward"));
             }
             FetchRows::Current(current)
@@ -841,10 +896,12 @@ async fn open(
 
 /// The columns a `FETCH` answers with, for `Describe`: its cursor's, as
 /// `PostgreSQL` describes them; none when the cursor does not exist (the
-/// `FETCH` then fails). `format` is the one the client asked results in
-/// (text for a statement). `None` when `statement` is not a `FETCH`.
+/// `FETCH` then fails) or `sql` is a `MOVE`. `format` is the one the client
+/// asked results in (text for a statement). `None` when `statement` is not
+/// a `FETCH`.
 pub(super) async fn fetch_fields<C>(
     client: &C,
+    sql: &str,
     statement: &Statement,
     format: &Format,
 ) -> Option<PgWireResult<Vec<FieldInfo>>>
@@ -855,6 +912,9 @@ where
     let Statement::Fetch { name, .. } = statement else {
         return None;
     };
+    if moves(sql) {
+        return Some(Ok(Vec::new()));
+    }
     let name = cursor_name(name);
     let Some(portal) = portals(client).and_then(|store| store.get_portal(&name)) else {
         return Some(Ok(Vec::new()));
@@ -932,21 +992,28 @@ fn unsupported(what: &str) -> PgWireError {
     )
 }
 
-/// A `FETCH` count: a whole number of rows, negative for backward.
+/// A `FETCH` count: a whole number of rows, negative for backward, that
+/// `PostgreSQL`'s grammar reads as an integer (`int4`): a larger one is a
+/// syntax error there (`42601`), never "every row".
 fn number(count: &ValueWithSpan) -> PgWireResult<i64> {
-    let invalid = || user_error("42601", format!("invalid FETCH count: {count}"));
+    let invalid = || user_error("42601", format!("syntax error at or near \"{count}\""));
     match &count.value {
-        Value::Number(text, _) => text.parse().map_err(|_| invalid()),
+        Value::Number(text, _) => text
+            .parse::<i64>()
+            .ok()
+            .filter(|rows| rows.unsigned_abs() <= u64::from(i32::MAX.unsigned_abs()))
+            .ok_or_else(invalid),
         _ => Err(invalid()),
     }
 }
 
 /// A message the SQL parser does not read (`error`) that holds a `FETCH` or
-/// a `MOVE`, answered at once: sent on, it would wait in the queue for an
-/// admission slot its own cursor may hold, then time out. A single `FETCH`
-/// is read here as `PostgreSQL` reads it (a negative count, no count, no
-/// `FROM`: `FETCH -1 FROM c`, `FETCH FROM c`, `FETCH c`); `MOVE` is not
-/// supported. `None` when the message holds neither.
+/// a `MOVE`, answered at once, on either protocol. A single `FETCH` is read
+/// here as `PostgreSQL` reads it (a negative count, no count, no `FROM`:
+/// `FETCH -1 FROM c`, `FETCH FROM c`, `FETCH c`), and a single `MOVE` as the
+/// `FETCH` of the same direction ([`moves`] tells them apart); among other
+/// statements they are a syntax error (`42601`). `None` when the message
+/// holds neither.
 pub(super) fn unparsed(sql: &str, error: &impl std::fmt::Display) -> Option<PgWireResult<Statement>> {
     let tokens: Vec<Token> = Tokenizer::new(&PostgreSqlDialect {}, sql)
         .tokenize()
@@ -961,12 +1028,10 @@ pub(super) fn unparsed(sql: &str, error: &impl std::fmt::Display) -> Option<PgWi
     let statements: Vec<&[Token]> = tokens.split(|token| *token == Token::SemiColon).collect();
     let starts =
         |statement: &[Token], keyword: &str| statement.first().is_some_and(|token| is(token, keyword));
-    if statements.iter().any(|statement| starts(statement, "MOVE")) {
-        return Some(Err(unsupported("MOVE")));
-    }
+    let cursor = |statement: &[Token]| starts(statement, "FETCH") || starts(statement, "MOVE");
     match statements.as_slice() {
-        [statement] if starts(statement, "FETCH") => Some(read_fetch(&statement[1..])),
-        _ if statements.iter().any(|statement| starts(statement, "FETCH")) => {
+        [statement] if cursor(statement) => Some(read_fetch(&statement[1..])),
+        _ if statements.iter().any(|statement| cursor(statement)) => {
             Some(Err(user_error("42601", format!("syntax error: {error}"))))
         }
         _ => None,
@@ -1370,6 +1435,17 @@ mod tests {
             Err("42601".to_owned())
         );
         assert_eq!(count("FETCH FORWARD 2.0 FROM c"), Err("42601".to_owned()));
+        // Counts are PostgreSQL's int4: a larger one is a syntax error.
+        assert_eq!(count("FETCH 2147483647 FROM c"), Ok(Count::Rows(2_147_483_647)));
+        for sql in [
+            "FETCH 2147483648 FROM c",
+            "FETCH 9223372036854775807 FROM c",
+            "FETCH FORWARD 2147483648 FROM c",
+            "FETCH BACKWARD 2147483648 FROM c",
+        ] {
+            assert_eq!(count(sql), Err("42601".to_owned()), "{sql}");
+        }
+        assert_eq!(count("FETCH BACKWARD 2147483647 FROM c"), Err("55000".to_owned()));
         // Backward: as PostgreSQL answers for a NO SCROLL cursor.
         for sql in [
             "FETCH PRIOR FROM c",
@@ -1469,7 +1545,14 @@ mod tests {
         }
         let refused =
             |sql: &str| unparsed(sql, &"parse error").map(|outcome| outcome.map(|_| ()).map_err(code));
-        assert_eq!(refused("MOVE 1 IN c"), Some(Err("0A000".to_owned())));
+        assert_eq!(refused("MOVE 1 IN c"), Some(Ok(())));
+        assert_eq!(refused("BEGIN; MOVE 1 IN c"), Some(Err("42601".to_owned())));
+        assert_eq!(
+            refused("FETCH -2147483648 FROM c").map(|_| unparsed_fetch("FETCH -2147483648 FROM c")),
+            Some(Ok(("c".to_owned(), Err("42601".to_owned()))))
+        );
+        assert!(moves("  move 1 IN c") && moves("/* x */ MOVE c"));
+        assert!(!moves("FETCH 1 FROM c") && !moves("SELECT 'MOVE'") && !moves("\"move\""));
         assert_eq!(refused("BEGIN; FETCH -1 FROM c"), Some(Err("42601".to_owned())));
         assert_eq!(refused("SELEC 1"), None);
         assert_eq!(refused("SELECT 'FETCH' FROM ("), None);
@@ -1522,6 +1605,7 @@ mod tests {
                 &name.value,
                 direction,
                 &Format::UnifiedText,
+                false,
             )
             .await
             .unwrap();
@@ -1548,9 +1632,16 @@ mod tests {
         let Statement::Fetch { name, direction, .. } = &parse(sql)[0] else {
             panic!("{sql}");
         };
-        let fetch = open(cursors, Some(store), &name.value, direction, &Format::UnifiedText)
-            .await
-            .map_err(code)?;
+        let fetch = open(
+            cursors,
+            Some(store),
+            &name.value,
+            direction,
+            &Format::UnifiedText,
+            false,
+        )
+        .await
+        .map_err(code)?;
         let response = if collected {
             fetch.collected(&pool(1 << 20)).await.map_err(code)?
         } else {
@@ -1596,6 +1687,62 @@ mod tests {
             Ok(vec![3, 4, 5])
         );
         assert_eq!(fetched(&cursors, &store, "FETCH 0 FROM c").await, Ok(vec![]));
+    }
+
+    /// How many rows `MOVE` `sql` moved over (its tag, `MOVE n`).
+    async fn moved(cursors: &Cursors, store: &Store, sql: &str) -> Result<usize, String> {
+        let Some(Ok(Statement::Fetch { name, direction, .. })) = unparsed(sql, &"parse error") else {
+            panic!("{sql}");
+        };
+        assert!(moves(sql), "{sql}");
+        let fetch = open(
+            cursors,
+            Some(store),
+            &name.value,
+            &direction,
+            &Format::UnifiedBinary,
+            true,
+        )
+        .await
+        .map_err(code)?;
+        let Response::Execution(tag) = fetch.moved().await.map_err(code)? else {
+            panic!("{sql}");
+        };
+        (0..=20)
+            .find(|rows| tag == Tag::new("MOVE").with_rows(*rows))
+            .ok_or_else(|| format!("{tag:?}"))
+    }
+
+    #[tokio::test]
+    async fn moves_as_postgresql_does() {
+        let (cursors, store) = cursor_over(10, "DECLARE c NO SCROLL CURSOR FOR SELECT 1").await;
+        for (sql, want) in [
+            ("MOVE 0 IN c", Ok(0)),
+            ("MOVE 2 IN c", Ok(2)),
+            // On a row: 1, with no error for a NO SCROLL cursor.
+            ("MOVE 0 IN c", Ok(1)),
+            ("MOVE RELATIVE 0 IN c", Ok(1)),
+            ("MOVE c", Ok(1)),
+            ("MOVE FORWARD 2 FROM c", Ok(2)),
+            ("MOVE -1 IN c", Err("55000")),
+            ("MOVE 20 IN c", Ok(5)),
+            ("MOVE 0 IN c", Ok(0)),
+            ("MOVE ALL IN c", Ok(0)),
+            ("MOVE 1 IN x", Err("34000")),
+        ] {
+            let got = moved(&cursors, &store, sql).await;
+            assert_eq!(got, want.map_err(str::to_owned), "{sql}");
+        }
+        let (cursors, store) = cursor_over(10, "DECLARE c NO SCROLL CURSOR FOR SELECT 1").await;
+        assert!(moved(&cursors, &store, "MOVE 3 IN c").await.is_ok());
+        assert_eq!(fetched(&cursors, &store, "FETCH 2 FROM c").await, Ok(vec![4, 5]));
+        assert_eq!(
+            fetched(&cursors, &store, "FETCH 0 FROM c").await,
+            Err("55000".to_owned())
+        );
+        let (cursors, store) = cursor_over(10, "DECLARE c CURSOR FOR SELECT 1").await;
+        assert!(moved(&cursors, &store, "MOVE 3 IN c").await.is_ok());
+        assert_eq!(fetched(&cursors, &store, "FETCH 0 FROM c").await, Ok(vec![3]));
     }
 
     #[tokio::test]
@@ -1652,6 +1799,7 @@ mod tests {
                     &name.value,
                     &direction,
                     &Format::UnifiedText,
+                    false,
                 )
                 .await
                 .unwrap()
