@@ -89,11 +89,15 @@ Blocking items, in order:
   cumulative). Evidence:
   `tools/shadow/selftest.sh` (SQL Server 2022 CDC, Trino 431, CodeLake) — two
   cycles without divergence, every injected mutation detected. Findings that
-  block the real run (docs/shadow-run.md): SQL Server `datetime` columns arrive
-  as `timestamp(6)` and a `MILLISECONDS` hive CTAS refuses them (F8-1), SQL
-  Server `varchar(n)` loses its length in CTAS (F8-2), window `ORDER BY` on
-  varbinary fails (F8-3). Pending: those fixes, then the run itself in
-  homologation (a person, three days).
+  block the real run (docs/shadow-run.md): SQL Server `datetime` values are
+  read as the exact 1/300 s tick instead of the millisecond the reference
+  reads (wrong values in filters and `date_diff`), `datetime2(7)` is
+  truncated, and every one arrives as `timestamp(6)`, which a `MILLISECONDS`
+  hive CTAS refuses (F8-1); SQL Server `varchar(n)` loses its length in CTAS
+  (F8-2); window `ORDER BY` on varbinary fails (F8-3); a SQL Server table
+  created after start is not found until a restart (F8-5). Fixed: SQL Server
+  columns in name order instead of the source's (F8-4). Pending: those fixes,
+  then the run itself in homologation (a person, three days).
 
 ## M2 — Production cut-over
 

@@ -31,10 +31,13 @@ codelake config import --from catalog/ --out codelake.toml --env-out codelake.en
   `[memory]`, sources) are kept; imported sources are appended. Without it, a
   loopback-only header is written.
 - Secrets (passwords, keys, tokens, credentials in a JDBC URL) go to the env
-  file only, mode `0600`, one `NAME=value` per line (`docker --env-file`,
-  Compose `env_file`, systemd `EnvironmentFile`, `kubectl create secret generic
-  --from-env-file`). The TOML names the variable (`password_env = "…"`).
-  Nothing is printed: the report names catalogs, settings and variables.
+  file only, mode `0600`, one `NAME=value` per line, unquoted: read literally
+  by `docker --env-file` and `kubectl create secret generic --from-env-file`.
+  Compose `env_file` and systemd `EnvironmentFile` interpret `$`, `#`, quotes,
+  backslashes and edge whitespace; the report names every variable whose value
+  holds one of them (use a literal reader or a `${ENV:…}` reference for it).
+  The TOML names the variable (`password_env = "…"`). Nothing is printed: the
+  report names catalogs, settings and variables.
 - A secret already written `${ENV:NAME}` becomes `password_env = "NAME"` and
   is not copied. Other `${ENV:NAME}` values stay as they are in the TOML and
   are resolved when the server loads it (below).
@@ -113,7 +116,8 @@ scripts/shadow-run.sh shadow.env          # SHADOW_CYCLES cycles
 scripts/shadow-run.sh shadow.env summary  # cumulative report again
 scripts/shadow-run.sh shadow.env test     # the harness's own tests
 scripts/shadow-run.sh shadow.env compare --reference-warehouse /a --candidate-warehouse /b \
-    --table schema.table [--ignore-column schema.table.col] [--show-rows]
+    --table schema.table [--ignore-column schema.table.col] [--parquet-time-zone ZONE] \
+    [--expected FILE] [--show-rows]
 ```
 
 The harness runs in its own image (`tools/shadow/Dockerfile`, built on first
@@ -134,7 +138,8 @@ same path inside it.
 | `SHADOW_DBT_VARS` | extra dbt variables, a JSON object | — |
 | `SHADOW_REFERENCE_WAREHOUSE`, `SHADOW_CANDIDATE_WAREHOUSE` | where each side's output is read: absolute path or `s3://bucket/prefix` | required, different |
 | `SHADOW_OUTPUT_CATALOGS` | catalogs whose models are compared | `hive` |
-| `SHADOW_TABLES` | compare these `schema.table` instead of the models that ran | — |
+| `SHADOW_TABLES` | compare these `schema.table` instead of the models that ran (any other entry is refused) | — |
+| `SHADOW_PARQUET_TIME_ZONE` | IANA zone the hive catalogs of **both** engines convert `INT96` timestamps with (`hive.parquet.time-zone` / `parquet_time_zone`); an `INT96` column is not compared without it | none |
 | `SHADOW_IGNORE_COLUMNS` | volatile columns (`uuid()`, `localtimestamp`): `schema.table.col`, `table.col` or `col`, globs allowed | — |
 | `SHADOW_CUTOFF_SQL` / `SHADOW_CUTOFF_VALUE` / `SHADOW_CUTOFF_VAR` | the cutoff (above) | — / — / `shadow_cutoff` |
 | `SHADOW_CUTOFF_USER` | user for the cutoff query | `shadow` |
@@ -142,13 +147,14 @@ same path inside it.
 | `SHADOW_CYCLES`, `SHADOW_INTERVAL_SECS` | cycles per invocation, pause between them | `1`, `0` |
 | `SHADOW_REFERENCE_RSS`, `SHADOW_CANDIDATE_RSS` | memory meter: `pid:<pid>`, `container:<name>`, `cmd:<command printing bytes>` | none |
 | `SHADOW_RSS_INTERVAL_MS` | sampling period | `200` |
-| `SHADOW_RSS_MAX_RATIO` | fail when candidate/reference peak exceeds it (M1: `0.5`) | report only |
+| `SHADOW_RSS_MAX_RATIO` | fail when candidate/reference peak exceeds it (M1: `0.5`); needs both meters, and a cycle where a side was not measured fails | report only |
 | `SHADOW_EXPECTED_DIFFERENCES` | rule file of expected, documented differences (below): a path, or `default` for the shipped `tools/shadow/codelake_shadow/expected-differences.json` | none (no rule) |
 | `SHADOW_SAMPLE`, `SHADOW_SHOW_ROWS` | differing row hashes listed; print their values (opt-in) | `10`, `false` |
 | `SHADOW_DUCKDB_MEMORY` | DuckDB memory limit (it spills beyond it) | `2GB` |
 | `SHADOW_S3_ENDPOINT`, `SHADOW_S3_REGION`, `SHADOW_S3_PATH_STYLE` | S3 warehouses; keys from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` via `SHADOW_PASS_ENV`, or the credential chain | — |
 | `SHADOW_OUT_DIR` | reports and dbt artifacts | required |
 | `SHADOW_PASS_ENV` | names of variables to pass through (profile passwords): values come from the calling environment | — |
+| `SHADOW_TZ` | time zone of report timestamps and logs | `TZ`, else the host's `/etc/localtime` |
 | `SHADOW_DOCKER_NETWORK`, `SHADOW_DOCKER_VOLUMES` | network to reach the engines; volumes to mount (`vol:/path:ro`, comma-separated) | — |
 
 Memory meters: `container:` reads the container's cgroup v2 `anon` (RSS without
@@ -165,8 +171,9 @@ For the M1 run: one invocation per day with the same `SHADOW_OUT_DIR`
 
 Per cycle `cycle-NNNN.json` / `.md`, and cumulative `summary.json` / `.md` in
 `SHADOW_OUT_DIR`. Exit code: 0 all equal; 1 divergence (a table, a model
-status that differs between sides, a dbt failure, or the RSS ratio); 2
-configuration; 3 harness failure.
+status that differs between sides, a dbt failure, the RSS ratio, or a side
+the configured RSS gate could not measure); 2 configuration; 3 harness
+failure.
 
 Per table:
 
@@ -175,11 +182,19 @@ Per table:
 - **columns differing**: per-column checksums, with NULL counts.
 - **sample**: hashes of rows whose count differs, with the count on each side.
   Values only with `SHADOW_SHOW_ROWS=true` (they are production data).
-- **schema**: columns on one side only and value-class mismatches
-  (divergences); **declared types** that differ (divergences unless a rule
-  documents them, below), read from each table's metastore file, or from the
-  Parquet schema when either side has none; Parquet storage types that differ
-  under equal declared types (warnings, e.g. INT96 vs INT64 timestamps).
+- **schema**, every difference a divergence:
+  - the metastore file (`.trinoSchema`, `dataColumns`) on one side only;
+  - declared columns: names, **order** (`SELECT *` and a positional `UNION`
+    depend on it) and **types** (unless a rule documents a type, below),
+    from the metastore file of both sides, or from the Parquet schema of both
+    sides when neither has one. A table without data files is still compared
+    on them;
+  - Parquet columns on one side only and value-class mismatches;
+  - Parquet **storage**: the type DuckDB reads (a decimal's precision and
+    scale, a timestamp's unit) and a timestamp's encoding (`INT96`, or
+    `INT64` with its unit and UTC adjustment). Both engines may read equal
+    values from files that differ there; another reader of the files does
+    not, so it is not equal.
 - **name case**: a table directory or a column whose name differs only by
   letter case (divergence unless a rule documents it). Directories are found
   without regard to case.
@@ -187,8 +202,13 @@ Per table:
   metastore) are refused with an error, never compared as empty.
 
 Canonical values: integers and decimals by value (`12.50` = `12.5`),
-timestamps as microseconds since the epoch (naive values read as UTC), strings
-exactly (trailing spaces count), binary as hex, NULL distinct from `''`.
+timestamps as nanoseconds since the epoch of the wall-clock value the engines
+read (an `INT64` timestamp as stored, naive values read as UTC; an `INT96`
+timestamp converted from the UTC instant it stores to
+`SHADOW_PARQUET_TIME_ZONE`, as the hive catalogs do), strings exactly
+(trailing spaces count), binary as hex, NULL distinct from `''`. DuckDB reads
+`INT96` at microsecond precision: sub-microsecond digits of an `INT96` column
+are not compared.
 
 Views have no data files and are listed as not compared; compare what is
 built from them.
@@ -203,6 +223,7 @@ in the output is declared, not hidden. A rule file (JSON) lists them:
 {"differences": [
   {"id": "ISS-019", "kind": "declared_type",
    "reason": "CTAS of a literal infers unbounded varchar",
+   "table": "marts.orders_by_status", "column": "label",
    "reference": ["varchar(*)"], "candidate": ["varchar", "string"]},
   {"id": "ISS-018", "kind": "name_case", "reason": "Case-preserving names"}
 ]}
@@ -210,43 +231,47 @@ in the output is declared, not hidden. A rule file (JSON) lists them:
 
 - `kind`: `declared_type` (a column's declared type) or `name_case` (a table or
   column name that differs only by case). `id` (the accepted issue) and
-  `reason` are required; `table` (`schema.table`) and `column` are globs
-  (default `*`); `reference`/`candidate` are globs over the declared type,
-  lower case without spaces. A `declared_type` rule must constrain at least
-  one side.
+  `reason` are required. `table` (`schema.table`) and `column`: globs for
+  `name_case` (default `*`); for `declared_type`, one exact table and column,
+  required: a type change is expected only on a column someone checked (the
+  change ISS-019 makes on a literal is also what a length lost from a source
+  column looks like, finding F8-2). `reference`/`candidate` are globs over
+  the declared type, lower case without spaces; a `declared_type` rule must
+  constrain at least one side.
 - A matching difference is reported under *Expected and documented
   differences* with its rule, per table and column, and counted per rule in
   the cumulative report; it does not make the table divergent.
 - A rule never covers values: row count, checksum, per-column checksums and
-  columns present on one side only are always compared. A table whose only
-  difference is a documented type is equal; the same table with one changed
-  value is divergent.
+  columns present on one side only are always compared, and so are column
+  order and storage. A table whose only difference is a documented type is
+  equal; the same table with one changed value is divergent.
 - No rule applies unless the run names a file: a rule is a decision about a
-  run, not a default. The shipped file (`default`) declares ISS-019 and
-  ISS-018; use it once those limitations are removed in the candidate. The
-  other removed limitations
+  run, not a default. The shipped file (`default`) declares ISS-018 only;
+  ISS-019 rules are written per column of the project, once the column is
+  known to come from a literal. The other removed limitations
   (ISS-017 atomic `CREATE OR REPLACE`, ISS-020 size units, ISS-023 `DROP VIEW`)
   change no table content: where they change a dbt run (a model that fails on
   one side only), the harness reports it as a model status difference, which
-  no rule covers. ISS-019's rule accepts any `varchar(n)` → unbounded change,
-  including a length lost from a source column (finding F8-2 below): do not
-  use it while that finding is open.
+  no rule covers.
 
 ## Findings of the self-test
 
-The self-test runs the acceptance pipelines' patterns; three of them fail on
-the candidate today. Each is a candidate defect, not a harness choice, and
-blocks the M1 shadow run on the real project. The fixture works around them
-behind the dbt variable `shadow_workarounds` (default true; each workaround is
-a no-op on the reference engine), so the harness itself is proven;
-`SHADOW_SELFTEST_STRICT=1` runs the fixture as the pipelines write it and
-fails until they are fixed.
+The self-test runs the acceptance pipelines' patterns; they show candidate
+defects, not harness choices, and each blocks the M1 shadow run on the real
+project. The fixture works around F8-1..F8-3 behind the dbt variable
+`shadow_workarounds` (default true; each workaround is a no-op on the
+reference engine), so the harness itself is proven; `SHADOW_SELFTEST_STRICT=1`
+runs the fixture as the pipelines write it and fails until they are fixed.
+The strict run stops at F8-1 (the models after it do not run); F8-2 and F8-3
+were confirmed by querying both engines directly.
 
 | ID | Pattern | Reference engine | CodeLake today | Workaround in the fixture |
 |---|---|---|---|---|
-| F8-1 | CTAS/INSERT of a SQL Server `datetime`/`datetime2(3)` column into a `MILLISECONDS` hive catalog | `timestamp(3)`, stored | the column arrives as `timestamp(6)`: `Incorrect timestamp precision for timestamp(6)` | `CAST(… AS timestamp(3))` |
+| F8-1 | SQL Server `datetime`, `smalldatetime`, `datetime2(n)` columns | `datetime` read as SQL Server shows it, rounded to the millisecond (`.003`, `.007`, `.997`); `datetime2(7)` kept to 100 ns (`.9999995`, and `1.000000` once cast to `timestamp(6)`); precision declared (`smalldatetime` `timestamp(0)`, `datetime` `timestamp(3)`, `datetime2(n)` `timestamp(n)`) | **wrong values**: `datetime` read as the exact 1/300 s tick (`.003333`, `.006667`, `.996667`), so `date_diff('millisecond', …)` gives 6 where the reference gives 7 and `WHERE dt = TIMESTAMP '….003'` matches a row the reference does not; `datetime2(7)` truncated to the microsecond (`.999999`, a value the reference never produces); every type arrives as `timestamp(6)`, which a `MILLISECONDS` hive CTAS refuses (`Incorrect timestamp precision for timestamp(6)`) | `CAST(… AS timestamp(3))`, which rounds like the reference and so also hides the value difference: the workaround hides a wrong result, not only a precision |
 | F8-2 | CTAS of a SQL Server `varchar(n)` column | declares `varchar(n)` | declares unbounded `string` (values equal) | `CAST(… AS varchar(n))` with the source's declared type |
-| F8-3 | `ROW_NUMBER() OVER (PARTITION BY … ORDER BY "__$seqval")` (varbinary) | ordered by bytes | `Cannot run range queries on datatype: Binary` | `ORDER BY to_hex(…)` |
+| F8-3 | `ROW_NUMBER() OVER (PARTITION BY … ORDER BY "__$seqval")` (varbinary), from the source or from a hive table | ordered by bytes | `Cannot run range queries on datatype: Binary` | `ORDER BY to_hex(…)` |
+| F8-4 | `SELECT *` on a SQL Server table | the source's column order | columns sorted by name, so `SELECT *` and a positional `UNION` or `INSERT` gave other results | none: fixed (the connector keeps `ORDINAL_POSITION`) |
+| F8-5 | a SQL Server table created after the server started (a new CDC capture instance) | visible at once | `TABLE_NOT_FOUND` until CodeLake restarts: the table list is read once, at start | none (the fixture creates its tables before the candidate starts) |
 
 Values were equal on every table and cycle once the workarounds let both sides
 run.
@@ -265,5 +290,9 @@ the import (secrets as references, the thrift catalog skipped with its reason,
 no secret value anywhere, env file `0600`), two cycles with CDC changes between
 them and zero divergences, and each injected mutation detected on the right
 column (a row more or less, decimal, timestamp +3h, trailing space, NULL to
-`''`) while a layout-only rewrite is not. Reports stay in
-`target/shadow-selftest/out`.
+`''`, a declared type, `INT96` copied as the stored instant). The copies are
+written by DuckDB, which cannot write `INT96`: each shows the timestamps'
+storage difference, and a rewrite that keeps the values shows nothing else.
+A command that fails stops the self-test with a `FAIL` line naming it.
+Reports stay in `target/shadow-selftest/out`. The harness's unit tests run on
+their own with `tools/shadow/test.sh` (CI job `shadow-harness`).

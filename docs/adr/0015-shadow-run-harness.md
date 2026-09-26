@@ -89,20 +89,27 @@ configuration sections use it instead of inventing their own.
 - **Comparison.** Per table: row count; a checksum that ignores row order and
   counts duplicates (sum of a 128-bit hash of each row's canonical text);
   a checksum per column to say which columns differ. Canonical values:
-  decimals and integers by value, timestamps as microseconds (naive read as
-  UTC), strings exact (no trimming), binary as hex, NULL distinct from `''`.
-  Declared types (each table's metastore file, or the Parquet schema when
-  either side has none) that differ are divergences, as are table or column
-  names that differ only by case, unless a rule of the expected-differences
-  file documents them (below). Storage-type differences under equal declared
-  types (INT96 vs INT64 timestamps) are reported as warnings. Table
-  directories are found without regard to case; partitioned tables are
-  refused, never compared as empty.
+  decimals and integers by value, timestamps as nanoseconds of the
+  wall-clock value the engines read (`INT96` converted from its stored UTC
+  instant with the hive catalogs' Parquet time zone,
+  `SHADOW_PARQUET_TIME_ZONE`; not compared without it), strings exact (no
+  trimming), binary as hex, NULL distinct from `''`. Every schema difference
+  is a divergence: a metastore file on one side only; declared column names,
+  order and types (each table's metastore file, or the Parquet schema when
+  neither side has one; also for tables without data files); Parquet columns,
+  value classes and storage (DuckDB type, timestamp encoding: another reader
+  of the files would see other values); names that differ only by case. A
+  rule of the expected-differences file can document a declared type or a
+  name's case only (below). Table directories are found without regard to
+  case; partitioned tables are refused, never compared as empty.
 - **Expected differences.** The engine removed limitations copied from the
   reference engine (ISS-017..020, ISS-023); their effect on output is
   declared in a rule file (`SHADOW_EXPECTED_DIFFERENCES`, JSON; the harness
-  ships ISS-018 names and ISS-019 unbounded `varchar`, applied only when a
-  run names it: a rule is a decision about a run, not a default). A rule cites the
+  ships ISS-018 names, applied only when a run names it: a rule is a
+  decision about a run, not a default). A `declared_type` rule names one
+  exact table and column: the change ISS-019 makes on a literal is also what
+  a length lost from a source column looks like (F8-2), so it is declared per
+  column, never project-wide. A rule cites the
   accepted issue and a reason, and classifies only a declared-type or
   name-case difference as "expected and documented"; it is listed per table
   and column and counted in the cumulative report. Values are always
@@ -116,7 +123,8 @@ configuration sections use it instead of inventing their own.
 - **Memory.** Peak RSS per side, sampled while that side's dbt run lasts:
   `pid:` (process tree `VmRSS`), `container:` (cgroup v2 `anon`, as the
   benchmark), or `cmd:` (a command printing bytes). Optional
-  `SHADOW_RSS_MAX_RATIO` turns the M1 ratio into a failure.
+  `SHADOW_RSS_MAX_RATIO` turns the M1 ratio into a failure; it needs a meter
+  on both sides, and a cycle where a side was not measured fails.
 - **Verdict.** JSON and Markdown per cycle and cumulative (cycles accumulate
   across invocations in the same output directory, one per day for the M1
   run). Exit 1 on any divergent table, model status that differs between
@@ -132,18 +140,24 @@ acceptance pipelines' patterns (CDC source, incremental `append` over an LSN
 watermark, `table` with `on_table_exists=drop`, a view, decimal, timestamp,
 varchar, varbinary). Two cycles with CDC changes between them must report no
 divergence; mutations of the candidate's output (a row more or less, a
-decimal, a timestamp +3h, a trailing space, NULL to `''`) must each be
-detected on the right column, and a layout-only rewrite must not.
+decimal, a timestamp +3h, a trailing space, NULL to `''`, a declared type,
+`INT96` copied as its stored instant) must each be detected on the right
+column; a DuckDB rewrite that keeps the values shows only the storage
+difference (DuckDB cannot write `INT96`).
 
 ### Findings
 
-The self-test surfaced three candidate defects on the acceptance pipelines'
-patterns (docs/shadow-run.md, "Findings"): SQL Server `datetime`/`datetime2(3)`
-columns arrive as `timestamp(6)` and a `MILLISECONDS` hive CTAS refuses them
-(F8-1); SQL Server `varchar(n)` columns lose their length in CTAS (F8-2); a
-window `ORDER BY` on varbinary fails (F8-3). They belong to the connector and
-planner, not to this front. The fixture works around them behind a dbt
-variable so the harness is proven; `SHADOW_SELFTEST_STRICT=1` shows them.
+The self-test surfaced candidate defects on the acceptance pipelines'
+patterns (docs/shadow-run.md, "Findings"): SQL Server `datetime` values read
+as the exact 1/300 s tick instead of the millisecond SQL Server shows, and
+`datetime2(7)` truncated, all as `timestamp(6)`, which a `MILLISECONDS` hive
+CTAS refuses (F8-1, a wrong result, not only a precision); SQL Server
+`varchar(n)` columns lose their length in CTAS (F8-2); a window `ORDER BY` on
+varbinary fails (F8-3); SQL Server columns exposed in name order (F8-4, fixed
+in the connector); the SQL Server table list read only at start (F8-5). F8-1,
+F8-2, F8-3 and F8-5 belong to the connector and planner, not to this front.
+The fixture works around F8-1..F8-3 behind a dbt variable so the harness is
+proven; `SHADOW_SELFTEST_STRICT=1` shows them.
 
 ## Consequences
 
