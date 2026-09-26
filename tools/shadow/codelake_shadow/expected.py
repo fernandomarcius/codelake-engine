@@ -11,6 +11,7 @@ but it must stay visible. A rule file declares them:
     {"differences": [
       {"id": "ISS-019", "kind": "declared_type",
        "reason": "CTAS of a literal infers unbounded varchar",
+       "table": "marts.orders_by_status", "column": "label",
        "reference": ["varchar(*)"], "candidate": ["varchar", "string"]},
       {"id": "ISS-018", "kind": "name_case",
        "reason": "Case-preserving names"}
@@ -18,7 +19,11 @@ but it must stay visible. A rule file declares them:
 
 - ``kind`` is ``declared_type`` (a column's declared type differs) or
   ``name_case`` (a table or column name differs only by letter case).
-- ``table`` (``schema.table``) and ``column`` are globs, default ``*``.
+- ``table`` (``schema.table``) and ``column``: globs for ``name_case``
+  (default ``*``); exact names for ``declared_type``, required. A type
+  difference is expected only where someone checked that column: the same
+  change elsewhere can be a defect (ISS-019's ``varchar(n)`` -> unbounded is
+  also what a lost source length looks like, finding F8-2).
 - ``reference`` / ``candidate``: globs (one or a list) over the declared type
   of each side, lower case, without spaces (``decimal(18,6)``). A
   ``declared_type`` rule must constrain at least one side: a rule that would
@@ -111,6 +116,13 @@ def parse(document: object, source: str = "expected differences") -> list[Rule]:
                 errors.append(f"{where}: `{key}` must be a non-empty glob")
         reference = _globs(entry.get("reference"), f"{where}.reference", errors)
         candidate = _globs(entry.get("candidate"), f"{where}.candidate", errors)
+        if kind == "declared_type":
+            for key, value in (("table", table), ("column", column)):
+                if key not in entry or (isinstance(value, str) and any(ch in value for ch in "*?[")):
+                    errors.append(
+                        f"{where}: a declared_type rule names one `{key}` exactly (no glob): "
+                        "a type change is expected only on the columns it was checked on"
+                    )
         if kind == "declared_type" and reference == ("*",) and candidate == ("*",):
             errors.append(f"{where}: a declared_type rule must name the reference or the candidate type")
         if kind == "name_case" and ("reference" in entry or "candidate" in entry):

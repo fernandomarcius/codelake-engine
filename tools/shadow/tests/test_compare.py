@@ -157,6 +157,7 @@ class CompareTests(unittest.TestCase):
         result = self.w.compare()
         self.assertEqual(result["reasons"], ["declared_types"], result)
         rules = {"differences": [{"id": "ISS-019", "kind": "declared_type", "reason": "literal",
+                                  "table": "s.t", "column": "label",
                                   "reference": "varchar(*)", "candidate": ["varchar", "string"]}]}
         result = self.w.compare(expected=rules)
         self.assertEqual(result["status"], "equal", result)
@@ -173,6 +174,7 @@ class CompareTests(unittest.TestCase):
         self.w.write("ref", "s.t", "SELECT 1 AS id, 'um' AS label", declared=[("id", "int"), ("label", "varchar(2)")])
         self.w.write("cand", "s.t", "SELECT 1 AS id, 'um ' AS label", declared=[("id", "int"), ("label", "string")])
         rules = {"differences": [{"id": "ISS-019", "kind": "declared_type", "reason": "literal",
+                                  "table": "s.t", "column": "label",
                                   "reference": "varchar(*)", "candidate": "string"}]}
         result = self.w.compare(expected=rules)
         self.assertEqual(result["status"], "divergent", result)
@@ -300,7 +302,7 @@ class CompareTests(unittest.TestCase):
 class ExpectedTests(unittest.TestCase):
     def test_shipped_rules_parse_and_cite_an_issue(self) -> None:
         rules = expected.load(config.DEFAULT_EXPECTED)
-        self.assertEqual(sorted(r.id for r in rules), ["ISS-018", "ISS-019"])
+        self.assertEqual(sorted(r.id for r in rules), ["ISS-018"])
 
     def test_invalid_rules_are_reported_together(self) -> None:
         document = {"differences": [
@@ -323,12 +325,21 @@ class ExpectedTests(unittest.TestCase):
 
     def test_types_match_without_case_or_spaces(self) -> None:
         rule = expected.parse({"differences": [
-            {"id": "A", "kind": "declared_type", "reason": "r", "table": "s.*", "column": "c*",
+            {"id": "A", "kind": "declared_type", "reason": "r", "table": "s.t", "column": "col",
              "reference": "decimal(18,*)", "candidate": "decimal(38,*)"}]})[0]
-        self.assertTrue(rule.matches("declared_type", "s.t", "col", "DECIMAL(18, 6)", "decimal(38,6)"))
+        self.assertTrue(rule.matches("declared_type", "S.T", "COL", "DECIMAL(18, 6)", "decimal(38,6)"))
         self.assertFalse(rule.matches("declared_type", "x.t", "col", "decimal(18,6)", "decimal(38,6)"))
         self.assertFalse(rule.matches("declared_type", "s.t", "id", "decimal(18,6)", "decimal(38,6)"))
         self.assertFalse(rule.matches("name_case", "s.t", "col"))
+
+    def test_a_declared_type_rule_names_its_column(self) -> None:
+        # A table-wide or project-wide type rule would also cover the same
+        # change where it is a defect (F8-2: a source varchar(n) length lost).
+        for scope in ({}, {"table": "s.t"}, {"table": "s.*", "column": "label"}, {"table": "s.t", "column": "l?bel"}):
+            with self.subTest(scope=scope), self.assertRaisesRegex(expected.ExpectedError, "names one `"):
+                expected.parse({"differences": [dict(
+                    {"id": "ISS-019", "kind": "declared_type", "reason": "r",
+                     "reference": "varchar(*)", "candidate": "string"}, **scope)]})
 
 
 class ConfigTests(unittest.TestCase):

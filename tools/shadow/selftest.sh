@@ -277,10 +277,16 @@ mutation decimal         amount     1 "$TABLE: divergent ($TS_STORAGE, checksum)
 mutation timestamp_3h    created_at 1 "$TABLE: divergent ($TS_STORAGE, checksum) columns: created_at"
 mutation trailing_space  note       1 "$TABLE: divergent ($TS_STORAGE, checksum) columns: note"
 mutation null_to_empty   note       1 "$TABLE: divergent ($TS_STORAGE, checksum) columns: note"
-# A declared type that differs (varchar(20) -> string) diverges; the shipped
-# rule file classifies it as ISS-019, expected and documented.
+# A declared type that differs (varchar(20) -> string) diverges. A rule for
+# that one column classifies it as expected and documented (ISS-019); the
+# shipped rule file has no type rule, so it still diverges with it.
 mutation declared_type   status     1 "$TABLE: divergent (declared_types, $TS_STORAGE)"
-mutation declared_type   status     1 "$TABLE: divergent ($TS_STORAGE) expected: ISS-019" --expected default
+mutation declared_type   status     1 "$TABLE: divergent (declared_types, $TS_STORAGE)" --expected default
+cat > "$WORK/out/iss-019.json" <<'JSON'
+{"differences": [{"id": "ISS-019", "kind": "declared_type", "table": "shadow_pilot.orders", "column": "status",
+  "reason": "self-test: the mutation declares the column unbounded", "reference": "varchar(*)", "candidate": "string"}]}
+JSON
+mutation declared_type   status     1 "$TABLE: divergent ($TS_STORAGE) expected: ISS-019" --expected "$WORK/out/iss-019.json"
 
 log "summary"
 printf '  %s\n' "${CHECKS[@]}" >&2
