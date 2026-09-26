@@ -347,10 +347,10 @@ impl CursorHook {
     async fn observe(statement: &Statement, client: &dyn HookClient) -> Option<PgWireResult<Response>> {
         let cursors = Cursors::of(client);
         match statement {
+            Statement::Close { cursor } => return Some(cursors.close(client.portal_store(), cursor)),
+            Statement::Fetch { into: Some(_), .. } => return Some(Err(into_error())),
             // A `FETCH` among other statements: its rows are read before the
             // next statement runs (a single `FETCH` streams them, [`fetch`]).
-            Statement::Fetch { into: Some(_), .. } => return Some(Err(into_error())),
-            Statement::Close { cursor } => return Some(cursors.close(client.portal_store(), cursor)),
             Statement::Fetch { name, direction, .. } => {
                 let store = Some(client.portal_store());
                 let fetch = open(&cursors, store, &name.value, direction, &Format::UnifiedText).await;
