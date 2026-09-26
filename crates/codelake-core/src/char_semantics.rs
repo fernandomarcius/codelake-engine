@@ -415,10 +415,16 @@ static CHAR_COMPARE_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
 
 /// The functions this module plans, for the engine to register.
 pub(crate) fn functions() -> Vec<ScalarUDF> {
-    [&CHAR_PAD_UDF, &CHAR_KEY_UDF, &CHAR_COMPARE_UDF, &VARCHAR_OF_UDF]
-        .into_iter()
-        .map(|udf| udf.as_ref().clone())
-        .collect()
+    [
+        &CHAR_PAD_UDF,
+        &CHAR_KEY_UDF,
+        &CHAR_COMPARE_UDF,
+        &VARCHAR_OF_UDF,
+        &crate::nested_values::NESTED_TEST_UDF,
+    ]
+    .into_iter()
+    .map(|udf| udf.as_ref().clone())
+    .collect()
 }
 
 /// `expr` as a `char(length)` value (`codelake_char`).
@@ -640,10 +646,41 @@ pub(crate) fn char_column(plan: &LogicalPlan, index: usize) -> Option<u32> {
     }
 }
 
+/// A type this rule follows through a plan: [`Text`] of a value, [`Shape`]
+/// of a row or an array.
+trait Typing: Sized {
+    /// The type of `expr`.
+    fn of(expr: &Expr, scope: &Scope<'_>) -> Option<Self>;
+    /// The type a field declares.
+    fn of_field(field: &Field) -> Option<Self>;
+    /// The common type of values of `types`.
+    fn common(types: &[Option<Self>]) -> Option<Self>;
+}
+
+impl Typing for Text {
+    fn of(expr: &Expr, scope: &Scope<'_>) -> Option<Self> {
+        infer(expr, scope)
+    }
+
+    fn of_field(field: &Field) -> Option<Self> {
+        from_field(field)
+    }
+
+    fn common(types: &[Option<Self>]) -> Option<Self> {
+        common(types)
+    }
+}
+
 /// The type of column `index` of `plan`'s output, followed through the plan.
 fn column_type(plan: &LogicalPlan, index: usize, outer: &[&LogicalPlan]) -> Option<Text> {
+    column_typed::<Text>(plan, index, outer)
+}
+
+/// The type `T` of column `index` of `plan`'s output, followed through the
+/// plan.
+fn column_typed<T: Typing>(plan: &LogicalPlan, index: usize, outer: &[&LogicalPlan]) -> Option<T> {
     match plan {
-        LogicalPlan::Projection(projection) => infer(
+        LogicalPlan::Projection(projection) => T::of(
             projection.expr.get(index)?,
             &Scope::over(&projection.input, outer),
         ),
@@ -657,51 +694,51 @@ fn column_type(plan: &LogicalPlan, index: usize, outer: &[&LogicalPlan]) -> Opti
                     .aggr_expr
                     .get(index.checked_sub(groups.len() + grouping_id)?)?
             };
-            infer(expr, &Scope::over(&aggregate.input, outer))
+            T::of(expr, &Scope::over(&aggregate.input, outer))
         }
         LogicalPlan::Window(window) => {
             let columns = window.input.schema().fields().len();
             match index.checked_sub(columns) {
-                None => column_type(&window.input, index, outer),
-                Some(at) => infer(window.window_expr.get(at)?, &Scope::over(&window.input, outer)),
+                None => column_typed::<T>(&window.input, index, outer),
+                Some(at) => T::of(window.window_expr.get(at)?, &Scope::over(&window.input, outer)),
             }
         }
         LogicalPlan::Union(union) => {
-            let types: Vec<Option<Text>> = union
+            let types: Vec<Option<T>> = union
                 .inputs
                 .iter()
-                .map(|input| column_type(input, index, outer))
+                .map(|input| column_typed::<T>(input, index, outer))
                 .collect();
-            common(&types)
+            T::common(&types)
         }
         LogicalPlan::Values(values) => {
             let empty = Scope::empty();
-            let types: Vec<Option<Text>> = values
+            let types: Vec<Option<T>> = values
                 .values
                 .iter()
-                .map(|row| row.get(index).and_then(|cell| infer(value_of_cell(cell), &empty)))
+                .map(|row| row.get(index).and_then(|cell| T::of(value_of_cell(cell), &empty)))
                 .collect();
-            common(&types)
+            T::common(&types)
         }
-        LogicalPlan::SubqueryAlias(alias) => column_type(&alias.input, index, outer),
-        LogicalPlan::Subquery(subquery) => column_type(&subquery.subquery, index, outer),
-        LogicalPlan::Distinct(Distinct::All(input)) => column_type(input, index, outer),
+        LogicalPlan::SubqueryAlias(alias) => column_typed::<T>(&alias.input, index, outer),
+        LogicalPlan::Subquery(subquery) => column_typed::<T>(&subquery.subquery, index, outer),
+        LogicalPlan::Distinct(Distinct::All(input)) => column_typed::<T>(input, index, outer),
         LogicalPlan::Filter(_)
         | LogicalPlan::Sort(_)
         | LogicalPlan::Limit(_)
         | LogicalPlan::Repartition(_)
             if plan.inputs().len() == 1 =>
         {
-            column_type(plan.inputs()[0], index, outer)
+            column_typed::<T>(plan.inputs()[0], index, outer)
         }
-        _ if plan.inputs().is_empty() => from_field(plan.schema().field(index)),
+        _ if plan.inputs().is_empty() => T::of_field(plan.schema().field(index)),
         other => {
             // The inputs' columns, found by name (a join's are both sides').
             let (qualifier, field) = other.schema().qualified_field(index);
             let column = Column::from((qualifier, field));
             match find_column(&other.inputs(), &column) {
-                Some((input, at)) => column_type(input, at, outer),
-                None => from_field(field),
+                Some((input, at)) => column_typed::<T>(input, at, outer),
+                None => T::of_field(field),
             }
         }
     }
@@ -1217,6 +1254,366 @@ fn outer_of<'a>(scope: &Scope<'a>) -> Vec<&'a LogicalPlan> {
     all
 }
 
+// ---------------------------------------------------------------- rows and arrays
+
+/// The reference engine's type of a row or an array, as far as char values
+/// go: the type of each value it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Shape {
+    /// A value that is not a row or an array (`None`: not text).
+    Value(Option<Text>),
+    Row(Vec<Shape>),
+    Array(Box<Shape>),
+}
+
+impl Typing for Shape {
+    fn of(expr: &Expr, scope: &Scope<'_>) -> Option<Self> {
+        Some(shape(expr, scope))
+    }
+
+    fn of_field(field: &Field) -> Option<Self> {
+        Some(shape_of_field(field))
+    }
+
+    fn common(types: &[Option<Self>]) -> Option<Self> {
+        common_shape(types)
+    }
+}
+
+/// The Arrow type of `expr` when it is a row or an array.
+fn nested_type(expr: &Expr, scope: &Scope<'_>) -> Option<DataType> {
+    expr.get_type(scope.schema.as_ref())
+        .ok()
+        .filter(crate::nested_values::is_nested)
+}
+
+/// The shape a field declares (its values' declared types).
+fn shape_of_field(field: &Field) -> Shape {
+    match field.data_type() {
+        DataType::Struct(fields) => Shape::Row(fields.iter().map(|f| shape_of_field(f)).collect()),
+        other => match crate::nested_values::element(other) {
+            Some(element) => Shape::Array(Box::new(shape_of_field(element))),
+            None => Shape::Value(from_field(field)),
+        },
+    }
+}
+
+/// The shape of a value of `data_type` this rule does not follow: text of
+/// a length it does not know.
+fn unknown_shape(data_type: &DataType) -> Shape {
+    match data_type {
+        DataType::Struct(fields) => Shape::Row(fields.iter().map(|f| unknown_shape(f.data_type())).collect()),
+        DataType::Null => Shape::Value(Some(Text::Null)),
+        text if is_text(text) => Shape::Value(Some(Text::Varchar(Bound::Uncertain))),
+        other => match crate::nested_values::element(other) {
+            Some(element) => Shape::Array(Box::new(unknown_shape(element.data_type()))),
+            None => Shape::Value(None),
+        },
+    }
+}
+
+/// Whether `shape` has the structure of `data_type`.
+fn fits(shape: &Shape, data_type: &DataType) -> bool {
+    match (shape, data_type) {
+        (Shape::Row(fields), DataType::Struct(types)) => {
+            fields.len() == types.len()
+                && fields
+                    .iter()
+                    .zip(types.iter())
+                    .all(|(s, f)| fits(s, f.data_type()))
+        }
+        (Shape::Array(element), other) => {
+            crate::nested_values::element(other).is_some_and(|f| fits(element, f.data_type()))
+        }
+        (Shape::Value(_), other) => !crate::nested_values::is_nested(other),
+        _ => false,
+    }
+}
+
+/// The common shape of values of `shapes`; `None` when one is not known or
+/// they do not have one structure.
+fn common_shape(shapes: &[Option<Shape>]) -> Option<Shape> {
+    let mut known: Vec<&Shape> = Vec::with_capacity(shapes.len());
+    for s in shapes {
+        match s {
+            None => return None,
+            Some(Shape::Value(Some(Text::Null))) => {}
+            Some(s) => known.push(s),
+        }
+    }
+    let Some(first) = known.first() else {
+        return Some(Shape::Value(Some(Text::Null)));
+    };
+    match first {
+        Shape::Value(_) => {
+            let texts: Vec<Option<Text>> = known
+                .iter()
+                .map(|s| match s {
+                    Shape::Value(t) => Some(*t),
+                    _ => None,
+                })
+                .collect::<Option<_>>()?;
+            Some(Shape::Value(common(&texts)))
+        }
+        Shape::Row(fields) => {
+            let width = fields.len();
+            let rows: Vec<&Vec<Shape>> = known
+                .iter()
+                .map(|s| match s {
+                    Shape::Row(f) if f.len() == width => Some(f),
+                    _ => None,
+                })
+                .collect::<Option<_>>()?;
+            (0..width)
+                .map(|k| {
+                    let column: Vec<Option<Shape>> = rows.iter().map(|r| Some(r[k].clone())).collect();
+                    common_shape(&column)
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(Shape::Row)
+        }
+        Shape::Array(_) => {
+            let elements: Vec<Option<Shape>> = known
+                .iter()
+                .map(|s| match s {
+                    Shape::Array(e) => Some(Some(e.as_ref().clone())),
+                    _ => None,
+                })
+                .collect::<Option<_>>()?;
+            common_shape(&elements).map(|e| Shape::Array(Box::new(e)))
+        }
+    }
+}
+
+/// The element shape of an array's shape.
+fn element_shape(shape: Option<Shape>) -> Option<Shape> {
+    match shape? {
+        Shape::Array(element) => Some(*element),
+        _ => None,
+    }
+}
+
+/// The shape of a function's result, where this rule follows it.
+fn function_shape(name: &str, args: &[Expr], scope: &Scope<'_>, whole: &Expr) -> Option<Shape> {
+    let arg = |i: usize| args.get(i).map(|a| shape(a, scope));
+    let all = |from: usize| -> Vec<Option<Shape>> {
+        args.iter().skip(from).map(|a| Some(shape(a, scope))).collect()
+    };
+    match name {
+        "struct" | "row" | "named_struct" => {
+            let kind = built(whole)?;
+            Some(Shape::Row(
+                value_positions(kind, args.len())
+                    .into_iter()
+                    .map(|i| shape(&args[i], scope))
+                    .collect(),
+            ))
+        }
+        "make_array" | "array" | "make_list" => common_shape(&all(0)).map(|e| Shape::Array(Box::new(e))),
+        "get_field" => {
+            let Some(Shape::Row(fields)) = arg(0) else {
+                return None;
+            };
+            let Ok(DataType::Struct(types)) = args[0].get_type(scope.schema.as_ref()) else {
+                return None;
+            };
+            let (_, wanted) = literal_text(args.get(1)?)?;
+            let at = types.iter().position(|f| f.name() == wanted)?;
+            fields.into_iter().nth(at)
+        }
+        "element_at" | crate::trino_functions::SUBSCRIPT => element_shape(arg(0)),
+        "flatten" => element_shape(arg(0)).filter(|e| matches!(e, Shape::Array(_))),
+        "array_intersect" | "array_union" | "array_except" => {
+            common_shape(&[element_shape(arg(0)), element_shape(arg(1))]).map(|e| Shape::Array(Box::new(e)))
+        }
+        "concat" | CONCAT_OPERATOR => {
+            let elements: Vec<Option<Shape>> = args
+                .iter()
+                .map(|a| {
+                    if nested_type(a, scope).is_some() {
+                        element_shape(Some(shape(a, scope)))
+                    } else {
+                        Some(shape(a, scope))
+                    }
+                })
+                .collect();
+            common_shape(&elements).map(|e| Shape::Array(Box::new(e)))
+        }
+        _ if keeps_elements(name) => arg(0),
+        "coalesce" | "nvl" | "ifnull" | "greatest" | "least" => common_shape(&all(0)),
+        "nvl2" => common_shape(&all(1)),
+        crate::coercion::VALUES_CELL
+        | crate::coercion::NAMED_CAST
+        | "nullif"
+        | crate::trino_functions::TRY
+        | crate::trino_functions::GUARDED_TRY
+        | crate::trino_functions::BARRIER => arg(0),
+        _ => None,
+    }
+}
+
+/// The shape of `expr`: of a row or an array, what char values it holds;
+/// of any other value, its type ([`infer`]).
+fn shape(expr: &Expr, scope: &Scope<'_>) -> Shape {
+    let Some(data_type) = nested_type(expr, scope) else {
+        return Shape::Value(infer(expr, scope));
+    };
+    let first = |args: &[Expr]| args.first().map(|a| shape(a, scope));
+    let found = match expr {
+        Expr::Alias(Alias { expr, .. }) => Some(shape(expr, scope)),
+        Expr::Column(column) => match find_column(&scope.inputs, column) {
+            Some((input, at)) => column_typed::<Shape>(input, at, scope.outer),
+            None => scope
+                .schema
+                .field_from_column(column)
+                .ok()
+                .map(|f| shape_of_field(f)),
+        },
+        Expr::OuterReferenceColumn(field, column) => match find_column(scope.outer, column) {
+            Some((input, at)) => column_typed::<Shape>(input, at, &[]),
+            None => Some(shape_of_field(field)),
+        },
+        Expr::Literal(..) => parts(expr).and_then(|(array, values)| {
+            let shapes: Vec<Option<Shape>> = values.iter().map(|v| Some(shape(v, scope))).collect();
+            if array {
+                common_shape(&shapes).map(|e| Shape::Array(Box::new(e)))
+            } else {
+                shapes.into_iter().collect::<Option<Vec<_>>>().map(Shape::Row)
+            }
+        }),
+        Expr::ScalarFunction(ScalarFunction { func, args }) => function_shape(func.name(), args, scope, expr),
+        Expr::Case(case) => {
+            let shapes: Vec<Option<Shape>> = case
+                .when_then_expr
+                .iter()
+                .map(|(_, then)| Some(shape(then, scope)))
+                .chain(case.else_expr.iter().map(|e| Some(shape(e, scope))))
+                .collect();
+            common_shape(&shapes)
+        }
+        Expr::Cast(Cast { expr: inner, .. }) | Expr::TryCast(TryCast { expr: inner, .. }) => {
+            Some(shape(inner, scope))
+        }
+        Expr::AggregateFunction(AggregateFunction { func, params }) => match (func.name(), params.args.len())
+        {
+            ("array_agg", _) | ("min_by" | "max_by", 3) => {
+                first(&params.args).map(|s| Shape::Array(Box::new(s)))
+            }
+            ("min_by" | "max_by", _) => first(&params.args),
+            (name, _) if picks_a_value(name) => first(&params.args),
+            _ => None,
+        },
+        Expr::WindowFunction(window) => {
+            let WindowFunction { fun, params } = window.as_ref();
+            match fun.name() {
+                "lag" | "lead" => {
+                    let shapes: Vec<Option<Shape>> = [params.args.first(), params.args.get(2)]
+                        .into_iter()
+                        .flatten()
+                        .map(|a| Some(shape(a, scope)))
+                        .collect();
+                    common_shape(&shapes)
+                }
+                name if picks_a_value(name) => first(&params.args),
+                _ => None,
+            }
+        }
+        Expr::ScalarSubquery(subquery) => column_typed::<Shape>(&subquery.subquery, 0, &outer_of(scope)),
+        _ => None,
+    };
+    match found.filter(|s| fits(s, &data_type)) {
+        Some(s) => s,
+        None => match infer(expr, scope) {
+            Some(Text::Array(n)) if crate::nested_values::element(&data_type).is_some() => {
+                Shape::Array(Box::new(Shape::Value(Some(Text::Char(n)))))
+            }
+            _ => unknown_shape(&data_type),
+        },
+    }
+}
+
+/// Field `k` of a row's shape.
+fn row_field(shape: Option<&Shape>, k: usize) -> Option<&Shape> {
+    match shape {
+        Some(Shape::Row(fields)) => fields.get(k),
+        _ => None,
+    }
+}
+
+/// The element of an array's shape.
+fn array_element(shape: Option<&Shape>) -> Option<&Shape> {
+    match shape {
+        Some(Shape::Array(element)) => Some(element.as_ref()),
+        _ => None,
+    }
+}
+
+/// For each value of a row or an array of `data_type` (in the order of
+/// [`crate::nested_values::leaves`]), whether it is compared as char:
+/// either side's is a char value.
+fn char_flags(data_type: &DataType, left: Option<&Shape>, right: Option<&Shape>, out: &mut Vec<bool>) {
+    match data_type {
+        DataType::Struct(fields) => {
+            for (k, f) in fields.iter().enumerate() {
+                char_flags(f.data_type(), row_field(left, k), row_field(right, k), out);
+            }
+        }
+        other => {
+            if let Some(f) = crate::nested_values::element(other) {
+                char_flags(f.data_type(), array_element(left), array_element(right), out);
+            } else {
+                let is_char = |s: Option<&Shape>| matches!(s, Some(Shape::Value(Some(Text::Char(_)))));
+                out.push(is_char(left) || is_char(right));
+            }
+        }
+    }
+}
+
+fn nested_test(left: Expr, right: Expr, test: crate::nested_values::Test, chars: &[bool]) -> Expr {
+    Expr::ScalarFunction(ScalarFunction::new_udf(
+        Arc::clone(&crate::nested_values::NESTED_TEST_UDF),
+        vec![
+            left,
+            right,
+            Expr::Literal(
+                ScalarValue::Utf8(Some(crate::nested_values::test_mode(test, chars))),
+                None,
+            ),
+        ],
+    ))
+}
+
+/// `left op right` (`=`, `<>`, `IS [NOT] DISTINCT FROM`) of rows or arrays
+/// not written out, as the reference compares them (see
+/// [`crate::nested_values`]); `None` when one is an untyped `NULL`.
+fn nested_comparison(left: Expr, op: Operator, right: Expr, scope: &Scope<'_>) -> Option<Expr> {
+    use crate::nested_values::Test;
+    let data_type = nested_type(&left, scope).or_else(|| nested_type(&right, scope))?;
+    let untyped_null = |e: &Expr| e.get_type(scope.schema.as_ref()).is_ok_and(|t| t.is_null());
+    if untyped_null(&left) || untyped_null(&right) {
+        return None;
+    }
+    let (ls, rs) = (shape(&left, scope), shape(&right, scope));
+    let mut chars = Vec::new();
+    char_flags(&data_type, Some(&ls), Some(&rs), &mut chars);
+    Some(match op {
+        Operator::NotEq => Expr::Not(Box::new(nested_test(left, right, Test::Equal, &chars))),
+        Operator::IsDistinctFrom => nested_test(left, right, Test::Distinct, &chars),
+        Operator::IsNotDistinctFrom => Expr::Not(Box::new(nested_test(left, right, Test::Distinct, &chars))),
+        _ => nested_test(left, right, Test::Equal, &chars),
+    })
+}
+
+/// Whether a row or an array holds a `NULL` at any depth.
+fn holds_null(expr: Expr, scope: &Scope<'_>) -> Expr {
+    let mut values = Vec::new();
+    if let Some(data_type) = nested_type(&expr, scope) {
+        crate::nested_values::leaves(&data_type, &mut values);
+    }
+    let chars = vec![false; values.len()];
+    nested_test(expr.clone(), expr, crate::nested_values::Test::HoldsNull, &chars)
+}
+
 // ---------------------------------------------------------------- rewrites
 
 fn refusal(what: &str) -> DataFusionError {
@@ -1678,6 +2075,14 @@ fn compare(left: Expr, op: Operator, right: Expr, scope: &Scope<'_>) -> Result<T
     {
         return Ok(Transformed::yes(expanded));
     }
+    // Rows and arrays not written out (a column, an aggregate, a `CASE`):
+    // compared value by value at run time.
+    if is_equality(op)
+        && (parts(&left).is_none() || parts(&right).is_none())
+        && let Some(test) = nested_comparison(left.clone(), op, right.clone(), scope)
+    {
+        return Ok(Transformed::yes(test));
+    }
     if built(&left).is_some() && built(&right).is_some() {
         return compare_built(left, op, right, scope);
     }
@@ -1841,6 +2246,40 @@ fn in_list(list: InList, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
     let InList { expr, list, negated } = list;
     let expr = Box::new(expr.unalias());
     let list: Vec<Expr> = list.into_iter().map(Expr::unalias).collect();
+    // A row or an array not written out, or items that are not: each item
+    // compared as `=` compares them ([`nested_comparison`]), a constant
+    // list looked up as a set as below.
+    if nested_type(&expr, scope).is_some()
+        && (parts(&expr).is_none() || list.iter().any(|item| parts(item).is_none()))
+    {
+        let mut tests = Vec::with_capacity(list.len());
+        for item in &list {
+            match nested_comparison(expr.as_ref().clone(), Operator::Eq, item.clone(), scope) {
+                Some(test) => tests.push(test),
+                None => tests.push(binary(expr.as_ref().clone(), Operator::Eq, item.clone())),
+            }
+        }
+        let looked_up = list.len() > 1 && !is_constant(&expr) && list.iter().all(definite_constant);
+        if let Some(any) = tests.into_iter().reduce(Expr::or) {
+            let any = if looked_up {
+                Expr::Case(Case::new(
+                    None,
+                    vec![(
+                        Box::new(holds_null(expr.as_ref().clone(), scope)),
+                        Box::new(Expr::Literal(ScalarValue::Boolean(None), None)),
+                    )],
+                    Some(Box::new(any)),
+                ))
+            } else {
+                any
+            };
+            return Ok(Transformed::yes(if negated {
+                Expr::Not(Box::new(any))
+            } else {
+                any
+            }));
+        }
+    }
     if let Some((arrays, values)) = parts(&expr)
         && list
             .iter()
@@ -3280,6 +3719,93 @@ mod tests {
              rtrim(CAST('xa  a' AS char(6)), 'a') || '|', length(rtrim(CAST('b a' AS char(4)), 'a'))",
             &[&["", " b", "a", " x", "xa|", "1"]],
         ),
+        // Rows and arrays not written out (a subquery's column, a CTE, an
+        // aggregate) compare value by value: a NULL value makes `=` NULL,
+        // never true (also without char values), a join does not match it,
+        // and char values compare padded.
+        (
+            "SELECT id, r = r, r = ROW(1, 2), r <> ROW(1, 2), r IS DISTINCT FROM ROW(id, NULL) \
+             FROM (SELECT id, ROW(id, CAST(NULL AS bigint)) AS r FROM cht) ORDER BY id",
+            &[
+                &["1", "NULL", "NULL", "NULL", "false"],
+                &["2", "NULL", "false", "true", "false"],
+                &["3", "NULL", "false", "true", "false"],
+                &["4", "NULL", "false", "true", "false"],
+            ],
+        ),
+        (
+            "SELECT a = a, a = ARRAY[1, NULL], a IS NOT DISTINCT FROM ARRAY[1, NULL], a <> ARRAY[2, NULL] \
+             FROM (SELECT array_agg(x) AS a FROM (VALUES 1, NULL) t(x))",
+            &[&["NULL", "NULL", "true", "true"]],
+        ),
+        (
+            "SELECT id FROM (SELECT id, ROW(id, CAST(NULL AS bigint)) AS r FROM cht) WHERE NOT (r = ROW(1, 2)) ORDER BY id",
+            &[&["2"], &["3"], &["4"]],
+        ),
+        (
+            "SELECT count(*) FROM (SELECT ROW(s, id) AS r FROM vct) a JOIN (SELECT ROW(s, id) AS r FROM vct) b ON a.r = b.r",
+            &[&["4"]],
+        ),
+        (
+            "SELECT count(*) FROM (SELECT ARRAY[s] AS r FROM vct) a JOIN (SELECT ARRAY[s] AS r FROM vct) b ON a.r = b.r",
+            &[&["4"]],
+        ),
+        (
+            "SELECT a.id, b.id FROM (SELECT id, ROW(ch) AS r FROM cht) a JOIN (SELECT id, ROW(c) AS r FROM c3) b \
+             ON a.r = b.r ORDER BY 1, 2",
+            &[&["1", "1"], &["2", "3"], &["4", "2"]],
+        ),
+        (
+            "SELECT id FROM (SELECT id, ROW(ch, id) AS r FROM cht) WHERE r = ROW('ab', 1) ORDER BY id",
+            &[&["1"]],
+        ),
+        (
+            "WITH w AS (SELECT id, ARRAY[ch] AS a FROM cht) SELECT id, a = ARRAY['ab'], a IN (ARRAY['ab'], ARRAY['zz']) \
+             FROM w ORDER BY id",
+            &[
+                &["1", "true", "true"],
+                &["2", "false", "true"],
+                &["3", "NULL", "NULL"],
+                &["4", "false", "false"],
+            ],
+        ),
+        (
+            "SELECT id, a IN (ARRAY[1, 2], ARRAY[3, 4]), a IN (ARRAY[1, 2]) \
+             FROM (SELECT id, ARRAY[id, CAST(NULL AS bigint)] AS a FROM cht) ORDER BY id",
+            &[
+                &["1", "NULL", "NULL"],
+                &["2", "NULL", "false"],
+                &["3", "NULL", "false"],
+                &["4", "NULL", "false"],
+            ],
+        ),
+        (
+            "SELECT id, r IN (ROW('ab', 1), ROW('zz', 3)) FROM (SELECT id, ROW(s, id) AS r FROM vct) ORDER BY id",
+            &[
+                &["1", "true"],
+                &["2", "false"],
+                &["3", "false"],
+                &["4", "NULL"],
+                &["5", "false"],
+            ],
+        ),
+        (
+            "SELECT cht.id, ARRAY[ch] = x.a FROM cht CROSS JOIN (SELECT array_agg(s) AS a FROM vct WHERE id = 2) x ORDER BY 1",
+            &[&["1", "true"], &["2", "false"], &["3", "NULL"], &["4", "false"]],
+        ),
+        (
+            "SELECT count(*) FROM cht CROSS JOIN (SELECT array_agg(ch) AS a FROM cht) x WHERE array_sort(x.a) = ARRAY['ab']",
+            &[&["0"]],
+        ),
+        (
+            "SELECT id, ROW(ch, id) IS DISTINCT FROM r, ROW(ch, id) = r FROM (SELECT id, ROW(c, id) AS r FROM c3) \
+             JOIN cht USING (id) ORDER BY id",
+            &[
+                &["1", "false", "true"],
+                &["2", "true", "false"],
+                &["3", "true", "NULL"],
+            ],
+        ),
         // `INTERSECT ALL` / `EXCEPT ALL` of char values of two Arrow text
         // types (a `VALUES` list and an in-memory table) stay multiset
         // operations.
@@ -3936,24 +4462,16 @@ mod tests {
                 "Cannot truncate non-space characters when casting from varchar(7) to char(5) on INSERT",
             ),
             (
+                "SELECT count(*) FROM (SELECT ARRAY[ch] FROM cht UNION SELECT ARRAY['ab'])",
+                "UNION of an array of char(n) values with another array is not supported yet",
+            ),
+            (
                 "SELECT CAST(ARRAY[s] AS array(char(3))) FROM vct",
                 "a cast to an array, map or row of char(3) is not supported yet",
             ),
             (
                 "SELECT CAST(ROW(s, 1) AS ROW(a varchar(1), b integer)) FROM vct",
                 "a cast to an array, map or row of varchar(1) is not supported yet",
-            ),
-            (
-                "SELECT count(*) FROM cht CROSS JOIN (SELECT array_agg(ch) AS a FROM cht) x WHERE array_sort(x.a) = ARRAY['ab']",
-                "a comparison of an array of char(n) values with another array is not supported yet",
-            ),
-            (
-                "SELECT id FROM cht CROSS JOIN (SELECT array_agg(s) AS a FROM vct) x WHERE ARRAY[ch] = x.a",
-                "a comparison of an array of char(n) values with another array is not supported yet",
-            ),
-            (
-                "SELECT count(*) FROM (SELECT ARRAY[ch] FROM cht UNION SELECT ARRAY['ab'])",
-                "UNION of an array of char(n) values with another array is not supported yet",
             ),
         ] {
             let err = rows(&engine, sql).await.unwrap_err();

@@ -25,6 +25,7 @@ pub mod join_guard;
 pub mod join_spill;
 mod literals;
 mod memory_tables;
+mod nested_values;
 pub mod operand_checks;
 pub mod output;
 pub mod overflow;
