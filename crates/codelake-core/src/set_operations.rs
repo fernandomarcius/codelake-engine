@@ -183,16 +183,82 @@ mod tests {
         ),
     ];
 
-    #[tokio::test]
-    async fn all_set_operations_are_multiset_operations() {
-        let dir = tempfile::tempdir().unwrap();
+    fn engine(dir: &std::path::Path) -> Engine {
         let memory = MemoryConfig {
             limit: ByteSize::mib(64),
-            spill_dir: dir.path().to_owned(),
+            spill_dir: dir.to_owned(),
             spill_limit: ByteSize::mib(64),
             metadata_cache_limit: ByteSize::mib(1),
         };
-        let engine = Engine::new(&memory, &ExecutionConfig::default()).unwrap();
+        Engine::new(&memory, &ExecutionConfig::default()).unwrap()
+    }
+
+    /// Floats: `-0.0` equals `0.0`, a filter `x = <constant>` leaves a
+    /// window partitioned by `x` (the numbering of the multiset operations
+    /// too) working. Rows of Trino 431 (its memory catalog).
+    const FLOAT_CASES: &[(&str, &[&str])] = &[
+        ("SELECT count(*) FROM f WHERE x = 0", &["2"]),
+        ("SELECT count(*) FROM f WHERE x = -0.0E0", &["2"]),
+        ("SELECT count(*) FROM f WHERE x <> 0", &["4"]),
+        ("SELECT count(*) FROM f WHERE x < 0", &["0"]),
+        ("SELECT count(*) FROM f WHERE x <= 0", &["2"]),
+        ("SELECT count(*) FROM f WHERE x > -0.0E0", &["2"]),
+        ("SELECT count(*) FROM f WHERE x <> 1", &["4"]),
+        (
+            "SELECT x, row_number() OVER (PARTITION BY x) FROM f WHERE x = 1 ORDER BY 2",
+            &["1.0|1", "1.0|2"],
+        ),
+        (
+            "SELECT count(*) OVER (PARTITION BY x) FROM f WHERE x = 0",
+            &["2", "2"],
+        ),
+        (
+            "SELECT count(*), count_if(x = 0) FROM (SELECT x FROM f INTERSECT ALL SELECT x FROM f WHERE x = 0)",
+            &["2|2"],
+        ),
+        (
+            "SELECT count(*), count_if(x = 0) FROM (SELECT x FROM f WHERE x = 0 INTERSECT ALL SELECT x FROM f)",
+            &["2|2"],
+        ),
+        (
+            "SELECT x FROM f INTERSECT ALL SELECT x FROM f WHERE x = 1",
+            &["1.0", "1.0"],
+        ),
+        (
+            "SELECT count(*), count_if(x = 1), count_if(is_nan(x)), count_if(x IS NULL) \
+             FROM (SELECT x FROM f EXCEPT ALL SELECT x FROM f WHERE x = 0)",
+            &["5|2|2|1"],
+        ),
+        (
+            "SELECT count(*) FROM (SELECT x FROM f EXCEPT ALL SELECT -0.0E0)",
+            &["6"],
+        ),
+    ];
+
+    #[tokio::test]
+    async fn float_zeros_and_constant_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path());
+        for statement in [
+            "CREATE TABLE f (x double)",
+            "INSERT INTO f VALUES (0.0E0), (-0.0E0), (nan()), (nan()), (1.0E0), (1.0E0), (NULL)",
+        ] {
+            rows(&engine, statement).await;
+        }
+        let mut wrong = Vec::new();
+        for (sql, answer) in FLOAT_CASES {
+            let got = rows(&engine, sql).await;
+            if got != *answer {
+                wrong.push(format!("{sql}: got {got:?}, Trino 431 {answer:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[tokio::test]
+    async fn all_set_operations_are_multiset_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path());
         let mut wrong = Vec::new();
         for (sql, answer) in CASES {
             let got = rows(&engine, sql).await;
