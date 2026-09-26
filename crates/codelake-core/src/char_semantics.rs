@@ -36,7 +36,8 @@
 //!   unbounded `varchar` or an untyped `NULL` the reference engine fails,
 //!   and so does this rule;
 //! - functions keep the padded value: `upper`/`lower` give `char(n)`,
-//!   `rtrim`, `trim`, `substr` give `varchar(n)` of the padded text, `LIKE`
+//!   `substr` gives `varchar(n)` of the padded text, the trims (`ltrim`,
+//!   `rtrim`, `trim`) `varchar(n)` of the text without its padding, `LIKE`
 //!   matches the padded text, `length` counts the padding. Functions the
 //!   reference engine has no char version of (`strpos`, `replace`, …; it
 //!   refuses them) see the padded text, as `CAST(ch AS varchar)` gives it;
@@ -816,6 +817,11 @@ fn function_type(name: &str, args: &[Expr], scope: &Scope<'_>, whole: &Expr) -> 
             _ => None,
         }),
         crate::coercion::VALUES_CELL | "nullif" => first(),
+        // A char value without its padding: `varchar(n)`.
+        CHAR_KEY => match first()? {
+            Text::Char(n) => Some(Text::Varchar(n.map_or(Bound::Uncertain, Bound::Known))),
+            other => Some(other),
+        },
         "coalesce" | "nvl" | "ifnull" | "greatest" | "least" => {
             let types: Vec<Option<Text>> = args.iter().map(|a| infer(a, scope)).collect();
             common(&types)
@@ -1605,6 +1611,20 @@ fn scalar_function(function: ScalarFunction, scope: &Scope<'_>) -> Result<Transf
                 Some(Box::new(a)),
             ))))
         }
+        // The trims of a char value work on it without its padding
+        // (`ltrim(CAST(' ab' AS char(5)))` is `'ab'`, `ltrim(ch, 'a')` of
+        // `'ab'` is `'b'`).
+        "ltrim" | "rtrim" | "trim" | "btrim"
+            if args
+                .first()
+                .and_then(|a| infer(a, scope))
+                .is_some_and(Text::is_char) =>
+        {
+            let mut args = args;
+            let value = args.remove(0);
+            args.insert(0, key(value));
+            Ok(Transformed::yes(func.call(args)))
+        }
         "concat" | CONCAT_OPERATOR => Ok(concat_args(args, scope)?.update_data(|args| func.call(args))),
         "make_array" | "array" | "make_list" => {
             Ok(unify_values(args, scope, "ARRAY")?.update_data(|args| func.call(args)))
@@ -2236,6 +2256,31 @@ mod tests {
 
     /// Each query and the rows Trino 431 answers to it (`typeof` included).
     const CASES: &[(&str, &[&[&str]])] = &[
+        // The trims work on the value without its padding.
+        (
+            "SELECT id, ltrim(ch), length(ltrim(ch)), ltrim(ch) = 'ab' FROM cht ORDER BY id",
+            &[
+                &["1", "ab", "2", "true"],
+                &["2", "zz", "2", "false"],
+                &["3", "NULL", "NULL", "NULL"],
+                &["4", "a", "1", "false"],
+            ],
+        ),
+        (
+            "SELECT ltrim(CAST('  ab' AS char(6))), length(ltrim(CAST('  ab' AS char(6)))), \
+             to_hex(to_utf8(ltrim(CAST(' a' || chr(9) AS char(5)))))",
+            &[&["ab", "2", "6109"]],
+        ),
+        (
+            "SELECT id, ltrim(ch, 'a'), length(ltrim(ch, 'a')), rtrim(ch, 'b'), length(rtrim(ch, 'b')), \
+             trim(ch, 'a'), length(trim(ch, 'a')) FROM cht ORDER BY id",
+            &[
+                &["1", "b", "1", "a", "1", "b", "1"],
+                &["2", "zz", "2", "zz", "2", "zz", "2"],
+                &["3", "NULL", "NULL", "NULL", "NULL", "NULL", "NULL"],
+                &["4", "", "0", "a", "1", "", "0"],
+            ],
+        ),
         (
             "SELECT id, ch, length(ch), typeof(ch) FROM cht ORDER BY id",
             &[

@@ -70,9 +70,12 @@ gives char values Trino 431's semantics (every rule below observed on
    `varchar`, padded to 65536 characters).
 6. **Concatenation** of a char value is `char(total)`, every other operand
    padded to its own length (`char(3) || varchar(2)` is `char(5)`).
-7. **Functions** see the padded text: `upper`/`lower` are `char(n)`, `rtrim`,
-   `trim`, `substr` are `varchar(n)` of the padded text, `LIKE` matches it,
-   `length` counts it. Functions Trino has no char version of (`strpos`,
+7. **Functions** see the padded text: `upper`/`lower` are `char(n)`,
+   `substr` is `varchar(n)` of the padded text, `LIKE` matches it,
+   `length` counts it. The trims (`ltrim`, `rtrim`, `trim`, with or without
+   the characters to remove) are `varchar(n)` of the value without its
+   padding: `ltrim(CAST(' ab' AS char(5)))` is `'ab'`, `ltrim(ch, 'a')` of
+   `'ab'` is `'b'`. Functions Trino has no char version of (`strpos`,
    `replace`, …; Trino refuses them) see the padded text, as
    `CAST(ch AS varchar)` gives it.
 8. **Scans** never refuse a filter on a char column any more: the filter is

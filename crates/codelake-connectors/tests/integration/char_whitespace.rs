@@ -28,7 +28,7 @@ const QUERIES: &[&str] = &[
     "SELECT ch = 'a', count(*) FROM {r} GROUP BY 1 ORDER BY 1",
     "SELECT count(DISTINCT ch) FROM {r}",
     "SELECT a.id, b.id FROM hive.s.ws a JOIN {r} b ON a.ch = b.ch ORDER BY 1, 2",
-    "SELECT id, to_hex(to_utf8(rtrim(ch))) FROM {r} ORDER BY 1",
+    "SELECT id, to_hex(to_utf8(ltrim(ch))), to_hex(to_utf8(rtrim(ch))), length(ltrim(ch)) FROM {r} ORDER BY 1",
 ];
 
 const RELATIONS: &[&str] = &["hive.s.ws", "hive.s.wsv", "hive.s.ewv"];
