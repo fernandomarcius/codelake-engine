@@ -4743,6 +4743,36 @@ mod tests {
         }
     }
 
+    /// `INSERT … SELECT` whose select list repeats a name inserts by
+    /// position (rows of Trino 431).
+    #[tokio::test]
+    async fn insert_select_repeating_a_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path()).await;
+        for statement in [
+            "CREATE TABLE ins (id bigint, a varchar, b varchar(2), c char(3))",
+            "INSERT INTO ins SELECT id, s, s, s FROM vct WHERE id <> 2",
+            "INSERT INTO ins SELECT 100 + id, ch, ch, ch FROM cht WHERE id IN (1, 4)",
+            "INSERT INTO ins SELECT id, s, s, s FROM vct WHERE id = 2",
+        ] {
+            rows(&engine, statement)
+                .await
+                .unwrap_or_else(|e| panic!("{statement}: {e}"));
+        }
+        assert_eq!(
+            rows(&engine, "SELECT id, a, b, c, length(c) FROM ins ORDER BY id").await,
+            Ok(expected(&[
+                &["1", "ab", "ab", "ab ", "3"],
+                &["2", "ab  ", "ab", "ab ", "3"],
+                &["3", "cd", "cd", "cd ", "3"],
+                &["4", "NULL", "NULL", "NULL", "NULL"],
+                &["5", "a", "a", "a  ", "3"],
+                &["101", "ab   ", "ab", "ab ", "3"],
+                &["104", "a    ", "a ", "a  ", "3"],
+            ]))
+        );
+    }
+
     /// `typeof` answers unbounded `varchar` (Trino 431), also of a constant.
     #[tokio::test]
     async fn typeof_is_unbounded_varchar() {

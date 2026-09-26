@@ -13,6 +13,10 @@
 //!   `ON a.flag IS NOT DISTINCT FROM b.flag AND a.id = b.id` answered other
 //!   rows, and with a non-boolean `b` the statement failed.
 //!   [`regroup_distinct_from`] gives the operator its operand back.
+//! - `INSERT INTO t SELECT a, a FROM u` inserts by position in Trino;
+//!   `DataFusion` refuses a projection that repeats a name ("Projections
+//!   require unique expression names"). [`name_insert_columns`] names the
+//!   items of such a select list.
 //!
 //! The case of identifiers is folded for every client protocol by
 //! [`crate::identifier_case`].
@@ -320,6 +324,68 @@ fn regroup(pieces: &mut Vec<Piece>, floor: u8) -> Expr {
         };
     }
     left
+}
+
+/// The name `DataFusion` gives a select item without an alias, as far as
+/// telling two apart goes (a column's last name part, case folded).
+fn item_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Identifier(ident) => ident.value.to_lowercase(),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map_or_else(String::new, |ident| ident.value.to_lowercase()),
+        other => other.to_string().to_lowercase(),
+    }
+}
+
+fn name_select_items(body: &mut SetExpr) {
+    match body {
+        SetExpr::Select(select) => {
+            let mut seen = HashSet::new();
+            let repeats = select
+                .projection
+                .iter()
+                .filter_map(|item| match item {
+                    SelectItem::UnnamedExpr(expr) => Some(item_name(expr)),
+                    SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.to_lowercase()),
+                    _ => None,
+                })
+                .any(|name| !seen.insert(name));
+            if !repeats {
+                return;
+            }
+            for (i, item) in select.projection.iter_mut().enumerate() {
+                if let SelectItem::UnnamedExpr(expr) = item {
+                    let expr = std::mem::replace(expr, Expr::value(Value::Null));
+                    *item = SelectItem::ExprWithAlias {
+                        expr,
+                        alias: Ident::new(format!("_col{i}")),
+                    };
+                }
+            }
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            name_select_items(left);
+            name_select_items(right);
+        }
+        SetExpr::Query(query) => name_select_items(query.body.as_mut()),
+        _ => {}
+    }
+}
+
+/// `INSERT … SELECT` whose select list repeats a name (`SELECT id, s, s`):
+/// its items without an alias are named `_col<i>`, as the reference inserts
+/// by position whatever the names are.
+pub(crate) fn name_insert_columns(statement: &mut DFStatement) {
+    let DFStatement::Statement(inner) = statement else {
+        return;
+    };
+    let SqlStatement::Insert(insert) = inner.as_mut() else {
+        return;
+    };
+    if let Some(source) = insert.source.as_mut() {
+        name_select_items(source.body.as_mut());
+    }
 }
 
 #[cfg(test)]

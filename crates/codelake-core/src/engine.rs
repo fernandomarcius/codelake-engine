@@ -443,6 +443,7 @@ pub fn trino_statement(
     if let datafusion::sql::parser::Statement::Statement(inner) = statement {
         crate::identifier_case::fold_identifiers(inner);
     }
+    crate::trino_sql_checks::name_insert_columns(statement);
     crate::trino_functions::rewrite_statement(statement)?;
     crate::literals::rewrite_zoned_timestamps(statement);
     crate::coercion::mark_values(statement);
