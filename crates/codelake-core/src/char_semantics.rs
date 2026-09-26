@@ -25,6 +25,12 @@
 //!   (`codelake_char_key`), ordering with `codelake_char_compare`, and a
 //!   text literal short enough is padded to the char's length instead;
 //!   `ANY`/`ALL` become the `EXISTS` tests they mean;
+//! - rows and arrays written out (`ROW(ch, 1) = ROW('ab', 1)`,
+//!   `ARRAY[ch] IN (ARRAY['ab'])`, also as the planner folds them into
+//!   literals) are compared value by value, each pair with the rules above:
+//!   `=` is false when a pair differs, `NULL` when none differs but a pair
+//!   is `NULL`; a constant `IN` list of several items without `NULL`s is a
+//!   set lookup, `NULL` for a row holding a `NULL`, as in the reference;
 //! - a value that is output in the common type is padded to its length: the
 //!   branches of `CASE`, `coalesce`, `nvl`, `ifnull`, `nvl2`, `greatest`,
 //!   `least`, the default of `lag`/`lead`, the elements of an array, the
@@ -1209,8 +1215,88 @@ fn search_array(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result<
     Ok(Transformed::yes(func.call(rebuilt)))
 }
 
+/// The values a row or an array written out holds, whether it is an
+/// array: a constructor's arguments, or a literal's fields or elements (the
+/// planner folds `ROW('ab', 1)` into a literal).
+fn parts(expr: &Expr) -> Option<(bool, Vec<Expr>)> {
+    let literals = |array: &ArrayRef| -> Option<Vec<Expr>> {
+        (0..array.len())
+            .map(|i| {
+                ScalarValue::try_from_array(array, i)
+                    .ok()
+                    .map(|v| Expr::Literal(v, None))
+            })
+            .collect()
+    };
+    match expr {
+        Expr::ScalarFunction(ScalarFunction { args, .. }) => {
+            let kind = built(expr)?;
+            let values = value_positions(kind, args.len())
+                .into_iter()
+                .map(|i| args[i].clone())
+                .collect();
+            Some((kind == Built::Array, values))
+        }
+        Expr::Literal(ScalarValue::Struct(array), _) if array.len() == 1 && array.is_valid(0) => {
+            let fields: Option<Vec<Expr>> = array
+                .columns()
+                .iter()
+                .map(|column| literals(column).and_then(|mut v| (v.len() == 1).then(|| v.remove(0))))
+                .collect();
+            Some((false, fields?))
+        }
+        Expr::Literal(ScalarValue::List(array), _) if array.len() == 1 && array.is_valid(0) => {
+            Some((true, literals(&array.value(0))?))
+        }
+        _ => None,
+    }
+}
+
+/// Equality (`=`, `<>`, `IS [NOT] DISTINCT FROM`) of two rows, or two
+/// arrays, written out: their values compared one by one (with char
+/// semantics), as the reference engine does. `=` holds when every pair is
+/// equal, is false when one pair differs and `NULL` otherwise (a `NULL`
+/// field makes the rows' equality `NULL`, never true); `<>` is its negation;
+/// `IS DISTINCT FROM` holds when a pair is distinct. Arrays of different
+/// lengths are not equal. `None` for rows of different sizes (left to the
+/// planner's error).
+fn compare_parts(
+    left: Vec<Expr>,
+    op: Operator,
+    right: Vec<Expr>,
+    arrays: bool,
+    scope: &Scope<'_>,
+) -> Result<Option<Expr>> {
+    let all = matches!(op, Operator::Eq | Operator::IsNotDistinctFrom);
+    let boolean = |b: bool| Expr::Literal(ScalarValue::Boolean(Some(b)), None);
+    if left.len() != right.len() {
+        return Ok(arrays.then(|| boolean(!all)));
+    }
+    let mut tests = Vec::with_capacity(left.len());
+    for (l, r) in left.into_iter().zip(right) {
+        tests.push(compare(l, op, r, scope)?.data);
+    }
+    Ok(Some(
+        tests
+            .into_iter()
+            .reduce(|a, b| if all { a.and(b) } else { a.or(b) })
+            .unwrap_or_else(|| boolean(all)),
+    ))
+}
+
 /// `left op right`, with char semantics (see the module documentation).
 fn compare(left: Expr, op: Operator, right: Expr, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
+    // The planner names a row written out in the select list
+    // (`struct(a, b) AS row(a,b)`); inside a comparison the name means
+    // nothing.
+    let (left, right) = (left.unalias(), right.unalias());
+    if is_equality(op)
+        && let (Some((la, lv)), Some((ra, rv))) = (parts(&left), parts(&right))
+        && la == ra
+        && let Some(expanded) = compare_parts(lv, op, rv, la, scope)?
+    {
+        return Ok(Transformed::yes(expanded));
+    }
     if built(&left).is_some() && built(&right).is_some() {
         return compare_built(left, op, right, scope);
     }
@@ -1311,13 +1397,88 @@ fn concat_args(args: Vec<Expr>, scope: &Scope<'_>) -> Result<Transformed<Vec<Exp
     Ok(Transformed::new_transformed(args, changed))
 }
 
+/// Whether `expr` is a constant without a `NULL` anywhere in it.
+fn definite_constant(expr: &Expr) -> bool {
+    match parts(expr) {
+        Some((_, values)) => values.iter().all(definite_constant),
+        None => matches!(expr, Expr::Literal(value, _) if !value.is_null()),
+    }
+}
+
+/// Whether `expr` is a constant (`NULL`s allowed).
+fn is_constant(expr: &Expr) -> bool {
+    match parts(expr) {
+        Some((_, values)) => values.iter().all(is_constant),
+        None => matches!(expr, Expr::Literal(..)),
+    }
+}
+
+/// Whether a row or array written out holds a `NULL`, at any depth.
+fn indeterminate(values: &[Expr]) -> Option<Expr> {
+    values
+        .iter()
+        .filter_map(|value| match parts(value) {
+            Some((_, inner)) => indeterminate(&inner),
+            None if definite_constant(value) => None,
+            None => Some(value.clone().is_null()),
+        })
+        .reduce(Expr::or)
+}
+
 /// `x [NOT] IN (list)` with char semantics.
-fn in_list(list: InList, scope: &Scope<'_>) -> Transformed<Expr> {
+///
+/// A row or an array written out is compared with each item as `=` compares
+/// them ([`compare_parts`]): `x IN (a, b)` is `x = a OR x = b`. As in the
+/// reference engine, when there are several items, all constants without a
+/// `NULL`, and `x` is not a constant, an `x` holding a `NULL` is `NULL`
+/// (Trino 431 looks such lists up as a set: `(s, id) IN (('ab', 1), ('cd',
+/// 3))` is `NULL` for `s` `NULL` and `id` 4, where each `=` is false).
+fn in_list(list: InList, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
     let InList { expr, list, negated } = list;
+    let expr = Box::new(expr.unalias());
+    let list: Vec<Expr> = list.into_iter().map(Expr::unalias).collect();
+    if let Some((arrays, values)) = parts(&expr)
+        && list
+            .iter()
+            .all(|item| parts(item).is_some_and(|(a, _)| a == arrays))
+    {
+        let mut tests = Vec::with_capacity(list.len());
+        for item in &list {
+            let (_, other) = parts(item).unwrap_or_default();
+            match compare_parts(values.clone(), Operator::Eq, other, arrays, scope)? {
+                Some(test) => tests.push(test),
+                None => return Ok(Transformed::no(Expr::InList(InList::new(expr, list, negated)))),
+            }
+        }
+        let looked_up = list.len() > 1 && !is_constant(&expr) && list.iter().all(definite_constant);
+        if let Some(any) = tests.into_iter().reduce(Expr::or) {
+            let any = match indeterminate(&values) {
+                Some(unknown) if looked_up => Expr::Case(Case::new(
+                    None,
+                    vec![(
+                        Box::new(unknown),
+                        Box::new(Expr::Literal(ScalarValue::Boolean(None), None)),
+                    )],
+                    Some(Box::new(any)),
+                )),
+                _ => any,
+            };
+            return Ok(Transformed::yes(if negated {
+                Expr::Not(Box::new(any))
+            } else {
+                any
+            }));
+        }
+    }
     let mut types = vec![infer(&expr, scope)];
     types.extend(list.iter().map(|e| infer(e, scope)));
+    if types.iter().flatten().any(|t| matches!(t, Text::Array(_)))
+        && (mixes_char_arrays(&types) || types.contains(&None))
+    {
+        return Err(char_array_refusal("IN"));
+    }
     if !needs_char_coercion(&types) {
-        return Transformed::no(Expr::InList(InList::new(expr, list, negated)));
+        return Ok(Transformed::no(Expr::InList(InList::new(expr, list, negated))));
     }
     if let Some(Text::Char(Some(n))) = types[0] {
         let fitted: Option<Vec<Expr>> = list
@@ -1328,7 +1489,7 @@ fn in_list(list: InList, scope: &Scope<'_>) -> Transformed<Expr> {
             })
             .collect();
         if let Some(fitted) = fitted {
-            return Transformed::yes(Expr::InList(InList::new(expr, fitted, negated)));
+            return Ok(Transformed::yes(Expr::InList(InList::new(expr, fitted, negated))));
         }
     }
     let list = list
@@ -1336,7 +1497,11 @@ fn in_list(list: InList, scope: &Scope<'_>) -> Transformed<Expr> {
         .zip(types.into_iter().skip(1))
         .map(|(item, t)| if t == Some(Text::Null) { item } else { key(item) })
         .collect();
-    Transformed::yes(Expr::InList(InList::new(Box::new(key(*expr)), list, negated)))
+    Ok(Transformed::yes(Expr::InList(InList::new(
+        Box::new(key(*expr)),
+        list,
+        negated,
+    ))))
 }
 
 /// Name of the column a subquery compares once converted (see
@@ -1697,7 +1862,7 @@ fn rewrite_one(expr: Expr, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
             let left = pair.pop().unwrap_or_default();
             binary(left, Operator::StringConcat, right)
         })),
-        Expr::InList(list) => Ok(in_list(list, scope)),
+        Expr::InList(list) => in_list(list, scope),
         Expr::Between(Between {
             expr,
             negated,
@@ -2256,6 +2421,66 @@ mod tests {
 
     /// Each query and the rows Trino 431 answers to it (`typeof` included).
     const CASES: &[(&str, &[&[&str]])] = &[
+        // Rows and arrays written out compare value by value: a NULL field
+        // makes `=` NULL (never true), and a constant IN list is looked up as
+        // a set (a row holding a NULL is NULL).
+        (
+            "SELECT cht.id, ROW(ch, cht.id) = ROW('ab', 1), ROW(ch) = ROW(c3.c), (ch, cht.id) IN (('ab', 1), ('zz', 2)), \
+             ROW(ch, 1) <> ROW('ab', 1), ROW(ch) IS DISTINCT FROM ROW('ab') FROM cht LEFT JOIN c3 ON cht.id = c3.id ORDER BY 1",
+            &[
+                &["1", "true", "true", "true", "false", "false"],
+                &["2", "false", "false", "true", "true", "true"],
+                &["3", "false", "NULL", "NULL", "NULL", "true"],
+                &["4", "false", "NULL", "false", "true", "true"],
+            ],
+        ),
+        (
+            "SELECT id, ROW(s, id) = ROW(s, id), (s, id) IN (('ab', 1), ('cd', 3)), ROW(s, 1) IS DISTINCT FROM ROW(s, 1), \
+             ROW(s, 1) IS NOT DISTINCT FROM ROW(NULL, 1), ROW(s, id) <> ROW('ab', 1), (s, id) NOT IN (('ab', 1)) \
+             FROM vct ORDER BY id",
+            &[
+                &["1", "true", "true", "false", "false", "false", "false"],
+                &["2", "true", "false", "false", "false", "true", "true"],
+                &["3", "true", "true", "false", "false", "true", "true"],
+                &["4", "NULL", "NULL", "false", "true", "true", "true"],
+                &["5", "true", "false", "false", "false", "true", "true"],
+            ],
+        ),
+        (
+            "SELECT id, (s, id) IN ((s, 5), ('cd', 3)), (s, id) IN (('ab', 1), ('cd', 3)), \
+             (s, id) NOT IN (('ab', 1), ('cd', 3)), (s, id) IN (('ab', id), ('cd', 3)) FROM vct ORDER BY id",
+            &[
+                &["1", "false", "true", "false", "true"],
+                &["2", "false", "false", "true", "false"],
+                &["3", "true", "true", "false", "true"],
+                &["4", "false", "NULL", "NULL", "NULL"],
+                &["5", "true", "false", "true", "false"],
+            ],
+        ),
+        (
+            "SELECT id FROM vct WHERE (s, id) NOT IN (('ab', 1)) ORDER BY id",
+            &[&["2"], &["3"], &["4"], &["5"]],
+        ),
+        (
+            "SELECT id, ARRAY[ch] IN (ARRAY['ab'], ARRAY['zz']), ARRAY[ch] NOT IN (ARRAY['ab'], ARRAY['zz']), \
+             ARRAY[ch, 'x'] IN (ARRAY['ab', 'y'], ARRAY['zz', 'y']), ARRAY[ch] = ARRAY['ab'], ARRAY[ch] <> ARRAY['ab'] \
+             FROM cht ORDER BY id",
+            &[
+                &["1", "true", "false", "false", "true", "false"],
+                &["2", "true", "false", "false", "false", "true"],
+                &["3", "NULL", "NULL", "NULL", "NULL", "NULL"],
+                &["4", "false", "true", "false", "false", "true"],
+            ],
+        ),
+        (
+            "SELECT id FROM cht WHERE ARRAY[ch] IN (ARRAY['ab'], ARRAY['zz']) ORDER BY id",
+            &[&["1"], &["2"]],
+        ),
+        (
+            "SELECT ARRAY['x', NULL] IN (ARRAY['y', 'z'], ARRAY['w', 'v']), ARRAY['x'] IN (ARRAY[NULL], ARRAY['y']), \
+             ARRAY['x'] IN (ARRAY['x', NULL], ARRAY['y'])",
+            &[&["false", "NULL", "false"]],
+        ),
         // The trims work on the value without its padding.
         (
             "SELECT id, ltrim(ch), length(ltrim(ch)), ltrim(ch) = 'ab' FROM cht ORDER BY id",

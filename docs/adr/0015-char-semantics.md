@@ -62,6 +62,15 @@ gives char values Trino 431's semantics (every rule below observed on
    `x op ANY/ALL (subquery)` becomes the `EXISTS` tests it means, `NULL`
    alike: DataFusion 54 cannot plan the mark join it makes of a quantified
    comparison over a computed column.
+   Rows and arrays written out (also as the planner folds them into
+   literals) are compared value by value: `=` is false when a pair differs
+   and `NULL` when none differs but a pair is `NULL` (a `NULL` field never
+   makes rows equal, char or not); `<>` is its negation; `IS DISTINCT FROM`
+   holds when a pair is distinct; arrays of different lengths differ.
+   `x IN (a, b)` is `x = a OR x = b`, except that a constant list of
+   several items without `NULL`s is a set lookup in Trino 431: a row
+   holding a `NULL` is then `NULL` (`(s, id) IN (('ab', 1), ('cd', 3))` for
+   `s` `NULL`, `id` 4), and so it is in the engine.
 5. **Values in a common type** are padded to its length: `CASE` branches,
    `coalesce`, `nvl`, `ifnull`, `nvl2`, `greatest`, `least`, the default of
    `lag`/`lead`, array elements, the columns of `UNION`, `INTERSECT`,
