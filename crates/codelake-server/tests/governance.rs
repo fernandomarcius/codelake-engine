@@ -704,42 +704,142 @@ async fn load(server: &Server) -> (u64, u64) {
     )
 }
 
-/// A `DECLARE … CURSOR` (psycopg2 named cursors, pandas chunked reads) runs
-/// under governance like a suspended portal: its time limit stops it and its
-/// memory returns to the pool. Found by the F6 audit: the `DECLARE` statement
-/// finishes at once, and the cursor's stream then lives in the connection
-/// without a slot, a deadline or a registry entry anyone can kill, holding
-/// its reservations until `CLOSE`.
+/// Values of a one-column `rows`, as numbers.
+fn numbers(rows: &[Vec<String>]) -> Vec<i64> {
+    rows.iter().map(|row| row[0].parse().unwrap()).collect()
+}
+
+/// Cursors, declared on either protocol, return every row, in order,
+/// across fetches of each kind, holding their slot until read to the end.
+async fn cursors_return_every_row(server: &Server, client: &Client, observer: &Client) {
+    // Declared on the simple protocol, read by fetches of each kind.
+    client
+        .batch_execute("DECLARE c0 CURSOR FOR SELECT value FROM generate_series(1, 5000)")
+        .await
+        .unwrap();
+    assert_eq!(states_of(observer, "zed").await, [["RUNNING", "-"]]);
+    assert_eq!(load(server).await, (1, 0), "the cursor holds its slot");
+    assert_eq!(numbers(&text_rows(client, "FETCH 3 FROM c0").await), [1, 2, 3]);
+    assert_eq!(numbers(&text_rows(client, "FETCH NEXT FROM c0").await), [4]);
+    assert_eq!(
+        numbers(&text_rows(client, "FETCH FORWARD 1000 FROM c0").await),
+        (5..=1004).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        numbers(&text_rows(client, "FETCH ALL FROM c0").await),
+        (1005..=5000).collect::<Vec<_>>()
+    );
+    assert!(text_rows(client, "FETCH ALL FROM c0").await.is_empty());
+    assert_eq!(states_of(observer, "zed").await, [["FINISHED", "-"]]);
+    server.slots_free().await;
+    client.batch_execute("CLOSE c0").await.unwrap();
+
+    // Declared on the extended protocol too.
+    client
+        .execute(
+            "DECLARE c1 CURSOR FOR SELECT value FROM generate_series(1, 10)",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(load(server).await, (1, 0));
+    assert_eq!(
+        numbers(&text_rows(client, "FETCH ALL FROM c1").await),
+        (1..=10).collect::<Vec<_>>()
+    );
+    server.slots_free().await;
+}
+
+/// A `DECLARE … CURSOR` (psycopg2 named cursors, pandas chunked reads) is
+/// one governed statement until its cursor is read to the end or closed: it
+/// holds its slot, and `FETCH` takes none (the user's only slot is the
+/// cursor's); fetches return every row, in order; `CLOSE`, `kill_query` and
+/// its time limit stop it and return its memory to the pool. (Found by the
+/// F6 audit: the `DECLARE` finished at once, and the cursor's stream then
+/// lived in the connection with no slot, deadline or registry entry,
+/// holding its reservations until `CLOSE`.)
 #[tokio::test]
-async fn audit_declared_cursor_is_bounded_by_its_time_limit() {
+async fn declared_cursor_runs_under_governance() {
     let dir = tempfile::tempdir().unwrap();
     let server = start_server(dir.path());
     server.wait_ready().await;
     let client = server.connect("zed").await;
+    let observer = server.connect("observer").await;
+    client.batch_execute("BEGIN").await.unwrap();
+
+    cursors_return_every_row(&server, &client, &observer).await;
+
+    // `CLOSE` ends it and frees the slot and the memory.
+    client
+        .batch_execute(&format!("DECLARE c2 CURSOR FOR {STREAMS_WITH_MEMORY}"))
+        .await
+        .unwrap();
+    assert_eq!(text_rows(&client, "FETCH 2 FROM c2").await.len(), 2);
+    let held = pool_fills(&server).await;
+    client.batch_execute("CLOSE c2").await.unwrap();
+    server.slots_free().await;
+    assert_eq!(server.pool_drains().await, 0, "reservations left (held {held})");
+
+    // `kill_query` reaches an open cursor.
+    client
+        .batch_execute(&format!("DECLARE c3 CURSOR FOR {STREAMS_WITH_MEMORY}"))
+        .await
+        .unwrap();
+    assert_eq!(text_rows(&client, "FETCH 1 FROM c3").await.len(), 1);
+    pool_fills(&server).await;
+    let id = running_join_of(&server, "zed").await;
+    let killer = server.connect("zed").await;
+    killer
+        .simple_query(&format!(
+            "CALL system.runtime.kill_query(query_id => '{id}', message => 'cursor')"
+        ))
+        .await
+        .unwrap();
+    server.slots_free().await;
+    assert_eq!(
+        server.pool_drains().await,
+        0,
+        "reservations left after kill_query"
+    );
+    let error = client.simple_query("FETCH 1 FROM c3").await.unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::QUERY_CANCELED), "{error:?}");
+    assert_eq!(
+        error.as_db_error().unwrap().message(),
+        "Query killed. Message: cursor"
+    );
+    client.batch_execute("ROLLBACK").await.unwrap();
+
+    // Past its time limit an idle cursor is stopped.
     client
         .batch_execute("SET statement_timeout = '5s'")
         .await
         .unwrap();
     client.batch_execute("BEGIN").await.unwrap();
     client
-        .batch_execute(
-            "DECLARE c1 CURSOR FOR SELECT a.value FROM generate_series(1, 2000000) a \
-             JOIN generate_series(1, 3000000000) b ON a.value = b.value",
-        )
+        .batch_execute(&format!("DECLARE c4 CURSOR FOR {STREAMS_WITH_MEMORY}"))
         .await
         .unwrap();
-    assert_eq!(text_rows(&client, "FETCH 1 FROM c1").await.len(), 1);
+    assert_eq!(text_rows(&client, "FETCH 1 FROM c4").await.len(), 1);
     let held = pool_fills(&server).await;
-    let slots = load(&server).await;
-    // Past the 5 s limit, idle: a suspended portal is stopped by now.
-    tokio::time::sleep(Duration::from_secs(8)).await;
-    let observer = server.connect("observer").await;
-    let states = states_of(&observer, "zed").await;
-    let left = server.pool_drains().await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    server.slots_free().await;
     assert_eq!(
-        left, 0,
-        "the cursor kept {left} bytes reserved past its time limit (held {held}; \
-         slots while it held them: {slots:?}; zed's queries: {states:?})"
+        server.pool_drains().await,
+        0,
+        "the cursor kept its reservations past its time limit (held {held})"
+    );
+    let error = client.simple_query("FETCH 1 FROM c4").await.unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::QUERY_CANCELED), "{error:?}");
+    client.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(
+        states_of(&observer, "zed").await,
+        [
+            ["FINISHED", "-"],
+            ["FINISHED", "-"],
+            ["FINISHED", "-"],
+            ["FAILED", "ADMINISTRATIVELY_KILLED"],
+            ["FAILED", "EXCEEDED_TIME_LIMIT"],
+        ]
     );
 }
 

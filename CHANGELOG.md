@@ -102,6 +102,13 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- PostgreSQL wire, cursors (`DECLARE … CURSOR`: psycopg2 named cursors, pandas chunked
+  reads): the `DECLARE` finished at once and the cursor's stream lived in the connection with
+  no admission slot, time limit or registry entry, holding its memory until `CLOSE`, and
+  `FETCH ALL` collected every row left before sending the first. A cursor now runs as its
+  `DECLARE`'s governed statement until it is read to the end or closed (cancel requests,
+  `kill_query` and its time limit stop it); `FETCH` and `CLOSE` take no slot of their own, and
+  `FETCH` streams its rows (ADR 0016).
 - PostgreSQL wire, extended protocol (JDBC, psycopg3, `tokio-postgres`' `query`): an
   `Execute` without a row limit collected every row of the result in server memory, outside
   the pool, before sending the first; the statement then ended (slot freed, time limit over)

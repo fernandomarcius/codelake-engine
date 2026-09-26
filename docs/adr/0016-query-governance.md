@@ -81,7 +81,7 @@ Per protocol:
 | time limit | `EXCEEDED_TIME_LIMIT` | SQLSTATE `57014` (`query_canceled`) |
 | session limit | `query_max_run_time`, `query_max_execution_time` | `SET statement_timeout` (as run time) |
 | slot held | from admission to the end of execution (the last batch produced; ≤ 2 buffered batches, reserved, may still wait for the client) | until every row is sent or the stream is dropped |
-| not governed | `USE`, `SET/RESET SESSION`, `PREPARE`, `DEALLOCATE`, `kill_query` | `SET`, `SHOW <variable>`, transaction control, `DISCARD`, `DEALLOCATE`, `kill_query` |
+| not governed | `USE`, `SET/RESET SESSION`, `PREPARE`, `DEALLOCATE`, `kill_query` | `SET`, `SHOW <variable>`, transaction control, `DISCARD`, `DEALLOCATE`, `kill_query`; `FETCH` and `CLOSE` (governed as their cursor's `DECLARE`) |
 | client cancel | `DELETE` of the query's `nextUri` | cancel request (process id + secret key): every governed statement of the connection, queued, planning or sending rows; SQLSTATE `57014` |
 | `kill_query` errors | as the reference engine 431 (checked against it): `NOT_FOUND`, `NOT_SUPPORTED` (not running), `INVALID_ARGUMENTS`, `INVALID_PROCEDURE_ARGUMENT` (`NULL` id), `TYPE_MISMATCH`; plus `PERMISSION_DENIED` (not the owner) | `42704`, `55000`, `22023`, `22023`, `42804`; `42501` |
 
@@ -103,6 +103,19 @@ collects every row of a portal executed without a row limit (JDBC,
 psycopg3) before sending the first, which would end the statement — slot
 freed, time limit over — while its rows wait in memory outside the pool;
 the replacement sends rows as the stream yields them.
+
+A cursor (`DECLARE … CURSOR`, `crates/codelake-server/src/pg/cursor.rs`)
+is its `DECLARE`'s statement: `datafusion-postgres` keeps the cursor's
+stream in a portal of the connection, and the server governs that stream as
+it does a query's, so the `DECLARE` stays `RUNNING`, holding its slot, until
+the cursor is read to the end, closed, stopped (cancel request,
+`kill_query`) or past its deadline — its time limit counts from the
+`DECLARE`, where PostgreSQL applies `statement_timeout` to each `FETCH`.
+`FETCH` and `CLOSE` take no slot: a `FETCH` queued behind its own cursor's
+slot would never run. `FETCH` is answered by the server, sending rows as the
+cursor yields them (`datafusion-postgres` collects the rows a `FETCH` asks
+for, all that are left for `FETCH ALL`, before sending the first). A
+statement that fails after declaring a cursor drops it.
 
 Metrics (Prometheus, `metrics` facade in the core): gauges
 `codelake_queries_running`, `codelake_queries_queued`,

@@ -22,6 +22,10 @@
 //! Statements the session answers itself (`SET`, `SHOW`, transaction
 //! control) neither register nor take a slot.
 //!
+//! A cursor (`DECLARE … CURSOR`) is its `DECLARE`'s statement: registered,
+//! holding its slot and its deadline until its rows are all fetched or it is
+//! closed; `FETCH` and `CLOSE` take no slot of their own ([`cursor`]).
+//!
 //! Stopping a statement from outside, which also frees its slot and memory:
 //!
 //! - a cancel request (`psql`'s Ctrl-C, JDBC `Statement.cancel`,
@@ -58,10 +62,10 @@ use datafusion::sql::sqlparser::parser::Parser;
 use datafusion_postgres::hooks::HookClient;
 use datafusion_postgres::pgwire::api::auth::noop::NoopStartupHandler;
 use datafusion_postgres::pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
-use datafusion_postgres::pgwire::api::portal::Portal;
+use datafusion_postgres::pgwire::api::portal::{Portal, PortalExecutionState};
 use datafusion_postgres::pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use datafusion_postgres::pgwire::api::results::{
-    DescribePortalResponse, DescribeStatementResponse, Response, SendableRowStream, Tag,
+    DescribePortalResponse, DescribeStatementResponse, QueryResponse, Response, SendableRowStream, Tag,
 };
 use datafusion_postgres::pgwire::api::stmt::StoredStatement;
 use datafusion_postgres::pgwire::api::store::PortalStore;
@@ -76,10 +80,11 @@ use datafusion_postgres::pgwire::messages::data::DataRow;
 use datafusion_postgres::pgwire::messages::extendedquery::Execute;
 use datafusion_postgres::{DfSessionService, QueryHook};
 use futures::{Sink, Stream};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OwnedMutexGuard};
 
 use crate::trino::{Everything, QueryError};
 
+mod cursor;
 mod execute;
 
 /// Client metadata key where `datafusion-postgres` keeps `SET
@@ -318,11 +323,14 @@ struct Governed {
     connections: Arc<Connections>,
 }
 
-/// Statements the session answers without executing a query.
+/// Statements the session answers without executing a query. `FETCH` and
+/// `CLOSE` read or drop a cursor, governed as its `DECLARE`.
 fn answered_by_the_session(statement: &Statement) -> bool {
     matches!(
         statement,
         Statement::Set(_)
+            | Statement::Fetch { .. }
+            | Statement::Close { .. }
             | Statement::ShowVariable { .. }
             | Statement::StartTransaction { .. }
             | Statement::Commit { .. }
@@ -535,6 +543,22 @@ impl Stream for GovernedRows {
     }
 }
 
+/// Moves `query`'s rows into a slot the deadline watcher can empty, and
+/// hands `query` governed rows that read them.
+fn govern(execution: &Arc<Execution>, query: &mut QueryResponse) -> Slot {
+    let rows = std::mem::replace(&mut query.data_rows, Box::pin(futures::stream::empty()));
+    let slot: Slot = Arc::new(Mutex::new(SlotState {
+        rows: Some(rows),
+        waker: None,
+    }));
+    query.data_rows = Box::pin(GovernedRows {
+        slot: Arc::clone(&slot),
+        execution: Some(Arc::clone(execution)),
+        rows: 0,
+    });
+    slot
+}
+
 /// A statement admitted to run.
 struct Admitted {
     execution: Arc<Execution>,
@@ -629,8 +653,14 @@ impl Governed {
             .map_err(|error| kill_error(&error))
     }
 
-    /// Wraps the result streams and watches the deadline until they end.
-    fn run(&self, admitted: Admitted, responses: Vec<Response>) -> Vec<Response> {
+    /// Wraps the result streams, the statement's and those of the cursors it
+    /// declared, and watches the deadline until they end.
+    fn run(
+        &self,
+        admitted: Admitted,
+        responses: Vec<Response>,
+        cursors: &mut [OwnedMutexGuard<PortalExecutionState>],
+    ) -> Vec<Response> {
         let Admitted {
             execution,
             deadline,
@@ -639,21 +669,16 @@ impl Governed {
         execution.ran.store(true, Ordering::SeqCst);
         execution.record.set_state(QueryState::Running);
         let mut slots = Vec::new();
+        for cursor in cursors.iter_mut() {
+            if let PortalExecutionState::Suspended(query) = &mut **cursor {
+                slots.push(govern(&execution, query));
+            }
+        }
         let responses = responses
             .into_iter()
             .map(|response| match response {
                 Response::Query(mut query) => {
-                    let rows = std::mem::replace(&mut query.data_rows, Box::pin(futures::stream::empty()));
-                    let slot: Slot = Arc::new(Mutex::new(SlotState {
-                        rows: Some(rows),
-                        waker: None,
-                    }));
-                    slots.push(Arc::clone(&slot));
-                    query.data_rows = Box::pin(GovernedRows {
-                        slot,
-                        execution: Some(Arc::clone(&execution)),
-                        rows: 0,
-                    });
+                    slots.push(govern(&execution, &mut query));
                     Response::Query(query)
                 }
                 Response::Error(info) => {
@@ -717,9 +742,16 @@ impl SimpleQueryHandler for Governed {
             return Ok(vec![self.kill(client, request)?]);
         }
         client.metadata_mut().remove(QUERY_ID);
+        let statements = Parser::parse_sql(&PostgreSqlDialect {}, query).unwrap_or_default();
+        if let [statement] = statements.as_slice()
+            && let Some(response) = cursor::fetch(&*client, statement).await
+        {
+            return Ok(vec![response?]);
+        }
         if !governed_text(query) {
             return SimpleQueryHandler::do_query(&*self.inner, client, query).await;
         }
+        let declared = cursor::Declared::before(&*client, cursor::declared_names(&statements));
         let admitted = self.admit(client, query).await?;
         let responses = self
             .bounded(
@@ -727,8 +759,10 @@ impl SimpleQueryHandler for Governed {
                 query,
                 SimpleQueryHandler::do_query(&*self.inner, client, query),
             )
-            .await?;
-        Ok(self.run(admitted, responses))
+            .await;
+        let responses = declared.settle(client, responses)?;
+        let mut cursors = declared.states(client).await;
+        Ok(self.run(admitted, responses, &mut cursors))
     }
 }
 
@@ -796,6 +830,11 @@ impl ExtendedQueryHandler for Governed {
         if let Some(request) = parsed.as_ref().and_then(|(statement, _)| kill_request(statement)) {
             return self.kill(client, request);
         }
+        if let Some((statement, _)) = parsed
+            && let Some(response) = cursor::fetch(&*client, statement).await
+        {
+            return response;
+        }
         client.metadata_mut().remove(QUERY_ID);
         let governed = parsed
             .as_ref()
@@ -803,6 +842,10 @@ impl ExtendedQueryHandler for Governed {
         if !governed {
             return ExtendedQueryHandler::do_query(&*self.inner, client, portal, max_rows).await;
         }
+        let declared = cursor::Declared::before(
+            &*client,
+            cursor::declared_names(parsed.as_ref().map(|(statement, _)| statement)),
+        );
         let admitted = self.admit(client, sql).await?;
         let response = self
             .bounded(
@@ -810,9 +853,11 @@ impl ExtendedQueryHandler for Governed {
                 sql,
                 ExtendedQueryHandler::do_query(&*self.inner, client, portal, max_rows),
             )
-            .await?;
+            .await;
+        let response = declared.settle(client, response)?;
+        let mut cursors = declared.states(client).await;
         Ok(self
-            .run(admitted, vec![response])
+            .run(admitted, vec![response], &mut cursors)
             .pop()
             .unwrap_or(Response::EmptyQuery))
     }
