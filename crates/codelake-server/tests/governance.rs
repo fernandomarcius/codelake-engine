@@ -1219,6 +1219,46 @@ async fn transaction_end_closes_cursors_and_portals() {
     cursors_need_a_transaction_block(&server, &client).await;
     held_cursors_outlive_their_commit(&server, &client).await;
     portals_end_with_their_transaction(&server).await;
+    abort_takes_no_slot(&server, &client).await;
+}
+
+/// `ABORT` is transaction control, as `ROLLBACK` is: it takes no admission
+/// slot, on either protocol, in a failed transaction block too, so it
+/// answers at once while another connection of its user holds the user's
+/// only slot. (The SQL parser does not read `ABORT`: read as a query, it
+/// queued behind the other connection's statement; the third F6
+/// verification found no test of it.)
+async fn abort_takes_no_slot(server: &Server, client: &Client) {
+    let other = server.connect("tx").await;
+    other
+        .batch_execute(&format!("BEGIN; DECLARE busy CURSOR FOR {STREAMS_WITH_MEMORY}"))
+        .await
+        .unwrap();
+    assert_eq!(text_rows(&other, "FETCH 1 FROM busy").await.len(), 1);
+    assert_eq!(load(server).await, (1, 0), "the other connection holds the slot");
+    let at_once = Duration::from_secs(10);
+    for abort in ["ABORT", "abort work"] {
+        client.batch_execute("BEGIN").await.unwrap();
+        tokio::time::timeout(at_once, client.batch_execute(abort))
+            .await
+            .unwrap_or_else(|_| panic!("{abort} queued"))
+            .unwrap();
+        client.batch_execute("BEGIN").await.unwrap();
+        tokio::time::timeout(at_once, client.execute(abort, &[]))
+            .await
+            .unwrap_or_else(|_| panic!("{abort} queued on the extended protocol"))
+            .unwrap();
+    }
+    // In a failed transaction block (a FETCH of no cursor takes no slot).
+    client.batch_execute("BEGIN").await.unwrap();
+    client.simple_query("FETCH 1 FROM nothing").await.unwrap_err();
+    tokio::time::timeout(at_once, client.batch_execute("ABORT"))
+        .await
+        .expect("ABORT queued in a failed transaction block")
+        .unwrap();
+    assert_eq!(load(server).await, (1, 0), "ABORT took no slot");
+    other.batch_execute("ROLLBACK").await.unwrap();
+    server.slots_free().await;
 }
 
 async fn commit_and_rollback_close_cursors(server: &Server, client: &Client) {
@@ -2660,7 +2700,9 @@ async fn extended_protocol_streams_rows_under_governance() {
 /// server from 114 MB to 815 MB of RSS, with a 256 MiB pool.)
 #[tokio::test]
 async fn fetch_among_other_statements_holds_its_rows_in_the_pool() {
-    const ROWS: i64 = 400_000;
+    // More than the connection's socket buffers hold: most rows wait in
+    // the server for the client.
+    const ROWS: i64 = 1_000_000;
     let dir = tempfile::tempdir().unwrap();
     let server = start_server(dir.path());
     server.wait_ready().await;
@@ -2683,10 +2725,11 @@ async fn fetch_among_other_statements_holds_its_rows_in_the_pool() {
     });
     fetch_sent.await.unwrap();
     // Held in the pool while they wait: at least a row's bookkeeping each.
+    let least = u64::try_from(ROWS).unwrap() * 32;
     let deadline = Instant::now() + Duration::from_secs(20);
     let held = loop {
         let reserved = server.reserved().await;
-        if reserved >= u64::try_from(ROWS).unwrap() * 32 {
+        if reserved >= least {
             break reserved;
         }
         assert!(
@@ -2695,6 +2738,14 @@ async fn fetch_among_other_statements_holds_its_rows_in_the_pool() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
+    // Still held once read, while the client has not read them: not only
+    // while the FETCH reads them from the cursor.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let waiting = server.reserved().await;
+    assert!(
+        waiting >= least,
+        "the rows waiting for the client left the pool ({waiting} bytes, {held} while read)"
+    );
     read.send(()).unwrap();
     let (fetched, ended) = fetching.await.unwrap();
     assert_eq!(error_code(&fetched), None);
