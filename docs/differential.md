@@ -113,7 +113,9 @@ Other case keys:
 
 `tools/differential/out/report.json` (ignored by git): summary counts per outcome,
 `failures`, `known`, `accepted`, `setup_errors`, and every case with both answers
-(first 50 rows) and, for sessions, every step. The console prints the same summary.
+(first 50 rows) and, for sessions, every step, stamped in the operator's time zone
+(`scripts/dev.sh` passes the host's as `CODELAKE_HOST_TZ`). The console prints the same
+summary.
 
 ## Part of the Definition of Done
 

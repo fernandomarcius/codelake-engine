@@ -186,6 +186,15 @@ class Expectations(unittest.TestCase):
         self.assertIn("diverges at steps [2, 3]", runner.judge(c, "ERRO", [2, 3], None))
 
 
+class Report(unittest.TestCase):
+    def test_timestamps_in_the_operators_zone(self):
+        os.environ["CODELAKE_HOST_TZ"] = "America/Sao_Paulo"
+        try:
+            self.assertEqual(runner.local_time(1790445313).isoformat(), "2026-09-26T14:55:13-03:00")
+        finally:
+            del os.environ["CODELAKE_HOST_TZ"]
+
+
 class Session(unittest.TestCase):
     def test_codelake_only_session_prefix(self):
         self.assertEqual(runner.split_session("/*CLSESSION a=1*/ SELECT 1", None), ("SELECT 1", "a=1"))

@@ -2,8 +2,10 @@
 
 import datetime
 import hashlib
+import os
 import re
 import time
+import zoneinfo
 
 from .clients import Pg, PgError, Trino
 from .compare import OUTCOMES, classify, rows_as_pg_text, worst
@@ -207,6 +209,17 @@ def run(suites, engines, log, binary=None):
     return report(results, setup_errors, started, binary)
 
 
+def local_time(ts):
+    """`ts` in the operator's zone (CODELAKE_HOST_TZ, from scripts/dev.sh), else the container's."""
+    zone = os.environ.get("CODELAKE_HOST_TZ")
+    if zone:
+        try:
+            return datetime.datetime.fromtimestamp(ts, zoneinfo.ZoneInfo(zone))
+        except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+            pass
+    return datetime.datetime.fromtimestamp(ts).astimezone()
+
+
 def report(results, setup_errors, started, binary):
     outcomes = {k: 0 for k in OUTCOMES}
     for r in results:
@@ -215,7 +228,7 @@ def report(results, setup_errors, started, binary):
     known = [r for r in results if r["status"] == "pass" and r["known"]]
     accepted = [r for r in results if r["status"] == "pass" and r["accepted"]]
     rep = {
-        "started": datetime.datetime.fromtimestamp(started).astimezone().isoformat(timespec="seconds"),
+        "started": local_time(started).isoformat(timespec="seconds"),
         "seconds": round(time.time() - started, 1),
         "summary": {"cases": len(results), "pass": len(results) - len(fails), "fail": len(fails),
                     "setup_errors": len(setup_errors), "known": len(known), "accepted": len(accepted),

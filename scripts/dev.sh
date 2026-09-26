@@ -53,6 +53,14 @@ ENV_FLAGS=()
 for var in MUTANTS_BASE GITHUB_ACTIONS CI; do
   [ -n "${!var:-}" ] && ENV_FLAGS+=(-e "$var")
 done
+# The operator's time zone, for reports the tools write (the container runs in
+# UTC and keeps doing so: tests do not depend on the host's zone).
+HOST_TZ="${TZ:-}"
+if [ -z "$HOST_TZ" ]; then
+  link="$(readlink /etc/localtime 2>/dev/null || true)"
+  case "$link" in *zoneinfo/*) HOST_TZ="${link##*zoneinfo/}" ;; esac
+fi
+[ -n "$HOST_TZ" ] && ENV_FLAGS+=(-e "CODELAKE_HOST_TZ=$HOST_TZ")
 
 # Wraps rustc in sccache when asked and the image has it; an image built before
 # sccache was added keeps working, uncached.
