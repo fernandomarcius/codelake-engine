@@ -754,7 +754,30 @@ async fn cursors_return_every_row(server: &Server, client: &Client, observer: &C
 /// A PostgreSQL connection spoken to message by message, for what
 /// `tokio-postgres` does not send: an extended-protocol `FETCH` with its
 /// results in text (psycopg3's server-side cursors).
-struct Wire(std::net::TcpStream);
+struct Wire(std::net::TcpStream, BackendKey);
+
+/// The process id and secret key a cancel request names a connection by.
+#[derive(Clone, Default)]
+struct BackendKey {
+    pid: i32,
+    secret: Vec<u8>,
+}
+
+impl BackendKey {
+    /// Sends a cancel request for the connection, as `psql`'s Ctrl-C does.
+    fn cancel(&self, port: u16) {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let len = i32::try_from(12 + self.secret.len()).unwrap();
+        let request = [
+            &len.to_be_bytes()[..],
+            &80_877_102_i32.to_be_bytes(),
+            &self.pid.to_be_bytes(),
+            &self.secret,
+        ]
+        .concat();
+        stream.write_all(&request).unwrap();
+    }
+}
 
 /// A backend message: its type byte and body.
 type Message = (u8, Vec<u8>);
@@ -769,7 +792,7 @@ impl Wire {
     fn connect(port: u16, user: &str) -> Self {
         let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-        let mut wire = Self(stream);
+        let mut wire = Self(stream, BackendKey::default());
         let mut body = 196_608_i32.to_be_bytes().to_vec();
         for part in ["user", user, "database", "codelake"] {
             body.extend(cstr(part));
@@ -779,7 +802,13 @@ impl Wire {
         wire.0
             .write_all(&[len.to_be_bytes().as_slice(), &body].concat())
             .unwrap();
-        wire.until_ready();
+        let started = wire.until_ready();
+        if let Some((_, key)) = started.iter().find(|(kind, _)| *kind == b'K') {
+            wire.1 = BackendKey {
+                pid: i32::from_be_bytes(key[..4].try_into().unwrap()),
+                secret: key[4..].to_vec(),
+            };
+        }
         wire
     }
 
@@ -1438,6 +1467,79 @@ async fn cursors_answer_like_postgresql() {
     }
     server.slots_free().await;
     assert_eq!(server.pool_drains().await, 0);
+}
+
+/// A cancel request stops a statement executing on the extended protocol
+/// (JDBC, psycopg3, `tokio-postgres`' `query`), not only on the simple one:
+/// SQLSTATE `57014`, the pool back at zero, the connection still usable.
+/// Both a query and a `FETCH` of a cursor are stopped while they execute.
+/// (Found by the F6 re-verification: no test covered the `Execute` path,
+/// where the connection is marked as executing for cancel requests to
+/// reach it; a regression there passed green.)
+#[tokio::test]
+async fn cancel_requests_reach_the_extended_protocol() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start_server(dir.path());
+    server.wait_ready().await;
+
+    let client = server.connect("ext-cancel").await;
+    let token = client.cancel_token();
+    let running = tokio::spawn(async move {
+        let outcome = client.query(HOLDS_MEMORY, &[]).await.map(|_| ());
+        (client, outcome)
+    });
+    let held = pool_fills(&server).await;
+    token.cancel_query(NoTls).await.unwrap();
+    let (client, outcome) = tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the canceled Execute ended")
+        .unwrap();
+    let error = outcome.unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::QUERY_CANCELED), "{error:?}");
+    assert_eq!(
+        error.as_db_error().unwrap().message(),
+        "canceling statement due to user request"
+    );
+    assert_eq!(server.pool_drains().await, 0, "reservations left (held {held})");
+    let rows = client.query("SELECT CAST(6 * 7 AS BIGINT)", &[]).await.unwrap();
+    assert_eq!(rows[0].get::<_, i64>(0), 42);
+    server.slots_free().await;
+
+    // A FETCH executing on the extended protocol: the cursor's join runs
+    // under it.
+    let port = server.pg;
+    let (key_sent, key) = tokio::sync::oneshot::channel();
+    let fetching = tokio::task::spawn_blocking(move || {
+        let mut wire = Wire::connect(port, "ext-cancel");
+        assert_eq!(error_code(&wire.query("BEGIN")), None);
+        let declared = wire.query(&format!("DECLARE cm CURSOR FOR {HOLDS_MEMORY}"));
+        assert_eq!(error_code(&declared), None, "{declared:?}");
+        key_sent
+            .send(wire.1.clone())
+            .unwrap_or_else(|_| panic!("key not sent"));
+        wire.parse("", "FETCH 1 FROM cm");
+        wire.bind("", 0);
+        wire.execute();
+        let fetched = wire.sync();
+        (wire, fetched)
+    });
+    let key = key.await.unwrap();
+    let held = pool_fills(&server).await;
+    tokio::task::spawn_blocking(move || key.cancel(port))
+        .await
+        .unwrap();
+    let (mut wire, fetched) = tokio::time::timeout(Duration::from_secs(10), fetching)
+        .await
+        .expect("the canceled FETCH ended")
+        .unwrap();
+    assert_eq!(error_code(&fetched).as_deref(), Some("57014"), "{fetched:?}");
+    assert!(data_rows(&fetched).is_empty());
+    assert_eq!(server.pool_drains().await, 0, "reservations left (held {held})");
+    let ended = tokio::task::spawn_blocking(move || wire.query("ROLLBACK"))
+        .await
+        .unwrap();
+    assert_eq!(error_code(&ended), None, "{ended:?}");
+    server.slots_free().await;
 }
 
 /// A join that streams rows (2 M, as its probe side advances) while its
