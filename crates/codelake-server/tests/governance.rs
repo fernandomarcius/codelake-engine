@@ -750,6 +750,206 @@ async fn cursors_return_every_row(server: &Server, client: &Client, observer: &C
     server.slots_free().await;
 }
 
+/// A PostgreSQL connection spoken to message by message, for what
+/// `tokio-postgres` does not send: an extended-protocol `FETCH` with its
+/// results in text (psycopg3's server-side cursors).
+struct Wire(std::net::TcpStream);
+
+/// A backend message: its type byte and body.
+type Message = (u8, Vec<u8>);
+
+fn cstr(text: &str) -> Vec<u8> {
+    let mut bytes = text.as_bytes().to_vec();
+    bytes.push(0);
+    bytes
+}
+
+impl Wire {
+    fn connect(port: u16, user: &str) -> Self {
+        let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let mut wire = Self(stream);
+        let mut body = 196_608_i32.to_be_bytes().to_vec();
+        for part in ["user", user, "database", "codelake"] {
+            body.extend(cstr(part));
+        }
+        body.push(0);
+        let len = i32::try_from(body.len() + 4).unwrap();
+        wire.0
+            .write_all(&[len.to_be_bytes().as_slice(), &body].concat())
+            .unwrap();
+        wire.until_ready();
+        wire
+    }
+
+    fn send(&mut self, kind: u8, body: &[u8]) {
+        let len = i32::try_from(body.len() + 4).unwrap();
+        self.0
+            .write_all(&[&[kind][..], &len.to_be_bytes(), body].concat())
+            .unwrap();
+    }
+
+    /// Backend messages up to and including `ReadyForQuery`.
+    fn until_ready(&mut self) -> Vec<Message> {
+        use std::io::Read;
+        let mut messages = Vec::new();
+        loop {
+            let mut head = [0_u8; 5];
+            self.0.read_exact(&mut head).unwrap();
+            let len = i32::from_be_bytes(head[1..5].try_into().unwrap());
+            let mut body = vec![0_u8; usize::try_from(len - 4).unwrap()];
+            self.0.read_exact(&mut body).unwrap();
+            messages.push((head[0], body));
+            if head[0] == b'Z' {
+                return messages;
+            }
+        }
+    }
+
+    fn query(&mut self, sql: &str) -> Vec<Message> {
+        self.send(b'Q', &cstr(sql));
+        self.until_ready()
+    }
+
+    fn parse(&mut self, statement: &str, sql: &str) {
+        self.send(b'P', &[cstr(statement), cstr(sql), vec![0, 0]].concat());
+    }
+
+    /// Binds `statement` to the unnamed portal, results in `format` (0 text,
+    /// 1 binary).
+    fn bind(&mut self, statement: &str, format: i16) {
+        let tail = [
+            &0_i16.to_be_bytes()[..],
+            &0_i16.to_be_bytes(),
+            &1_i16.to_be_bytes(),
+            &format.to_be_bytes(),
+        ]
+        .concat();
+        self.send(b'B', &[cstr(""), cstr(statement), tail].concat());
+    }
+
+    fn describe(&mut self, kind: u8, name: &str) {
+        self.send(b'D', &[vec![kind], cstr(name)].concat());
+    }
+
+    fn execute(&mut self) {
+        self.send(b'E', &[cstr(""), 0_i32.to_be_bytes().to_vec()].concat());
+    }
+
+    fn sync(&mut self) -> Vec<Message> {
+        self.send(b'S', &[]);
+        self.until_ready()
+    }
+}
+
+/// The message types of `messages`, as text (`1t T Z`, …).
+fn kinds(messages: &[Message]) -> String {
+    messages.iter().map(|(kind, _)| char::from(*kind)).collect()
+}
+
+/// Column count of the `RowDescription` in `messages`; `None` for `NoData`.
+fn described_columns(messages: &[Message]) -> Option<i16> {
+    messages
+        .iter()
+        .find(|(kind, _)| *kind == b'T')
+        .map(|(_, body)| i16::from_be_bytes([body[0], body[1]]))
+}
+
+/// Text values of the `DataRow`s in `messages`.
+fn data_rows(messages: &[Message]) -> Vec<Vec<String>> {
+    messages
+        .iter()
+        .filter(|(kind, _)| *kind == b'D')
+        .map(|(_, body)| {
+            let columns = i16::from_be_bytes([body[0], body[1]]);
+            let mut at = 2;
+            (0..columns)
+                .map(|_| {
+                    let len = i32::from_be_bytes(body[at..at + 4].try_into().unwrap());
+                    at += 4;
+                    let len = usize::try_from(len).unwrap();
+                    let value = String::from_utf8(body[at..at + len].to_vec()).unwrap();
+                    at += len;
+                    value
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// SQLSTATE of the `ErrorResponse` in `messages`.
+fn error_code(messages: &[Message]) -> Option<String> {
+    let (_, body) = messages.iter().find(|(kind, _)| *kind == b'E')?;
+    let mut fields = body.split(|byte| *byte == 0);
+    fields
+        .find(|field| field.first() == Some(&b'C'))
+        .map(|field| String::from_utf8_lossy(&field[1..]).into_owned())
+}
+
+/// Rows `from..=to` of `SELECT value, value % 13`, as text.
+fn value_and_mod(from: i64, to: i64) -> Vec<Vec<String>> {
+    (from..=to)
+        .map(|value| vec![value.to_string(), (value % 13).to_string()])
+        .collect()
+}
+
+/// `FETCH` on the extended protocol (psycopg3's server-side cursors) is
+/// described with its cursor's columns and returns every row, in order,
+/// with the simple protocol reading on where it stopped; bound for binary
+/// results (`tokio-postgres`) it is refused before it reads a row. (Found by
+/// the F6 re-verification: a `FETCH` was described with no columns, so the
+/// client failed on its first row after the server had consumed the rows it
+/// asked for, which the next `FETCH` no longer returned.)
+async fn fetch_on_the_extended_protocol(server: &Server) {
+    let port = server.pg;
+    tokio::task::spawn_blocking(move || {
+        let mut wire = Wire::connect(port, "wire");
+        assert_eq!(error_code(&wire.query("BEGIN")), None);
+        let declared =
+            wire.query("DECLARE cx CURSOR FOR SELECT value, value % 13 AS m FROM generate_series(1, 20)");
+        assert_eq!(error_code(&declared), None, "{declared:?}");
+
+        // Described as a statement, then as a portal, then read.
+        wire.parse("f4", "FETCH 4 FROM cx");
+        wire.describe(b'S', "f4");
+        let described = wire.sync();
+        assert_eq!(kinds(&described), "1tTZ", "{described:?}");
+        assert_eq!(described_columns(&described), Some(2));
+        wire.bind("f4", 0);
+        wire.describe(b'P', "");
+        wire.execute();
+        let fetched = wire.sync();
+        assert_eq!(described_columns(&fetched), Some(2), "{fetched:?}");
+        assert_eq!(data_rows(&fetched), value_and_mod(1, 4));
+        // Executed again, without a Describe: the next rows.
+        wire.bind("f4", 0);
+        wire.execute();
+        assert_eq!(data_rows(&wire.sync()), value_and_mod(5, 8));
+        // The simple protocol reads on from there: no row was lost.
+        assert_eq!(data_rows(&wire.query("FETCH ALL FROM cx")), value_and_mod(9, 20));
+        let done = wire.query("COMMIT");
+        assert_eq!(error_code(&done), None, "{done:?}");
+    })
+    .await
+    .unwrap();
+    server.slots_free().await;
+
+    // Results bound in binary: refused, no row read.
+    let client = server.connect("wire").await;
+    client
+        .batch_execute("BEGIN; DECLARE cb CURSOR FOR SELECT value FROM generate_series(1, 5)")
+        .await
+        .unwrap();
+    let error = client.query("FETCH 2 FROM cb", &[]).await.unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::FEATURE_NOT_SUPPORTED), "{error:?}");
+    assert_eq!(
+        numbers(&text_rows(&client, "FETCH ALL FROM cb").await),
+        [1, 2, 3, 4, 5]
+    );
+    client.batch_execute("ROLLBACK").await.unwrap();
+    server.slots_free().await;
+}
+
 /// A `DECLARE … CURSOR` (psycopg2 named cursors, pandas chunked reads) is
 /// one governed statement until its cursor is read to the end or closed: it
 /// holds its slot, and `FETCH` takes none (the user's only slot is the
@@ -768,6 +968,7 @@ async fn declared_cursor_runs_under_governance() {
     client.batch_execute("BEGIN").await.unwrap();
 
     cursors_return_every_row(&server, &client, &observer).await;
+    fetch_on_the_extended_protocol(&server).await;
 
     // `CLOSE` ends it and frees the slot and the memory.
     client

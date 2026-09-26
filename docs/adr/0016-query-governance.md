@@ -114,8 +114,15 @@ the cursor is read to the end, closed, stopped (cancel request,
 `FETCH` and `CLOSE` take no slot: a `FETCH` queued behind its own cursor's
 slot would never run. `FETCH` is answered by the server, sending rows as the
 cursor yields them (`datafusion-postgres` collects the rows a `FETCH` asks
-for, all that are left for `FETCH ALL`, before sending the first). A
-statement that fails after declaring a cursor drops it.
+for, all that are left for `FETCH ALL`, before sending the first). On the
+extended protocol (psycopg3's server-side cursors) a `FETCH` is described
+with its cursor's columns, as PostgreSQL does (`datafusion-postgres`
+describes it with none: the client failed on the first row, after the
+server had consumed the rows it asked for). A cursor's rows are encoded as
+text when it is declared, so a `FETCH` bound for binary results
+(`tokio-postgres`' `query`) is refused with SQLSTATE `0A000` before it reads
+a row, where PostgreSQL would send them in binary. A statement that fails
+after declaring a cursor drops it.
 
 Metrics (Prometheus, `metrics` facade in the core): gauges
 `codelake_queries_running`, `codelake_queries_queued`,

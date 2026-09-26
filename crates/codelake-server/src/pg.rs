@@ -62,7 +62,7 @@ use datafusion::sql::sqlparser::parser::Parser;
 use datafusion_postgres::hooks::HookClient;
 use datafusion_postgres::pgwire::api::auth::noop::NoopStartupHandler;
 use datafusion_postgres::pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
-use datafusion_postgres::pgwire::api::portal::{Portal, PortalExecutionState};
+use datafusion_postgres::pgwire::api::portal::{Format, Portal, PortalExecutionState};
 use datafusion_postgres::pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use datafusion_postgres::pgwire::api::results::{
     DescribePortalResponse, DescribeStatementResponse, QueryResponse, Response, SendableRowStream, Tag,
@@ -744,7 +744,7 @@ impl SimpleQueryHandler for Governed {
         client.metadata_mut().remove(QUERY_ID);
         let statements = Parser::parse_sql(&PostgreSqlDialect {}, query).unwrap_or_default();
         if let [statement] = statements.as_slice()
-            && let Some(response) = cursor::fetch(&*client, statement).await
+            && let Some(response) = cursor::fetch(&*client, statement, &Format::UnifiedText).await
         {
             return Ok(vec![response?]);
         }
@@ -797,6 +797,11 @@ impl ExtendedQueryHandler for Governed {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if let Some((statement, _)) = &target.statement.1
+            && let Some(fields) = cursor::fetch_fields(&*client, statement, &Format::UnifiedText).await
+        {
+            return Ok(DescribeStatementResponse::new(Vec::new(), fields?));
+        }
         ExtendedQueryHandler::do_describe_statement(&*self.inner, client, target).await
     }
 
@@ -811,6 +816,12 @@ impl ExtendedQueryHandler for Governed {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if let Some((statement, _)) = &target.statement.statement.1
+            && let Some(fields) =
+                cursor::fetch_fields(&*client, statement, &target.result_column_format).await
+        {
+            return Ok(DescribePortalResponse::new(fields?));
+        }
         ExtendedQueryHandler::do_describe_portal(&*self.inner, client, target).await
     }
 
@@ -831,7 +842,7 @@ impl ExtendedQueryHandler for Governed {
             return self.kill(client, request);
         }
         if let Some((statement, _)) = parsed
-            && let Some(response) = cursor::fetch(&*client, statement).await
+            && let Some(response) = cursor::fetch(&*client, statement, &portal.result_column_format).await
         {
             return response;
         }

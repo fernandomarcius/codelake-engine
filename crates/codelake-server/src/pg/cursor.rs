@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use datafusion::sql::sqlparser::ast::{FetchDirection, Statement, Value};
 use datafusion_postgres::pgwire::api::ClientPortalStore;
-use datafusion_postgres::pgwire::api::portal::{Portal, PortalExecutionState};
-use datafusion_postgres::pgwire::api::results::{QueryResponse, Response};
+use datafusion_postgres::pgwire::api::portal::{Format, Portal, PortalExecutionState};
+use datafusion_postgres::pgwire::api::results::{FieldInfo, QueryResponse, Response};
 use datafusion_postgres::pgwire::api::store::{MemPortalStore, PortalStore};
 use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::data::DataRow;
@@ -123,9 +123,14 @@ impl Declared {
     }
 }
 
-/// `FETCH` from a cursor, its rows sent as the cursor's stream yields them;
-/// `None` when `statement` is not a `FETCH`.
-pub(super) async fn fetch<C>(client: &C, statement: &Statement) -> Option<PgWireResult<Response>>
+/// `FETCH` from a cursor, its rows sent as the cursor's stream yields them,
+/// in the result `format` its client asked for; `None` when `statement` is
+/// not a `FETCH`.
+pub(super) async fn fetch<C>(
+    client: &C,
+    statement: &Statement,
+    format: &Format,
+) -> Option<PgWireResult<Response>>
 where
     C: ClientPortalStore + ?Sized,
     C::PortalStore: PortalStore,
@@ -133,10 +138,15 @@ where
     let Statement::Fetch { name, direction, .. } = statement else {
         return None;
     };
-    Some(fetch_from(client, &name.value, direction).await)
+    Some(fetch_from(client, &name.value, direction, format).await)
 }
 
-async fn fetch_from<C>(client: &C, name: &str, direction: &FetchDirection) -> PgWireResult<Response>
+async fn fetch_from<C>(
+    client: &C,
+    name: &str,
+    direction: &FetchDirection,
+    format: &Format,
+) -> PgWireResult<Response>
 where
     C: ClientPortalStore + ?Sized,
     C::PortalStore: PortalStore,
@@ -153,9 +163,55 @@ where
             (response.row_schema(), response.command_tag().to_owned())
         }
     };
+    text_only(format, schema.len())?;
     let mut response = QueryResponse::new(schema, cursor_rows(state, max_rows));
     response.set_command_tag(&tag);
     Ok(Response::Query(response))
+}
+
+/// The columns a `FETCH` answers with, for `Describe`: its cursor's, as
+/// `PostgreSQL` describes them; none when the cursor does not exist (the
+/// `FETCH` then fails) or was read to the end. `format` is the one the
+/// client asked results in (text for a statement). `None` when `statement`
+/// is not a `FETCH`.
+pub(super) async fn fetch_fields<C>(
+    client: &C,
+    statement: &Statement,
+    format: &Format,
+) -> Option<PgWireResult<Vec<FieldInfo>>>
+where
+    C: ClientPortalStore + ?Sized,
+    C::PortalStore: PortalStore,
+{
+    let Statement::Fetch { name, .. } = statement else {
+        return None;
+    };
+    let Some(portal) = portals(client).and_then(|store| store.get_portal(&name.value)) else {
+        return Some(Ok(Vec::new()));
+    };
+    let fields = match &*portal.state().lock().await {
+        PortalExecutionState::Suspended(response) => response.row_schema().to_vec(),
+        PortalExecutionState::Initial | PortalExecutionState::Finished => Vec::new(),
+    };
+    Some(text_only(format, fields.len()).map(|()| fields))
+}
+
+/// Refuses results in binary: a cursor's rows were encoded as text when it
+/// was declared, and a client decoding them as binary would read wrong
+/// values.
+fn text_only(format: &Format, columns: usize) -> PgWireResult<()> {
+    let binary = match format {
+        Format::UnifiedText => false,
+        Format::UnifiedBinary => columns > 0,
+        Format::Individual(codes) => (0..codes.len()).any(|column| format.is_binary(column)),
+    };
+    if binary {
+        return Err(user_error(
+            "0A000",
+            "FETCH returns a cursor's rows in text format only",
+        ));
+    }
+    Ok(())
 }
 
 /// Rows a `FETCH` asks for, `0` for all that are left. As
@@ -239,6 +295,16 @@ mod tests {
         assert!(count("FETCH PRIOR FROM c").is_err());
         assert!(count("FETCH BACKWARD 2 FROM c").is_err());
         assert!(count("FETCH ABSOLUTE 3 FROM c").is_err());
+    }
+
+    #[test]
+    fn cursor_rows_are_text_only() {
+        let refused = |format: &Format, columns| text_only(format, columns).is_err();
+        assert!(!refused(&Format::UnifiedText, 2));
+        assert!(refused(&Format::UnifiedBinary, 2));
+        assert!(!refused(&Format::UnifiedBinary, 0), "no column to send in binary");
+        assert!(!refused(&Format::Individual(vec![0, 0]), 2));
+        assert!(refused(&Format::Individual(vec![0, 1]), 2));
     }
 
     fn row(value: u8) -> DataRow {
