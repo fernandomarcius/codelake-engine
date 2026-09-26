@@ -291,6 +291,18 @@ versioning: [SemVer](https://semver.org/).
   the pool, before sending the first; the statement then ended (slot freed, time limit over)
   while its client had read nothing. Rows now stream to the client as they are produced, so
   the statement holds its slot and its time limit until they are read (ADR 0016).
+- `char(n)` values still answered other rows than Trino 431 in shapes the matrix did not
+  cover (ADR 0015): a view over a char column dropped a trailing tab or line feed before
+  padding; `ltrim(ch)` kept the padding; rows written out (`ROW(ch, c3) = ROW('ab',
+  'ab')`, `(ch, id) IN (...)`) compared without char semantics in a select list and made
+  a `NULL` field equal; elements of arrays of char values (`ARRAY[ch, c3][2]`,
+  `array_max`, `array_agg(ch)[1]`), `array_remove`, array concatenation, `min_by`,
+  `max_by`, `map_agg`, `histogram` lookups and `try` lost the char type; `INTERSECT` and
+  `EXCEPT` kept values equal as char apart. They now answer Trino's rows; a cast to an
+  array, map or row of `char(n)`/`varchar(n)` and `char(n)` on the PostgreSQL wire are
+  refused instead of answering unpadded values. Text computed from a char value is
+  typed `varchar(n)` (clients, `typeof`, `CREATE TABLE AS`).
+- `ARRAY[1] || CAST(NULL AS integer)` answered `[1, NULL]`; Trino 431 answers `NULL`.
 - `INTERSECT ALL` kept every left copy of a row found on the right (`VALUES 1, 1, 1
   INTERSECT ALL SELECT 1` answered three rows) and `EXCEPT ALL` removed every copy of
   it (`VALUES 1, 1, 2 EXCEPT ALL SELECT 1` answered `[2]`); they are now the multiset
