@@ -1555,6 +1555,7 @@ fn cursor_script() -> Vec<(String, Want)> {
         discard_script(),
         names_script(),
         unparsed_script(),
+        savepoints_script(),
     ]
     .into_iter()
     .flatten()
@@ -1698,6 +1699,88 @@ fn unparsed_script() -> Vec<(String, Want)> {
             Rows(vec![1, 9, 10]),
         ),
         ("FETCH 1 FROM w".into(), Code("34000")),
+    ]
+}
+
+/// Savepoints and `AND CHAIN`, as PostgreSQL treats the cursors in them:
+/// `ROLLBACK TO SAVEPOINT` closes the cursors declared since, keeps the
+/// others where they stand and ends the failed state; `RELEASE` keeps
+/// them; `AND CHAIN` begins a new transaction at once. (Found by the third
+/// F6 verification: `SAVEPOINT` and `RELEASE` failed with XX000, `ROLLBACK
+/// TO SAVEPOINT` ended the whole transaction, and `AND CHAIN` began none.)
+fn savepoints_script() -> Vec<(String, Want)> {
+    savepoints_and_cursors_script()
+        .into_iter()
+        .chain(chain_script())
+        .collect()
+}
+
+fn savepoints_and_cursors_script() -> Vec<(String, Want)> {
+    use Want::{Code, Rows};
+    let none = Want::none;
+    let declare = |name: &str, how: &str| format!("DECLARE {name} {how} FOR {TEN}");
+    vec![
+        ("BEGIN".into(), none()),
+        (declare("sa", "NO SCROLL CURSOR"), none()),
+        ("FETCH 1 FROM sa".into(), Rows(vec![1])),
+        ("SAVEPOINT s1".into(), none()),
+        (declare("sb", "CURSOR"), none()),
+        ("FETCH 1 FROM sa".into(), Rows(vec![2])),
+        ("SAVEPOINT s2".into(), none()),
+        ("FETCH 1 FROM nothing".into(), Code("34000")),
+        ("FETCH 1 FROM sa".into(), Code("25P02")),
+        ("RELEASE s2".into(), Code("25P02")),
+        ("ROLLBACK TO SAVEPOINT s2".into(), none()),
+        ("FETCH 1 FROM sa".into(), Rows(vec![3])),
+        ("FETCH 1 FROM sb".into(), Rows(vec![1])),
+        ("ROLLBACK TO s1".into(), none()),
+        ("FETCH 1 FROM sa".into(), Rows(vec![4])),
+        ("FETCH 1 FROM sb".into(), Code("34000")),
+        ("ROLLBACK TO S1".into(), none()),
+        ("RELEASE SAVEPOINT s1".into(), none()),
+        ("RELEASE s1".into(), Code("3B001")),
+        ("ROLLBACK TO s1".into(), Code("3B001")),
+        ("ROLLBACK".into(), none()),
+        ("FETCH 1 FROM sa".into(), Code("34000")),
+        // Outside a transaction block.
+        ("SAVEPOINT x".into(), Code("25P01")),
+        ("RELEASE x".into(), Code("25P01")),
+        ("ROLLBACK TO x".into(), Code("25P01")),
+        // A name set twice: the last savepoint of that name.
+        ("BEGIN; SAVEPOINT d".into(), none()),
+        (declare("d1", "CURSOR"), none()),
+        ("SAVEPOINT d".into(), none()),
+        (declare("d2", "CURSOR"), none()),
+        ("ROLLBACK TO d".into(), none()),
+        ("FETCH 1 FROM d1".into(), Rows(vec![1])),
+        ("FETCH 1 FROM d2".into(), Code("34000")),
+        ("ROLLBACK".into(), none()),
+    ]
+}
+
+/// `AND CHAIN`: the transaction ends as `COMMIT` or `ROLLBACK` ends it (a
+/// failed one is rolled back), and the next one is open at once; outside a
+/// transaction block it fails.
+fn chain_script() -> Vec<(String, Want)> {
+    use Want::{Code, Rows};
+    let none = Want::none;
+    let declare = |name: &str, how: &str| format!("DECLARE {name} {how} FOR {TEN}");
+    vec![
+        ("COMMIT AND CHAIN".into(), Code("25P01")),
+        ("ROLLBACK AND CHAIN".into(), Code("25P01")),
+        ("BEGIN".into(), none()),
+        (declare("ch", "CURSOR WITH HOLD"), none()),
+        (declare("cn", "CURSOR"), none()),
+        ("COMMIT AND CHAIN".into(), none()),
+        ("FETCH 1 FROM ch".into(), Rows(vec![1])),
+        (declare("cm", "CURSOR"), none()),
+        ("ROLLBACK AND CHAIN".into(), none()),
+        ("FETCH 1 FROM cm".into(), Code("34000")),
+        ("COMMIT AND CHAIN".into(), none()),
+        (declare("cn", "CURSOR"), none()),
+        ("FETCH 1 FROM ch".into(), Rows(vec![2])),
+        ("COMMIT".into(), none()),
+        ("CLOSE ch".into(), none()),
     ]
 }
 
@@ -2302,6 +2385,8 @@ async fn cursors_answer_like_postgresql() {
         moves_through_a_driver(client).await;
     }
     suspended_fetches_answer_like_postgresql(&host, port, server.pg).await;
+    savepoints_answer_like_postgresql(&host, port, server.pg).await;
+    rollback_to_refused_after_a_write(&engine).await;
     // On the extended protocol too, a DECLARE needs a transaction block.
     let declare = format!("DECLARE x CURSOR FOR {TEN}");
     for client in [&postgres, &engine] {
@@ -2314,6 +2399,118 @@ async fn cursors_answer_like_postgresql() {
     }
     server.slots_free().await;
     assert_eq!(server.pool_drains().await, 0);
+}
+
+/// The engine's writes are not transactional: a `ROLLBACK TO SAVEPOINT`
+/// after a statement that may write fails rather than leave the write as
+/// if it were undone; after reads only it runs.
+async fn rollback_to_refused_after_a_write(engine: &Client) {
+    for (sql, want) in [
+        ("BEGIN; SAVEPOINT r", Some(Ok(Vec::new()))),
+        ("SELECT 1", Some(Ok(vec![vec!["1".to_owned()]]))),
+        ("ROLLBACK TO r", Some(Ok(Vec::new()))),
+        ("INSERT INTO nowhere VALUES (1)", None),
+        ("ROLLBACK TO r", Some(Err("0A000".to_owned()))),
+        ("ROLLBACK", Some(Ok(Vec::new()))),
+    ] {
+        let answered = seen(engine, sql).await;
+        match want {
+            Some(want) => assert_eq!(answered, want, "engine: {sql}"),
+            None => assert!(answered.is_err(), "engine: {sql}"),
+        }
+    }
+}
+
+/// The transaction statuses of [`savepoint_statuses`] on PostgreSQL
+/// (`host`, `port`) and on the engine (`engine`).
+async fn savepoints_answer_like_postgresql(host: &str, port: u16, engine: u16) {
+    let want = [
+        ('T', "BEGIN"),
+        ('T', "SAVEPOINT"),
+        ('E', "34000"),
+        ('T', "ROLLBACK"),
+        ('T', "COMMIT"),
+        ('E', "34000"),
+        ('T', "ROLLBACK"),
+        ('T', "ROLLBACK"),
+        ('I', "COMMIT"),
+    ]
+    .map(|(status, answer)| (status, answer.to_owned()));
+    for steps in savepoint_statuses() {
+        let reference = transaction_statuses(host.to_owned(), port, "postgres", "postgres", &steps).await;
+        let answered =
+            transaction_statuses("127.0.0.1".to_owned(), engine, "pgcursors", "codelake", &steps).await;
+        assert_eq!(reference, want, "PostgreSQL: {steps:?}");
+        assert_eq!(answered, want, "engine: {steps:?}");
+    }
+}
+
+/// Savepoints and `AND CHAIN` that end or leave a failed state, on each
+/// protocol ([`transaction_statuses`]).
+fn savepoint_statuses() -> Vec<Vec<Step>> {
+    let statements = [
+        "BEGIN",
+        "SAVEPOINT a",
+        "FETCH 1 FROM nothing",
+        "ROLLBACK TO a",
+        "COMMIT AND CHAIN",
+        "FETCH 1 FROM nothing",
+        "COMMIT AND CHAIN",
+        "ROLLBACK AND CHAIN",
+        "COMMIT",
+    ];
+    vec![
+        statements
+            .iter()
+            .map(|sql| Step::Simple((*sql).to_owned()))
+            .collect(),
+        statements
+            .iter()
+            .map(|sql| Step::Extended((*sql).to_owned()))
+            .collect(),
+    ]
+}
+
+/// The transaction status each step of `steps` leaves the connection in
+/// (`ReadyForQuery`: `I`, `T` or `E`), with its tag or SQLSTATE.
+async fn transaction_statuses(
+    host: String,
+    port: u16,
+    user: &'static str,
+    database: &'static str,
+    steps: &[Step],
+) -> Vec<(char, String)> {
+    let steps = steps.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let mut wire = Wire::connect_to(&host, port, user, database);
+        steps
+            .iter()
+            .map(|step| {
+                let messages = match step {
+                    Step::Simple(sql) => wire.query(sql),
+                    Step::Extended(sql) => {
+                        wire.parse("", sql);
+                        wire.bind("", 0);
+                        wire.execute();
+                        wire.sync()
+                    }
+                    other => panic!("{other:?}"),
+                };
+                let status = messages
+                    .iter()
+                    .rev()
+                    .find(|(kind, _)| *kind == b'Z')
+                    .map(|(_, body)| char::from(body[0]))
+                    .unwrap();
+                let answer = error_code(&messages)
+                    .or_else(|| tags(&messages).pop())
+                    .unwrap_or_default();
+                (status, answer)
+            })
+            .collect()
+    })
+    .await
+    .unwrap()
 }
 
 /// What a client sees of `messages`, in order: the first value of each row,

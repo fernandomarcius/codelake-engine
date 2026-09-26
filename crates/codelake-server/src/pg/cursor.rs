@@ -91,13 +91,17 @@ struct Cursor {
     failed: AtomicBool,
     /// The governed statement that declared it.
     record: Mutex<Option<Arc<QueryRecord>>>,
+    /// The subtransaction it was declared in ([`Book::subtransactions`]):
+    /// a `ROLLBACK TO SAVEPOINT` of a savepoint set before closes it.
+    subtransaction: u64,
 }
 
 impl Cursor {
-    fn new(hold: bool, scroll: bool) -> Self {
+    fn new(hold: bool, scroll: bool, subtransaction: u64) -> Self {
         Self {
             hold,
             scroll,
+            subtransaction,
             pending: AtomicBool::new(true),
             current: Mutex::new(None),
             columns: Mutex::new(None),
@@ -133,6 +137,23 @@ struct Book {
     /// `PostgreSQL` runs them in one implicit transaction block, where a
     /// cursor may be declared.
     implicit_block: bool,
+    /// The transaction block's savepoints, oldest first, each with the
+    /// subtransaction it began.
+    savepoints: Vec<(String, u64)>,
+    /// The last subtransaction begun (by `SAVEPOINT`, or `ROLLBACK TO
+    /// SAVEPOINT`, which begins its savepoint's again), counted from the
+    /// connection's first: what was declared since a savepoint has a number
+    /// at least its own.
+    subtransactions: u64,
+    /// The subtransaction in which the transaction last ran a statement
+    /// that may write ([`reads_only`]): the engine's writes are not
+    /// transactional, so a `ROLLBACK TO SAVEPOINT` could not undo it.
+    last_write: Option<u64>,
+    /// A statement set the transaction status to one `pgwire` cannot tell
+    /// from its answer (`ROLLBACK TO SAVEPOINT` in a failed block, `AND
+    /// CHAIN`): the message ends in the status this book says
+    /// ([`restated`]).
+    restated: bool,
     /// An extended-protocol `Execute` of the transaction completed before
     /// the one being run, in the same pipeline (`PostgreSQL`'s
     /// `XACT_FLAGS_PIPELINING`): what cannot run in a transaction block
@@ -149,6 +170,11 @@ impl Cursors {
     /// transaction status as `pgwire` tracks it.
     fn begin_message(&self, status: TransactionStatus, statements: usize) {
         let mut book = lock(&self.0);
+        book.restated = false;
+        if status == TransactionStatus::Idle {
+            book.savepoints.clear();
+            book.last_write = None;
+        }
         book.explicit = status != TransactionStatus::Idle;
         book.aborted = status == TransactionStatus::Error;
         book.implicit_block = statements > 1;
@@ -241,11 +267,117 @@ impl Cursors {
     /// The cursor `name` (a portal of the extended protocol has one too).
     fn cursor(&self, name: &str) -> Arc<Cursor> {
         let mut book = lock(&self.0);
+        let subtransaction = book.subtransactions;
         let cursor = book
             .cursors
             .entry(name.to_owned())
-            .or_insert_with(|| Arc::new(Cursor::new(false, true)));
+            .or_insert_with(|| Arc::new(Cursor::new(false, true, subtransaction)));
         Arc::clone(cursor)
+    }
+
+    /// `SAVEPOINT`: a subtransaction begins, in a transaction block only
+    /// (`25P01`), as in `PostgreSQL`.
+    fn savepoint(&self, name: &Ident) -> PgWireResult<Response> {
+        let mut book = lock(&self.0);
+        if !book.explicit {
+            return Err(outside_block("SAVEPOINT"));
+        }
+        book.subtransactions += 1;
+        let subtransaction = book.subtransactions;
+        book.savepoints.push((cursor_name(name), subtransaction));
+        Ok(Response::Execution(Tag::new("SAVEPOINT")))
+    }
+
+    /// Where the savepoint `name` stands: the last set of that name
+    /// (`3B001` when there is none, `25P01` outside a transaction block).
+    fn find_savepoint(book: &Book, name: &Ident, statement: &str) -> PgWireResult<usize> {
+        if !book.explicit {
+            return Err(outside_block(statement));
+        }
+        let name = cursor_name(name);
+        book.savepoints
+            .iter()
+            .rposition(|(set, _)| *set == name)
+            .ok_or_else(|| user_error("3B001", format!("savepoint \"{name}\" does not exist")))
+    }
+
+    /// `RELEASE SAVEPOINT`: the savepoint and those set after it are gone;
+    /// what was declared since stays open, as in `PostgreSQL`.
+    fn release(&self, name: &Ident) -> PgWireResult<Response> {
+        let mut book = lock(&self.0);
+        let at = Self::find_savepoint(&book, name, "RELEASE SAVEPOINT")?;
+        book.savepoints.truncate(at);
+        Ok(Response::Execution(Tag::new("RELEASE")))
+    }
+
+    /// `ROLLBACK TO SAVEPOINT`, as `PostgreSQL` does it for cursors: the
+    /// cursors declared since the savepoint are closed (their statements end,
+    /// slot and memory given back), those declared before stay open where
+    /// they stand (a move is not undone), the savepoints set after it are
+    /// gone, and a failed transaction block is no longer failed. The
+    /// engine's writes are not transactional: after a statement that may
+    /// write ([`reads_only`]) since the savepoint it fails with `0A000`
+    /// rather than leave the write in place as if undone.
+    fn rollback_to(&self, client: &mut dyn HookClient, name: &Ident) -> PgWireResult<Response> {
+        let store = client.portal_store();
+        let mut book = lock(&self.0);
+        let at = Self::find_savepoint(&book, name, "ROLLBACK TO SAVEPOINT")?;
+        let (set, since) = book.savepoints[at].clone();
+        if book.last_write.is_some_and(|written| written >= since) {
+            return Err(user_error(
+                "0A000",
+                format!(
+                    "ROLLBACK TO SAVEPOINT \"{set}\" cannot undo the statements since it that may \
+                     write: the engine's writes are not transactional"
+                ),
+            ));
+        }
+        let closed: Vec<String> = book
+            .cursors
+            .iter()
+            .filter(|(_, cursor)| cursor.subtransaction >= since)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in closed {
+            store.rm_portal(&name);
+            book.cursors.remove(&name);
+        }
+        book.savepoints.truncate(at + 1);
+        book.subtransactions += 1;
+        let subtransaction = book.subtransactions;
+        book.savepoints[at].1 = subtransaction;
+        book.aborted = false;
+        book.restated = true;
+        drop(book);
+        client.set_transaction_status(TransactionStatus::Transaction);
+        Ok(Response::Execution(Tag::new("ROLLBACK")))
+    }
+
+    /// `COMMIT AND CHAIN` (`commit`) or `ROLLBACK AND CHAIN`: the
+    /// transaction block ends, as `COMMIT` or `ROLLBACK` would end it (a
+    /// failed one is rolled back), and a new one begins at once, in a
+    /// transaction block only (`25P01`), as in `PostgreSQL`.
+    fn chain(&self, client: &mut dyn HookClient, commit: bool) -> PgWireResult<Response> {
+        let (explicit, aborted) = {
+            let book = lock(&self.0);
+            (book.explicit, book.aborted)
+        };
+        if !explicit {
+            let statement = if commit {
+                "COMMIT AND CHAIN"
+            } else {
+                "ROLLBACK AND CHAIN"
+            };
+            return Err(outside_block(statement));
+        }
+        self.end_transaction(Some(client.portal_store()), commit);
+        let mut book = lock(&self.0);
+        book.explicit = true;
+        book.restated = true;
+        drop(book);
+        client.set_transaction_status(TransactionStatus::Transaction);
+        let tag = if commit && !aborted { "COMMIT" } else { "ROLLBACK" };
+        Ok(Response::Execution(Tag::new(tag)))
     }
 
     /// The transaction in progress ends, committed or rolled back (a failed
@@ -256,6 +388,8 @@ impl Cursors {
         let commit = commit && !book.aborted;
         book.explicit = false;
         book.aborted = false;
+        book.savepoints.clear();
+        book.last_write = None;
         book.pipelined = false;
         book.cursors
             .retain(|_, cursor| cursor.hold && (commit || !cursor.pending.load(Ordering::SeqCst)));
@@ -316,7 +450,10 @@ impl Book {
             if store.is_some_and(|store| store.get_portal(&name).is_some()) {
                 return Err(user_error("42P03", format!("cursor \"{name}\" already exists")));
             }
-            made.push((name, Cursor::new(hold, declare.scroll != Some(false))));
+            made.push((
+                name,
+                Cursor::new(hold, declare.scroll != Some(false), self.subtransactions),
+            ));
         }
         Ok(made)
     }
@@ -373,6 +510,98 @@ where
     };
     if implicit {
         cursors.end_transaction(portals(client), ok);
+    }
+}
+
+/// `statement` can only be used in transaction blocks (`25P01`).
+fn outside_block(statement: &str) -> PgWireError {
+    user_error(
+        "25P01",
+        format!("{statement} can only be used in transaction blocks"),
+    )
+}
+
+/// The transaction status a message or an `Execute` ends in, when one of
+/// its statements set it where `pgwire` cannot follow ([`Cursors::rollback_to`],
+/// [`Cursors::chain`]): the one this connection's book says.
+pub(super) fn restated(client: &(impl ClientInfo + ?Sized)) -> Option<TransactionStatus> {
+    let cursors = Cursors::of(client);
+    let mut book = lock(&cursors.0);
+    if !std::mem::take(&mut book.restated) {
+        return None;
+    }
+    Some(match (book.explicit, book.aborted) {
+        (false, _) => TransactionStatus::Idle,
+        (true, false) => TransactionStatus::Transaction,
+        (true, true) => TransactionStatus::Error,
+    })
+}
+
+/// `statements` are about to run (`None`: a message the SQL parser does not
+/// read): when one may write ([`reads_only`]), a `ROLLBACK TO SAVEPOINT` of
+/// a savepoint set before cannot undo it.
+pub(super) fn will_run(client: &(impl ClientInfo + ?Sized), statements: Option<&[Statement]>) {
+    if !statements.is_some_and(|statements| statements.iter().all(reads_only)) {
+        let cursors = Cursors::of(client);
+        let mut book = lock(&cursors.0);
+        book.last_write = Some(book.subtransactions);
+    }
+}
+
+/// Whether `statement` leaves every table as it was: a query (no `SELECT
+/// INTO`, no data-modifying `WITH`), a cursor statement, `EXPLAIN` without
+/// `ANALYZE`, `SHOW`, `SET`, transaction control, `PREPARE`, a procedure
+/// `CALL` (`kill_query`). Anything else may write.
+fn reads_only(statement: &Statement) -> bool {
+    match statement {
+        Statement::Query(query) => query_reads_only(query),
+        Statement::Declare { stmts } => stmts
+            .iter()
+            .all(|declare| declare.for_query.as_deref().is_none_or(query_reads_only)),
+        Statement::Explain {
+            analyze, statement, ..
+        } => !*analyze || reads_only(statement),
+        Statement::Fetch { .. }
+        | Statement::Close { .. }
+        | Statement::ExplainTable { .. }
+        | Statement::ShowVariable { .. }
+        | Statement::ShowVariables { .. }
+        | Statement::ShowTables { .. }
+        | Statement::ShowColumns { .. }
+        | Statement::ShowFunctions { .. }
+        | Statement::ShowCreate { .. }
+        | Statement::ShowSchemas { .. }
+        | Statement::ShowViews { .. }
+        | Statement::Set(_)
+        | Statement::StartTransaction { .. }
+        | Statement::Commit { .. }
+        | Statement::Rollback { .. }
+        | Statement::Savepoint { .. }
+        | Statement::ReleaseSavepoint { .. }
+        | Statement::Discard { .. }
+        | Statement::Deallocate { .. }
+        | Statement::Prepare { .. }
+        | Statement::Call(_) => true,
+        _ => false,
+    }
+}
+
+fn query_reads_only(query: &datafusion::sql::sqlparser::ast::Query) -> bool {
+    query
+        .with
+        .as_ref()
+        .is_none_or(|with| with.cte_tables.iter().all(|cte| query_reads_only(&cte.query)))
+        && set_reads_only(&query.body)
+}
+
+fn set_reads_only(body: &datafusion::sql::sqlparser::ast::SetExpr) -> bool {
+    use datafusion::sql::sqlparser::ast::SetExpr;
+    match body {
+        SetExpr::Select(select) => select.into.is_none(),
+        SetExpr::Values(_) | SetExpr::Table(_) => true,
+        SetExpr::Query(query) => query_reads_only(query),
+        SetExpr::SetOperation { left, right, .. } => set_reads_only(left) && set_reads_only(right),
+        _ => false,
     }
 }
 
@@ -462,6 +691,14 @@ impl CursorHook {
                     Err(error) => Err(error),
                 });
             }
+            Statement::Savepoint { name } => return Some(cursors.savepoint(name)),
+            Statement::ReleaseSavepoint { name } => return Some(cursors.release(name)),
+            Statement::Rollback {
+                savepoint: Some(name),
+                ..
+            } => return Some(cursors.rollback_to(client, name)),
+            Statement::Commit { chain: true, .. } => return Some(cursors.chain(client, true)),
+            Statement::Rollback { chain: true, .. } => return Some(cursors.chain(client, false)),
             Statement::StartTransaction { .. } => cursors.begin(),
             Statement::Commit { .. } => cursors.end_transaction(Some(client.portal_store()), true),
             Statement::Rollback { .. } => cursors.end_transaction(Some(client.portal_store()), false),
@@ -508,7 +745,11 @@ impl QueryHook for CursorHook {
                     .map_err(|error| PgWireError::ApiError(Box::new(error))),
             );
         }
-        matches!(statement, Statement::Discard { .. }).then(|| Ok(empty_plan()))
+        matches!(
+            statement,
+            Statement::Discard { .. } | Statement::Savepoint { .. } | Statement::ReleaseSavepoint { .. }
+        )
+        .then(|| Ok(empty_plan()))
     }
 
     async fn handle_extended_query(
@@ -2141,7 +2382,7 @@ mod tests {
         max_rows: usize,
     ) -> Vec<Result<Vec<u8>, String>> {
         let max = (max_rows > 0).then_some(max_rows);
-        cursor_rows(Arc::clone(state), max, Arc::new(Cursor::new(false, true)))
+        cursor_rows(Arc::clone(state), max, Arc::new(Cursor::new(false, true, 0)))
             .map(|row| row.map(|row| row.data.to_vec()).map_err(|e| e.to_string()))
             .collect()
             .await

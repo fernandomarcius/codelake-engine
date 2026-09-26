@@ -70,7 +70,13 @@ where
             },
             None => handler.do_query(client, portal.as_ref(), max_rows).await,
         }?;
-        send_response(client, portal.as_ref(), response, &mut transaction_status).await?
+        let has_rows = send_response(client, portal.as_ref(), response, &mut transaction_status).await?;
+        // ROLLBACK TO SAVEPOINT in a failed block, AND CHAIN: statuses
+        // pgwire cannot tell from the answer.
+        if let Some(status) = super::cursor::restated(&*client) {
+            transaction_status = status;
+        }
+        has_rows
     } else {
         // Suspended or finished: send what is left.
         true

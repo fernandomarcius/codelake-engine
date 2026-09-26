@@ -81,7 +81,10 @@ use datafusion_postgres::hooks::HookClient;
 use datafusion_postgres::pgwire::api::auth::noop::NoopStartupHandler;
 use datafusion_postgres::pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
 use datafusion_postgres::pgwire::api::portal::{Format, Portal, PortalExecutionState};
-use datafusion_postgres::pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use datafusion_postgres::pgwire::api::query::{
+    ExtendedQueryHandler, SimpleQueryHandler, send_execution_response, send_query_response,
+    send_ready_for_query,
+};
 use datafusion_postgres::pgwire::api::results::FieldInfo;
 use datafusion_postgres::pgwire::api::results::{
     DescribePortalResponse, DescribeStatementResponse, QueryResponse, Response, SendableRowStream, Tag,
@@ -92,14 +95,18 @@ use datafusion_postgres::pgwire::api::{
     ClientInfo, ClientPortalStore, ConnectionManager, DEFAULT_NAME, ErrorHandler, METADATA_APPLICATION_NAME,
     METADATA_USER, PgWireServerHandlers, Type,
 };
+use datafusion_postgres::pgwire::api::{ConnectionHandle, PgWireConnectionState, copy};
 use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
 use datafusion_postgres::pgwire::messages::cancel::CancelRequest;
 use datafusion_postgres::pgwire::messages::data::DataRow;
 use datafusion_postgres::pgwire::messages::extendedquery::{Execute, Sync as PgSync};
+use datafusion_postgres::pgwire::messages::response::EmptyQueryResponse;
 use datafusion_postgres::pgwire::messages::response::TransactionStatus;
 use datafusion_postgres::pgwire::messages::simplequery::Query;
 use datafusion_postgres::{DfSessionService, QueryHook};
+use futures::SinkExt;
+use futures::future::{Either, select};
 use futures::{Sink, Stream};
 use tokio::sync::{Notify, OwnedMutexGuard};
 
@@ -940,7 +947,11 @@ impl Governed {
 
 #[async_trait]
 impl SimpleQueryHandler for Governed {
-    /// `pgwire`'s, with the connection marked as executing while it runs.
+    /// `pgwire`'s (`_on_query`), with the connection marked as executing
+    /// while it runs, and the transaction status it ends in taken from the
+    /// connection's book when a statement set one `pgwire` cannot tell from
+    /// its answer ([`cursor::restated`]: `ROLLBACK TO SAVEPOINT` in a failed
+    /// block, `AND CHAIN`).
     async fn on_query<C>(&self, client: &mut C, query: Query) -> PgWireResult<()>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -951,7 +962,76 @@ impl SimpleQueryHandler for Governed {
         let _executing = self
             .connections
             .execute(connection_key(client), &Running::of(client));
-        self._on_query(client, query).await
+        if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+            return Err(PgWireError::NotReadyForQuery);
+        }
+        let mut transaction_status = client.transaction_status();
+        client.set_state(PgWireConnectionState::QueryInProgress);
+        let query = query.query;
+        if query.chars().all(|c| c == ';' || c.is_whitespace()) {
+            client
+                .feed(PgWireBackendMessage::EmptyQueryResponse(EmptyQueryResponse::new()))
+                .await?;
+        } else {
+            let cancel = match client.session_extensions().get::<Arc<ConnectionHandle>>() {
+                Some(handle) => Some(handle.start_query().await),
+                None => None,
+            };
+            let responses = match cancel {
+                Some(cancel) => {
+                    match select(SimpleQueryHandler::do_query(self, client, &query), cancel).await {
+                        Either::Left((responses, _)) => responses,
+                        Either::Right(_) => Err(PgWireError::QueryCanceled),
+                    }
+                }
+                None => SimpleQueryHandler::do_query(self, client, &query).await,
+            }?;
+            let mut failed = false;
+            for response in responses {
+                match response {
+                    Response::EmptyQuery => {
+                        client
+                            .feed(PgWireBackendMessage::EmptyQueryResponse(EmptyQueryResponse::new()))
+                            .await?;
+                    }
+                    Response::Query(results) => send_query_response(client, results, true).await?,
+                    Response::Execution(tag) => send_execution_response(client, tag).await?,
+                    Response::TransactionStart(tag) => {
+                        send_execution_response(client, tag).await?;
+                        transaction_status = transaction_status.to_in_transaction_state();
+                    }
+                    Response::TransactionEnd(tag) => {
+                        send_execution_response(client, tag).await?;
+                        transaction_status = transaction_status.to_idle_state();
+                    }
+                    Response::Error(error) => {
+                        client
+                            .feed(PgWireBackendMessage::ErrorResponse((*error).into()))
+                            .await?;
+                        transaction_status = transaction_status.to_error_state();
+                        failed = true;
+                    }
+                    Response::CopyIn(result) => {
+                        copy::send_copy_in_response(client, result).await?;
+                        client.set_state(PgWireConnectionState::CopyInProgress(false));
+                    }
+                    Response::CopyOut(result) => copy::send_copy_out_response(client, result).await?,
+                    Response::CopyBoth(result) => {
+                        copy::send_copy_both_response(client, result).await?;
+                        client.set_state(PgWireConnectionState::CopyInProgress(false));
+                    }
+                }
+            }
+            if let Some(status) = cursor::restated(&*client).filter(|_| !failed) {
+                transaction_status = status;
+            }
+        }
+        if !matches!(client.state(), PgWireConnectionState::CopyInProgress(_)) {
+            client.set_state(PgWireConnectionState::ReadyForQuery);
+            client.set_transaction_status(transaction_status);
+            send_ready_for_query(client, transaction_status).await?;
+        }
+        Ok(())
     }
 
     /// Runs the message's statements in the connection's transaction: when
@@ -1045,6 +1125,10 @@ impl Governed {
         if let [statement] = statements.as_slice() {
             cursor::check_declare(&*client, statement)?;
         }
+        cursor::will_run(
+            &*client,
+            (!statements.is_empty()).then_some(statements.as_slice()),
+        );
         if let Some(request) = kill_request_sql(query) {
             return Ok(vec![self.kill(client, request)?]);
         }
@@ -1195,6 +1279,14 @@ impl ExtendedQueryHandler for Governed {
             aborted(&*client, statement)?;
             cursor::check_declare(&*client, statement)?;
         }
+        cursor::will_run(
+            &*client,
+            Some(
+                parsed
+                    .as_ref()
+                    .map_or(&[], |(statement, _)| std::slice::from_ref(statement)),
+            ),
+        );
         if let Some(request) = parsed.as_ref().and_then(|(statement, _)| kill_request(statement)) {
             return self.kill(client, request);
         }
