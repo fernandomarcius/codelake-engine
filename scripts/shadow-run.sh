@@ -102,6 +102,14 @@ for side in REFERENCE CANDIDATE; do
     pid:*) [[ " ${args[*]} " == *" --pid=host "* ]] || args+=(--pid=host) ;;
   esac
 done
+# Reports and logs in the operator's time zone, not the container's UTC:
+# SHADOW_TZ, else TZ, else the zone /etc/localtime points to.
+zone="$(cfg SHADOW_TZ)"; zone="${zone:-${TZ:-}}"
+if [ -z "$zone" ]; then
+  link="$(readlink /etc/localtime 2>/dev/null || true)"
+  case "$link" in *zoneinfo/*) zone="${link##*zoneinfo/}" ;; *) zone=UTC ;; esac
+fi
+args+=(-e "TZ=$zone")
 network="$(cfg SHADOW_DOCKER_NETWORK)"
 [ -n "$network" ] && args+=(--network "$network")
 
