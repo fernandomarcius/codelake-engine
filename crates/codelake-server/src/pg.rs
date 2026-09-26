@@ -801,7 +801,14 @@ impl SimpleQueryHandler for Governed {
     {
         let statements = Parser::parse_sql(&PostgreSqlDialect {}, query);
         cursor::begin_simple(&*client, statements.as_ref().map_or(1, Vec::len));
-        let outcome = self.simple(client, query, statements.unwrap_or_default()).await;
+        let outcome = match statements {
+            Ok(statements) => self.simple(client, query, statements).await,
+            Err(error) => match cursor::unparsed(query, &error) {
+                Some(Ok(fetch)) => self.simple(client, query, vec![fetch]).await,
+                Some(Err(error)) => Err(error),
+                None => self.simple(client, query, Vec::new()).await,
+            },
+        };
         cursor::end_simple(&*client, outcome.is_ok());
         outcome
     }

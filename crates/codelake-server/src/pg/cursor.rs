@@ -34,8 +34,10 @@ use datafusion::common::ParamValues;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{
-    Declare, DeclareType, FetchDirection, Statement, Value, ValueWithSpan,
+    Declare, DeclareType, FetchDirection, FetchPosition, Ident, Statement, Value, ValueWithSpan,
 };
+use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+use datafusion::sql::sqlparser::tokenizer::{Span, Token, Tokenizer, Word};
 use datafusion_postgres::hooks::{HookClient, QueryHook};
 use datafusion_postgres::pgwire::api::portal::{Format, Portal, PortalExecutionState};
 use datafusion_postgres::pgwire::api::results::{FieldInfo, QueryResponse, Response};
@@ -604,30 +606,169 @@ fn text_only(format: &Format, columns: usize) -> PgWireResult<()> {
 }
 
 /// How far a `FETCH` moves its cursor, as `PostgreSQL` reads it; a cursor
-/// here only scans forward. A count that is not a whole number is an error,
-/// never "every row".
+/// here only scans forward (`55000` for a move backward, as `PostgreSQL`
+/// answers for a `NO SCROLL` cursor). A count that is not a whole number
+/// is an error, never "every row".
 fn fetch_count(direction: &FetchDirection) -> PgWireResult<Count> {
+    let forward = |rows: i64| match rows {
+        0 => Ok(Count::Current),
+        rows if rows > 0 => usize::try_from(rows).map(Count::Rows).map_err(|_| backward()),
+        _ => Err(backward()),
+    };
     match direction {
         FetchDirection::Next | FetchDirection::Forward { limit: None } => Ok(Count::Rows(1)),
         FetchDirection::Forward { limit: Some(count) } | FetchDirection::Count { limit: count } => {
-            match number(count)? {
-                0 => Ok(Count::Current),
-                rows => Ok(Count::Rows(rows)),
-            }
+            forward(number(count)?)
         }
-        FetchDirection::Relative { limit } if number(limit)? == 0 => Ok(Count::Current),
+        FetchDirection::Backward { limit: Some(count) } => forward(-number(count)?),
         FetchDirection::ForwardAll | FetchDirection::All => Ok(Count::All),
-        _ => Err(user_error("42000", "cursor can only scan forward")),
+        FetchDirection::Relative { limit } => match number(limit)? {
+            0 => Ok(Count::Current),
+            rows if rows < 0 => Err(backward()),
+            _ => Err(unsupported("FETCH RELATIVE")),
+        },
+        FetchDirection::Absolute { .. } => Err(unsupported("FETCH ABSOLUTE")),
+        FetchDirection::First => Err(unsupported("FETCH FIRST")),
+        FetchDirection::Last => Err(unsupported("FETCH LAST")),
+        FetchDirection::Prior | FetchDirection::Backward { limit: None } | FetchDirection::BackwardAll => {
+            Err(backward())
+        }
     }
 }
 
-/// A `FETCH` count: a whole number of rows.
-fn number(count: &ValueWithSpan) -> PgWireResult<usize> {
+fn backward() -> PgWireError {
+    user_error("55000", "cursor can only scan forward")
+}
+
+fn unsupported(what: &str) -> PgWireError {
+    user_error(
+        "0A000",
+        format!("{what} is not supported: cursors only scan forward"),
+    )
+}
+
+/// A `FETCH` count: a whole number of rows, negative for backward.
+fn number(count: &ValueWithSpan) -> PgWireResult<i64> {
     let invalid = || user_error("42601", format!("invalid FETCH count: {count}"));
     match &count.value {
         Value::Number(text, _) => text.parse().map_err(|_| invalid()),
         _ => Err(invalid()),
     }
+}
+
+/// A message the SQL parser does not read (`error`) that holds a `FETCH` or
+/// a `MOVE`, answered at once: sent on, it would wait in the queue for an
+/// admission slot its own cursor may hold, then time out. A single `FETCH`
+/// is read here as `PostgreSQL` reads it (a negative count, no count, no
+/// `FROM`: `FETCH -1 FROM c`, `FETCH FROM c`, `FETCH c`); `MOVE` is not
+/// supported. `None` when the message holds neither.
+pub(super) fn unparsed(sql: &str, error: &impl std::fmt::Display) -> Option<PgWireResult<Statement>> {
+    let tokens: Vec<Token> = Tokenizer::new(&PostgreSqlDialect {}, sql)
+        .tokenize()
+        .ok()?
+        .into_iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect();
+    let mut tokens = tokens.as_slice();
+    while let [rest @ .., Token::SemiColon] = tokens {
+        tokens = rest;
+    }
+    let statements: Vec<&[Token]> = tokens.split(|token| *token == Token::SemiColon).collect();
+    let starts =
+        |statement: &[Token], keyword: &str| statement.first().is_some_and(|token| is(token, keyword));
+    if statements.iter().any(|statement| starts(statement, "MOVE")) {
+        return Some(Err(unsupported("MOVE")));
+    }
+    match statements.as_slice() {
+        [statement] if starts(statement, "FETCH") => Some(read_fetch(&statement[1..])),
+        _ if statements.iter().any(|statement| starts(statement, "FETCH")) => {
+            Some(Err(user_error("42601", format!("syntax error: {error}"))))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `token` is the (unquoted) keyword `keyword`.
+fn is(token: &Token, keyword: &str) -> bool {
+    matches!(token, Token::Word(word) if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(keyword))
+}
+
+/// A count after a `FETCH` direction, `-` or `+` signed.
+fn signed_count(tokens: &[Token]) -> Option<(ValueWithSpan, &[Token])> {
+    let (sign, tokens) = match tokens {
+        [Token::Minus, rest @ ..] => ("-", rest),
+        [Token::Plus, rest @ ..] => ("", rest),
+        _ => ("", tokens),
+    };
+    match tokens {
+        [Token::Number(number, _), rest @ ..] => Some((
+            Value::Number(format!("{sign}{number}"), false).with_empty_span(),
+            rest,
+        )),
+        _ => None,
+    }
+}
+
+/// A `FETCH` after its keyword, as `PostgreSQL`'s grammar has it:
+/// `[direction] [FROM | IN] cursor_name`.
+fn read_fetch(tokens: &[Token]) -> PgWireResult<Statement> {
+    let syntax = || user_error("42601", "syntax error in FETCH");
+    let (direction, rest) = match tokens {
+        [first, rest @ ..] if is(first, "NEXT") => (FetchDirection::Next, rest),
+        [first, rest @ ..] if is(first, "PRIOR") => (FetchDirection::Prior, rest),
+        [first, rest @ ..] if is(first, "FIRST") => (FetchDirection::First, rest),
+        [first, rest @ ..] if is(first, "LAST") => (FetchDirection::Last, rest),
+        [first, rest @ ..] if is(first, "ALL") => (FetchDirection::All, rest),
+        [first, rest @ ..] if is(first, "ABSOLUTE") => {
+            let (limit, rest) = signed_count(rest).ok_or_else(syntax)?;
+            (FetchDirection::Absolute { limit }, rest)
+        }
+        [first, rest @ ..] if is(first, "RELATIVE") => {
+            let (limit, rest) = signed_count(rest).ok_or_else(syntax)?;
+            (FetchDirection::Relative { limit }, rest)
+        }
+        [first, all, rest @ ..] if is(first, "FORWARD") && is(all, "ALL") => {
+            (FetchDirection::ForwardAll, rest)
+        }
+        [first, all, rest @ ..] if is(first, "BACKWARD") && is(all, "ALL") => {
+            (FetchDirection::BackwardAll, rest)
+        }
+        [first, rest @ ..] if is(first, "FORWARD") => match signed_count(rest) {
+            Some((limit, rest)) => (FetchDirection::Forward { limit: Some(limit) }, rest),
+            None => (FetchDirection::Forward { limit: None }, rest),
+        },
+        [first, rest @ ..] if is(first, "BACKWARD") => match signed_count(rest) {
+            Some((limit, rest)) => (FetchDirection::Backward { limit: Some(limit) }, rest),
+            None => (FetchDirection::Backward { limit: None }, rest),
+        },
+        _ => match signed_count(tokens) {
+            Some((limit, rest)) => (FetchDirection::Count { limit }, rest),
+            None => (FetchDirection::Next, tokens),
+        },
+    };
+    let (position, rest) = match rest {
+        [from, rest @ ..] if is(from, "FROM") => (FetchPosition::From, rest),
+        [from, rest @ ..] if is(from, "IN") => (FetchPosition::In, rest),
+        _ => (FetchPosition::From, rest),
+    };
+    let [
+        Token::Word(Word {
+            value, quote_style, ..
+        }),
+    ] = rest
+    else {
+        return Err(syntax());
+    };
+    Ok(Statement::Fetch {
+        name: Ident {
+            value: value.clone(),
+            quote_style: *quote_style,
+            span: Span::empty(),
+        },
+        direction,
+        position,
+        into: None,
+    })
 }
 
 /// Up to `max` rows (all when `None`) of a cursor, read one at a time from
@@ -838,10 +979,78 @@ mod tests {
             Err("42601".to_owned())
         );
         assert_eq!(count("FETCH FORWARD 2.0 FROM c"), Err("42601".to_owned()));
-        assert!(count("FETCH PRIOR FROM c").is_err());
-        assert!(count("FETCH BACKWARD 2 FROM c").is_err());
-        assert!(count("FETCH ABSOLUTE 3 FROM c").is_err());
-        assert!(count("FETCH RELATIVE 2 FROM c").is_err());
+        // Backward: as PostgreSQL answers for a NO SCROLL cursor.
+        for sql in [
+            "FETCH PRIOR FROM c",
+            "FETCH BACKWARD 2 FROM c",
+            "FETCH BACKWARD ALL FROM c",
+        ] {
+            assert_eq!(count(sql), Err("55000".to_owned()), "{sql}");
+        }
+        assert_eq!(count("FETCH BACKWARD 0 FROM c"), Ok(Count::Current));
+        for sql in [
+            "FETCH ABSOLUTE 3 FROM c",
+            "FETCH RELATIVE 2 FROM c",
+            "FETCH FIRST FROM c",
+            "FETCH LAST FROM c",
+        ] {
+            assert_eq!(count(sql), Err("0A000".to_owned()), "{sql}");
+        }
+    }
+
+    /// The `FETCH` the SQL parser does not read, as read here: its cursor
+    /// and its count.
+    fn unparsed_fetch(sql: &str) -> Result<(String, Result<Count, String>), String> {
+        assert!(
+            Parser::parse_sql(&PostgreSqlDialect {}, sql).is_err(),
+            "{sql} parses"
+        );
+        match unparsed(sql, &"parse error").expect(sql).map_err(code)? {
+            Statement::Fetch { name, direction, .. } => {
+                Ok((name.value, fetch_count(&direction).map_err(code)))
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetches_the_parser_does_not_read() {
+        let backward = || Err("55000".to_owned());
+        for (sql, name, count) in [
+            ("FETCH -1 FROM c", "c", backward()),
+            ("fetch -3 in c;", "c", backward()),
+            ("FETCH FORWARD -1 FROM c", "c", backward()),
+            ("FETCH RELATIVE -1 c", "c", backward()),
+            ("FETCH BACKWARD FROM c", "c", backward()),
+            ("FETCH BACKWARD -2 FROM c", "c", Ok(Count::Rows(2))),
+            ("FETCH FROM c", "c", Ok(Count::Rows(1))),
+            ("FETCH c", "c", Ok(Count::Rows(1))),
+            ("FETCH NEXT c", "c", Ok(Count::Rows(1))),
+            (
+                "FETCH FORWARD FROM \"My Cursor\"",
+                "My Cursor",
+                Ok(Count::Rows(1)),
+            ),
+            ("FETCH +2 c", "c", Ok(Count::Rows(2))),
+            ("FETCH 2 c", "c", Ok(Count::Rows(2))),
+            ("FETCH ALL c", "c", Ok(Count::All)),
+        ] {
+            assert_eq!(unparsed_fetch(sql), Ok((name.to_owned(), count)), "{sql}");
+        }
+        for sql in [
+            "FETCH 1 FROM",
+            "FETCH -x FROM c",
+            "FETCH 1 FROM a b",
+            "FETCH ABSOLUTE FROM c",
+        ] {
+            assert_eq!(unparsed_fetch(sql), Err("42601".to_owned()), "{sql}");
+        }
+        let refused =
+            |sql: &str| unparsed(sql, &"parse error").map(|outcome| outcome.map(|_| ()).map_err(code));
+        assert_eq!(refused("MOVE 1 IN c"), Some(Err("0A000".to_owned())));
+        assert_eq!(refused("BEGIN; FETCH -1 FROM c"), Some(Err("42601".to_owned())));
+        assert_eq!(refused("SELEC 1"), None);
+        assert_eq!(refused("SELECT 'FETCH' FROM ("), None);
     }
 
     /// A cursor `c` over rows `1..=rows`, declared in a transaction block.

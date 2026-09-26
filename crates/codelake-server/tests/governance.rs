@@ -1393,6 +1393,24 @@ fn cursor_script() -> Vec<(String, Want)> {
         ("FETCH 1 FROM n".into(), Rows(vec![1])),
         ("FETCH 0 FROM n".into(), Code("55000")),
         ("ROLLBACK".into(), none()),
+        // What the SQL parser does not read, as PostgreSQL reads it, and at
+        // once: the cursor holds the user's only slot.
+        (format!("BEGIN; {}", declare("p", "NO SCROLL CURSOR")), none()),
+        ("FETCH FROM p".into(), Rows(vec![1])),
+        ("FETCH p".into(), Rows(vec![2])),
+        ("FETCH NEXT p".into(), Rows(vec![3])),
+        ("FETCH FORWARD FROM p".into(), Rows(vec![4])),
+        ("FETCH 2 p".into(), Rows(vec![5, 6])),
+        ("FETCH BACKWARD -2 FROM p".into(), Rows(vec![7, 8])),
+        ("FETCH -1 FROM p".into(), Code("55000")),
+        ("ROLLBACK".into(), none()),
+        (format!("BEGIN; {}", declare("q", "NO SCROLL CURSOR")), none()),
+        ("FETCH FORWARD -1 FROM q".into(), Code("55000")),
+        ("ROLLBACK".into(), none()),
+        (format!("BEGIN; {}", declare("q", "NO SCROLL CURSOR")), none()),
+        ("FETCH 1 FROM q".into(), Rows(vec![1])),
+        ("FETCH BACKWARD 0 FROM q".into(), Code("55000")),
+        ("ROLLBACK".into(), none()),
         // A count that is not a whole number.
         (format!("BEGIN; {}", declare("i", "CURSOR")), none()),
         ("FETCH 1.5 FROM i".into(), Code("42601")),
@@ -1453,8 +1471,14 @@ async fn cursors_answer_like_postgresql() {
     for (sql, want) in cursor_script() {
         let want = want.seen();
         assert_eq!(seen(&postgres, &sql).await, want, "PostgreSQL: {sql}");
-        assert_eq!(seen(&engine, &sql).await, want, "engine: {sql}");
+        // Well before the queue's timeout (60 s): no step waits for a slot.
+        let answered = tokio::time::timeout(Duration::from_secs(20), seen(&engine, &sql))
+            .await
+            .unwrap_or_else(|_| panic!("engine: {sql} did not answer at once"));
+        assert_eq!(answered, want, "engine: {sql}");
     }
+    // MOVE is not supported: refused at once, not queued.
+    assert_eq!(seen(&engine, "MOVE 1 IN c").await, Err("0A000".to_owned()));
     // On the extended protocol too, a DECLARE needs a transaction block.
     let declare = format!("DECLARE x CURSOR FOR {TEN}");
     for client in [&postgres, &engine] {
