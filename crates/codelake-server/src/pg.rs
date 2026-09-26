@@ -84,8 +84,8 @@ use datafusion_postgres::pgwire::api::results::{
 use datafusion_postgres::pgwire::api::stmt::{QueryParser, StoredStatement};
 use datafusion_postgres::pgwire::api::store::PortalStore;
 use datafusion_postgres::pgwire::api::{
-    ClientInfo, ClientPortalStore, ConnectionManager, ErrorHandler, METADATA_APPLICATION_NAME, METADATA_USER,
-    PgWireServerHandlers, Type,
+    ClientInfo, ClientPortalStore, ConnectionManager, DEFAULT_NAME, ErrorHandler, METADATA_APPLICATION_NAME,
+    METADATA_USER, PgWireServerHandlers, Type,
 };
 use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
@@ -1020,7 +1020,22 @@ impl ExtendedQueryHandler for Governed {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let _executing = self.connections.execute(connection_key(client));
-        execute::execute(self, client, message).await
+        let portal = client
+            .portal_store()
+            .get_portal(message.name.as_deref().unwrap_or(DEFAULT_NAME));
+        execute::execute(self, client, message).await?;
+        if let Some(portal) = portal
+            && !matches!(*portal.state().lock().await, PortalExecutionState::Suspended(_))
+        {
+            let statement = portal
+                .statement
+                .statement
+                .1
+                .as_ref()
+                .map(|(statement, _)| statement);
+            cursor::executed(&*client, statement);
+        }
+        Ok(())
     }
 
     async fn do_describe_statement<C>(

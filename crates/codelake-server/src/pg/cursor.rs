@@ -116,6 +116,10 @@ impl Cursor {
 pub(super) struct Cursors(Mutex<Book>);
 
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "PostgreSQL's transaction flags, each set on its own"
+)]
 struct Book {
     cursors: HashMap<String, Arc<Cursor>>,
     /// In a transaction block (`BEGIN`), as `pgwire` tracks it when a
@@ -128,6 +132,11 @@ struct Book {
     /// `PostgreSQL` runs them in one implicit transaction block, where a
     /// cursor may be declared.
     implicit_block: bool,
+    /// An extended-protocol `Execute` of the transaction completed before
+    /// the one being run, in the same pipeline (`PostgreSQL`'s
+    /// `XACT_FLAGS_PIPELINING`): what cannot run in a transaction block
+    /// cannot run here either.
+    pipelined: bool,
 }
 
 impl Cursors {
@@ -214,6 +223,12 @@ impl Cursors {
                     "DISCARD ALL cannot run inside a transaction block",
                 ));
             }
+            if book.pipelined {
+                return Err(user_error(
+                    "25001",
+                    "DISCARD ALL cannot be executed within a pipeline",
+                ));
+            }
             client.portal_store().clear_portals();
             book.cursors.clear();
             drop(book);
@@ -240,6 +255,7 @@ impl Cursors {
         let commit = commit && !book.aborted;
         book.explicit = false;
         book.aborted = false;
+        book.pipelined = false;
         book.cursors
             .retain(|_, cursor| cursor.hold && (commit || !cursor.pending.load(Ordering::SeqCst)));
         let Some(store) = store else {
@@ -362,6 +378,30 @@ where
 /// An extended-protocol `Execute` starts.
 pub(super) fn begin_execute(client: &(impl ClientInfo + ?Sized)) {
     Cursors::of(client).begin_message(client.transaction_status(), 1);
+}
+
+/// An extended-protocol `Execute` of `statement` completed (its portal not
+/// suspended): as in `PostgreSQL`, the statements after it before the next
+/// `Sync` run in a pipeline, where `DISCARD ALL` fails with `25001`. A
+/// transaction statement or a `DISCARD ALL` ends the transaction it ran in
+/// instead (`PostgreSQL` commits it at once).
+pub(super) fn executed(client: &(impl ClientInfo + ?Sized), statement: Option<&Statement>) {
+    let ends = matches!(
+        statement,
+        Some(
+            Statement::StartTransaction { .. }
+                | Statement::Commit { .. }
+                | Statement::Rollback { .. }
+                | Statement::Savepoint { .. }
+                | Statement::ReleaseSavepoint { .. }
+                | Statement::Discard {
+                    object_type: DiscardObject::ALL
+                }
+        )
+    );
+    if !ends {
+        lock(&Cursors::of(client).0).pipelined = true;
+    }
 }
 
 /// An extended-protocol `Sync`: outside a transaction block it ends the

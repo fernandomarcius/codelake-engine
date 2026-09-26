@@ -1734,6 +1734,8 @@ enum Step {
     /// On the extended protocol with parameters bound as text, the portal
     /// described before it runs (psycopg3's server-side cursors).
     Bound(String, Vec<&'static str>),
+    /// Statements on the extended protocol, one `Sync` after them all.
+    Pipeline(Vec<String>),
 }
 
 /// What a client sees of one step: its command tags, the text of its rows
@@ -1760,6 +1762,14 @@ async fn exchanged(
                         wire.parse("", sql);
                         wire.bind("", 0);
                         wire.execute();
+                        wire.sync()
+                    }
+                    Step::Pipeline(statements) => {
+                        for sql in statements {
+                            wire.parse("", sql);
+                            wire.bind("", 0);
+                            wire.execute();
+                        }
                         wire.sync()
                     }
                     Step::Bound(sql, params) => {
@@ -1868,6 +1878,7 @@ fn extended_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
     .chain(session_scripts())
     .chain(move_scripts())
     .chain(parameter_scripts())
+    .chain(pipeline_scripts())
     .collect()
 }
 
@@ -1992,6 +2003,55 @@ fn parameter_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
             ),
             rows("FETCH 1", &[9]),
             ok("ROLLBACK"),
+        ],
+    )]
+}
+
+/// In a pipeline, after a statement completed, `DISCARD ALL` fails as in a
+/// transaction block; first in the pipeline it runs, closing the cursor the
+/// next statement reads. (Found by the third F6 verification: the `DISCARD
+/// ALL` ran after the `SELECT`.)
+fn pipeline_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
+    use Step::{Pipeline, Simple};
+    let ok = |tag: &str| (vec![tag.to_owned()], Vec::new(), None);
+    let rows = |tag: &str, values: &[i64]| {
+        (
+            vec![tag.to_owned()],
+            values.iter().map(|v| vec![v.to_string()]).collect(),
+            None,
+        )
+    };
+    let declare = |name: &str, how: &str| format!("DECLARE {name} {how} FOR {TEN}");
+    vec![(
+        vec![
+            Simple(declare("z", "CURSOR WITH HOLD")),
+            Pipeline(vec!["SELECT 1".into(), "DISCARD ALL".into()]),
+            Simple("FETCH 1 FROM z".into()),
+            Pipeline(vec!["DISCARD ALL".into(), "FETCH 1 FROM z".into()]),
+            Pipeline(vec!["SELECT 2".into(), "COMMIT".into(), "DISCARD ALL".into()]),
+        ],
+        vec![
+            ok("DECLARE CURSOR"),
+            (
+                vec!["SELECT 1".to_owned()],
+                vec![vec!["1".to_owned()]],
+                Some("25001".to_owned()),
+            ),
+            rows("FETCH 1", &[1]),
+            (
+                vec!["DISCARD ALL".to_owned()],
+                Vec::new(),
+                Some("34000".to_owned()),
+            ),
+            (
+                vec![
+                    "SELECT 1".to_owned(),
+                    "COMMIT".to_owned(),
+                    "DISCARD ALL".to_owned(),
+                ],
+                vec![vec!["2".to_owned()]],
+                None,
+            ),
         ],
     )]
 }
