@@ -265,7 +265,7 @@ impl SqlServerResolver {
                 tracing::warn!(source = %self.source, %schema, %table, %column, "name contains `]`; column not exposed");
                 continue;
             }
-            let Some(arrow) = types::arrow_type(data_type, precision, scale) else {
+            let Some(arrow) = types::arrow_type(data_type, precision, scale, datetime_precision) else {
                 tracing::warn!(
                     source = %self.source, %schema, %table, %column, %data_type,
                     "unsupported column type; column not exposed"
