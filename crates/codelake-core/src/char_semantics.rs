@@ -71,8 +71,13 @@
 //!   a function whose result length it does not know, output together with
 //!   a char value (`CASE WHEN … THEN ch ELSE element_at(t.arr, 1) END`);
 //!   compare it, or cast it to `varchar(n)`, instead;
-//! - a char value searched in an array that is not written out
-//!   (`contains(array_agg(s), ch)`): the element type is not followed;
+//! - a char value searched in, or removed from, an array of text that is
+//!   not written out (`contains(array_agg(s), ch)`), and an array of char
+//!   values not written out compared with, or concatenated to, an array of
+//!   another element type: the element type of an array is followed through
+//!   `ARRAY[…]`, `array_agg`, the elements (`[i]`, `element_at`,
+//!   `array_max`, `array_min`) and the functions that keep them
+//!   (`array_sort`, `array_distinct`, `slice`, …), not through every array;
 //! - an ordering of rows or arrays of char values whose common length is not
 //!   known, and `ANY`/`ALL` of a value holding an aggregate or a subquery.
 
@@ -784,6 +789,52 @@ fn computed_length(name: &str, args: &[Expr], scope: &Scope<'_>) -> Option<Text>
     }
 }
 
+/// Array functions whose result holds some of their first argument's
+/// elements, of its element type.
+fn keeps_elements(name: &str) -> bool {
+    matches!(
+        name,
+        "array_distinct" | "array_sort" | "reverse" | "slice" | "shuffle" | "trim_array" | "array_remove"
+    )
+}
+
+/// Array functions that answer one of their array's elements.
+fn picks_an_element(name: &str) -> bool {
+    matches!(
+        name,
+        "element_at" | crate::trino_functions::SUBSCRIPT | "array_max" | "array_min"
+    )
+}
+
+/// Whether `expr` is an array of text.
+fn is_text_array(expr: &Expr, scope: &Scope<'_>) -> bool {
+    matches!(
+        expr.get_type(scope.schema.as_ref()),
+        Ok(DataType::List(field) | DataType::LargeList(field)) if is_text(field.data_type())
+    )
+}
+
+/// The element types of the arrays (and elements) `args` concatenate: an
+/// array written out gives its elements', an array of `char(n)` values
+/// `char(n)`, an element its own; `None` for an array whose element type is
+/// not followed.
+fn concatenated_elements(args: &[Expr], scope: &Scope<'_>) -> Vec<Option<Text>> {
+    let mut types = Vec::new();
+    for arg in args {
+        if let Some((true, elements)) = parts(arg) {
+            types.extend(elements.iter().map(|e| infer(e, scope)));
+        } else if is_text_array(arg, scope) {
+            types.push(match infer(arg, scope) {
+                Some(Text::Array(n)) => Some(Text::Char(n)),
+                _ => None,
+            });
+        } else {
+            types.push(infer(arg, scope));
+        }
+    }
+    types
+}
+
 /// Functions whose result is unbounded `varchar`.
 fn unbounded_result(name: &str) -> bool {
     matches!(
@@ -816,8 +867,28 @@ fn function_type(name: &str, args: &[Expr], scope: &Scope<'_>, whole: &Expr) -> 
         return scope.is_text(whole).then_some(text);
     }
     let first = || args.first().and_then(|a| infer(a, scope));
+    if picks_an_element(name)
+        && let Some(Text::Array(n)) = first()
+    {
+        return Some(Text::Char(n));
+    }
+    if keeps_elements(name)
+        && let Some(array @ Text::Array(_)) = first()
+    {
+        return Some(array);
+    }
     match name {
         crate::declared::TRINO_TYPED | crate::declared::TRINO_TRY_TYPED => typed_as(args, scope),
+        "concat" | CONCAT_OPERATOR if is_text_array(whole, scope) => {
+            match common(&concatenated_elements(args, scope)) {
+                Some(Text::Char(n)) => Some(Text::Array(n)),
+                _ => None,
+            }
+        }
+        "repeat" => match first()? {
+            Text::Char(n) => Some(Text::Array(n)),
+            _ => None,
+        },
         CHAR_PAD => args.get(1).and_then(|n| match n {
             Expr::Literal(value, _) => length_argument(Some(value)).ok().map(|n| Text::Char(Some(n))),
             _ => None,
@@ -854,6 +925,15 @@ fn function_type(name: &str, args: &[Expr], scope: &Scope<'_>, whole: &Expr) -> 
             other => Some(other),
         },
         _ if unbounded_result(name) => scope.is_text(whole).then_some(Text::Varchar(Bound::Unbounded)),
+        // An array of text made from an array of char values: char values
+        // of a length not followed.
+        _ if is_text_array(whole, scope)
+            && args
+                .iter()
+                .any(|a| matches!(infer(a, scope), Some(Text::Array(_)))) =>
+        {
+            Some(Text::Array(None))
+        }
         _ => scope.unknown(whole),
     }
 }
@@ -909,6 +989,12 @@ fn infer(expr: &Expr, scope: &Scope<'_>) -> Option<Text> {
         // A cast to text the statement wrote is marked (`crate::declared`):
         // any other is type coercion's, between Arrow's text types.
         Expr::Cast(Cast { expr: inner, field }) | Expr::TryCast(TryCast { expr: inner, field }) => {
+            if let DataType::List(element) | DataType::LargeList(element) = field.data_type() {
+                // Type coercion's cast between arrays of Arrow's text types.
+                return (is_text(element.data_type()) && is_text_array(inner, scope))
+                    .then(|| infer(inner, scope))
+                    .flatten();
+            }
             if !is_text(field.data_type()) {
                 None
             } else if scope.is_text(inner) || matches!(inner.as_ref(), Expr::Literal(v, _) if v.is_null()) {
@@ -1021,6 +1107,9 @@ fn mixes_char_arrays(types: &[Option<Text>]) -> bool {
     let Some(array) = types.iter().flatten().find(|t| matches!(t, Text::Array(_))) else {
         return false;
     };
+    if *array == Text::Array(None) {
+        return true;
+    }
     !types
         .iter()
         .all(|t| matches!(t, Some(Text::Null)) || *t == Some(*array))
@@ -1033,10 +1122,12 @@ fn char_array_refusal(what: &str) -> DataFusionError {
     ))
 }
 
-/// A text literal, and its text.
+/// A text literal, and its text (also inside the cast type coercion puts
+/// around it on a second analysis).
 fn literal_text(expr: &Expr) -> Option<(&ScalarValue, &str)> {
     match expr {
         Expr::Literal(value, _) => Some((value, text_of(value)?)),
+        Expr::Cast(Cast { expr, field }) if is_text(field.data_type()) => literal_text(expr),
         _ => None,
     }
 }
@@ -1186,6 +1277,14 @@ fn search_array(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result<
             (elements, needle_type),
             (Some(Text::Array(Some(n))), Some(Text::Char(Some(m)))) if n == m
         );
+        if let Some(Text::Array(Some(n))) = elements
+            && needle_type.is_some_and(|t| !t.is_char())
+            && let Some(fitted) = fitted_literal(needle, n, true)
+        {
+            let mut args = args;
+            args[1] = fitted;
+            return Ok(Transformed::yes(func.call(args)));
+        }
         let elements_are_char = matches!(elements, Some(Text::Array(_)));
         if !same
             && (needle_type.is_some_and(Text::is_char)
@@ -1282,6 +1381,101 @@ fn compare_parts(
             .reduce(|a, b| if all { a.and(b) } else { a.or(b) })
             .unwrap_or_else(|| boolean(all)),
     ))
+}
+
+/// `x` padded to `length` unless it is `NULL` or already a `char(length)`.
+fn pad_to(x: Expr, t: Option<Text>, length: u32) -> Expr {
+    match t {
+        Some(Text::Null) => x,
+        Some(Text::Char(Some(n))) if n == length => x,
+        _ => pad(x, length),
+    }
+}
+
+/// `array_remove(array, x)` of char values: the elements and `x` in their
+/// common type (`array_remove(ARRAY[ch], 'abcdefg')` is `array(char(7))`),
+/// so an element is removed exactly when it equals `x` as char.
+fn remove_from_array(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
+    let [array, needle] = <[Expr; 2]>::try_from(args).map_err(|_| refusal("array_remove"))?;
+    let needle_type = infer(&needle, scope);
+    if built(&array) == Some(Built::Array) {
+        let (inner, elements) = constructor_args(array);
+        let mut types: Vec<Option<Text>> = elements.iter().map(|e| infer(e, scope)).collect();
+        types.push(needle_type);
+        if !needs_char_coercion(&types) {
+            return Ok(Transformed::no(func.call(vec![inner.call(elements), needle])));
+        }
+        let Some(Text::Char(Some(n))) = common(&types) else {
+            return Err(refusal("array_remove"));
+        };
+        let elements = elements
+            .into_iter()
+            .zip(&types)
+            .map(|(e, t)| pad_to(e, *t, n))
+            .collect();
+        let needle = pad_to(needle, needle_type, n);
+        return Ok(Transformed::yes(func.call(vec![inner.call(elements), needle])));
+    }
+    match (infer(&array, scope), needle_type) {
+        (Some(Text::Array(Some(n))), Some(Text::Char(Some(m)))) if n == m => {
+            Ok(Transformed::no(func.call(vec![array, needle])))
+        }
+        (Some(Text::Array(_)), Some(Text::Null)) => Ok(Transformed::no(func.call(vec![array, needle]))),
+        (Some(Text::Array(Some(n))), _) if fitted_literal(&needle, n, true).is_some() => {
+            let fitted = fitted_literal(&needle, n, true).unwrap_or(needle);
+            Ok(Transformed::yes(func.call(vec![array, fitted])))
+        }
+        (Some(Text::Array(_)), _) | (_, Some(Text::Char(_))) => Err(DataFusionError::NotImplemented(
+            "array_remove: removing a char(n) value from an array that is not written out (ARRAY[...]), or \
+             text from an array of char(n) values, is not supported yet; cast the char values to varchar"
+                .into(),
+        )),
+        _ => Ok(Transformed::no(func.call(vec![array, needle]))),
+    }
+}
+
+/// `||` / `concat` of arrays (and elements) of char values: every element
+/// in their common type (`ARRAY[ch] || ARRAY[v3]` is `array(char(5))`).
+fn concat_arrays(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
+    let types = concatenated_elements(&args, scope);
+    if !types.iter().flatten().any(|t| t.is_char()) {
+        return Ok(Transformed::no(func.call(args)));
+    }
+    let length = match common(&types) {
+        _ if types.contains(&None) => None,
+        Some(Text::Char(Some(n))) => Some(n),
+        _ => None,
+    };
+    let Some(length) = length else {
+        return Err(char_array_refusal("a concatenation"));
+    };
+    let mut changed = false;
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        if built(&arg) == Some(Built::Array) {
+            let (inner, elements) = constructor_args(arg);
+            let elements: Vec<Expr> = elements
+                .into_iter()
+                .map(|e| {
+                    let t = infer(&e, scope);
+                    let padded = pad_to(e, t, length);
+                    changed |= !matches!(t, Some(Text::Null)) && t != Some(Text::Char(Some(length)));
+                    padded
+                })
+                .collect();
+            out.push(inner.call(elements));
+        } else if is_text_array(&arg, scope) {
+            if infer(&arg, scope) != Some(Text::Array(Some(length))) {
+                return Err(char_array_refusal("a concatenation"));
+            }
+            out.push(arg);
+        } else {
+            let t = infer(&arg, scope);
+            changed |= !matches!(t, Some(Text::Null)) && t != Some(Text::Char(Some(length)));
+            out.push(pad_to(arg, t, length));
+        }
+    }
+    Ok(Transformed::new_transformed(func.call(out), changed))
 }
 
 /// `left op right`, with char semantics (see the module documentation).
@@ -1790,7 +1984,11 @@ fn scalar_function(function: ScalarFunction, scope: &Scope<'_>) -> Result<Transf
             args.insert(0, key(value));
             Ok(Transformed::yes(func.call(args)))
         }
+        "concat" | CONCAT_OPERATOR if args.iter().any(|a| is_text_array(a, scope)) => {
+            concat_arrays(&func, args, scope)
+        }
         "concat" | CONCAT_OPERATOR => Ok(concat_args(args, scope)?.update_data(|args| func.call(args))),
+        "array_remove" if args.len() == 2 => remove_from_array(&func, args, scope),
         "make_array" | "array" | "make_list" => {
             Ok(unify_values(args, scope, "ARRAY")?.update_data(|args| func.call(args)))
         }
@@ -2481,6 +2679,94 @@ mod tests {
              ARRAY['x'] IN (ARRAY['x', NULL], ARRAY['y'])",
             &[&["false", "NULL", "false"]],
         ),
+        // Elements of arrays of char values are char values.
+        (
+            "SELECT id, ARRAY[ch, c][2] = 'a', element_at(ARRAY[ch], 1) = 'ab', element_at(ARRAY[ch], 1) IN ('ab', 'zz'), \
+             ARRAY[c][1] BETWEEN 'a' AND 'ab', array_max(ARRAY[ch, c]) = 'ab', array_min(ARRAY[ch, c]), \
+             typeof(ARRAY[ch, c][1]) FROM cht LEFT JOIN c3 USING (id) ORDER BY id",
+            &[
+                &["1", "false", "true", "true", "true", "true", "ab   ", "char(5)"],
+                &["2", "true", "false", "true", "true", "false", "a    ", "char(5)"],
+                &["3", "false", "NULL", "NULL", "false", "NULL", "NULL", "char(5)"],
+                &["4", "NULL", "false", "false", "NULL", "NULL", "NULL", "char(5)"],
+            ],
+        ),
+        (
+            "SELECT id, array_remove(ARRAY[ch, c], 'a'), array_remove(ARRAY[ch], 'abcdefg') FROM cht LEFT JOIN c3 USING (id) ORDER BY id",
+            &[
+                &["1", "[ab   , ab   ]", "[ab     ]"],
+                &["2", "[zz   ]", "[zz     ]"],
+                &["3", "[NULL, zz   ]", "[NULL]"],
+                &["4", "[NULL]", "[a      ]"],
+            ],
+        ),
+        (
+            "SELECT id, ARRAY[ch] || ARRAY[s], ARRAY[ch] || s, s || ARRAY[ch] FROM cht JOIN v3 USING (id) ORDER BY id",
+            &[
+                &["1", "[ab   , ab   ]", "[ab   , ab   ]", "[ab   , ab   ]"],
+                &["2", "[zz   , a    ]", "[zz   , a    ]", "[a    , zz   ]"],
+            ],
+        ),
+        (
+            "SELECT id, concat(ARRAY[ch], ARRAY[c], ARRAY['x']), ARRAY[ch] || ARRAY[c] || ARRAY['x'], ARRAY[c] || ch, \
+             ch || ARRAY[c] FROM cht JOIN c3 USING (id) ORDER BY id",
+            &[
+                &[
+                    "1",
+                    "[ab   , ab   , x    ]",
+                    "[ab   , ab   , x    ]",
+                    "[ab   , ab   ]",
+                    "[ab   , ab   ]",
+                ],
+                &[
+                    "2",
+                    "[zz   , a    , x    ]",
+                    "[zz   , a    , x    ]",
+                    "[a    , zz   ]",
+                    "[zz   , a    ]",
+                ],
+                &[
+                    "3",
+                    "[NULL, zz   , x    ]",
+                    "[NULL, zz   , x    ]",
+                    "NULL",
+                    "NULL",
+                ],
+            ],
+        ),
+        (
+            "SELECT id, coalesce(element_at(ARRAY[c], 1), CAST('x' AS char(7))) FROM c3 ORDER BY id",
+            &[&["1", "ab     "], &["2", "a      "], &["3", "zz     "]],
+        ),
+        (
+            "SELECT id, array_sort(ARRAY[ch, 'a'])[1] = 'a', array_distinct(ARRAY[ch, 'ab']), reverse(ARRAY[ch, 'b'])[1] = 'b', \
+             slice(ARRAY[ch, 'b'], 1, 1)[1] = 'ab' FROM cht ORDER BY id",
+            &[
+                &["1", "true", "[ab   ]", "true", "true"],
+                &["2", "true", "[zz   , ab   ]", "true", "false"],
+                &["3", "true", "[NULL, ab   ]", "true", "NULL"],
+                &["4", "true", "[a    , ab   ]", "true", "false"],
+            ],
+        ),
+        (
+            "SELECT element_at(array_agg(ch ORDER BY id), 1) = 'ab', array_agg(ch ORDER BY id)[4] = 'a', \
+             coalesce(element_at(array_agg(ch ORDER BY id), 4), CAST('x' AS char(7))), \
+             array_agg(ch ORDER BY id)[4] < 'a' || chr(9), array_agg(ch ORDER BY id)[4] > 'a' || chr(9) FROM cht",
+            &[&["true", "true", "a      ", "false", "true"]],
+        ),
+        (
+            "SELECT array_sort(array_agg(ch))[1] = 'a', array_distinct(array_agg(c))[2] = 'a', cardinality(array_agg(ch)), \
+             array_max(array_agg(ch)) = 'zz', array_min(array_agg(c)) = 'a' FROM cht CROSS JOIN c3",
+            &[&["true", "true", "12", "NULL", "true"]],
+        ),
+        (
+            "SELECT contains(array_agg(ch), 'ab'), array_position(array_agg(ch ORDER BY id), 'zz ') FROM cht",
+            &[&["true", "2"]],
+        ),
+        (
+            "SELECT cht.id FROM cht CROSS JOIN (SELECT array_agg(ch) AS a FROM cht) x WHERE contains(x.a, 'ab') ORDER BY 1",
+            &[&["1"], &["2"], &["3"], &["4"]],
+        ),
         // The trims work on the value without its padding.
         (
             "SELECT id, ltrim(ch), length(ltrim(ch)), ltrim(ch) = 'ab' FROM cht ORDER BY id",
@@ -3077,8 +3363,20 @@ mod tests {
                 "comparing a char(n) value with the elements of an array that is not written out",
             ),
             (
-                "SELECT cht.id FROM cht CROSS JOIN (SELECT array_agg(ch) AS a FROM cht) x WHERE contains(x.a, 'ab')",
-                "comparing a char(n) value with the elements of an array that is not written out",
+                "SELECT cht.id FROM cht CROSS JOIN (SELECT array_agg(s) AS a FROM vct) x WHERE array_remove(x.a, ch) = x.a",
+                "removing a char(n) value from an array that is not written out",
+            ),
+            (
+                "SELECT CAST(ARRAY[s] AS array(char(3))) FROM vct",
+                "a cast to an array, map or row of char(3) is not supported yet",
+            ),
+            (
+                "SELECT CAST(ROW(s, 1) AS ROW(a varchar(1), b integer)) FROM vct",
+                "a cast to an array, map or row of varchar(1) is not supported yet",
+            ),
+            (
+                "SELECT count(*) FROM cht CROSS JOIN (SELECT array_agg(ch) AS a FROM cht) x WHERE array_sort(x.a) = ARRAY['ab']",
+                "a comparison of an array of char(n) values with another array is not supported yet",
             ),
             (
                 "SELECT id FROM cht CROSS JOIN (SELECT array_agg(s) AS a FROM vct) x WHERE ARRAY[ch] = x.a",

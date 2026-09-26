@@ -73,7 +73,8 @@ gives char values Trino 431's semantics (every rule below observed on
    `s` `NULL`, `id` 4), and so it is in the engine.
 5. **Values in a common type** are padded to its length: `CASE` branches,
    `coalesce`, `nvl`, `ifnull`, `nvl2`, `greatest`, `least`, the default of
-   `lag`/`lead`, array elements, the columns of `UNION`, `INTERSECT`,
+   `lag`/`lead`, array elements (also of arrays concatenated with `||` or
+   `concat`, and the elements and value of `array_remove`), the columns of `UNION`, `INTERSECT`,
    `EXCEPT`, `VALUES` and the key of a `USING` join (Trino outputs the
    `USING` column in the common type: `char(65536)` against unbounded
    `varchar`, padded to 65536 characters).
@@ -124,10 +125,18 @@ error naming a way around it):
   `to_base64url`, `human_readable_seconds`, `current_timezone`, `version`
   and `||` of text without char values are unbounded `varchar`; a length
   past 2147483646 is unbounded `varchar`;
-- a char value searched in an array not written out, or text in an array
-  of char values (`contains(array_agg(ch), 'ab')`), and an array of char
-  values compared with, or put in a `UNION` with, another array: element
-  types of arrays are followed only for arrays written out (`ARRAY[…]`);
+- a char value searched in, or removed from, an array of text not written
+  out, text other than a literal searched in an array of char values not
+  written out, and an array of char values compared with, concatenated to,
+  or put in a `UNION` with, an array of another element type: the element
+  type of an array is followed through `ARRAY[…]`, `array_agg`, `||` and
+  `concat` of arrays, the functions that keep the elements (`array_sort`,
+  `array_distinct`, `array_remove`, `slice`, `reverse`, …) and those that
+  pick one (`[i]`, `element_at`, `array_max`, `array_min`: a `char(n)`
+  value), not through every array function;
+- a cast to an array, map or row of `char(n)` or `varchar(n)`
+  (`CAST(ARRAY[v] AS array(char(3)))`): Trino pads or cuts each value, the
+  conversion does not;
 - an ordering of rows or arrays of char values whose common length is not
   known, and `ANY`/`ALL` of a value that holds an aggregate or a subquery.
 
