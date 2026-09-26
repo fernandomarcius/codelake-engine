@@ -3110,6 +3110,19 @@ mod tests {
              SELECT ch FROM cht) GROUP BY 1 ORDER BY 1",
             &[&["a  ", "2"], &["ab ", "2"]],
         ),
+        // Only spaces are padding: a trailing tab or line feed is compared.
+        (
+            "SELECT count(*) FROM (VALUES CAST('a' || chr(9) AS char(3))) t(x) JOIN (VALUES 'a') u(y) ON x = y",
+            &[&["0"]],
+        ),
+        (
+            "SELECT x = y, x < y, x > y, x IN (y, 'b') FROM (VALUES (CAST('a' || chr(9) AS char(3)), 'a')) t(x, y)",
+            &[&["false", "true", "false", "false"]],
+        ),
+        (
+            "SELECT x = y, x IN (y, 'b') FROM (VALUES (CAST('a' || chr(10) AS char(3)), 'a' || chr(10) || ' ')) t(x, y)",
+            &[&["true", "true"]],
+        ),
         // The trims work on the value without its padding.
         (
             "SELECT id, ltrim(ch), length(ltrim(ch)), ltrim(ch) = 'ab' FROM cht ORDER BY id",

@@ -675,6 +675,12 @@ mod tests {
         assert_eq!(pad_char("", 2), "  ");
         assert_eq!(pad_char("abcdef", 3), "abc");
         assert_eq!(pad_char("ç", 2), "ç ");
+        // Only spaces are padding: a trailing tab, line feed or ideographic
+        // space is part of the value (Trino 431 reads 'a' || chr(9) as
+        // 'a\t   ' in a char(5) column).
+        assert_eq!(pad_char("a\t", 5), "a\t   ");
+        assert_eq!(pad_char("a\n  ", 3), "a\n ");
+        assert_eq!(pad_char("a\u{3000}", 3), "a\u{3000} ");
     }
 
     #[test]
