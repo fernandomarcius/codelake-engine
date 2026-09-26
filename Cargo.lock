@@ -1110,6 +1110,7 @@ dependencies = [
  "mongodb",
  "mysql_async",
  "object_store",
+ "rustix",
  "secrecy",
  "serde",
  "serde_json",

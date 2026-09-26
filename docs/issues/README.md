@@ -26,7 +26,7 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-014](ISS-014-w1-corrections-by-recommendation.md) | W1 corrections: choices applied by recommendation | behavior | 2026-09-25 | open |
 | [ISS-015](ISS-015-bench-harness-sub-millisecond.md) | Bench harness measures sub-millisecond cases in bursts | measurement | 2026-09-25 | open |
 | [ISS-016](ISS-016-erp-network-shadow-run.md) | Access to the source network authorized for the F8 shadow run | security | 2026-09-25 | open |
-| [ISS-017](ISS-017-create-or-replace-atomic.md) | CREATE OR REPLACE on hive tables, atomic | removed limitation | 2026-09-25 | open |
+| [ISS-017](ISS-017-create-or-replace-atomic.md) | CREATE OR REPLACE on hive tables, atomic | removed limitation | 2026-09-25 | closed |
 | [ISS-018](ISS-018-case-preserving-names.md) | Case-preserving names, case-insensitive resolution | removed limitation | 2026-09-25 | open |
 | [ISS-019](ISS-019-ctas-literal-unbounded-varchar.md) | CTAS of a literal infers unbounded varchar | removed limitation | 2026-09-25 | open |
 | [ISS-020](ISS-020-datasize-iec-units.md) | Data sizes accept MiB/GiB | removed limitation | 2026-09-25 | closed |

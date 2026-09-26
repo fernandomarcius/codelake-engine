@@ -147,11 +147,46 @@ requires where Trino has no equivalent.
   never mix rows (the loser fails), an `ADD COLUMN` is never lost to a
   concurrent `INSERT` or `ADD COLUMN`, an `INSERT` whose metadata update fails
   leaves no file visible, and a failed CTAS removes only its own staging.
-- **`CREATE OR REPLACE TABLE`** is refused as Trino 431's Hive connector
-  refuses it (`NOT_SUPPORTED`, "This connector does not support replacing
-  tables"), whether the name exists or not (owner decision, 2026-09-24: the
-  catalog answers what Trino answers on the same metastore). The existing
-  table and the staging area are untouched.
+- **`CREATE OR REPLACE TABLE`** (and `… AS`) replaces the table atomically
+  (amended 2026-09-26, ISS-017, deliberate divergence, no compatibility
+  mode; it was refused as Trino 431's Hive connector refuses it, "This
+  connector does not support replacing tables"):
+  - the new table (data files, `.trinoSchema`, permissions) is written in
+    the statement's staging directory, like a CTAS; a query that fails, or
+    a process that dies, leaves the old table untouched (the orphan staging
+    is hidden, disk only);
+  - under the table's commit lock, cross-process file lock and metadata
+    lock (those `DROP TABLE` takes), the staging directory and the table
+    directory are **exchanged in one step** (`renameat2(RENAME_EXCHANGE)`,
+    `renamex_np(RENAME_SWAP)` on macOS): every reader, in this process,
+    another node, Trino or the sink, finds the whole old table or the whole
+    new one under the name, never a mix and never nothing. The old table
+    is then in the staging directory and is removed last; a crash before
+    that leaves the new table and a hidden orphan;
+  - a free name is a CTAS (a directory without a table is refused, never
+    deleted: W1-1); a view, or a table of another type than
+    `MANAGED_TABLE` (an `EXTERNAL_TABLE` does not own its data), is
+    refused with nothing changed; a file system or platform that cannot
+    exchange two directories, and object-store warehouses, refuse the
+    statement with the table unchanged;
+  - the new table's metadata carries a `codelake.table_id` parameter. A
+    scan lists files only after checking, under the locks the swap takes,
+    that the table still has the identity it was planned with; an `INSERT`
+    commits its file under the same check; `OPTIMIZE` checks it before its
+    swap. A statement planned against the replaced table fails ("was
+    replaced … run the query again"): it never reads the new table's files
+    with the old table's columns, nor puts rows planned for one into the
+    other. A query that listed the old files just before the swap fails
+    reading them (file not found: loud, never partial), as a query planned
+    before an `OPTIMIZE` swap does (ADR 0009);
+  - evidence: `hive::limits_tests` (replacement and self-reading
+    replacement, free name, view, foreign directory and external table
+    refused, failed query, a crash while writing, a crash before and after
+    the swap with a reopened catalog, statements planned before the swap,
+    readers of two processes racing twelve replacements, two processes
+    replacing at once), `hive_redteam_w1` (`OR REPLACE` racing `OPTIMIZE`
+    on another node; Trino 431 reads the replaced table with the same rows
+    as `CodeLake`).
 - **Stored views are queries.** The SQL of a view is parsed and must be one
   `SELECT`/`WITH`/`VALUES`, when it is created and every time it is read.
 - **Timestamps.** The catalog has Trino's `hive.timestamp-precision`
@@ -197,8 +232,10 @@ A second red-team (`tests/integration/hive_redteam_w1.rs`, after the F9
 its correction and passes after it (2026-09-25).
 
 - **W1-1 `CREATE OR REPLACE` over a foreign directory** deleted it. The
-  statement is refused as Trino 431 refuses it (see above), so nothing is
-  deleted (`w1_or_replace_never_deletes_a_foreign_directory`).
+  statement was then refused as Trino 431 refuses it; since ISS-017 it
+  replaces tables, and a name without a table whose directory exists is
+  still refused, nothing deleted (see above;
+  `w1_or_replace_never_deletes_a_foreign_directory`).
 - **W1-2 NANOSECONDS scans of `INT96` outside 1677–2262** answered another
   instant (the reader's nanoseconds wrap: 1500-06-01 read as 2084-12-18).
   A NANOSECONDS catalog now reads its timestamps exactly

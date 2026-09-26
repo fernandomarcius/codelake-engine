@@ -420,6 +420,7 @@ mod tests {
                 schema: Arc::clone(&schema),
                 columns: columns.clone(),
                 statistics: Arc::new(statistics),
+                table_id: None,
             };
             let state = ctx.state();
             async move {

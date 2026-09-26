@@ -93,6 +93,14 @@ versioning: [SemVer](https://semver.org/).
   fronts' Definition of Done (docs/gates.md).
 
 ### Changed
+- **Breaking:** `CREATE OR REPLACE TABLE [… AS]` on a hive catalog replaces the table instead
+  of failing with "This connector does not support replacing tables" (the reference engine's
+  answer). The new table is written aside and exchanged with the old one's directory in one
+  step: readers see the old or the new table, never a mix or nothing; a failure or a crash
+  before the swap leaves the old table. Views, external tables, directories without a table
+  and warehouses that cannot exchange two directories are refused with nothing changed. A
+  query or `INSERT` planned against the replaced table fails and can be run again
+  (ADR 0007, ISS-017).
 - Session properties and table-procedure arguments of type data size
   (`file_size_threshold`, `target_max_file_size`) accept `KiB MiB GiB TiB PiB`
   besides `kB MB GB TB PB`, all powers of 1024 (`MB` keeps its meaning); the

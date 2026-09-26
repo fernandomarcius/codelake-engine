@@ -25,7 +25,7 @@ mysql = [
 # Not shipped: object_store's S3 client pulls quick-xml 0.39 (RUSTSEC-2026-0194/0195)
 # until the DataFusion train moves to object_store >= 0.14 (ROADMAP F11).
 hive-s3 = ["hive", "object_store/aws"]
-hive = ["dep:object_store", "dep:bytes", "dep:crc32fast", "dep:uuid", "dep:base64", "dep:serde", "dep:serde_json", "dep:futures"]
+hive = ["dep:object_store", "dep:bytes", "dep:crc32fast", "dep:uuid", "dep:base64", "dep:serde", "dep:serde_json", "dep:futures", "dep:rustix"]
 sqlserver = ["dep:tiberius", "dep:bb8", "dep:tokio-util", "dep:futures", "dep:datafusion-federation"]
 mongodb = ["dep:datafusion-table-providers-mongodb"]
 # No `iceberg` feature: the connector is parked in `parked/iceberg.rs`, outside
@@ -50,6 +50,7 @@ uuid = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
 async-trait.workspace = true
 secrecy.workspace = true
 tokio.workspace = true

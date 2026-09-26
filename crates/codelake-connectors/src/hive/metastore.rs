@@ -48,6 +48,11 @@ pub(crate) const VIRTUAL_VIEW: &str = "VIRTUAL_VIEW";
 /// removes only its metadata.
 #[cfg(test)]
 const EXTERNAL_TABLE: &str = "EXTERNAL_TABLE";
+/// Table parameter: the identity of a table `CREATE OR REPLACE` wrote. Two
+/// handles of one name with different identities are different tables, so
+/// a scan or an `INSERT` planned against the table that was replaced never
+/// reads or writes the new one (ISS-017).
+pub(crate) const TABLE_ID: &str = "codelake.table_id";
 pub(crate) const METADATA_FILE: &str = ".trinoSchema";
 const PERMISSIONS_DIR: &str = ".trinoPermissions";
 /// Directory of `CodeLake`'s own files at the warehouse root: locks, staging
@@ -171,6 +176,11 @@ impl TableMetadata {
             column_statistics: BTreeMap::new(),
             extra: BTreeMap::from([("originalStorageFormat".into(), serde_json::json!({}))]),
         }
+    }
+
+    /// The identity [`TABLE_ID`] records, if any.
+    pub(crate) fn table_id(&self) -> Option<&str> {
+        self.parameters.get(TABLE_ID).map(String::as_str)
     }
 
     /// After new data files, the table's statistics no longer describe it.
@@ -307,6 +317,20 @@ async fn remove_local_dir(path: PathBuf) -> std::io::Result<()> {
     })
     .await
     .map_err(std::io::Error::other)?
+}
+
+/// Exchanges the directories `a` and `b` in one step (`renameat2` with
+/// `RENAME_EXCHANGE` on Linux, `renamex_np` with `RENAME_SWAP` on macOS):
+/// any reader sees one or the other under each name, never neither.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn exchange_dirs(a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    renameat_with(CWD, a, CWD, b, RenameFlags::EXCHANGE).map_err(std::io::Error::from)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn exchange_dirs(_: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 /// Directory of `path` (every part but the last).
@@ -810,16 +834,90 @@ impl FileMetastore {
         Ok(())
     }
 
+    /// `CREATE OR REPLACE TABLE`: makes the table staged in `staging` the
+    /// table `schema.table` (ISS-017). The caller holds the table's commit,
+    /// file and metadata locks.
+    ///
+    /// - No table of that name: [`FileMetastore::publish_table`] (a
+    ///   directory without a table is refused, never deleted).
+    /// - A managed table: its directory and the staging directory are
+    ///   exchanged in one step, metadata and data together, so a reader
+    ///   (this engine, another node, the reference engine, the sink) finds
+    ///   the old table or the new one, never a mix and never nothing. The
+    ///   old table is then in `staging`, for the caller to remove. A crash
+    ///   before the exchange leaves the old table; after it, the new one
+    ///   (and the old one in hidden staging).
+    /// - A view, or a table whose data is not its own (`EXTERNAL_TABLE`):
+    ///   refused, nothing changed.
+    ///
+    /// Only a local warehouse on a file system that can exchange two
+    /// directories replaces a table; elsewhere the statement is refused
+    /// with the table unchanged.
+    pub(crate) async fn replace_table(
+        &self,
+        staging: &Staging,
+        schema: &str,
+        table: &str,
+    ) -> MetastoreResult<()> {
+        let Some(existing) = self.table(schema, table).await? else {
+            return self.publish_table(staging, schema, table).await;
+        };
+        if existing.is_view() {
+            return Err(MetastoreError::Conflict(format!(
+                "{schema}.{table} is a view: use CREATE OR REPLACE VIEW, or DROP VIEW first"
+            )));
+        }
+        if existing.table_type != MANAGED_TABLE {
+            return Err(MetastoreError::Conflict(format!(
+                "{schema}.{table} is a table of type {} whose data does not belong to it; \
+                 CREATE OR REPLACE replaces only managed tables (DROP TABLE it first)",
+                existing.table_type
+            )));
+        }
+        let target = self.table_dir(schema, table);
+        let (Some(from), Some(to)) = (self.local_path(&staging.dir), self.local_path(&target)) else {
+            return Err(MetastoreError::Conflict(format!(
+                "CREATE OR REPLACE TABLE {schema}.{table} needs a local warehouse (the table's \
+                 directory is exchanged with the new one in one step); the table is unchanged"
+            )));
+        };
+        tokio::task::spawn_blocking(move || exchange_dirs(&from, &to))
+            .await
+            .map_err(std::io::Error::other)?
+            .map_err(|err| match rustix::io::Errno::from_io_error(&err) {
+                // What a file system answers when it cannot exchange.
+                Some(errno)
+                    if [
+                        rustix::io::Errno::INVAL,
+                        rustix::io::Errno::NOSYS,
+                        rustix::io::Errno::OPNOTSUPP,
+                    ]
+                    .contains(&errno) =>
+                {
+                    MetastoreError::Conflict(format!(
+                        "the warehouse's file system cannot exchange two directories in one step \
+                         ({err}), which CREATE OR REPLACE TABLE {schema}.{table} needs; the table is unchanged"
+                    ))
+                }
+                _ if err.kind() == std::io::ErrorKind::Unsupported => MetastoreError::Conflict(format!(
+                    "this platform cannot exchange two directories in one step, which CREATE OR \
+                     REPLACE TABLE {schema}.{table} needs; the table is unchanged"
+                )),
+                _ => MetastoreError::Io(err),
+            })
+    }
+
     /// Commits the data file `staged` of an `INSERT` into `schema.table` as
     /// `name`: under the table's metadata lock, checks that the table still
     /// exists with the columns the file was written with (an `ADD COLUMN`
-    /// meanwhile only appends), marks its statistics unknown, then renames
-    /// the file into the table directory. The rename is the commit: any
-    /// failure before it leaves no row visible.
+    /// meanwhile only appends) and is the table the statement was planned
+    /// against (`table_id`: not replaced meanwhile), marks its statistics
+    /// unknown, then renames the file into the table directory. The rename is
+    /// the commit: any failure before it leaves no row visible.
     pub(crate) async fn commit_insert(
         &self,
-        schema: &str,
-        table: &str,
+        (schema, table): (&str, &str),
+        table_id: Option<&str>,
         written: &[ColumnMetadata],
         staged: &Path,
         name: &str,
@@ -828,6 +926,11 @@ impl FileMetastore {
         let Some(metadata) = self.table(schema, table).await?.filter(|m| !m.is_view()) else {
             return Err(MetastoreError::NotFound(format!("table {schema}.{table}")));
         };
+        if metadata.table_id() != table_id {
+            return Err(MetastoreError::Conflict(format!(
+                "table {schema}.{table} was replaced while the INSERT ran; nothing was written"
+            )));
+        }
         let same = |a: &ColumnMetadata, b: &ColumnMetadata| {
             a.name.eq_ignore_ascii_case(&b.name) && a.hive_type.eq_ignore_ascii_case(&b.hive_type)
         };

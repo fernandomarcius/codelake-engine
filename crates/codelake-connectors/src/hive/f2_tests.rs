@@ -711,38 +711,6 @@ async fn names_that_are_not_a_directory_of_their_own_are_refused() {
     assert_eq!(lake.ok("SELECT x FROM hive.s.t").await, rows(&[&["1"]]));
 }
 
-/// Trino 431's hive connector does not replace tables (`NOT_SUPPORTED`,
-/// "This connector does not support replacing tables"), whether the name
-/// exists or not; the existing table and the staging area stay untouched.
-#[tokio::test]
-async fn or_replace_is_refused_like_trino_431() {
-    let lake = lake().await;
-    lake.ok("CREATE TABLE hive.s.t AS SELECT CAST(x AS BIGINT) AS x FROM (VALUES (1), (2)) v(x)")
-        .await;
-    for sql in [
-        "CREATE OR REPLACE TABLE hive.s.t AS SELECT x * 10 AS y, 'a' AS z FROM hive.s.t",
-        "CREATE OR REPLACE TABLE hive.s.fresh AS SELECT CAST(1 AS BIGINT) AS a",
-    ] {
-        let err = lake.err(sql).await;
-        assert!(
-            err.contains("This connector does not support replacing tables"),
-            "{sql}: {err}"
-        );
-    }
-    assert_eq!(
-        lake.ok("SELECT x FROM hive.s.t ORDER BY x").await,
-        rows(&[&["1"], &["2"]])
-    );
-    assert_eq!(lake.columns("t"), vec![("x".into(), "bigint".into())]);
-    assert!(lake.err("SELECT a FROM hive.s.fresh").await.contains("fresh"));
-    // Nothing is left behind in staging.
-    let staging = lake.warehouse.path().join(".codelake/staging");
-    let left: Vec<_> = std::fs::read_dir(&staging)
-        .map(|entries| entries.map(|e| e.unwrap().file_name()).collect())
-        .unwrap_or_default();
-    assert!(left.is_empty(), "{left:?}");
-}
-
 // ---------------------------------------------------------------------------
 // Concurrency on tables whose metadata carries statistics (as Trino's do)
 // ---------------------------------------------------------------------------

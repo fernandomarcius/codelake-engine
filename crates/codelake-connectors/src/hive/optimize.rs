@@ -477,15 +477,19 @@ pub(crate) async fn commit(table: &HiveTable, manifest: &Manifest) -> Result<()>
 /// The table still exists and every file to replace is still there, unchanged.
 async fn verify(table: &HiveTable, manifest: &Manifest) -> Result<()> {
     let target = format!("{}.{}", table.schema_name, table.table);
-    let exists = table
+    let current = table
         .metastore
         .table(&table.schema_name, &table.table)
         .await
-        .map_err(external)?
-        .is_some();
-    if !exists {
+        .map_err(external)?;
+    let Some(current) = current else {
         return Err(DataFusionError::Plan(format!(
             "table {target} was dropped while OPTIMIZE ran"
+        )));
+    };
+    if current.is_view() || current.table_id() != table.table_id.as_deref() {
+        return Err(DataFusionError::Plan(format!(
+            "table {target} was replaced while OPTIMIZE ran; nothing was changed, run it again"
         )));
     }
     for removed in &manifest.remove {

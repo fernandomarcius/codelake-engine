@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 
 use codelake_core::config::HiveTimestampPrecision;
 
-use super::metastore::{ColumnMetadata, FileMetastore, MetastoreError, Staging, TableMetadata};
+use super::metastore::{ColumnMetadata, FileMetastore, MetastoreError, Staging, TABLE_ID, TableMetadata};
 use super::optimize::{self, OPTIMIZE, Settings};
 use super::table::{HiveSink, HiveTable, refuse_char_comparisons};
 use super::types::{UNSUPPORTED, arrow_type, char_column, hive_type, stored_type, unsupported};
@@ -672,6 +672,8 @@ fn check_names(schema: &str, table: &str, kind: ObjectKind) -> Result<()> {
 enum Existing {
     Fail,
     Keep,
+    /// `CREATE OR REPLACE` (ISS-017).
+    Replace,
 }
 
 impl HiveCatalog {
@@ -685,6 +687,9 @@ impl HiveCatalog {
         table: &str,
         existing: Existing,
     ) -> Result<bool> {
+        if existing == Existing::Replace {
+            return self.swap_in(staging, schema, table).await.map(|()| true);
+        }
         let _metadata = self
             .metastore
             .lock_metadata(schema, table)
@@ -703,11 +708,36 @@ impl HiveCatalog {
         }
     }
 
-    /// `CREATE TABLE [AS]`: rows and metadata are written into a private
-    /// staging directory, then published
-    /// under the table's metadata lock (see `metastore.rs`). A failure at any
-    /// point removes only the staging directory: an existing table, or one
-    /// another statement created meanwhile, is never touched.
+    /// `CREATE OR REPLACE`: the staged table takes the name in one step
+    /// ([`FileMetastore::replace_table`]), under the same locks as
+    /// `DROP TABLE` (no `OPTIMIZE` swap, commit of `INSERT` files, or scan
+    /// listing of this table, in any process, sees it half done).
+    async fn swap_in(&self, staging: &Staging, schema: &str, table: &str) -> Result<()> {
+        let locks = self.metastore.table_locks(schema, table);
+        let _swap = locks.commit.write().await;
+        let _other_processes = self
+            .metastore
+            .table_file_lock(schema, table, true)
+            .await
+            .map_err(metastore_error)?;
+        let _metadata = self
+            .metastore
+            .lock_metadata(schema, table)
+            .await
+            .map_err(metastore_error)?;
+        match self.metastore.replace_table(staging, schema, table).await {
+            Ok(()) => Ok(()),
+            Err(MetastoreError::Conflict(message)) => Err(DataFusionError::Plan(message)),
+            Err(err) => Err(metastore_error(err)),
+        }
+    }
+
+    /// `CREATE [OR REPLACE] TABLE [AS]`: rows and metadata are written into a
+    /// private staging directory, then published (or swapped in, for `OR
+    /// REPLACE`) under the table's locks (see `metastore.rs`). A failure
+    /// before that removes only the staging directory: an existing table, or
+    /// one another statement created meanwhile, is never touched. After a
+    /// replacement the staging directory holds the old table, removed last.
     async fn write_table_as(
         &self,
         (schema, table): (&str, &str),
@@ -725,8 +755,14 @@ impl HiveCatalog {
             .table(schema, table)
             .await
             .map_err(metastore_error)?;
-        match found {
+        match &found {
             Some(_) if if_not_exists => return Ok(0),
+            Some(metadata) if existing == Existing::Replace && metadata.is_view() => {
+                return Err(DataFusionError::Plan(format!(
+                    "{schema}.{table} is a view: use CREATE OR REPLACE VIEW, or DROP VIEW first"
+                )));
+            }
+            Some(_) if existing == Existing::Replace => {}
             Some(_) => {
                 return Err(DataFusionError::Plan(format!(
                     "table {}.{schema}.{table} already exists",
@@ -750,19 +786,26 @@ impl HiveCatalog {
             )));
         }
         // Trino refuses a target directory that exists without a table (left
-        // by another writer); taking it over could mix foreign files in.
-        if self
-            .metastore
-            .table_location_exists(schema, table)
-            .await
-            .map_err(metastore_error)?
+        // by another writer); taking it over could mix foreign files in, and
+        // replacing it would delete them (red-team W1-1).
+        if found.is_none()
+            && self
+                .metastore
+                .table_location_exists(schema, table)
+                .await
+                .map_err(metastore_error)?
         {
             return Err(DataFusionError::Plan(format!(
                 "target directory for table {}.{schema}.{table} already exists",
                 self.name
             )));
         }
-        let metadata = TableMetadata::managed_parquet(owner, columns);
+        let mut metadata = TableMetadata::managed_parquet(owner, columns);
+        if existing == Existing::Replace {
+            metadata
+                .parameters
+                .insert(TABLE_ID.into(), uuid::Uuid::new_v4().simple().to_string());
+        }
         let hive = self.table_provider(schema, table, &metadata)?;
         let staging = self.metastore.staging();
         let committed = async {
@@ -777,7 +820,8 @@ impl HiveCatalog {
             Ok::<_, DataFusionError>(if published { written } else { 0 })
         }
         .await;
-        // Published or not, nothing of this statement stays in staging.
+        // Published or not, nothing of this statement stays in staging
+        // (after a replacement: the old table, no longer visible).
         self.metastore.discard(&staging).await;
         let written = committed?;
         self.refresh().await?;
@@ -813,6 +857,22 @@ impl WritableCatalog for HiveCatalog {
             Existing::Fail
         };
         self.write_table_as((schema, table), existing, owner, rows, context)
+            .await
+    }
+
+    /// `CREATE OR REPLACE TABLE`, which Trino 431's hive connector refuses
+    /// (ISS-017, deliberate divergence): the new table is staged, then its
+    /// directory and the old table's are exchanged in one step (see
+    /// `HiveCatalog::write_table_as` and `FileMetastore::replace_table`).
+    async fn replace_table_as(
+        &self,
+        schema: &str,
+        table: &str,
+        owner: &str,
+        rows: SendableRecordBatchStream,
+        context: Arc<TaskContext>,
+    ) -> Result<u64> {
+        self.write_table_as((schema, table), Existing::Replace, owner, rows, context)
             .await
     }
 

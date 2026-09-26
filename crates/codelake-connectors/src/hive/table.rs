@@ -306,6 +306,10 @@ pub(crate) struct HiveTable {
     pub(crate) columns: Vec<ColumnMetadata>,
     /// Statistics recorded in the metastore when the table was resolved.
     pub(crate) statistics: Arc<MetastoreStatistics>,
+    /// Identity of the table this handle was made for (`None` for tables no
+    /// `CREATE OR REPLACE` wrote): a table of the same name with another
+    /// identity replaced it, and this handle must not read or write it.
+    pub(crate) table_id: Option<String>,
 }
 
 impl HiveTable {
@@ -341,6 +345,7 @@ impl HiveTable {
             schema: Arc::new(Schema::new(fields)),
             columns: metadata.data_columns.clone(),
             statistics: Arc::new(MetastoreStatistics::from_metadata(metadata)),
+            table_id: metadata.table_id().map(str::to_owned),
         })
     }
 
@@ -394,15 +399,25 @@ impl HiveTable {
         // A table dropped (or replaced by a view) since the query resolved it
         // has no files left to list: an error, never an empty result. DROP
         // holds these locks while it removes the metadata and the files.
-        let exists = self
+        let current = self
             .metastore
             .table(&self.schema_name, &self.table)
             .await
             .map_err(external)?
-            .is_some_and(|metadata| !metadata.is_view());
-        if !exists {
+            .filter(|metadata| !metadata.is_view());
+        let Some(current) = current else {
             return Err(DataFusionError::Plan(format!(
                 "table {}.{} does not exist anymore: it was dropped while the query ran",
+                self.schema_name, self.table
+            )));
+        };
+        // Replaced (`CREATE OR REPLACE`, which holds these locks while it
+        // swaps) since the query resolved it: its files belong to another
+        // table, with other columns and rows. An error, never a mix of the
+        // two tables in one query.
+        if current.table_id() != self.table_id.as_deref() {
+            return Err(DataFusionError::Plan(format!(
+                "table {}.{} was replaced (CREATE OR REPLACE) while the query ran; run the query again",
                 self.schema_name, self.table
             )));
         }
@@ -806,8 +821,8 @@ impl DataSink for HiveSink {
                 if rows > 0 {
                     metastore
                         .commit_insert(
-                            &self.table.schema_name,
-                            &self.table.table,
+                            (&self.table.schema_name, &self.table.table),
+                            self.table.table_id.as_deref(),
                             &self.table.columns,
                             &staged,
                             &name,

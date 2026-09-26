@@ -4,11 +4,16 @@
 
 use std::path::Path as FsPath;
 use std::sync::Arc;
+use std::time::Duration;
 
+use codelake_core::config::HiveTimestampPrecision;
 use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::parquet::arrow::ArrowWriter;
+use object_store::path::Path;
 
-use super::f2_tests::{lake, rows};
+use super::f2_tests::{Lake, Rows, engine_over, lake, rows, run_on};
+use super::metastore::{ColumnMetadata, TABLE_ID, TableMetadata};
 
 fn int_batch(name: &str, values: Vec<i64>) -> RecordBatch {
     RecordBatch::try_new(
@@ -126,4 +131,441 @@ async fn renaming_a_view_leaves_nothing_under_the_old_name() {
     lake.ok("CREATE TABLE hive.s.v AS SELECT CAST(3 AS BIGINT) AS a")
         .await;
     assert_eq!(lake.ok("SELECT a FROM hive.s.v").await, rows(&[&["3"]]));
+}
+
+// ---------------------------------------------------------------------------
+// ISS-017: CREATE OR REPLACE TABLE, atomic
+// ---------------------------------------------------------------------------
+
+/// Entries of `dir` (not recursive), sorted; empty when it does not exist.
+fn entries(dir: &FsPath) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+fn staging(lake: &Lake) -> Vec<String> {
+    entries(&lake.warehouse.path().join(".codelake/staging"))
+}
+
+/// Visible data files of a table directory.
+fn data_files(lake: &Lake, table: &str) -> Vec<String> {
+    entries(&lake.dir(table))
+        .into_iter()
+        .filter(|name| !name.starts_with(['.', '_']))
+        .collect()
+}
+
+fn triangle(n: i64) -> String {
+    (n * (n + 1) / 2).to_string()
+}
+
+/// Trino 431's hive connector refuses `CREATE OR REPLACE TABLE` ("This
+/// connector does not support replacing tables"). `CodeLake` replaces the
+/// table: the new rows and columns, the old files gone, nothing left in
+/// staging, and the table can read itself while it is replaced.
+#[tokio::test]
+async fn or_replace_replaces_the_table_and_its_files() {
+    let lake = lake().await;
+    lake.ok("CREATE TABLE hive.s.t AS SELECT CAST(x AS BIGINT) AS x FROM (VALUES (1), (2)) v(x)")
+        .await;
+    lake.ok("INSERT INTO hive.s.t VALUES (3)").await;
+    let old_files = data_files(&lake, "t");
+    assert_eq!(old_files.len(), 2);
+
+    let written = lake
+        .ok("CREATE OR REPLACE TABLE hive.s.t AS SELECT x * 10 AS y, 'a' AS z FROM hive.s.t")
+        .await;
+    assert_eq!(written, rows(&[&["3"]]));
+    assert_eq!(
+        lake.ok("SELECT y, z FROM hive.s.t ORDER BY y").await,
+        rows(&[&["10", "a"], &["20", "a"], &["30", "a"]])
+    );
+    assert_eq!(
+        lake.columns("t"),
+        vec![("y".into(), "bigint".into()), ("z".into(), "varchar(1)".into())]
+    );
+    assert!(lake.err("SELECT x FROM hive.s.t").await.contains('x'));
+    let new_files = data_files(&lake, "t");
+    assert_eq!(new_files.len(), 1, "{new_files:?}");
+    assert!(old_files.iter().all(|f| !new_files.contains(f)));
+    assert!(staging(&lake).is_empty(), "{:?}", staging(&lake));
+    // A second replacement, of a table a replacement wrote.
+    lake.ok("CREATE OR REPLACE TABLE hive.s.t AS SELECT CAST(7 AS BIGINT) AS w")
+        .await;
+    assert_eq!(lake.ok("SELECT w FROM hive.s.t").await, rows(&[&["7"]]));
+    assert!(staging(&lake).is_empty());
+    // Every replacement has its own identity.
+    let metadata = lake.metastore().table("s", "t").await.unwrap().unwrap();
+    assert!(metadata.parameters.get(TABLE_ID).is_some_and(|id| id.len() == 32));
+}
+
+/// `CREATE OR REPLACE` of a free name is a `CREATE TABLE`; `CREATE OR
+/// REPLACE TABLE … (columns)` replaces with an empty table.
+#[tokio::test]
+async fn or_replace_of_a_free_name_creates_the_table() {
+    let lake = lake().await;
+    lake.ok("CREATE OR REPLACE TABLE hive.s.fresh AS SELECT CAST(1 AS BIGINT) AS a")
+        .await;
+    assert_eq!(lake.ok("SELECT a FROM hive.s.fresh").await, rows(&[&["1"]]));
+    lake.ok("CREATE OR REPLACE TABLE hive.s.fresh (b varchar(3))")
+        .await;
+    assert_eq!(
+        lake.ok("SELECT count(*) FROM hive.s.fresh").await,
+        rows(&[&["0"]])
+    );
+    assert_eq!(lake.columns("fresh"), vec![("b".into(), "varchar(3)".into())]);
+    assert!(data_files(&lake, "fresh").is_empty());
+    let err = lake
+        .err("CREATE OR REPLACE TABLE IF NOT EXISTS hive.s.fresh AS SELECT 1 AS a")
+        .await;
+    assert!(!err.is_empty());
+}
+
+/// What `CREATE OR REPLACE` never takes: a view (the view stays), a
+/// directory without a table (its files stay: red-team W1-1), a table whose
+/// data is not its own (`EXTERNAL_TABLE`: its data and metadata stay).
+#[tokio::test]
+async fn or_replace_never_takes_a_view_a_foreign_directory_or_external_data() {
+    let lake = lake().await;
+    lake.ok("CREATE VIEW hive.s.v AS SELECT 1 AS a").await;
+    let err = lake
+        .err("CREATE OR REPLACE TABLE hive.s.v AS SELECT CAST(2 AS BIGINT) AS a")
+        .await;
+    assert!(err.contains("is a view"), "{err}");
+    assert_eq!(lake.ok("SELECT a FROM hive.s.v").await, rows(&[&["1"]]));
+
+    std::fs::create_dir_all(lake.dir("foreign")).unwrap();
+    lake.put_file("foreign", "part-00000.parquet", &int_batch("v", vec![42]));
+    let foreign = snapshot(&lake.dir("foreign"));
+    let err = lake
+        .err("CREATE OR REPLACE TABLE hive.s.foreign AS SELECT CAST(1 AS BIGINT) AS v")
+        .await;
+    assert!(err.contains("already exists"), "{err}");
+    assert_eq!(snapshot(&lake.dir("foreign")), foreign);
+
+    lake.ok("CREATE TABLE hive.s.ext AS SELECT CAST(5 AS BIGINT) AS v")
+        .await;
+    let elsewhere = tempfile::tempdir().unwrap();
+    let data = std::fs::File::create(elsewhere.path().join("data")).unwrap();
+    let mut writer = ArrowWriter::try_new(data, int_batch("v", vec![9]).schema(), None).unwrap();
+    writer.write(&int_batch("v", vec![9])).unwrap();
+    writer.close().unwrap();
+    let metastore = lake.metastore();
+    let mut external = metastore.table("s", "ext").await.unwrap().unwrap();
+    external.table_type = "EXTERNAL_TABLE".into();
+    external.external_location = Some(format!("file:{}", elsewhere.path().display()));
+    metastore.write_table("s", "ext", &external).await.unwrap();
+    let before = (snapshot(&lake.dir("ext")), snapshot(elsewhere.path()));
+    let err = lake
+        .err("CREATE OR REPLACE TABLE hive.s.ext AS SELECT CAST(1 AS BIGINT) AS v")
+        .await;
+    assert!(err.contains("replaces only managed tables"), "{err}");
+    assert_eq!((snapshot(&lake.dir("ext")), snapshot(elsewhere.path())), before);
+    assert!(staging(&lake).is_empty());
+}
+
+/// A replacement whose query fails leaves the old table, rows and files.
+#[tokio::test]
+async fn a_failed_or_replace_keeps_the_old_table() {
+    let lake = lake().await;
+    lake.ok("CREATE TABLE hive.s.t AS SELECT CAST(x AS BIGINT) AS x FROM (VALUES (7), (8)) v(x)")
+        .await;
+    let before = snapshot(&lake.dir("t"));
+    let err = lake
+        .err("CREATE OR REPLACE TABLE hive.s.t AS SELECT 1 / (x - x) AS y FROM hive.s.t")
+        .await;
+    assert!(err.to_lowercase().contains("divi"), "{err}");
+    assert_eq!(snapshot(&lake.dir("t")), before);
+    assert_eq!(
+        lake.ok("SELECT x FROM hive.s.t ORDER BY x").await,
+        rows(&[&["7"], &["8"]])
+    );
+    assert!(staging(&lake).is_empty());
+}
+
+/// A process that dies while the new table is being written (the
+/// statement's future dropped mid-write, before any cleanup) leaves the old
+/// table as it was; what it wrote stays hidden in staging, and the next
+/// replacement works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_while_writing_the_new_table_keeps_the_old_one() {
+    let lake = Arc::new(lake().await);
+    lake.ok("CREATE TABLE hive.s.t AS SELECT CAST(value AS BIGINT) AS v FROM generate_series(1, 10)")
+        .await;
+    let before = snapshot(&lake.dir("t"));
+    let writer = Arc::clone(&lake);
+    let replace = tokio::spawn(async move {
+        writer
+            .run(
+                "CREATE OR REPLACE TABLE hive.s.t AS SELECT CAST(value AS BIGINT) AS v, \
+                 rpad(CAST(value AS varchar), 200, 'x') AS pad FROM generate_series(1, 200000000)",
+            )
+            .await
+    });
+    // Until the new table has started to land in staging.
+    let started = async {
+        loop {
+            if replace.is_finished() {
+                return false;
+            }
+            let written = staging(&lake)
+                .into_iter()
+                .any(|id| !entries(&lake.warehouse.path().join(".codelake/staging").join(id)).is_empty());
+            if written {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let started = tokio::time::timeout(Duration::from_secs(60), started)
+        .await
+        .expect("the replacement never started writing");
+    assert!(
+        started,
+        "the replacement ended before the crash: {:?}",
+        replace.await
+    );
+    replace.abort();
+    assert!(replace.await.unwrap_err().is_cancelled());
+
+    assert_eq!(snapshot(&lake.dir("t")), before);
+    assert_eq!(
+        lake.ok("SELECT count(*), sum(v) FROM hive.s.t").await,
+        rows(&[&["10", "55"]])
+    );
+    assert!(!staging(&lake).is_empty(), "the crash leaves its staging");
+    lake.ok("CREATE OR REPLACE TABLE hive.s.t AS SELECT CAST(3 AS BIGINT) AS v")
+        .await;
+    assert_eq!(lake.ok("SELECT v FROM hive.s.t").await, rows(&[&["3"]]));
+}
+
+/// Stages the table `v` = `values` in a new staging directory, as a
+/// replacement does before its swap.
+async fn staged_table(lake: &Lake, values: Vec<i64>) -> super::metastore::Staging {
+    let metastore = lake.metastore();
+    let staging = metastore.staging();
+    let dir = lake.warehouse.path().join(staging.dir.as_ref());
+    std::fs::create_dir_all(&dir).unwrap();
+    let batch = int_batch("v", values);
+    let file = std::fs::File::create(dir.join("20260926_000000_00000_codelake_staged")).unwrap();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let mut metadata = TableMetadata::managed_parquet(
+        "codelake",
+        vec![ColumnMetadata {
+            name: "v".into(),
+            hive_type: "bigint".into(),
+            comment: None,
+            properties: std::collections::BTreeMap::new(),
+            extra: std::collections::BTreeMap::new(),
+        }],
+    );
+    metadata.parameters.insert(TABLE_ID.into(), "staged".into());
+    metastore
+        .stage_table(&staging, &metadata, "codelake")
+        .await
+        .unwrap();
+    staging
+}
+
+/// A new process over the same warehouse (catalog opened again).
+async fn reopened(lake: &Lake, sql: &str) -> Result<Rows, String> {
+    let spill = tempfile::tempdir().unwrap();
+    let engine = engine_over(
+        lake.warehouse.path(),
+        spill.path(),
+        HiveTimestampPrecision::Milliseconds,
+    )
+    .await;
+    run_on(&engine, sql).await
+}
+
+/// The crash points around the swap: staged but not swapped (the old table,
+/// here and after a restart), swapped but not cleaned up (the new table,
+/// here and after a restart; the old one only in hidden staging).
+#[tokio::test]
+async fn a_crash_around_the_swap_leaves_the_old_or_the_new_table() {
+    let lake = lake().await;
+    lake.ok("CREATE TABLE hive.s.t AS SELECT CAST(x AS BIGINT) AS v FROM (VALUES (1), (2)) v(x)")
+        .await;
+    let old = rows(&[&["2", "3"]]);
+    let query = "SELECT count(*), sum(v) FROM hive.s.t";
+
+    let staged = staged_table(&lake, vec![10, 20, 30]).await;
+    assert_eq!(lake.ok(query).await, old, "staged, not swapped");
+    assert_eq!(reopened(&lake, query).await, Ok(old.clone()));
+
+    lake.metastore().replace_table(&staged, "s", "t").await.unwrap();
+    let new = rows(&[&["3", "60"]]);
+    assert_eq!(lake.ok(query).await, new, "swapped, not cleaned up");
+    assert_eq!(reopened(&lake, query).await, Ok(new.clone()));
+    let hidden = lake.warehouse.path().join(staged.dir.as_ref());
+    assert!(
+        hidden.join(".trinoSchema").exists(),
+        "the old table waits in staging"
+    );
+    assert_eq!(
+        lake.ok("SELECT table_name FROM hive.information_schema.tables WHERE table_schema = 's'")
+            .await,
+        rows(&[&["t"]])
+    );
+    lake.metastore().discard(&staged).await;
+    assert_eq!(lake.ok(query).await, new);
+    assert!(!hidden.exists());
+}
+
+/// A query or an `INSERT` planned against the table that a replacement then
+/// swapped out fails; it never reads or writes the new table.
+#[tokio::test]
+async fn statements_planned_before_a_replace_never_touch_the_new_table() {
+    let lake = lake().await;
+    lake.ok("CREATE TABLE hive.s.t AS SELECT CAST(value AS BIGINT) AS v FROM generate_series(1, 10)")
+        .await;
+    let select = lake
+        .engine
+        .sql("SELECT count(*), sum(v) FROM hive.s.t")
+        .await
+        .unwrap();
+    let insert = lake.engine.sql("INSERT INTO hive.s.t VALUES (99)").await.unwrap();
+    lake.ok("CREATE OR REPLACE TABLE hive.s.t AS SELECT CAST(5 AS BIGINT) AS v")
+        .await;
+    let err = select.collect().await.unwrap_err().to_string();
+    assert!(err.contains("was replaced"), "{err}");
+    let err = insert.collect().await.unwrap_err().to_string();
+    assert!(err.contains("was replaced while the INSERT ran"), "{err}");
+    assert_eq!(lake.ok("SELECT v FROM hive.s.t").await, rows(&[&["5"]]));
+    // Planned after the replacement: the new table.
+    lake.ok("INSERT INTO hive.s.t VALUES (6)").await;
+    assert_eq!(
+        lake.ok("SELECT v FROM hive.s.t ORDER BY v").await,
+        rows(&[&["5"], &["6"]])
+    );
+}
+
+/// Readers in this process and in another one, racing replacements of the
+/// table by tables of other sizes: every answer is the count and sum of one
+/// whole version, never a mix and never an empty table. A reader that
+/// listed the old files just before a swap fails loudly (the file is gone).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn readers_racing_or_replace_see_the_old_or_the_new_table() {
+    let lake = Arc::new(lake().await);
+    let versions: Vec<i64> = (1..=12).map(|k| 1_000 * k).collect();
+    lake.ok(&format!(
+        "CREATE TABLE hive.s.t AS SELECT CAST(value AS BIGINT) AS v FROM generate_series(1, {})",
+        versions[0]
+    ))
+    .await;
+    let valid: Vec<Rows> = versions
+        .iter()
+        .map(|n| vec![vec![n.to_string(), triangle(*n)]])
+        .collect();
+    let spill = tempfile::tempdir().unwrap();
+    let other = Arc::new(
+        engine_over(
+            lake.warehouse.path(),
+            spill.path(),
+            HiveTimestampPrecision::Milliseconds,
+        )
+        .await,
+    );
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut readers = Vec::new();
+    for reader in 0..4 {
+        let (lake, other, done) = (Arc::clone(&lake), Arc::clone(&other), Arc::clone(&done));
+        readers.push(tokio::spawn(async move {
+            let mut answers = Vec::new();
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                let sql = "SELECT count(*), CAST(sum(v) AS varchar) FROM hive.s.t";
+                let answer = if reader % 2 == 0 {
+                    lake.run(sql).await
+                } else {
+                    run_on(&other, sql).await
+                };
+                answers.push(answer);
+            }
+            answers
+        }));
+    }
+    for n in &versions[1..] {
+        lake.ok(&format!(
+            "CREATE OR REPLACE TABLE hive.s.t AS SELECT CAST(value AS BIGINT) AS v \
+             FROM generate_series(1, {n})"
+        ))
+        .await;
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut ok = 0;
+    for reader in readers {
+        for answer in reader.await.unwrap() {
+            match answer {
+                Ok(rows) => {
+                    assert!(valid.contains(&rows), "a mix of versions: {rows:?}");
+                    ok += 1;
+                }
+                Err(err) => assert!(
+                    err.contains("was replaced") || err.contains("not found") || err.contains("No such file"),
+                    "unexpected failure: {err}"
+                ),
+            }
+        }
+    }
+    assert!(ok > 0);
+    assert_eq!(
+        lake.ok("SELECT count(*) FROM hive.s.t").await,
+        rows(&[&[&versions[versions.len() - 1].to_string()]])
+    );
+    assert!(staging(&lake).is_empty(), "{:?}", staging(&lake));
+}
+
+/// Two replacements of one table from two processes at once: the table is
+/// one of them, whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_replacements_leave_one_whole_table() {
+    let lake = lake().await;
+    lake.ok("CREATE TABLE hive.s.t AS SELECT CAST(0 AS BIGINT) AS v")
+        .await;
+    let spill = tempfile::tempdir().unwrap();
+    let other = engine_over(
+        lake.warehouse.path(),
+        spill.path(),
+        HiveTimestampPrecision::Milliseconds,
+    )
+    .await;
+    for round in 0..5 {
+        let (a, b) = tokio::join!(
+            lake.run("CREATE OR REPLACE TABLE hive.s.t AS SELECT CAST(value AS BIGINT) AS v FROM generate_series(1, 3000)"),
+            run_on(
+                &other,
+                "CREATE OR REPLACE TABLE hive.s.t AS SELECT CAST(value AS BIGINT) * 2 AS v FROM generate_series(1, 5000)"
+            ),
+        );
+        a.unwrap();
+        b.unwrap();
+        let got = lake
+            .ok("SELECT count(*), CAST(sum(v) AS varchar) FROM hive.s.t")
+            .await;
+        assert!(
+            got == rows(&[&["3000", &triangle(3000)]])
+                || got == rows(&[&["5000", &(2 * 12_502_500).to_string()]]),
+            "round {round}: {got:?}"
+        );
+        assert_eq!(data_files(&lake, "t").len(), 1);
+    }
+    assert!(staging(&lake).is_empty());
+}
+
+#[test]
+fn staging_paths_are_object_store_paths() {
+    // The helper above joins the staging path onto the warehouse directory.
+    let path = Path::from(".codelake/staging/abc");
+    assert_eq!(path.as_ref(), ".codelake/staging/abc");
 }
