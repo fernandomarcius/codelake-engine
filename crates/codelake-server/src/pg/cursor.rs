@@ -871,6 +871,58 @@ pub(super) fn unparsed(sql: &str, error: &impl std::fmt::Display) -> Option<PgWi
     }
 }
 
+/// `sql` with its `ABORT` statements (`PostgreSQL`'s `ROLLBACK`, which the
+/// SQL parser does not read) written as `ROLLBACK`, so they end their
+/// transaction as it does; `None` when it has none.
+pub(super) fn abort_as_rollback(sql: &str) -> Option<String> {
+    if !sql.to_ascii_uppercase().contains("ABORT") {
+        return None;
+    }
+    let tokens = Tokenizer::new(&PostgreSqlDialect {}, sql)
+        .tokenize_with_location()
+        .ok()?;
+    let mut starts = Vec::new();
+    let mut first = true;
+    for token in &tokens {
+        match &token.token {
+            Token::Whitespace(_) => {}
+            Token::SemiColon => first = true,
+            other => {
+                if first && is(other, "ABORT") {
+                    starts.push(offset(sql, token.span.start.line, token.span.start.column)?);
+                }
+                first = false;
+            }
+        }
+    }
+    if starts.is_empty() {
+        return None;
+    }
+    let mut rewritten = sql.to_owned();
+    for start in starts.into_iter().rev() {
+        rewritten.replace_range(start..start + "ABORT".len(), "ROLLBACK");
+    }
+    Some(rewritten)
+}
+
+/// Byte offset in `sql` of the tokenizer's `line` and `column` (from 1, in
+/// characters).
+fn offset(sql: &str, line: u64, column: u64) -> Option<usize> {
+    let (mut at_line, mut at_column) = (1, 1);
+    for (index, character) in sql.char_indices() {
+        if (at_line, at_column) == (line, column) {
+            return Some(index);
+        }
+        if character == '\n' {
+            at_line += 1;
+            at_column = 1;
+        } else {
+            at_column += 1;
+        }
+    }
+    None
+}
+
 /// Whether `token` is the (unquoted) keyword `keyword`.
 fn is(token: &Token, keyword: &str) -> bool {
     matches!(token, Token::Word(word) if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(keyword))
@@ -1229,6 +1281,37 @@ mod tests {
                 Ok((name.value, fetch_count(&direction).map_err(code)))
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn aborts_are_rollbacks() {
+        for (sql, want) in [
+            ("ABORT", Some("ROLLBACK")),
+            ("abort work", Some("ROLLBACK work")),
+            (
+                "  Abort TRANSACTION AND NO CHAIN;",
+                Some("  ROLLBACK TRANSACTION AND NO CHAIN;"),
+            ),
+            (
+                "SELECT 'é abort'; -- ABORT\n\tABORT; SELECT abort FROM t",
+                Some("SELECT 'é abort'; -- ABORT\n\tROLLBACK; SELECT abort FROM t"),
+            ),
+            ("/* é */ ABORT", Some("/* é */ ROLLBACK")),
+            ("SELECT 'ABORT'", None),
+            ("SELECT abort FROM t", None),
+            ("\"abort\"", None),
+            ("ROLLBACK", None),
+        ] {
+            assert_eq!(abort_as_rollback(sql).as_deref(), want, "{sql}");
+        }
+        for sql in ["ABORT", "abort work", "BEGIN; ABORT AND CHAIN"] {
+            let rewritten = abort_as_rollback(sql).unwrap();
+            let statements = parse(&rewritten);
+            assert!(
+                matches!(statements.last(), Some(Statement::Rollback { .. })),
+                "{sql}: {statements:?}"
+            );
         }
     }
 

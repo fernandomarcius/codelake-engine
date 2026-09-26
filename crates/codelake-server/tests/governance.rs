@@ -1200,6 +1200,7 @@ async fn transaction_end_closes_cursors_and_portals() {
     server.wait_ready().await;
     let client = server.connect("tx").await;
     commit_and_rollback_close_cursors(&server, &client).await;
+    statements_run_beside_their_connections_cursor(&server, &client).await;
     cursors_need_a_transaction_block(&server, &client).await;
     held_cursors_outlive_their_commit(&server, &client).await;
     portals_end_with_their_transaction(&server).await;
@@ -1229,6 +1230,85 @@ async fn commit_and_rollback_close_cursors(server: &Server, client: &Client) {
             "{end}: {error:?}"
         );
     }
+}
+
+/// While a cursor or a suspended portal of the connection holds its slot,
+/// the connection's other statements run at once in that slot, as
+/// PostgreSQL runs them, instead of queueing behind it (the user may run one
+/// query): one slot for the connection, every row in order. `ABORT` ends
+/// the transaction as `ROLLBACK` does. (Found by the F6 re-verification: a
+/// `SELECT`, a second `DECLARE`, `ABORT` and a query beside a suspended
+/// portal waited 60 s for the cursor's slot, then failed with 57014.)
+async fn statements_run_beside_their_connections_cursor(server: &Server, client: &Client) {
+    client
+        .batch_execute(&format!("BEGIN; DECLARE a CURSOR FOR {STREAMS_WITH_MEMORY}"))
+        .await
+        .unwrap();
+    assert_eq!(text_rows(client, "FETCH 2 FROM a").await.len(), 2);
+    let at_once = Duration::from_secs(10);
+    let rows = tokio::time::timeout(at_once, text_rows(client, "SELECT 6 * 7"))
+        .await
+        .expect("queued behind its own cursor");
+    assert_eq!(rows, [["42"]]);
+    tokio::time::timeout(
+        at_once,
+        client.batch_execute("DECLARE b CURSOR FOR SELECT value FROM generate_series(1, 10)"),
+    )
+    .await
+    .expect("queued behind its own cursor")
+    .unwrap();
+    assert_eq!(load(server).await, (1, 0), "one slot for the connection");
+    assert_eq!(
+        numbers(&text_rows(client, "FETCH ALL FROM b").await),
+        (1..=10).collect::<Vec<_>>()
+    );
+    assert_eq!(text_rows(client, "FETCH 1 FROM a").await.len(), 1);
+    let held = pool_fills(server).await;
+    tokio::time::timeout(at_once, client.batch_execute("ABORT"))
+        .await
+        .expect("ABORT queued")
+        .unwrap();
+    server.slots_free().await;
+    assert_eq!(
+        server.pool_drains().await,
+        0,
+        "ABORT left reservations (held {held})"
+    );
+    let error = client.simple_query("FETCH 1 FROM a").await.unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::INVALID_CURSOR_NAME), "{error:?}");
+
+    // A query beside a portal suspended by a row limit (JDBC's fetch size).
+    let mut pooled = server.connect("tx").await;
+    let transaction = pooled.transaction().await.unwrap();
+    let portal = transaction
+        .bind("SELECT value FROM generate_series(1, 100)", &[])
+        .await
+        .unwrap();
+    let mut values: Vec<i64> = transaction
+        .query_portal(&portal, 5)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    let beside = tokio::time::timeout(at_once, transaction.query("SELECT CAST(7 AS BIGINT)", &[]))
+        .await
+        .expect("queued behind its own portal")
+        .unwrap();
+    assert_eq!(beside[0].get::<_, i64>(0), 7);
+    assert_eq!(load(server).await, (1, 0), "one slot for the connection");
+    loop {
+        let rows = transaction.query_portal(&portal, 30).await.unwrap();
+        if rows.is_empty() {
+            break;
+        }
+        values.extend(rows.iter().map(|row| row.get::<_, i64>(0)));
+    }
+    assert_eq!(values, (1..=100).collect::<Vec<_>>());
+    drop(portal);
+    transaction.commit().await.unwrap();
+    server.slots_free().await;
+    next_query_runs(server, "tx").await;
 }
 
 /// Without `WITH HOLD`, a cursor needs a transaction block, on both
@@ -1504,6 +1584,29 @@ fn cursor_script() -> Vec<(String, Want)> {
         ),
         ("FETCH 1 FROM r".into(), Code("34000")),
     ]
+    .into_iter()
+    .chain(beside_cursors_script())
+    .collect()
+}
+
+/// The transaction's other statements run beside its open cursors, at
+/// once: the cursor holds the user's only slot. `ABORT` closes them.
+fn beside_cursors_script() -> Vec<(String, Want)> {
+    use Want::{Code, Rows};
+    let none = Want::none;
+    let declare = |name: &str, how: &str| format!("DECLARE {name} {how} FOR {TEN}");
+    vec![
+        (format!("BEGIN; {}", declare("s", "CURSOR")), none()),
+        ("FETCH 1 FROM s".into(), Rows(vec![1])),
+        ("SELECT 42".into(), Rows(vec![42])),
+        (declare("s2", "CURSOR"), none()),
+        ("FETCH 2 FROM s2".into(), Rows(vec![1, 2])),
+        ("SELECT 7; FETCH 1 FROM s".into(), Rows(vec![7, 2])),
+        ("ABORT".into(), none()),
+        ("FETCH 1 FROM s".into(), Code("34000")),
+        (format!("BEGIN; {}; abort work", declare("s", "CURSOR")), none()),
+        ("FETCH 1 FROM s".into(), Code("34000")),
+    ]
 }
 
 /// A step of a wire script: a simple-protocol message, or one statement on
@@ -1624,6 +1727,34 @@ fn extended_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
                 rows("FETCH 1", &[3]),
                 ok("CLOSE CURSOR"),
             ],
+        ),
+        // FETCH … INTO among other statements: the message fails (it waits
+        // for no slot: the cursor holds the user's only one).
+        (
+            vec![
+                Simple(format!("BEGIN; {}", declare("t", "CURSOR"))),
+                Simple("FETCH 1 FROM t INTO x; SELECT 1".into()),
+                Simple("ROLLBACK".into()),
+            ],
+            vec![
+                (
+                    vec!["BEGIN".to_owned(), "DECLARE CURSOR".to_owned()],
+                    Vec::new(),
+                    None,
+                ),
+                failed("42601"),
+                ok("ROLLBACK"),
+            ],
+        ),
+        // ABORT on the extended protocol ends the transaction too.
+        (
+            vec![
+                Extended("BEGIN".into()),
+                Extended(declare("x", "CURSOR")),
+                Extended("ABORT".into()),
+                Extended("FETCH 1 FROM x".into()),
+            ],
+            vec![ok("BEGIN"), ok("DECLARE CURSOR"), ok("ROLLBACK"), failed("34000")],
         ),
     ]
 }

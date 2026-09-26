@@ -27,6 +27,14 @@
 //! closed or its transaction ends (unless `WITH HOLD`), as a portal does;
 //! `FETCH` and `CLOSE` take no slot of their own ([`cursor`]).
 //!
+//! A connection holds one admission slot at most: while a statement of the
+//! connection holds one (an open cursor, a portal suspended by a row limit),
+//! the connection's next governed statements run in it at once — registered,
+//! each with its own deadline — instead of queueing behind it, which with a
+//! per-user limit of one would wait for as long as the cursor stays open.
+//! The connection runs one statement at a time; memory stays bounded by the
+//! pool. The slot is given back when the last of them ends.
+//!
 //! Stopping a statement from outside, which also frees its slot and memory:
 //!
 //! - a cancel request (`psql`'s Ctrl-C, JDBC `Statement.cancel`,
@@ -69,14 +77,15 @@ use datafusion_postgres::pgwire::api::auth::noop::NoopStartupHandler;
 use datafusion_postgres::pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
 use datafusion_postgres::pgwire::api::portal::{Format, Portal, PortalExecutionState};
 use datafusion_postgres::pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use datafusion_postgres::pgwire::api::results::FieldInfo;
 use datafusion_postgres::pgwire::api::results::{
     DescribePortalResponse, DescribeStatementResponse, QueryResponse, Response, SendableRowStream, Tag,
 };
-use datafusion_postgres::pgwire::api::stmt::StoredStatement;
+use datafusion_postgres::pgwire::api::stmt::{QueryParser, StoredStatement};
 use datafusion_postgres::pgwire::api::store::PortalStore;
 use datafusion_postgres::pgwire::api::{
     ClientInfo, ClientPortalStore, ConnectionManager, ErrorHandler, METADATA_APPLICATION_NAME, METADATA_USER,
-    PgWireServerHandlers,
+    PgWireServerHandlers, Type,
 };
 use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
@@ -134,9 +143,14 @@ impl Handlers {
         let connections = Arc::new(Connections::default());
         let mut all: Vec<Arc<dyn QueryHook>> = vec![Arc::new(KillCallHook)];
         all.extend(hooks);
+        let inner = Arc::new(DfSessionService::new_with_hooks(session, all));
+        let parser = Arc::new(Statements {
+            inner: ExtendedQueryHandler::query_parser(&*inner),
+        });
         Self {
             service: Arc::new(Governed {
-                inner: Arc::new(DfSessionService::new_with_hooks(session, all)),
+                inner,
+                parser,
                 engine,
                 connections: Arc::clone(&connections),
             }),
@@ -206,13 +220,19 @@ fn connection_key(client: &(impl ClientInfo + ?Sized)) -> ConnectionKey {
 }
 
 /// The governed statements alive on each connection, so a cancel request
-/// (which names a connection, not a statement) reaches them, and the
-/// connections executing a message, the only ones a cancel request stops.
+/// (which names a connection, not a statement) reaches them, the
+/// connections executing a message, the only ones a cancel request stops,
+/// and the admission slot each connection holds, with its resource group.
 #[derive(Default)]
 struct Connections {
     live: Mutex<HashMap<ConnectionKey, Vec<Weak<QueryRecord>>>>,
     executing: Mutex<HashMap<ConnectionKey, usize>>,
+    slots: Mutex<HashMap<ConnectionKey, HeldSlot>>,
 }
+
+/// A connection's admission slot, while a statement holds it, and the
+/// resource group it was taken in.
+type HeldSlot = (Weak<Permit>, Arc<str>);
 
 /// A connection executing a message, until dropped.
 struct Executing {
@@ -262,6 +282,35 @@ impl Connections {
         }
     }
 
+    /// The admission slot a statement of the connection holds, if any, and
+    /// its resource group.
+    fn slot(&self, key: &ConnectionKey) -> Option<(Arc<Permit>, Arc<str>)> {
+        let mut slots = lock(&self.slots);
+        let held = slots
+            .get(key)
+            .and_then(|(permit, group)| Some((permit.upgrade()?, Arc::clone(group))));
+        if held.is_none() {
+            slots.remove(key);
+        }
+        held
+    }
+
+    /// Forgets the connection's slot once no statement holds it.
+    fn release(&self, key: &ConnectionKey) {
+        let mut slots = lock(&self.slots);
+        if slots
+            .get(key)
+            .is_some_and(|(permit, _)| permit.strong_count() == 0)
+        {
+            slots.remove(key);
+        }
+    }
+
+    /// The connection holds `permit`, taken in `group`.
+    fn hold(&self, key: &ConnectionKey, permit: &Arc<Permit>, group: Arc<str>) {
+        lock(&self.slots).insert(key.clone(), (Arc::downgrade(permit), group));
+    }
+
     fn records(&self, key: &ConnectionKey) -> Vec<Arc<QueryRecord>> {
         lock(&self.live)
             .get(key)
@@ -271,7 +320,7 @@ impl Connections {
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        lock(&self.live).len()
+        lock(&self.live).len() + lock(&self.slots).len()
     }
 }
 
@@ -367,8 +416,41 @@ fn kill_error(error: &KillError) -> PgWireError {
 
 struct Governed {
     inner: Arc<DfSessionService>,
+    parser: Arc<Statements>,
     engine: Arc<Engine>,
     connections: Arc<Connections>,
+}
+
+/// The extended protocol's parser: `datafusion-postgres`'s, reading too
+/// what the SQL parser does not (`ABORT`, [`cursor::abort_as_rollback`]).
+struct Statements {
+    inner: Arc<<DfSessionService as ExtendedQueryHandler>::QueryParser>,
+}
+
+#[async_trait]
+impl QueryParser for Statements {
+    type Statement = DfStatement;
+
+    async fn parse_sql<C>(&self, client: &C, sql: &str, types: &[Option<Type>]) -> PgWireResult<DfStatement>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let rewritten = cursor::abort_as_rollback(sql);
+        let sql = rewritten.as_deref().unwrap_or(sql);
+        self.inner.parse_sql(client, sql, types).await
+    }
+
+    fn get_parameter_types(&self, statement: &DfStatement) -> PgWireResult<Vec<Type>> {
+        self.inner.get_parameter_types(statement)
+    }
+
+    fn get_result_schema(
+        &self,
+        statement: &DfStatement,
+        format: Option<&Format>,
+    ) -> PgWireResult<Vec<FieldInfo>> {
+        self.inner.get_result_schema(statement, format)
+    }
 }
 
 /// Statements the session answers without executing a query. `FETCH` and
@@ -482,7 +564,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// cancel request while it waited), which fails it as canceled.
 struct Execution {
     record: Arc<QueryRecord>,
-    permit: Mutex<Option<Permit>>,
+    /// The connection's slot, shared with its other statements alive.
+    permit: Mutex<Option<Arc<Permit>>>,
     ran: AtomicBool,
     done: Arc<Notify>,
     /// Where cancel requests find the statement.
@@ -500,6 +583,7 @@ impl Drop for Execution {
         }
         self.connections.remove(&self.connection, &self.record);
         lock(&self.permit).take();
+        self.connections.release(&self.connection);
         self.done.notify_one();
     }
 }
@@ -633,7 +717,8 @@ struct Admitted {
 }
 
 impl Governed {
-    /// Registers the statement and waits for its admission slot.
+    /// Registers the statement and waits for its admission slot, unless the
+    /// connection holds one already: the statement then runs in it at once.
     async fn admit(&self, client: &mut (impl ClientInfo + ?Sized), sql: &str) -> PgWireResult<Admitted> {
         let governance = self.engine.governance();
         let user = metadata(client, METADATA_USER).unwrap_or(UNKNOWN_USER);
@@ -654,11 +739,20 @@ impl Governed {
             .metadata_mut()
             .insert(QUERY_ID.to_owned(), record.id().to_owned());
         let limits = governance.limits(statement_timeout(client), None);
-        let ticket = governance.enter(&record).map_err(|e| pg_error(&e.failure()))?;
-        let permit = governance
-            .admit(ticket, &record, &limits)
-            .await
-            .map_err(|e| pg_error(&record.failure().unwrap_or_else(|| e.failure())))?;
+        let permit = if let Some((permit, group)) = self.connections.slot(&execution.connection) {
+            governance.admit_alongside(&record, group);
+            permit
+        } else {
+            let ticket = governance.enter(&record).map_err(|e| pg_error(&e.failure()))?;
+            let permit = governance
+                .admit(ticket, &record, &limits)
+                .await
+                .map_err(|e| pg_error(&record.failure().unwrap_or_else(|| e.failure())))?;
+            let permit = Arc::new(permit);
+            let group = record.snapshot().resource_group;
+            self.connections.hold(&execution.connection, &permit, group);
+            permit
+        };
         *lock(&execution.permit) = Some(permit);
         record.set_state(QueryState::Planning);
         let (deadline, limit) = limits.deadline(&record.snapshot());
@@ -819,6 +913,8 @@ impl SimpleQueryHandler for Governed {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        let rewritten = cursor::abort_as_rollback(query);
+        let query = rewritten.as_deref().unwrap_or(query);
         let statements = Parser::parse_sql(&PostgreSqlDialect {}, query);
         cursor::begin_simple(&*client, statements.as_ref().map_or(1, Vec::len));
         let outcome = match statements {
@@ -885,10 +981,10 @@ impl Governed {
 #[async_trait]
 impl ExtendedQueryHandler for Governed {
     type Statement = DfStatement;
-    type QueryParser = <DfSessionService as ExtendedQueryHandler>::QueryParser;
+    type QueryParser = Statements;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
-        ExtendedQueryHandler::query_parser(&*self.inner)
+        Arc::clone(&self.parser)
     }
 
     /// Outside a transaction block, closes the portals and cursors of the

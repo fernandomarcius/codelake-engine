@@ -248,6 +248,17 @@ impl Governance {
         outcome
     }
 
+    /// Admits `record` at once, without a slot of its own: it runs in a
+    /// running slot an earlier query of the same client still holds, in that
+    /// query's `resource_group` (a PostgreSQL connection's statement while a
+    /// cursor or portal of the connection is open, ADR 0016). The client
+    /// executes one statement at a time, so the slot still bounds what it
+    /// runs at once; memory stays bounded by the pool.
+    pub fn admit_alongside(&self, record: &QueryRecord, resource_group: Arc<str>) {
+        record.set_resource_group(resource_group);
+        record.admitted();
+    }
+
     /// The error for a query whose time `limit` ran out while it executed,
     /// counted in the metrics. The caller records it (with its own detail).
     pub fn time_limit_exceeded(&self, record: &QueryRecord, limit: Duration) -> GovernanceError {
@@ -278,6 +289,24 @@ mod tests {
             },
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn a_query_admitted_alongside_takes_no_slot() {
+        let g = governance(1, 0, 60);
+        let holder = g.register(Protocol::Postgres, "u", None, "DECLARE c CURSOR FOR SELECT 1");
+        let permit = g
+            .admit(g.enter(&holder).unwrap(), &holder, &g.default_limits())
+            .await;
+        let permit = permit.unwrap();
+        let alongside = g.register(Protocol::Postgres, "u", None, "SELECT 2");
+        g.admit_alongside(&alongside, Arc::from("etl"));
+        let info = alongside.snapshot();
+        assert!(info.admitted_at.is_some(), "admitted");
+        assert_eq!(&*info.resource_group, "etl");
+        assert_eq!(g.admission().load(), (1, 0), "no slot of its own");
+        drop(permit);
+        assert_eq!(g.admission().load(), (0, 0));
     }
 
     #[tokio::test]
