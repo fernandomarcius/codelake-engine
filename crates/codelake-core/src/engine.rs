@@ -269,8 +269,10 @@ fn trino_literal(value: &ScalarValue) -> String {
 /// [`crate::federation_guard`] and [`crate::join_guard`]), with
 /// aggregates answered from statistics only over exact sources (see
 /// [`crate::statistics_guard`]), hash joins too large for the pool planned as
-/// sort-merge joins right after `EnforceSorting` ([`crate::join_spill`]), and
-/// followed by
+/// sort-merge joins right after `EnforceSorting` ([`crate::join_spill`]), the
+/// null-safe join guard right before `FilterPushdown(Post)` (it must see the
+/// build and probe sides `JoinSelection` picked; see [`crate::join_guard`]),
+/// and followed by
 /// [`PlainViews`], which keeps string views out of operators that retain rows
 /// (ADR 0003), [`ComputedBatches`], which sizes the batches of computed values
 /// in bytes, the nested loop join spill guard ([`crate::join_guard`]), and
@@ -281,6 +283,7 @@ pub(crate) fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Syn
         vec![Arc::new(FederationFilterGuard), Arc::new(NullAwareAntiJoinGuard)];
     rules.extend(PhysicalOptimizer::new().rules);
     let rules = crate::join_spill::with_sort_merge_oversized_joins(rules);
+    let rules = crate::join_guard::with_null_safe_join_guard(rules);
     let mut rules = guard_aggregate_statistics(rules);
     rules.extend(crate::trino_functions::physical_rules());
     rules.push(Arc::new(PlainViews));
@@ -1724,6 +1727,18 @@ mod tests {
         let guard = names.iter().position(|n| n == "federation_filter_guard").unwrap();
         let pushdown = names.iter().position(|n| n.contains("FilterPushdown")).unwrap();
         assert!(guard < pushdown, "{names:?}");
+    }
+
+    #[test]
+    fn null_safe_join_guard_runs_after_join_selection_right_before_dynamic_filters() {
+        let names: Vec<String> = physical_rules().iter().map(|r| r.name().to_owned()).collect();
+        let guard = names
+            .iter()
+            .position(|n| n == crate::join_guard::NULL_SAFE_JOIN_GUARD)
+            .unwrap();
+        let selection = names.iter().position(|n| n == "join_selection").unwrap();
+        assert!(selection < guard, "{names:?}");
+        assert_eq!(names[guard + 1], "FilterPushdown(Post)", "{names:?}");
     }
 
     #[test]

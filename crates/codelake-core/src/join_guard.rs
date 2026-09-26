@@ -60,6 +60,18 @@
 //!    other `IN (subquery)` whose value or subquery column may be NULL
 //!    (`NOT_SUPPORTED`), before decorrelation; `NOT EXISTS` and a conjunct
 //!    `NOT IN` keep answering.
+//! 6. **Null-safe joins keep the NULL keys of their probe side.** A hash join
+//!    whose keys match NULL with NULL (`JOIN … ON a IS NOT DISTINCT FROM b`,
+//!    `[NOT] EXISTS (… WHERE a IS NOT DISTINCT FROM b)`, `INTERSECT`,
+//!    `EXCEPT`) pushes the same dynamic filter as any other (bounds or `IN`
+//!    of the build side's non-NULL keys) into the scan of its probe side,
+//!    which drops the rows with a NULL key and prunes the row groups that
+//!    hold only NULLs (what an `INSERT` of a NULL row leaves): `t EXCEPT t`
+//!    returned the NULL row, `t INTERSECT t` lost it (`DataFusion` 54.1).
+//!    [`NullSafeJoinGuard`], right before the dynamic filters are pushed,
+//!    puts a [`NullKeysKept`] above the probe side of every such join; it
+//!    adds `OR key IS NULL` for every key to each dynamic filter going
+//!    through it. The join still compares the keys itself.
 //!
 //! Remove a guard only when a `DataFusion` release carries the upstream fix
 //! **and** the matching test of
@@ -72,7 +84,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, DFSchema, ScalarValue};
+use datafusion::common::{Column, DFSchema, NullEquality, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
@@ -85,7 +97,12 @@ use datafusion::logical_expr::{
 };
 use datafusion::optimizer::extract_equijoin_predicate::ExtractEquijoinPredicate;
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{BinaryExpr, DynamicFilterPhysicalExpr, IsNullExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::filter_pushdown::{
+    ChildFilterDescription, FilterDescription, FilterPushdownPhase,
+};
 use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec};
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
@@ -799,6 +816,171 @@ impl OptimizerRule for UnknownMembershipGuard {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 6. Null-safe joins keep the NULL keys of their probe side.
+// ---------------------------------------------------------------------------
+
+/// Name of [`NullSafeJoinGuard`].
+pub const NULL_SAFE_JOIN_GUARD: &str = "codelake_null_safe_join_guard";
+
+/// Name of the physical rule [`NullSafeJoinGuard`] runs right before: the
+/// pushdown of the joins' dynamic filters.
+const FILTER_PUSHDOWN_POST: &str = "FilterPushdown(Post)";
+
+/// A hash join whose keys match NULL with NULL (`IS NOT DISTINCT FROM`,
+/// `INTERSECT`, `EXCEPT`), other than a null-aware anti join (guarded by
+/// [`NullAwareAntiJoinGuard`]).
+fn null_safe_join(plan: &dyn ExecutionPlan) -> Option<&HashJoinExec> {
+    plan.downcast_ref::<HashJoinExec>()
+        .filter(|join| join.null_equality() == NullEquality::NullEqualsNull && !join.null_aware)
+}
+
+/// Physical rule, right before the pushdown of dynamic filters (after
+/// `JoinSelection` has picked each join's build and probe sides): puts a
+/// [`NullKeysKept`] above the probe side (right input) of every null-safe
+/// hash join.
+#[derive(Debug, Default)]
+pub struct NullSafeJoinGuard;
+
+impl PhysicalOptimizerRule for NullSafeJoinGuard {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        plan.transform_up(|node| {
+            let Some(join) = null_safe_join(node.as_ref()) else {
+                return Ok(Transformed::no(node));
+            };
+            if join.right().is::<NullKeysKept>() {
+                return Ok(Transformed::no(node));
+            }
+            let keys = join.on().iter().map(|(_, right)| Arc::clone(right)).collect();
+            let kept: Arc<dyn ExecutionPlan> = Arc::new(NullKeysKept::new(Arc::clone(join.right()), keys));
+            let children = vec![Arc::clone(join.left()), kept];
+            Ok(Transformed::yes(Arc::clone(&node).with_new_children(children)?))
+        })
+        .data()
+    }
+
+    fn name(&self) -> &'static str {
+        NULL_SAFE_JOIN_GUARD
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+/// `rules` with [`NullSafeJoinGuard`] right before `FilterPushdown(Post)`.
+pub fn with_null_safe_join_guard(
+    rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>>,
+) -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
+    let mut guarded = Vec::with_capacity(rules.len() + 1);
+    for rule in rules {
+        if rule.name() == FILTER_PUSHDOWN_POST {
+            guarded.push(Arc::new(NullSafeJoinGuard) as Arc<dyn PhysicalOptimizerRule + Send + Sync>);
+        }
+        guarded.push(rule);
+    }
+    guarded
+}
+
+/// Transparent node above the probe side of a null-safe join. Every filter
+/// from above goes on to its input with `OR key IS NULL` for each join key
+/// when it holds a dynamic filter (built from the non-NULL keys of the build
+/// side, it would drop the probe rows whose NULL key matches a NULL of the
+/// build side, and the row groups holding only them); other filters go on
+/// as they are. Every filter is reported unsupported, so the operators
+/// above keep evaluating theirs.
+#[derive(Debug)]
+pub struct NullKeysKept {
+    input: Arc<dyn ExecutionPlan>,
+    keys: Vec<Arc<dyn PhysicalExpr>>,
+    properties: Arc<PlanProperties>,
+}
+
+impl NullKeysKept {
+    pub fn new(input: Arc<dyn ExecutionPlan>, keys: Vec<Arc<dyn PhysicalExpr>>) -> Self {
+        let properties = Arc::clone(input.properties());
+        Self {
+            input,
+            keys,
+            properties,
+        }
+    }
+
+    /// `filter`, or `filter OR k1 IS NULL OR …` when it holds a dynamic filter.
+    fn keeping_null_keys(&self, filter: &Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
+        let dynamic = filter
+            .exists(|e| Ok(e.is::<DynamicFilterPhysicalExpr>()))
+            .unwrap_or(true);
+        if !dynamic {
+            return Arc::clone(filter);
+        }
+        self.keys.iter().fold(Arc::clone(filter), |kept, key| {
+            Arc::new(BinaryExpr::new(
+                kept,
+                Operator::Or,
+                Arc::new(IsNullExpr::new(Arc::clone(key))),
+            ))
+        })
+    }
+}
+
+impl DisplayAs for NullKeysKept {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "NullKeysKept")
+    }
+}
+
+impl ExecutionPlan for NullKeysKept {
+    fn name(&self) -> &'static str {
+        "NullKeysKept"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self::new(
+            one_child(self.name(), children)?,
+            self.keys.clone(),
+        )))
+    }
+
+    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
+        self.input.execute(partition, context)
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        let kept = parent_filters.iter().map(|f| self.keeping_null_keys(f)).collect();
+        Ok(FilterDescription::new()
+            .with_child(ChildFilterDescription::all_unsupported(&parent_filters).with_self_filters(kept)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -979,6 +1161,128 @@ mod tests {
             )
             .await
                 > 0,
+            "upstream behaviour changed: see the module documentation before removing the guard"
+        );
+    }
+
+    // -- 6. Dynamic filter of a null-safe join -------------------------------
+
+    /// `t` holds (1, 'a') and (2, 'b') in one file and (3, NULL) in another
+    /// (what an `INSERT` of the NULL row leaves).
+    async fn null_file_table(dir: &std::path::Path) {
+        let writer = SessionContext::new();
+        std::fs::create_dir_all(dir.join("t")).unwrap();
+        for (file, sql) in [
+            (
+                "t/part-0.parquet",
+                "SELECT CAST(id AS BIGINT) AS id, arrow_cast(v, 'Utf8') AS v FROM (VALUES (1, 'a'), (2, 'b')) r(id, v)",
+            ),
+            (
+                "t/part-1.parquet",
+                "SELECT CAST(3 AS BIGINT) AS id, arrow_cast(NULL, 'Utf8') AS v",
+            ),
+        ] {
+            writer
+                .sql(&format!(
+                    "COPY ({sql}) TO '{}' STORED AS PARQUET",
+                    dir.join(file).display()
+                ))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn register_null_file_table(ctx: &SessionContext, dir: &std::path::Path) {
+        ctx.register_parquet(
+            "t",
+            format!("{}/", dir.join("t").display()),
+            ParquetReadOptions::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    const NULL_SAFE_JOIN: &str = "SELECT count(*) FROM t a JOIN t b ON a.v IS NOT DISTINCT FROM b.v";
+
+    /// Trino 431's answers: the NULL row matches itself.
+    const NULL_SAFE_ANSWERS: [(&str, i64); 6] = [
+        (NULL_SAFE_JOIN, 3),
+        ("SELECT count(*) FROM (SELECT * FROM t EXCEPT SELECT * FROM t)", 0),
+        (
+            "SELECT count(*) FROM (SELECT * FROM t INTERSECT SELECT * FROM t)",
+            3,
+        ),
+        (
+            "SELECT count(*) FROM t a WHERE NOT EXISTS (SELECT 1 FROM t b WHERE b.v IS NOT DISTINCT FROM a.v)",
+            0,
+        ),
+        (
+            "SELECT count(*) FROM t a WHERE EXISTS (SELECT 1 FROM t b WHERE b.v IS NOT DISTINCT FROM a.v)",
+            3,
+        ),
+        (
+            "SELECT count(*) FROM t a LEFT JOIN t b ON a.v IS NOT DISTINCT FROM b.v WHERE b.id IS NULL",
+            0,
+        ),
+    ];
+
+    #[tokio::test]
+    async fn null_safe_joins_see_the_null_only_row_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        null_file_table(dir.path()).await;
+        for pushdown in [false, true] {
+            let config = SessionConfig::new()
+                .set_bool("datafusion.execution.parquet.pushdown_filters", pushdown)
+                .with_target_partitions(1);
+            let ctx = session(config, None, true);
+            register_null_file_table(&ctx, dir.path()).await;
+            for (sql, expected) in NULL_SAFE_ANSWERS {
+                assert_eq!(
+                    count(&ctx, sql).await,
+                    expected,
+                    "pushdown_filters = {pushdown}: {sql}"
+                );
+            }
+            let plan = ctx
+                .sql(&format!("EXPLAIN {NULL_SAFE_JOIN}"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let text = datafusion::arrow::util::pretty::pretty_format_batches(&plan)
+                .unwrap()
+                .to_string();
+            assert!(text.contains("NullKeysKept"), "{text}");
+            assert!(
+                text.contains("IS NULL"),
+                "the probe scan keeps its NULL keys: {text}"
+            );
+        }
+    }
+
+    /// Documents that `DataFusion` 54.1 prunes the row group that holds only
+    /// the NULL key of a null-safe join's probe side with the join's dynamic
+    /// filter. When this starts failing, upstream fixed it: run
+    /// `join_regressions` without the guard, then remove it.
+    #[tokio::test]
+    async fn upstream_null_safe_join_still_prunes_null_only_row_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        null_file_table(dir.path()).await;
+        let ctx = session(
+            SessionConfig::new()
+                .set_bool("datafusion.execution.parquet.pushdown_filters", true)
+                .with_target_partitions(1),
+            None,
+            false,
+        );
+        register_null_file_table(&ctx, dir.path()).await;
+        assert_eq!(
+            count(&ctx, NULL_SAFE_JOIN).await,
+            2,
             "upstream behaviour changed: see the module documentation before removing the guard"
         );
     }
