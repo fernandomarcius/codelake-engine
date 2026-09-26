@@ -41,14 +41,17 @@ use datafusion::sql::sqlparser::ast::{
 };
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::tokenizer::{Span, Token, Tokenizer, Word};
+use datafusion_postgres::arrow_pg::datatypes::df::encode_dataframe;
 use datafusion_postgres::hooks::{HookClient, QueryHook};
 use datafusion_postgres::pgwire::api::portal::{Format, Portal, PortalExecutionState};
 use datafusion_postgres::pgwire::api::results::{FieldInfo, QueryResponse, Response, Tag};
+use datafusion_postgres::pgwire::api::stmt::StoredStatement;
 use datafusion_postgres::pgwire::api::store::{MemPortalStore, PortalStore};
 use datafusion_postgres::pgwire::api::{ClientInfo, ClientPortalStore, PgWireConnectionState};
 use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::data::DataRow;
 use datafusion_postgres::pgwire::messages::response::TransactionStatus;
+use datafusion_postgres::pgwire::types::format::FormatOptions;
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -147,14 +150,24 @@ impl Cursors {
         }
     }
 
-    /// Checks the cursors `declares` make and records them, before
-    /// `datafusion-postgres` declares them in `store`.
-    fn declare(&self, declares: &[Declare], store: Option<&Store>) -> PgWireResult<()> {
+    /// Checks the cursors `declares` make, as `PostgreSQL` does, and the
+    /// engine can answer, and records them; planned and started in `store`
+    /// by [`declare`].
+    fn declare(
+        &self,
+        declares: &[Declare],
+        store: Option<&Store>,
+    ) -> PgWireResult<Vec<(String, Arc<Cursor>)>> {
         let mut book = lock(&self.0);
-        for (name, cursor) in book.checked(declares, store)? {
-            book.cursors.insert(name, Arc::new(cursor));
+        let made: Vec<(String, Arc<Cursor>)> = book
+            .checked(declares, store)?
+            .into_iter()
+            .map(|(name, cursor)| (name, Arc::new(cursor)))
+            .collect();
+        for (name, cursor) in &made {
+            book.cursors.insert(name.clone(), Arc::clone(cursor));
         }
-        Ok(())
+        Ok(made)
     }
 
     /// `CLOSE`: `PostgreSQL`'s answers, a missing cursor included (34000,
@@ -168,14 +181,12 @@ impl Cursors {
                 Ok(Response::Execution(Tag::new("CLOSE CURSOR ALL")))
             }
             CloseCursor::Specific { name } => {
-                if store.get_portal(&name.value).is_none() {
-                    return Err(user_error(
-                        "34000",
-                        format!("cursor \"{}\" does not exist", name.value),
-                    ));
+                let name = cursor_name(name);
+                if store.get_portal(&name).is_none() {
+                    return Err(user_error("34000", format!("cursor \"{name}\" does not exist")));
                 }
-                store.rm_portal(&name.value);
-                book.cursors.remove(&name.value);
+                store.rm_portal(&name);
+                book.cursors.remove(&name);
                 Ok(Response::Execution(Tag::new("CLOSE CURSOR")))
             }
         }
@@ -259,10 +270,13 @@ impl Book {
         let mut made = Vec::new();
         for declare in declares {
             if declare.declare_type != Some(DeclareType::Cursor) {
-                continue; // `datafusion-postgres` refuses it
+                return Err(user_error(
+                    "42601",
+                    format!("unsupported DECLARE type: {:?}", declare.declare_type),
+                ));
             }
-            let Some(name) = declare.names.first() else {
-                continue;
+            let Some(name) = declare.names.first().map(cursor_name) else {
+                return Err(user_error("42601", "cursor name is required"));
             };
             // Its rows are encoded as text: a client decoding them as binary
             // would read wrong values.
@@ -279,17 +293,11 @@ impl Book {
                     "DECLARE CURSOR can only be used in transaction blocks",
                 ));
             }
-            // `datafusion-postgres` would replace it, dropping its rows.
-            if store.is_some_and(|store| store.get_portal(&name.value).is_some()) {
-                return Err(user_error(
-                    "42P03",
-                    format!("cursor \"{}\" already exists", name.value),
-                ));
+            // Declared again, it would replace the cursor, dropping its rows.
+            if store.is_some_and(|store| store.get_portal(&name).is_some()) {
+                return Err(user_error("42P03", format!("cursor \"{name}\" already exists")));
             }
-            made.push((
-                name.value.clone(),
-                Cursor::new(hold, declare.scroll != Some(false)),
-            ));
+            made.push((name, Cursor::new(hold, declare.scroll != Some(false))));
         }
         Ok(made)
     }
@@ -393,7 +401,14 @@ impl CursorHook {
             // them, [`fetch`]).
             Statement::Fetch { name, direction, .. } => {
                 let store = Some(client.portal_store());
-                let fetch = open(&cursors, store, &name.value, direction, &Format::UnifiedText).await;
+                let fetch = open(
+                    &cursors,
+                    store,
+                    &cursor_name(name),
+                    direction,
+                    &Format::UnifiedText,
+                )
+                .await;
                 let pool = &session_context.runtime_env().memory_pool;
                 return Some(match fetch {
                     Ok(fetch) => fetch.collected(pool).await,
@@ -404,7 +419,7 @@ impl CursorHook {
             Statement::Commit { .. } => cursors.end_transaction(Some(client.portal_store()), true),
             Statement::Rollback { .. } => cursors.end_transaction(Some(client.portal_store()), false),
             Statement::Declare { stmts } => {
-                return cursors.declare(stmts, Some(client.portal_store())).err().map(Err);
+                return Some(declare(&cursors, stmts, session_context, client).await);
             }
             _ => {}
         }
@@ -446,6 +461,52 @@ impl QueryHook for CursorHook {
     }
 }
 
+/// A cursor's name as `PostgreSQL` reads it: folded to lower case unless
+/// quoted (`DECLARE Big` declares `big`).
+fn cursor_name(name: &Ident) -> String {
+    if name.quote_style.is_some() {
+        name.value.clone()
+    } else {
+        name.value.to_ascii_lowercase()
+    }
+}
+
+/// `DECLARE … CURSOR`: each cursor checked ([`Cursors::declare`]), its
+/// query planned as a query of the session is (operands checked,
+/// [`crate::hooks::plan_checked`]) and its stream kept in a portal of the
+/// connection, rows encoded in text as a query's are, for `FETCH` to read.
+async fn declare(
+    cursors: &Cursors,
+    declares: &[Declare],
+    session_context: &SessionContext,
+    client: &mut dyn HookClient,
+) -> PgWireResult<Response> {
+    let made = cursors.declare(declares, Some(client.portal_store()))?;
+    let options = Arc::new(FormatOptions::from_client_metadata(client.metadata()));
+    for ((name, _), declare) in made.iter().zip(declares) {
+        let outcome = async {
+            let query = declare
+                .for_query
+                .as_ref()
+                .ok_or_else(|| user_error("42601", "DECLARE CURSOR requires a FOR query"))?
+                .to_string();
+            let df = crate::hooks::plan_checked(session_context, &query).await?;
+            let rows = encode_dataframe(df, &Format::UnifiedText, Some(Arc::clone(&options))).await?;
+            let statement = StoredStatement::new(name.clone(), (query, None), Vec::new());
+            let portal = Portal::new_cursor(name.clone(), Arc::new(statement));
+            portal.start(rows).await;
+            client.portal_store().put_portal(Arc::new(portal));
+            Ok(())
+        }
+        .await;
+        if let Err(error) = outcome {
+            lock(&cursors.0).cursors.remove(name);
+            return Err(error);
+        }
+    }
+    Ok(Response::Execution(Tag::new("DECLARE CURSOR")))
+}
+
 /// The plan of a statement answered without one.
 pub(super) fn empty_plan() -> LogicalPlan {
     LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
@@ -463,7 +524,7 @@ pub(super) fn declared_names<'a>(statements: impl IntoIterator<Item = &'a Statem
             _ => None,
         })
         .flatten()
-        .filter_map(|declare| declare.names.first().map(|name| name.value.clone()))
+        .filter_map(|declare| declare.names.first().map(cursor_name))
         .collect()
 }
 
@@ -578,7 +639,7 @@ where
         return Some(Err(into_error()));
     }
     let cursors = Cursors::of(client);
-    let fetch = open(&cursors, portals(client), &name.value, direction, format).await;
+    let fetch = open(&cursors, portals(client), &cursor_name(name), direction, format).await;
     Some(fetch.map(Fetch::streamed))
 }
 
@@ -794,13 +855,14 @@ where
     let Statement::Fetch { name, .. } = statement else {
         return None;
     };
-    let Some(portal) = portals(client).and_then(|store| store.get_portal(&name.value)) else {
+    let name = cursor_name(name);
+    let Some(portal) = portals(client).and_then(|store| store.get_portal(&name)) else {
         return Some(Ok(Vec::new()));
     };
     let fields = match &*portal.state().lock().await {
         PortalExecutionState::Suspended(response) => response.row_schema().to_vec(),
         PortalExecutionState::Finished => Cursors::of(client)
-            .cursor(&name.value)
+            .cursor(&name)
             .columns
             .lock()
             .map(|columns| columns.as_deref().cloned().unwrap_or_default())
@@ -1095,7 +1157,6 @@ fn cursor_rows(
 mod tests {
     use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
     use datafusion::sql::sqlparser::parser::Parser;
-    use datafusion_postgres::pgwire::api::stmt::StoredStatement;
     use futures::TryStreamExt;
 
     use super::*;
@@ -1106,9 +1167,12 @@ mod tests {
 
     #[test]
     fn names_of_declared_cursors() {
-        let statements =
-            parse("DECLARE c1 CURSOR FOR SELECT 1; SELECT 2; DECLARE \"Big\" CURSOR FOR SELECT 3");
-        assert_eq!(declared_names(&statements), ["c1", "Big"]);
+        let statements = parse(
+            "DECLARE c1 CURSOR FOR SELECT 1; SELECT 2; DECLARE \"Big\" CURSOR FOR SELECT 3; \
+             DECLARE Small CURSOR FOR SELECT 4",
+        );
+        // Folded to lower case unless quoted, as PostgreSQL reads them.
+        assert_eq!(declared_names(&statements), ["c1", "Big", "small"]);
         assert!(declared_names(&parse("SELECT 1; FETCH 1 FROM c1")).is_empty());
     }
 
@@ -1151,7 +1215,7 @@ mod tests {
         let cursors = Cursors::default();
         cursors.begin_message(TransactionStatus::Idle, 1);
         let refused = cursors.declare(&declares("DECLARE c CURSOR FOR SELECT 1"), None);
-        assert_eq!(refused.map_err(code), Err("25P01".to_owned()));
+        assert_eq!(refused.map(|_| ()).map_err(code), Err("25P01".to_owned()));
         assert!(
             cursors
                 .declare(&declares("DECLARE c CURSOR WITHOUT HOLD FOR SELECT 1"), None)
@@ -1184,8 +1248,16 @@ mod tests {
         let cursors = Cursors::default();
         cursors.begin_message(TransactionStatus::Transaction, 1);
         let store = store_with(&["c"]);
-        let declare = |sql| cursors.declare(&declares(sql), Some(&store)).map_err(code);
+        let declare = |sql| {
+            cursors
+                .declare(&declares(sql), Some(&store))
+                .map(|_| ())
+                .map_err(code)
+        };
         assert_eq!(declare("DECLARE c CURSOR FOR SELECT 1"), Err("42P03".to_owned()));
+        // Unquoted names are folded to lower case, quoted ones kept.
+        assert_eq!(declare("DECLARE C CURSOR FOR SELECT 1"), Err("42P03".to_owned()));
+        assert_eq!(declare("DECLARE \"C\" CURSOR FOR SELECT 1"), Ok(()));
         assert_eq!(
             declare("DECLARE b BINARY CURSOR FOR SELECT 1"),
             Err("0A000".to_owned())
@@ -1203,12 +1275,20 @@ mod tests {
                 .close(
                     &store,
                     &CloseCursor::Specific {
-                        name: Ident::new("c")
+                        name: Ident::new("C")
                     }
                 )
-                .is_ok()
+                .is_ok(),
+            "CLOSE C closes c"
         );
         assert!(store.get_portal("c").is_none());
+        let quoted = cursors.close(
+            &store,
+            &CloseCursor::Specific {
+                name: Ident::with_quote('"', "D"),
+            },
+        );
+        assert_eq!(quoted.map(|_| ()).map_err(code), Err("34000".to_owned()));
     }
 
     #[test]

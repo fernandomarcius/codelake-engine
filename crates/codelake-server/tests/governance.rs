@@ -1494,6 +1494,20 @@ impl Want {
 
 /// Cursors across transactions, as a client sees them, message by message.
 fn cursor_script() -> Vec<(String, Want)> {
+    [
+        transactions_script(),
+        beside_cursors_script(),
+        discard_script(),
+        names_script(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Cursors across transactions: FETCH counts, COMMIT and ROLLBACK, the
+/// aborted transaction, WITH HOLD.
+fn transactions_script() -> Vec<(String, Want)> {
     use Want::{Code, Rows};
     let none = Want::none;
     let declare = |name: &str, how: &str| format!("DECLARE {name} {how} FOR {TEN}");
@@ -1603,10 +1617,34 @@ fn cursor_script() -> Vec<(String, Want)> {
         ),
         ("FETCH 1 FROM r".into(), Code("34000")),
     ]
-    .into_iter()
-    .chain(beside_cursors_script())
-    .chain(discard_script())
-    .collect()
+}
+
+/// Cursor names are folded to lower case unless quoted.
+fn names_script() -> Vec<(String, Want)> {
+    use Want::{Code, Rows};
+    let none = Want::none;
+    vec![
+        (format!("BEGIN; DECLARE Big NO SCROLL CURSOR FOR {TEN}"), none()),
+        ("FETCH 1 FROM big".into(), Rows(vec![1])),
+        ("FETCH 1 FROM BIG".into(), Rows(vec![2])),
+        ("FETCH 1 FROM \"big\"; FETCH 1 FROM bIG".into(), Rows(vec![3, 4])),
+        ("FETCH 1 FROM \"Big\"".into(), Code("34000")),
+        ("ROLLBACK".into(), none()),
+        (format!("BEGIN; DECLARE \"Q\" CURSOR FOR {TEN}"), none()),
+        ("FETCH 1 FROM \"Q\"".into(), Rows(vec![1])),
+        ("CLOSE q".into(), Code("34000")),
+        ("ROLLBACK".into(), none()),
+        (format!("BEGIN; DECLARE \"Q\" CURSOR FOR {TEN}"), none()),
+        ("FETCH 1 FROM Q".into(), Code("34000")),
+        ("ROLLBACK".into(), none()),
+        (format!("BEGIN; DECLARE Mixed CURSOR FOR {TEN}"), none()),
+        (format!("DECLARE MIXED CURSOR FOR {TEN}"), Code("42P03")),
+        ("ROLLBACK".into(), none()),
+        (format!("BEGIN; DECLARE Mixed CURSOR FOR {TEN}"), none()),
+        ("CLOSE MIXED".into(), none()),
+        ("FETCH 1 FROM mixed".into(), Code("34000")),
+        ("ROLLBACK".into(), none()),
+    ]
 }
 
 /// `DISCARD ALL` closes every cursor, held ones too, and resets the
@@ -1808,6 +1846,23 @@ fn session_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
                 ),
                 failed("42601"),
                 ok("ROLLBACK"),
+            ],
+        ),
+        // Names folded to lower case on the extended protocol too.
+        (
+            vec![
+                Extended("BEGIN".into()),
+                Extended(declare("Ext", "CURSOR")),
+                Extended("FETCH 2 FROM ext".into()),
+                Extended("FETCH 1 FROM EXT".into()),
+                Extended("COMMIT".into()),
+            ],
+            vec![
+                ok("BEGIN"),
+                ok("DECLARE CURSOR"),
+                rows("FETCH 2", &[1, 2]),
+                rows("FETCH 1", &[3]),
+                ok("COMMIT"),
             ],
         ),
         // DISCARD ALL on the extended protocol.

@@ -183,7 +183,7 @@ fn api_error(err: datafusion::error::DataFusionError) -> PgWireError {
 
 /// What `SessionContext::sql` does, with the operand check between planning
 /// and running.
-async fn plan_checked(session_context: &SessionContext, sql: &str) -> PgWireResult<DataFrame> {
+pub(crate) async fn plan_checked(session_context: &SessionContext, sql: &str) -> PgWireResult<DataFrame> {
     let plan = session_context
         .state()
         .create_logical_plan(sql)
@@ -386,7 +386,9 @@ pub(crate) fn all(session_sampling: Option<f64>) -> Vec<Arc<dyn QueryHook>> {
         hooks.push(Arc::new(TracingHook { ratio }));
     }
     // Before `datafusion-postgres`'s cursor and transaction hooks: it sees
-    // the statements they answer (crate::pg::CursorHook).
+    // the statements they answer, and answers the cursor statements itself
+    // (crate::pg::CursorHook); `datafusion-postgres`'s still plans them on
+    // the extended protocol.
     hooks.push(Arc::new(crate::pg::CursorHook));
     hooks.push(Arc::new(CursorStatementHook));
     hooks.push(Arc::new(SetShowHook));
