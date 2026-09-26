@@ -872,3 +872,41 @@ async fn in_subquery_is_refused_where_unknown_would_read_as_false() {
     )
     .await;
 }
+
+/// Timestamps of different precisions meet at the higher one, as in Trino
+/// 431; `DataFusion` truncated the finer side (the equality was true).
+#[tokio::test]
+async fn timestamps_of_different_precisions_compare_at_the_finer_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    assert_same(
+        &engine,
+        &[
+            (
+                "SELECT TIMESTAMP '2020-01-01 00:00:00.123' = TIMESTAMP '2020-01-01 00:00:00.123400', \
+                 TIMESTAMP '2020-01-01 00:00:00.123' >= TIMESTAMP '2020-01-01 00:00:00.123500', \
+                 TIMESTAMP '2020-01-01 00:00:00.123' < TIMESTAMP '2020-01-01 00:00:00.123001', \
+                 TIMESTAMP '2020-01-01 00:00:00' = TIMESTAMP '2020-01-01 00:00:00.000'",
+                answer(
+                    &["boolean", "boolean", "boolean", "boolean"],
+                    &[&["false", "false", "true", "true"]],
+                ),
+            ),
+            (
+                "SELECT k FROM (VALUES (1, TIMESTAMP '2020-01-01 00:00:00.123'), (2, TIMESTAMP '2020-01-01 00:00:00.124')) t(k, ts) \
+                 WHERE ts BETWEEN TIMESTAMP '2020-01-01 00:00:00.123100' AND TIMESTAMP '2020-01-01 00:00:00.124000'",
+                answer(&["integer"], &[&["2"]]),
+            ),
+            (
+                "SELECT k FROM (VALUES (1, TIMESTAMP '2020-01-01 00:00:00.123'), (2, TIMESTAMP '2020-01-01 00:00:00.124')) t(k, ts) \
+                 WHERE ts IN (TIMESTAMP '2020-01-01 00:00:00.123400', TIMESTAMP '2020-01-01 00:00:00.124000')",
+                answer(&["integer"], &[&["2"]]),
+            ),
+            (
+                "SELECT coalesce(CAST(NULL AS TIMESTAMP(3)), TIMESTAMP '2020-01-01 00:00:00.123456')",
+                answer(&["timestamp(6)"], &[&["2020-01-01T00:00:00.123456"]]),
+            ),
+        ],
+    )
+    .await;
+}

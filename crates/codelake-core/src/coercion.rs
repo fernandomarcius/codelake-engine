@@ -32,7 +32,7 @@
 use std::ops::ControlFlow;
 use std::sync::{Arc, LazyLock};
 
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, TimeUnit};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DFSchema, Result, ScalarValue, exec_err};
@@ -265,6 +265,78 @@ pub(crate) fn unname_cast(expr: Expr) -> Transformed<Expr> {
         }
         other => Transformed::no(other),
     }
+}
+
+/// Name of the identity around a timestamp cast that must stay exact.
+const EXACT_CAST: &str = "codelake_exact_cast";
+
+/// `codelake_exact_cast(CAST(x AS timestamp(finer)))`: the cast itself.
+///
+/// `DataFusion`'s simplifier unwraps `CAST(col AS T) <op> literal` into
+/// `col <op> CAST(literal AS type of col)` and converts a timestamp literal
+/// to a coarser unit by truncation (`expr-common` `cast_between_timestamp`),
+/// so `CAST(ms AS µs) >= .123100` became `ms >= .123` (true for `.123`).
+/// The wrapper hides the cast from that rewrite; the comparison is made in
+/// the finer unit, as [`unify_timestamps`] decided.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ExactCast {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for ExactCast {
+    fn name(&self) -> &'static str {
+        EXACT_CAST
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn schema_name(&self, args: &[Expr]) -> Result<String> {
+        let [only] = args else {
+            return exec_err!("{EXACT_CAST} expects one argument");
+        };
+        Ok(only.schema_name().to_string())
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        let [only] = arg_types else {
+            return exec_err!("{EXACT_CAST} expects one argument");
+        };
+        Ok(only.clone())
+    }
+
+    fn return_field_from_args(&self, args: ReturnFieldArgs<'_>) -> Result<FieldRef> {
+        let [only] = args.arg_fields else {
+            return exec_err!("{EXACT_CAST} expects one argument");
+        };
+        Ok(Arc::new(only.as_ref().clone().with_name(EXACT_CAST)))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let Some(only) = args.args.first() else {
+            return exec_err!("{EXACT_CAST} expects one argument");
+        };
+        Ok(only.clone())
+    }
+}
+
+static EXACT_CAST_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
+    Arc::new(ScalarUDF::new_from_impl(ExactCast {
+        signature: Signature::any(1, Volatility::Immutable),
+    }))
+});
+
+/// The identity [`unify_timestamps`] calls; the engine registers it so plans
+/// that carry it can be printed and planned again.
+pub(crate) fn exact_cast() -> ScalarUDF {
+    EXACT_CAST_UDF.as_ref().clone()
+}
+
+/// A timestamp cast to a finer unit, kept from the simplifier (see
+/// [`ExactCast`]).
+fn widen_timestamp(expr: Expr, to: DataType) -> Expr {
+    EXACT_CAST_UDF.call(vec![Expr::Cast(Cast::new(Box::new(expr), to))])
 }
 
 /// `f(…)` with every cast removed, as `DataFusion` names it.
@@ -546,26 +618,52 @@ fn cast_if_needed(expr: Expr, from: &DataType, to: &DataType) -> Expr {
     }
 }
 
+/// Fractional digits of a timestamp unit, to order units by precision.
+fn unit_digits(unit: TimeUnit) -> u8 {
+    match unit {
+        TimeUnit::Second => 0,
+        TimeUnit::Millisecond => 3,
+        TimeUnit::Microsecond => 6,
+        TimeUnit::Nanosecond => 9,
+    }
+}
+
+/// Where timestamps meet, Trino converts them to the higher precision
+/// (`TIMESTAMP '… 00.123' = TIMESTAMP '… 00.123400'` is false);
+/// `DataFusion` converts them to the lower one, truncating the other side
+/// (it was true). Every timestamp is cast to the finest unit among them.
+///
 /// Where timestamps with and without time zone meet, a timestamp without
-/// time zone is the local time in the session zone (Trino casts it to
-/// `timestamp with time zone`); `DataFusion` reads it as UTC. Each such
-/// expression is cast to its own precision in the session zone.
+/// time zone is also the local time in the session zone (Trino casts it to
+/// `timestamp with time zone`); `DataFusion` reads it as UTC.
 fn unify_timestamps(exprs: Vec<Expr>, types: &[DataType], session_zone: &str) -> Transformed<Vec<Expr>> {
     let zoned = types.iter().any(|t| matches!(t, DataType::Timestamp(_, Some(_))));
-    let local = types.iter().any(|t| matches!(t, DataType::Timestamp(_, None)));
-    if !zoned || !local {
+    let Some(finest) = types
+        .iter()
+        .filter_map(|t| match t {
+            DataType::Timestamp(unit, _) => Some(*unit),
+            _ => None,
+        })
+        .max_by_key(|unit| unit_digits(*unit))
+    else {
+        return Transformed::no(exprs);
+    };
+    let target = |t: &DataType| match t {
+        DataType::Timestamp(_, None) if zoned => Some(DataType::Timestamp(finest, Some(session_zone.into()))),
+        DataType::Timestamp(_, zone) => Some(DataType::Timestamp(finest, zone.clone())),
+        _ => None,
+    };
+    if !types.iter().any(|t| target(t).is_some_and(|to| to != *t)) {
         return Transformed::no(exprs);
     }
     Transformed::yes(
         exprs
             .into_iter()
             .zip(types)
-            .map(|(e, t)| match t {
-                DataType::Timestamp(unit, None) => Expr::Cast(Cast::new(
-                    Box::new(e),
-                    DataType::Timestamp(*unit, Some(session_zone.into())),
-                )),
-                _ => e,
+            .map(|(e, t)| match (target(t), t) {
+                (Some(to), DataType::Timestamp(unit, _)) if *unit != finest => widen_timestamp(e, to),
+                (Some(to), _) => cast_if_needed(e, t, &to),
+                (None, _) => e,
             })
             .collect(),
     )
