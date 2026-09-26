@@ -430,6 +430,7 @@ pub fn trino_statement(
     crate::trino_functions::rewrite_statement(statement)?;
     crate::literals::rewrite_zoned_timestamps(statement);
     crate::coercion::mark_values(statement);
+    crate::coercion::name_later_branches(statement);
     crate::coercion::default_decimal_precision(statement);
     crate::declared::rewrite_declared_casts(statement)?;
     crate::literals::rewrite_timestamp_types(statement, session_zone);

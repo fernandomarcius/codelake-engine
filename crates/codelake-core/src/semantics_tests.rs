@@ -936,3 +936,26 @@ async fn windows_ordered_by_varbinary_keep_range_peers() {
     )
     .await;
 }
+
+/// A name written twice in a later branch of a `UNION` plans: the names of
+/// a set operation come from its first branch.
+#[tokio::test]
+async fn repeated_names_in_later_union_branches_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    assert_same(
+        &engine,
+        &[(
+            "SELECT * FROM (\
+               SELECT 1 AS g, t.a AS first_a, t.* FROM (VALUES (10, 'x')) t(a, b) \
+               UNION ALL \
+               SELECT 2, t.a, t.* FROM (VALUES (20, 'y')) t(a, b)\
+             ) ORDER BY g",
+            answer(
+                &["integer", "integer", "integer", "varchar(1)"],
+                &[&["1", "10", "10", "x"], &["2", "20", "20", "y"]],
+            ),
+        )],
+    )
+    .await;
+}

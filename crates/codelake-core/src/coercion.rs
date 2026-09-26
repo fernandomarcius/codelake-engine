@@ -145,6 +145,61 @@ fn mark_set_expr(body: &mut SetExpr) {
     }
 }
 
+/// Positional names for the unnamed items of every branch of a set
+/// operation but the first (see [`name_later_branches`]).
+fn name_branches(body: &mut SetExpr, first: bool) {
+    match body {
+        SetExpr::SetOperation {
+            left,
+            right,
+            set_quantifier,
+            ..
+        } if !matches!(
+            set_quantifier,
+            sql::SetQuantifier::ByName | sql::SetQuantifier::AllByName | sql::SetQuantifier::DistinctByName
+        ) =>
+        {
+            name_branches(left, first);
+            name_branches(right, false);
+        }
+        SetExpr::Select(select) if !first => {
+            for (position, item) in select.projection.iter_mut().enumerate() {
+                if let sql::SelectItem::UnnamedExpr(expr) = item {
+                    *item = sql::SelectItem::ExprWithAlias {
+                        expr: std::mem::replace(expr, sql::Expr::value(sql::Value::Null)),
+                        alias: sql::Ident::new(format!("_codelake_col{}", position + 1)),
+                    };
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+struct NameLaterBranches;
+
+impl VisitorMut for NameLaterBranches {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<()> {
+        name_branches(&mut query.body, true);
+        ControlFlow::Continue(())
+    }
+}
+
+/// A set operation takes its column names from its first branch; the names
+/// in the others mean nothing, and Trino accepts one written twice there
+/// (`SELECT ct."__$start_lsn", …, ct.* FROM …` after `UNION ALL`).
+/// `DataFusion` plans each branch as a projection and refuses the repeated
+/// name ("Projections require unique expression names"). Every unnamed item
+/// of a later branch gets a positional name (`BY NAME` operations excepted).
+pub(crate) fn name_later_branches(statement: &mut DFStatement) {
+    let DFStatement::Statement(inner) = statement else {
+        return;
+    };
+    let _ = inner.as_mut().visit(&mut NameLaterBranches);
+}
+
 /// Marks every `VALUES` list but the one an `INSERT` reads.
 #[derive(Default)]
 struct MarkValues {
