@@ -12,6 +12,13 @@
 //!   folds a quoted column reference to lower case, unless the statement
 //!   itself defines that exact name (a column alias, a table or CTE alias, a
 //!   derived column list), which then stays reachable as written.
+//! - `IS [NOT] DISTINCT FROM` binds tighter than `AND` and `OR` in Trino (and
+//!   PostgreSQL): `a IS NOT DISTINCT FROM b AND c` is `(a IS NOT DISTINCT
+//!   FROM b) AND c`. The parser reads the whole rest of the expression as the
+//!   right operand, `a IS NOT DISTINCT FROM (b AND c)`: a join condition
+//!   `ON a.flag IS NOT DISTINCT FROM b.flag AND a.id = b.id` answered other
+//!   rows, and with a non-boolean `b` the statement failed.
+//!   [`regroup_distinct_from`] gives the operator its operand back.
 
 use std::collections::HashSet;
 use std::ops::ControlFlow;
@@ -19,8 +26,9 @@ use std::ops::ControlFlow;
 use datafusion::error::DataFusionError;
 use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
-    DataType, Expr, Ident, Query, SelectItem, SetExpr, Statement as SqlStatement, TableFactor, TimezoneInfo,
-    UnaryOperator, Value, ValueWithSpan, Visit, VisitMut, Visitor, VisitorMut, visit_expressions,
+    BinaryOperator, DataType, Expr, Ident, Query, SelectItem, SetExpr, Statement as SqlStatement,
+    TableFactor, TimezoneInfo, UnaryOperator, Value, ValueWithSpan, Visit, VisitMut, Visitor, VisitorMut,
+    visit_expressions, visit_expressions_mut,
 };
 use datafusion::sql::sqlparser::parser::ParserError;
 
@@ -278,9 +286,269 @@ impl VisitorMut for NameFoldedItems<'_> {
     }
 }
 
+/// `statement` with the operands of its `IS [NOT] DISTINCT FROM` regrouped
+/// (see [`regroup_distinct_from`]), or `None` when they need no change. For
+/// the PostgreSQL wire, whose statements come parsed.
+pub fn regrouped_statement(statement: &SqlStatement) -> Option<SqlStatement> {
+    let mut regrouped = DFStatement::Statement(Box::new(statement.clone()));
+    regroup_distinct_from(&mut regrouped);
+    match regrouped {
+        DFStatement::Statement(regrouped) if *regrouped != *statement => Some(*regrouped),
+        _ => None,
+    }
+}
+
+/// Regroups the operands of every `IS [NOT] DISTINCT FROM` (see the module
+/// documentation). A parenthesized operand is left as written.
+pub fn regroup_distinct_from(statement: &mut DFStatement) {
+    let DFStatement::Statement(inner) = statement else {
+        return;
+    };
+    let _ = visit_expressions_mut(inner.as_mut(), |expr| {
+        if is_operator(expr) && holds_distinct_from(expr) {
+            let taken = std::mem::replace(expr, Expr::Value(Value::Null.into()));
+            let mut pieces = Vec::new();
+            flatten(taken, &mut pieces);
+            pieces.reverse();
+            *expr = regroup(&mut pieces, 0);
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// Precedences of the operators the parser can misgroup around `IS [NOT]
+/// DISTINCT FROM` (the parser's own values): anything else is an operand.
+const OR: u8 = 5;
+const AND: u8 = 10;
+const NOT: u8 = 15;
+const IS: u8 = 17;
+
+/// Builds an `IS NULL`, `IS TRUE`, … node around its operand.
+type Postfix = fn(Box<Expr>) -> Expr;
+
+/// The source order of an operator tree: operands and operators as written.
+enum Piece {
+    Operand(Box<Expr>),
+    /// `AND`, `OR`, `IS DISTINCT FROM` (false) or `IS NOT DISTINCT FROM` (true).
+    Binary(Option<BinaryOperator>, bool),
+    /// `IS NULL`, `IS TRUE`, …
+    Postfix(Postfix),
+    Not,
+}
+
+fn is_operator(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::BinaryOp {
+            op: BinaryOperator::And | BinaryOperator::Or,
+            ..
+        } | Expr::IsDistinctFrom(..)
+            | Expr::IsNotDistinctFrom(..)
+            | Expr::IsNull(_)
+            | Expr::IsNotNull(_)
+            | Expr::IsTrue(_)
+            | Expr::IsNotTrue(_)
+            | Expr::IsFalse(_)
+            | Expr::IsNotFalse(_)
+            | Expr::IsUnknown(_)
+            | Expr::IsNotUnknown(_)
+            | Expr::UnaryOp {
+                op: UnaryOperator::Not,
+                ..
+            }
+    )
+}
+
+/// An `IS [NOT] DISTINCT FROM` in the operator tree of `expr` (operands
+/// excluded: they are regrouped on their own).
+fn holds_distinct_from(expr: &Expr) -> bool {
+    match expr {
+        Expr::IsDistinctFrom(..) | Expr::IsNotDistinctFrom(..) => true,
+        Expr::BinaryOp { left, right, .. } if is_operator(expr) => {
+            holds_distinct_from(left) || holds_distinct_from(right)
+        }
+        Expr::IsNull(x)
+        | Expr::IsNotNull(x)
+        | Expr::IsTrue(x)
+        | Expr::IsNotTrue(x)
+        | Expr::IsFalse(x)
+        | Expr::IsNotFalse(x)
+        | Expr::IsUnknown(x)
+        | Expr::IsNotUnknown(x)
+        | Expr::UnaryOp { expr: x, .. }
+            if is_operator(expr) =>
+        {
+            holds_distinct_from(x)
+        }
+        _ => false,
+    }
+}
+
+fn flatten(expr: Expr, pieces: &mut Vec<Piece>) {
+    let postfix: (Box<Expr>, Postfix) = match expr {
+        Expr::BinaryOp {
+            left,
+            op: op @ (BinaryOperator::And | BinaryOperator::Or),
+            right,
+        } => {
+            flatten(*left, pieces);
+            pieces.push(Piece::Binary(Some(op), false));
+            return flatten(*right, pieces);
+        }
+        Expr::IsDistinctFrom(left, right) => {
+            flatten(*left, pieces);
+            pieces.push(Piece::Binary(None, false));
+            return flatten(*right, pieces);
+        }
+        Expr::IsNotDistinctFrom(left, right) => {
+            flatten(*left, pieces);
+            pieces.push(Piece::Binary(None, true));
+            return flatten(*right, pieces);
+        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr,
+        } => {
+            pieces.push(Piece::Not);
+            return flatten(*expr, pieces);
+        }
+        Expr::IsNull(x) => (x, Expr::IsNull),
+        Expr::IsNotNull(x) => (x, Expr::IsNotNull),
+        Expr::IsTrue(x) => (x, Expr::IsTrue),
+        Expr::IsNotTrue(x) => (x, Expr::IsNotTrue),
+        Expr::IsFalse(x) => (x, Expr::IsFalse),
+        Expr::IsNotFalse(x) => (x, Expr::IsNotFalse),
+        Expr::IsUnknown(x) => (x, Expr::IsUnknown),
+        Expr::IsNotUnknown(x) => (x, Expr::IsNotUnknown),
+        operand => {
+            pieces.push(Piece::Operand(Box::new(operand)));
+            return;
+        }
+    };
+    let (operand, build) = postfix;
+    flatten(*operand, pieces);
+    pieces.push(Piece::Postfix(build));
+}
+
+fn binding(piece: &Piece) -> Option<u8> {
+    match piece {
+        Piece::Binary(Some(BinaryOperator::Or), _) => Some(OR),
+        Piece::Binary(Some(_), _) => Some(AND),
+        Piece::Binary(None, _) | Piece::Postfix(_) => Some(IS),
+        Piece::Not | Piece::Operand(_) => None,
+    }
+}
+
+/// Precedence climbing over `pieces` (in reverse source order), as the
+/// parser does for every other operator: an operator binds while its
+/// precedence is above `floor`, all of them left to right.
+fn regroup(pieces: &mut Vec<Piece>, floor: u8) -> Expr {
+    let mut left = match pieces.pop() {
+        Some(Piece::Not) => Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: Box::new(regroup(pieces, NOT)),
+        },
+        Some(Piece::Operand(operand)) => *operand,
+        // `flatten` starts and follows every operator with an operand.
+        _ => Expr::Value(Value::Null.into()),
+    };
+    while let Some(precedence) = pieces.last().and_then(binding) {
+        if precedence <= floor {
+            break;
+        }
+        left = match pieces.pop() {
+            Some(Piece::Binary(Some(op), _)) => Expr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(regroup(pieces, precedence)),
+            },
+            Some(Piece::Binary(None, true)) => {
+                Expr::IsNotDistinctFrom(Box::new(left), Box::new(regroup(pieces, precedence)))
+            }
+            Some(Piece::Binary(None, false)) => {
+                Expr::IsDistinctFrom(Box::new(left), Box::new(regroup(pieces, precedence)))
+            }
+            Some(Piece::Postfix(build)) => build(Box::new(left)),
+            _ => left,
+        };
+    }
+    left
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tree of `e` with every operator in parentheses.
+    fn shape(e: &Expr) -> String {
+        match e {
+            Expr::BinaryOp { left, op, right } => format!("({} {op} {})", shape(left), shape(right)),
+            Expr::IsDistinctFrom(l, r) => format!("({} IDF {})", shape(l), shape(r)),
+            Expr::IsNotDistinctFrom(l, r) => format!("({} INDF {})", shape(l), shape(r)),
+            Expr::IsNull(x) => format!("({} IS NULL)", shape(x)),
+            Expr::Nested(x) => format!("[{}]", shape(x)),
+            Expr::UnaryOp {
+                op: UnaryOperator::Not,
+                expr,
+            } => format!("(NOT {})", shape(expr)),
+            other => other.to_string(),
+        }
+    }
+
+    fn regrouped(sql: &str) -> String {
+        let mut statement = datafusion::sql::parser::DFParser::parse_sql(sql)
+            .unwrap()
+            .pop_front()
+            .unwrap();
+        regroup_distinct_from(&mut statement);
+        let DFStatement::Statement(inner) = &statement else {
+            panic!("not a statement")
+        };
+        let SqlStatement::Query(query) = inner.as_ref() else {
+            panic!("not a query")
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("not a select")
+        };
+        match select.selection.as_ref() {
+            Some(selection) => shape(selection),
+            None => panic!("no WHERE"),
+        }
+    }
+
+    /// Trino 431 and PostgreSQL group `IS [NOT] DISTINCT FROM` tighter than
+    /// `AND`/`OR`, left to right with the other `IS` forms.
+    #[test]
+    fn distinct_from_binds_tighter_than_and_or() {
+        for (condition, expected) in [
+            ("a IS NOT DISTINCT FROM b AND c", "((a INDF b) AND c)"),
+            ("a IS DISTINCT FROM b OR c AND d", "((a IDF b) OR (c AND d))"),
+            ("a IS DISTINCT FROM b AND c OR d", "(((a IDF b) AND c) OR d)"),
+            ("a IS DISTINCT FROM b IS NULL", "((a IDF b) IS NULL)"),
+            ("a IS DISTINCT FROM b IS DISTINCT FROM c", "((a IDF b) IDF c)"),
+            (
+                "a IS NOT DISTINCT FROM b AND c IS DISTINCT FROM d",
+                "((a INDF b) AND (c IDF d))",
+            ),
+            ("x AND a IS DISTINCT FROM b OR c", "((x AND (a IDF b)) OR c)"),
+            ("NOT a IS DISTINCT FROM b AND c", "((NOT (a IDF b)) AND c)"),
+            (
+                "x OR NOT a IS NOT DISTINCT FROM b AND c OR d",
+                "((x OR ((NOT (a INDF b)) AND c)) OR d)",
+            ),
+            ("x = 1 AND y = 2 OR z = 3", "(((x = 1) AND (y = 2)) OR (z = 3))"),
+            ("a IS DISTINCT FROM (b AND c)", "(a IDF [(b AND c)])"),
+            ("a IS DISTINCT FROM b + 1", "(a IDF (b + 1))"),
+            ("a IS DISTINCT FROM b = c", "(a IDF (b = c))"),
+            (
+                "a.f IS NOT DISTINCT FROM b.f AND a.id = b.id",
+                "((a.f INDF b.f) AND (a.id = b.id))",
+            ),
+        ] {
+            let sql = format!("SELECT 1 FROM t WHERE {condition}");
+            assert_eq!(regrouped(&sql), expected, "{condition}");
+        }
+    }
 
     fn checked(sql: &str) -> Result<(), DataFusionError> {
         let statement = datafusion::sql::parser::DFParser::parse_sql(sql)

@@ -428,6 +428,7 @@ pub fn trino_statement(
     statement: &mut datafusion::sql::parser::Statement,
     session_zone: &str,
 ) -> Result<(), DataFusionError> {
+    crate::trino_sql_checks::regroup_distinct_from(statement);
     crate::coercion::name_casts_in_aggregates(statement);
     crate::trino_sql_checks::fold_quoted_columns(statement);
     crate::trino_functions::rewrite_statement(statement)?;

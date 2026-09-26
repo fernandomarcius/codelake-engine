@@ -699,11 +699,45 @@ async fn in_subquery_answers_trinos_rows_or_is_refused() {
 /// `ns_tr`, written by Trino: (1, 'a', 10) and (2, 'b', 20) in one file, then
 /// (3, NULL, NULL) in a file of its own (a second `INSERT`), so the NULL keys
 /// are a row group of their own.
-const NULL_SAFE_SETUP: [&str; 4] = [
+const NULL_SAFE_SETUP: [&str; 6] = [
     "CREATE SCHEMA hive.jr",
     "CREATE TABLE hive.jr.ns_tr (id bigint, v varchar, k bigint) WITH (format = 'PARQUET')",
     "INSERT INTO hive.jr.ns_tr VALUES (1, 'a', 10), (2, 'b', 20)",
     "INSERT INTO hive.jr.ns_tr VALUES (3, NULL, NULL)",
+    "CREATE TABLE hive.jr.flags (id bigint, f boolean) WITH (format = 'PARQUET')",
+    "INSERT INTO hive.jr.flags VALUES (1, true), (2, false), (3, NULL)",
+];
+
+/// `IS [NOT] DISTINCT FROM` binds tighter than `AND` and `OR`; the parser
+/// took the rest of the condition as its right operand, and over booleans
+/// that answered other rows.
+const DISTINCT_FROM_PRECEDENCE: [Case; 4] = [
+    Case {
+        label: "IS NOT DISTINCT FROM … AND, join condition",
+        sql: "SELECT a.id, b.id FROM hive.jr.flags a JOIN hive.jr.flags b \
+              ON a.f IS NOT DISTINCT FROM b.f AND a.id = b.id",
+        operator: "",
+        must_spill: false,
+    },
+    Case {
+        label: "IS DISTINCT FROM … OR",
+        sql: "SELECT a.id, b.id FROM hive.jr.flags a, hive.jr.flags b \
+              WHERE a.f IS DISTINCT FROM b.f OR a.id = b.id",
+        operator: "",
+        must_spill: false,
+    },
+    Case {
+        label: "IS DISTINCT FROM … AND",
+        sql: "SELECT id FROM hive.jr.flags WHERE f IS DISTINCT FROM true AND id > 1",
+        operator: "",
+        must_spill: false,
+    },
+    Case {
+        label: "NOT … IS DISTINCT FROM … OR",
+        sql: "SELECT id FROM hive.jr.flags WHERE NOT f IS DISTINCT FROM false OR id = 3",
+        operator: "",
+        must_spill: false,
+    },
 ];
 
 /// `ns_cl`: the same rows, written by the engine the same way.
@@ -812,7 +846,8 @@ macro_rules! null_safe_cases {
 /// side, which prunes the row group holding only the NULL keys: `t EXCEPT t`
 /// returned the NULL row, `t INTERSECT t` and the joins lost it. Tables
 /// written by Trino and by the engine, alone and against each other, with
-/// default settings and with row-level Parquet filtering.
+/// default settings and with row-level Parquet filtering; and the grouping of
+/// `IS [NOT] DISTINCT FROM` with `AND`/`OR` (`DISTINCT_FROM_PRECEDENCE`).
 #[tokio::test]
 async fn null_safe_joins_keep_the_rows_whose_key_is_null() {
     let shared = shared().await;
@@ -841,6 +876,7 @@ async fn null_safe_joins_keep_the_rows_whose_key_is_null() {
     ]
     .into_iter()
     .flatten()
+    .chain(DISTINCT_FROM_PRECEDENCE)
     .collect();
     let mut failures = Vec::new();
     for settings in [
