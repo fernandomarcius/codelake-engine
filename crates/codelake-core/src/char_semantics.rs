@@ -2158,7 +2158,10 @@ fn scalar_function(function: ScalarFunction, scope: &Scope<'_>) -> Result<Transf
         }
         // The trims of a char value work on it without its padding
         // (`ltrim(CAST(' ab' AS char(5)))` is `'ab'`, `ltrim(ch, 'a')` of
-        // `'ab'` is `'b'`).
+        // `'ab'` is `'b'`); trimming other characters from its end also
+        // drops the spaces that end up last (`rtrim(CAST('a b' AS char(5)),
+        // 'b')` is `'a'`, `trim(BOTH 'a' FROM CAST(' a' AS char(5)))` is
+        // `''`), as the reference does.
         "ltrim" | "rtrim" | "trim" | "btrim"
             if args
                 .first()
@@ -2168,7 +2171,13 @@ fn scalar_function(function: ScalarFunction, scope: &Scope<'_>) -> Result<Transf
             let mut args = args;
             let value = args.remove(0);
             args.insert(0, key(value));
-            Ok(Transformed::yes(func.call(args)))
+            let trims_the_end = name != "ltrim" && args.len() > 1;
+            let trimmed = func.call(args);
+            Ok(Transformed::yes(if trims_the_end {
+                key(trimmed)
+            } else {
+                trimmed
+            }))
         }
         "concat" | CONCAT_OPERATOR if args.iter().any(|a| is_text_array(a, scope)) => {
             concat_arrays(&func, args, scope)
@@ -2878,6 +2887,9 @@ mod tests {
         "INSERT INTO vct VALUES (1, 'ab'), (2, 'ab  '), (3, 'cd'), (4, NULL), (5, 'a')",
         "CREATE TABLE v3 (id bigint, s varchar(3))",
         "INSERT INTO v3 VALUES (1, 'ab'), (2, 'a')",
+        "CREATE TABLE w (id bigint, ch char(5))",
+        "INSERT INTO w VALUES (1, ' a'), (2, 'a b'), (3, 'ab'), (5, '  '), (6, 'aa a'), (7, 'b  b'), \
+         (8, ' ab '), (9, 'a' || chr(9)), (10, NULL), (11, 'xa'), (12, 'a  a')",
     ];
 
     async fn engine(dir: &std::path::Path) -> Engine {
@@ -3179,6 +3191,51 @@ mod tests {
                 &["3", "NULL", "NULL", "NULL", "NULL", "NULL", "NULL"],
                 &["4", "", "0", "a", "1", "", "0"],
             ],
+        ),
+        // Trimming other characters from the end of a char value drops the
+        // spaces that end up last.
+        (
+            "SELECT id, rtrim(ch, 'a'), length(rtrim(ch, 'a')), rtrim(ch, 'a') = 'a', trim(ch, 'a'), \
+             length(trim(ch, 'a')), trim(TRAILING 'b' FROM ch), trim(BOTH ' b' FROM ch), ltrim(ch, 'a') || '|' \
+             FROM w ORDER BY id",
+            &[
+                &["1", "", "0", "false", "", "0", " a", "a", " a|"],
+                &["2", "a b", "3", "false", " b", "2", "a", "a", " b|"],
+                &["3", "ab", "2", "false", "b", "1", "a", "a", "b|"],
+                &["5", "", "0", "false", "", "0", "", "", "|"],
+                &["6", "aa", "2", "false", "", "0", "aa a", "aa a", " a|"],
+                &["7", "b  b", "4", "false", "b  b", "4", "b", "", "b  b|"],
+                &["8", " ab", "3", "false", " ab", "3", " a", "a", " ab|"],
+                &["9", "a\t", "2", "false", "\t", "1", "a\t", "a\t", "\t|"],
+                &[
+                    "10", "NULL", "NULL", "NULL", "NULL", "NULL", "NULL", "NULL", "NULL",
+                ],
+                &["11", "x", "1", "false", "x", "1", "xa", "xa", "xa|"],
+                &["12", "a", "1", "true", "", "0", "a  a", "a  a", "  a|"],
+            ],
+        ),
+        (
+            "SELECT trim(BOTH 'a' FROM ch) AS r, count(*) FROM w GROUP BY 1 ORDER BY 1",
+            &[
+                &["", "4"],
+                &["\t", "1"],
+                &[" ab", "1"],
+                &[" b", "1"],
+                &["b", "1"],
+                &["b  b", "1"],
+                &["x", "1"],
+                &["NULL", "1"],
+            ],
+        ),
+        (
+            "SELECT id FROM w WHERE rtrim(ch, 'b') = 'a' ORDER BY id",
+            &[&["2"], &["3"]],
+        ),
+        (
+            "SELECT trim(BOTH 'a' FROM CAST(' a' AS char(5))), ltrim(CAST('a b' AS char(5)), 'a'), \
+             rtrim(CAST('a b' AS char(5)), 'b'), trim(CAST(' xa' AS char(5)), 'a'), \
+             rtrim(CAST('xa  a' AS char(6)), 'a') || '|', length(rtrim(CAST('b a' AS char(4)), 'a'))",
+            &[&["", " b", "a", " x", "xa|", "1"]],
         ),
         (
             "SELECT id, ch, length(ch), typeof(ch) FROM cht ORDER BY id",
