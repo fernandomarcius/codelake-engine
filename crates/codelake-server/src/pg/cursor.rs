@@ -34,13 +34,13 @@ use datafusion::common::ParamValues;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{
-    Declare, DeclareType, FetchDirection, FetchPosition, Ident, Statement, Value, ValueWithSpan,
+    CloseCursor, Declare, DeclareType, FetchDirection, FetchPosition, Ident, Statement, Value, ValueWithSpan,
 };
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::tokenizer::{Span, Token, Tokenizer, Word};
 use datafusion_postgres::hooks::{HookClient, QueryHook};
 use datafusion_postgres::pgwire::api::portal::{Format, Portal, PortalExecutionState};
-use datafusion_postgres::pgwire::api::results::{FieldInfo, QueryResponse, Response};
+use datafusion_postgres::pgwire::api::results::{FieldInfo, QueryResponse, Response, Tag};
 use datafusion_postgres::pgwire::api::store::{MemPortalStore, PortalStore};
 use datafusion_postgres::pgwire::api::{ClientInfo, ClientPortalStore, PgWireConnectionState};
 use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
@@ -142,33 +142,37 @@ impl Cursors {
     }
 
     /// Checks the cursors `declares` make and records them, before
-    /// `datafusion-postgres` declares them.
-    fn declare(&self, declares: &[Declare]) -> PgWireResult<()> {
+    /// `datafusion-postgres` declares them in `store`.
+    fn declare(&self, declares: &[Declare], store: Option<&Store>) -> PgWireResult<()> {
         let mut book = lock(&self.0);
-        let mut made = Vec::new();
-        for declare in declares {
-            if declare.declare_type != Some(DeclareType::Cursor) {
-                continue; // `datafusion-postgres` refuses it
-            }
-            let Some(name) = declare.names.first() else {
-                continue;
-            };
-            let hold = declare.hold == Some(true);
-            if !hold && !book.explicit && !book.implicit_block {
-                return Err(user_error(
-                    "25P01",
-                    "DECLARE CURSOR can only be used in transaction blocks",
-                ));
-            }
-            made.push((
-                name.value.clone(),
-                Cursor::new(hold, declare.scroll != Some(false)),
-            ));
-        }
-        for (name, cursor) in made {
+        for (name, cursor) in book.checked(declares, store)? {
             book.cursors.insert(name, Arc::new(cursor));
         }
         Ok(())
+    }
+
+    /// `CLOSE`: `PostgreSQL`'s answers, a missing cursor included (34000,
+    /// where `datafusion-postgres` answers nothing).
+    fn close(&self, store: &Store, cursor: &CloseCursor) -> PgWireResult<Response> {
+        let mut book = lock(&self.0);
+        match cursor {
+            CloseCursor::All => {
+                store.clear_portals();
+                book.cursors.clear();
+                Ok(Response::Execution(Tag::new("CLOSE CURSOR ALL")))
+            }
+            CloseCursor::Specific { name } => {
+                if store.get_portal(&name.value).is_none() {
+                    return Err(user_error(
+                        "34000",
+                        format!("cursor \"{}\" does not exist", name.value),
+                    ));
+                }
+                store.rm_portal(&name.value);
+                book.cursors.remove(&name.value);
+                Ok(Response::Execution(Tag::new("CLOSE CURSOR")))
+            }
+        }
     }
 
     /// The cursor `name` (a portal of the extended protocol has one too).
@@ -212,6 +216,67 @@ impl Cursors {
             store.put_portal(portal);
         }
     }
+}
+
+impl Book {
+    /// The cursors `declares` make in `store`, refused when `PostgreSQL`
+    /// refuses them or the engine could not answer them right.
+    fn checked(&self, declares: &[Declare], store: Option<&Store>) -> PgWireResult<Vec<(String, Cursor)>> {
+        let mut made = Vec::new();
+        for declare in declares {
+            if declare.declare_type != Some(DeclareType::Cursor) {
+                continue; // `datafusion-postgres` refuses it
+            }
+            let Some(name) = declare.names.first() else {
+                continue;
+            };
+            // Its rows are encoded as text: a client decoding them as binary
+            // would read wrong values.
+            if declare.binary == Some(true) {
+                return Err(user_error(
+                    "0A000",
+                    "BINARY cursors are not supported: a cursor's rows are sent as text",
+                ));
+            }
+            let hold = declare.hold == Some(true);
+            if !hold && !self.explicit && !self.implicit_block {
+                return Err(user_error(
+                    "25P01",
+                    "DECLARE CURSOR can only be used in transaction blocks",
+                ));
+            }
+            // `datafusion-postgres` would replace it, dropping its rows.
+            if store.is_some_and(|store| store.get_portal(&name.value).is_some()) {
+                return Err(user_error(
+                    "42P03",
+                    format!("cursor \"{}\" already exists", name.value),
+                ));
+            }
+            made.push((
+                name.value.clone(),
+                Cursor::new(hold, declare.scroll != Some(false)),
+            ));
+        }
+        Ok(made)
+    }
+}
+
+/// Refuses a `DECLARE` sent alone, before it takes an admission slot, when
+/// its cursor would be refused (`25P01`, `42P03`, `0A000`): it would
+/// otherwise wait for a slot the connection's open cursor may hold. (The
+/// statements of a longer message are checked as they run: one may close
+/// or declare a cursor another names.)
+pub(super) fn check_declare<C>(client: &C, statement: &Statement) -> PgWireResult<()>
+where
+    C: ClientInfo + ClientPortalStore + ?Sized,
+    C::PortalStore: PortalStore,
+{
+    let Statement::Declare { stmts } = statement else {
+        return Ok(());
+    };
+    let cursors = Cursors::of(client);
+    let book = lock(&cursors.0);
+    book.checked(stmts, portals(client)).map(|_| ())
 }
 
 /// A simple-protocol message of `statements` statements starts. Outside a
@@ -284,6 +349,8 @@ impl CursorHook {
         match statement {
             // A `FETCH` among other statements: its rows are read before the
             // next statement runs (a single `FETCH` streams them, [`fetch`]).
+            Statement::Fetch { into: Some(_), .. } => return Some(Err(into_error())),
+            Statement::Close { cursor } => return Some(cursors.close(client.portal_store(), cursor)),
             Statement::Fetch { name, direction, .. } => {
                 let store = Some(client.portal_store());
                 let fetch = open(&cursors, store, &name.value, direction, &Format::UnifiedText).await;
@@ -295,7 +362,9 @@ impl CursorHook {
             Statement::StartTransaction { .. } => cursors.begin(),
             Statement::Commit { .. } => cursors.end_transaction(Some(client.portal_store()), true),
             Statement::Rollback { .. } => cursors.end_transaction(Some(client.portal_store()), false),
-            Statement::Declare { stmts } => return cursors.declare(stmts).err().map(Err),
+            Statement::Declare { stmts } => {
+                return cursors.declare(stmts, Some(client.portal_store())).err().map(Err);
+            }
             _ => {}
         }
         None
@@ -432,12 +501,26 @@ where
     C: ClientInfo + ClientPortalStore + ?Sized,
     C::PortalStore: PortalStore,
 {
-    let Statement::Fetch { name, direction, .. } = statement else {
+    let Statement::Fetch {
+        name,
+        direction,
+        into,
+        ..
+    } = statement
+    else {
         return None;
     };
+    if into.is_some() {
+        return Some(Err(into_error()));
+    }
     let cursors = Cursors::of(client);
     let fetch = open(&cursors, portals(client), &name.value, direction, format).await;
     Some(fetch.map(Fetch::streamed))
+}
+
+/// `FETCH … INTO`, which `PostgreSQL`'s SQL does not have (`PL/pgSQL` does).
+fn into_error() -> PgWireError {
+    user_error("42601", "syntax error at or near \"INTO\"")
 }
 
 /// How far a `FETCH` moves a cursor that only scans forward.
@@ -874,33 +957,65 @@ mod tests {
     fn cursors_are_declared_in_transaction_blocks() {
         let cursors = Cursors::default();
         cursors.begin_message(TransactionStatus::Idle, 1);
-        let refused = cursors.declare(&declares("DECLARE c CURSOR FOR SELECT 1"));
+        let refused = cursors.declare(&declares("DECLARE c CURSOR FOR SELECT 1"), None);
         assert_eq!(refused.map_err(code), Err("25P01".to_owned()));
         assert!(
             cursors
-                .declare(&declares("DECLARE c CURSOR WITHOUT HOLD FOR SELECT 1"))
+                .declare(&declares("DECLARE c CURSOR WITHOUT HOLD FOR SELECT 1"), None)
                 .is_err()
         );
         cursors
-            .declare(&declares("DECLARE h CURSOR WITH HOLD FOR SELECT 1"))
+            .declare(&declares("DECLARE h CURSOR WITH HOLD FOR SELECT 1"), None)
             .unwrap();
         // A message of several statements is an implicit transaction block.
         cursors.begin_message(TransactionStatus::Idle, 2);
         cursors
-            .declare(&declares("DECLARE m CURSOR FOR SELECT 1"))
+            .declare(&declares("DECLARE m CURSOR FOR SELECT 1"), None)
             .unwrap();
         cursors.begin_message(TransactionStatus::Idle, 1);
         cursors.begin();
         cursors
-            .declare(&declares("DECLARE b CURSOR FOR SELECT 1"))
+            .declare(&declares("DECLARE b CURSOR FOR SELECT 1"), None)
             .unwrap();
         cursors.begin_message(TransactionStatus::Transaction, 1);
         cursors
-            .declare(&declares("DECLARE t CURSOR FOR SELECT 1"))
+            .declare(&declares("DECLARE t CURSOR FOR SELECT 1"), None)
             .unwrap();
         let mut names: Vec<String> = lock(&cursors.0).cursors.keys().cloned().collect();
         names.sort();
         assert_eq!(names, ["b", "h", "m", "t"]);
+    }
+
+    #[test]
+    fn declares_postgresql_refuses_or_the_engine_cannot_answer() {
+        let cursors = Cursors::default();
+        cursors.begin_message(TransactionStatus::Transaction, 1);
+        let store = store_with(&["c"]);
+        let declare = |sql| cursors.declare(&declares(sql), Some(&store)).map_err(code);
+        assert_eq!(declare("DECLARE c CURSOR FOR SELECT 1"), Err("42P03".to_owned()));
+        assert_eq!(
+            declare("DECLARE b BINARY CURSOR FOR SELECT 1"),
+            Err("0A000".to_owned())
+        );
+        assert_eq!(declare("DECLARE d CURSOR FOR SELECT 1"), Ok(()));
+        let closed = cursors.close(
+            &store,
+            &CloseCursor::Specific {
+                name: Ident::new("x"),
+            },
+        );
+        assert_eq!(closed.map(|_| ()).map_err(code), Err("34000".to_owned()));
+        assert!(
+            cursors
+                .close(
+                    &store,
+                    &CloseCursor::Specific {
+                        name: Ident::new("c")
+                    }
+                )
+                .is_ok()
+        );
+        assert!(store.get_portal("c").is_none());
     }
 
     #[test]
@@ -910,7 +1025,7 @@ mod tests {
         let store = store_with(&all);
         cursors.begin_message(TransactionStatus::Idle, 1);
         cursors
-            .declare(&declares("DECLARE old CURSOR WITH HOLD FOR SELECT 1"))
+            .declare(&declares("DECLARE old CURSOR WITH HOLD FOR SELECT 1"), None)
             .unwrap();
         cursors.end_transaction(Some(&store), true);
         assert_eq!(
@@ -922,10 +1037,10 @@ mod tests {
         let store = store_with(&all);
         cursors.begin_message(TransactionStatus::Transaction, 1);
         cursors
-            .declare(&declares("DECLARE c CURSOR FOR SELECT 1"))
+            .declare(&declares("DECLARE c CURSOR FOR SELECT 1"), None)
             .unwrap();
         cursors
-            .declare(&declares("DECLARE h CURSOR WITH HOLD FOR SELECT 1"))
+            .declare(&declares("DECLARE h CURSOR WITH HOLD FOR SELECT 1"), None)
             .unwrap();
         cursors.end_transaction(Some(&store), false);
         assert_eq!(
@@ -937,7 +1052,7 @@ mod tests {
         let store = store_with(&all);
         cursors.begin_message(TransactionStatus::Transaction, 1);
         cursors
-            .declare(&declares("DECLARE h CURSOR WITH HOLD FOR SELECT 1"))
+            .declare(&declares("DECLARE h CURSOR WITH HOLD FOR SELECT 1"), None)
             .unwrap();
         cursors.end_transaction(Some(&store), true);
         assert_eq!(open_names(&store, &all), ["h", "old"]);
@@ -950,7 +1065,7 @@ mod tests {
         let store = store_with(&all);
         cursors.begin_message(TransactionStatus::Error, 1);
         cursors
-            .declare(&declares("DECLARE c CURSOR WITH HOLD FOR SELECT 1"))
+            .declare(&declares("DECLARE c CURSOR WITH HOLD FOR SELECT 1"), None)
             .unwrap();
         cursors.end_transaction(Some(&store), true);
         assert_eq!(open_names(&store, &all), ["h", "old"]);
@@ -1066,7 +1181,7 @@ mod tests {
     async fn cursor_streaming(rows: Vec<PgWireResult<DataRow>>, declare: &str) -> (Cursors, Store) {
         let cursors = Cursors::default();
         cursors.begin_message(TransactionStatus::Transaction, 1);
-        cursors.declare(&declares(declare)).unwrap();
+        cursors.declare(&declares(declare), None).unwrap();
         let store = store_with(&["c"]);
         let response = QueryResponse::new(Arc::new(Vec::new()), futures::stream::iter(rows));
         store.get_portal("c").unwrap().start(response).await;

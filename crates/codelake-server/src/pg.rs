@@ -846,6 +846,9 @@ impl Governed {
         if let Some(first) = statements.first() {
             aborted(&*client, first)?;
         }
+        if let [statement] = statements.as_slice() {
+            cursor::check_declare(&*client, statement)?;
+        }
         if let Some(request) = kill_request_sql(query) {
             return Ok(vec![self.kill(client, request)?]);
         }
@@ -962,6 +965,7 @@ impl ExtendedQueryHandler for Governed {
         let (sql, parsed) = &portal.statement.statement;
         if let Some((statement, _)) = parsed {
             aborted(&*client, statement)?;
+            cursor::check_declare(&*client, statement)?;
         }
         if let Some(request) = parsed.as_ref().and_then(|(statement, _)| kill_request(statement)) {
             return self.kill(client, request);

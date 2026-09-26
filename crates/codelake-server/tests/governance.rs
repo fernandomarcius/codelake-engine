@@ -1453,6 +1453,21 @@ fn cursor_script() -> Vec<(String, Want)> {
         ("SELECT 1".into(), Code("25P02")),
         ("COMMIT".into(), none()),
         ("FETCH 1 FROM f".into(), Code("34000")),
+        // Names, CLOSE and INTO as PostgreSQL answers them.
+        (format!("BEGIN; {}", declare("d", "CURSOR")), none()),
+        (declare("d", "CURSOR"), Code("42P03")),
+        ("ROLLBACK".into(), none()),
+        ("CLOSE nothing".into(), Code("34000")),
+        (
+            format!("BEGIN; {}; {}", declare("a1", "CURSOR"), declare("a2", "CURSOR")),
+            none(),
+        ),
+        ("CLOSE ALL".into(), none()),
+        ("FETCH 1 FROM a2".into(), Code("34000")),
+        ("ROLLBACK".into(), none()),
+        (format!("BEGIN; {}", declare("t", "CURSOR")), none()),
+        ("FETCH 1 FROM t INTO x".into(), Code("42601")),
+        ("ROLLBACK".into(), none()),
         // A count that is not a whole number.
         (format!("BEGIN; {}", declare("i", "CURSOR")), none()),
         ("FETCH 1.5 FROM i".into(), Code("42601")),
@@ -1519,8 +1534,12 @@ async fn cursors_answer_like_postgresql() {
             .unwrap_or_else(|_| panic!("engine: {sql} did not answer at once"));
         assert_eq!(answered, want, "engine: {sql}");
     }
-    // MOVE is not supported: refused at once, not queued.
+    // MOVE is not supported: refused at once, not queued. A BINARY cursor
+    // neither: its rows would be read as binary, and are text.
     assert_eq!(seen(&engine, "MOVE 1 IN c").await, Err("0A000".to_owned()));
+    let binary = format!("BEGIN; DECLARE b BINARY CURSOR FOR {TEN}");
+    assert_eq!(seen(&engine, &binary).await, Err("0A000".to_owned()));
+    assert_eq!(seen(&engine, "ROLLBACK").await, Ok(Vec::new()));
     // FETCH tags and rows on both protocols, message by message.
     let exchanges = |host: String, port: u16, user: &'static str, database: &'static str| {
         tokio::task::spawn_blocking(move || {
@@ -1536,6 +1555,8 @@ async fn cursors_answer_like_postgresql() {
             seen.push(wire.sync());
             seen.push(wire.query("FETCH 0 FROM w"));
             seen.push(wire.query("FETCH ALL FROM w"));
+            seen.push(wire.query("CLOSE w"));
+            seen.push(wire.query(&format!("DECLARE v CURSOR FOR {TEN}; CLOSE ALL")));
             seen.push(wire.query("COMMIT"));
             seen.iter()
                 .map(|messages| (tags(messages), data_rows(messages)))
@@ -1552,6 +1573,11 @@ async fn cursors_answer_like_postgresql() {
         (vec!["FETCH 3".to_owned()], text(&[3, 4, 5])),
         (vec!["FETCH 1".to_owned()], text(&[5])),
         (vec!["FETCH 5".to_owned()], text(&[6, 7, 8, 9, 10])),
+        (vec!["CLOSE CURSOR".to_owned()], text(&[])),
+        (
+            vec!["DECLARE CURSOR".to_owned(), "CLOSE CURSOR ALL".to_owned()],
+            text(&[]),
+        ),
         (vec!["COMMIT".to_owned()], text(&[])),
     ];
     assert_eq!(reference, want, "PostgreSQL");
