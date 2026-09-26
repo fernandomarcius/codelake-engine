@@ -232,9 +232,11 @@ fn render_source(catalog: &Catalog, imported: &Imported) -> String {
     out
 }
 
-/// The env file: `NAME=value` lines, no quoting, as `docker --env-file`,
-/// Compose `env_file`, systemd `EnvironmentFile` and
-/// `kubectl create secret generic --from-env-file` read them.
+/// The env file: `NAME=value` lines, no quoting, read literally by
+/// `docker --env-file` and `kubectl create secret generic --from-env-file`.
+/// Compose `env_file` and systemd `EnvironmentFile` interpret some
+/// characters; the report names every variable whose value they would change
+/// (`mapping::literal_only`).
 fn render_env(secrets: &[&EnvSecret]) -> String {
     let mut out = String::from(
         "# Secrets for the sources of the generated configuration. Keep this file\n\

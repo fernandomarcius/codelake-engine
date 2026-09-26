@@ -211,6 +211,18 @@ struct Secrets<'a> {
     generated: Vec<EnvSecret>,
     references: Vec<String>,
     value_references: Vec<String>,
+    /// Generated variables whose value only a literal reader of the env
+    /// file keeps (see [`literal_only`]).
+    literal_only: Vec<String>,
+}
+
+/// Whether a value would be changed by the env-file readers that interpret
+/// their input: Compose `env_file` (`$` interpolation, ` #` comments, quotes,
+/// trimmed whitespace) and systemd `EnvironmentFile` (quotes, backslash
+/// escapes, trimmed whitespace). `docker --env-file` and `kubectl create
+/// secret --from-env-file` read it literally.
+pub(crate) fn literal_only(value: &str) -> bool {
+    value.contains(['$', '#', '"', '\'', '\\', '`']) || value.trim() != value || value.contains('\t')
 }
 
 impl Secrets<'_> {
@@ -233,6 +245,9 @@ impl Secrets<'_> {
             ));
         }
         let var = env_var(self.ctx, self.catalog, suffix);
+        if literal_only(&value) {
+            self.literal_only.push(var.clone());
+        }
         self.generated.push(EnvSecret {
             var: var.clone(),
             value: SecretString::from(value),
@@ -279,6 +294,7 @@ pub(crate) fn map_catalog(
         generated: Vec::new(),
         references: Vec::new(),
         value_references: Vec::new(),
+        literal_only: Vec::new(),
     };
     let mut notes = Vec::new();
     let mut source = Table::new();
@@ -290,6 +306,15 @@ pub(crate) fn map_catalog(
         other => Err(format!("connector `{other}` is not supported by the import")),
     };
     mapped.map_err(skip)?;
+    if !secrets.literal_only.is_empty() {
+        notes.push(format!(
+            "the value of {} holds `$`, `#`, a quote, a backslash or edge whitespace: pass the env file \
+             with `docker --env-file` or `kubectl create secret generic --from-env-file` (read \
+             literally), not Compose `env_file` or systemd `EnvironmentFile` (they change it), or \
+             reference the secret with ${{ENV:…}}",
+            secrets.literal_only.join(", ")
+        ));
+    }
     let ignored = props.ignored();
     let sensitive: Vec<&String> = ignored.iter().filter(|k| is_sensitive_key(k)).collect();
     if !sensitive.is_empty() {
@@ -1148,6 +1173,38 @@ mod tests {
         )
         .unwrap_err();
         assert!(skipped.reason.contains("no connection-user"), "{skipped:?}");
+    }
+
+    #[test]
+    fn secrets_that_only_a_literal_reader_keeps_are_named() {
+        for (value, flagged) in [
+            ("plain-Secret_1", false),
+            ("pa$$word", true),
+            ("abc #tail", true),
+            ("\"quoted\"", true),
+            ("it's", true),
+            ("back\\slash", true),
+            (" edge", true),
+            ("edge ", true),
+        ] {
+            assert_eq!(literal_only(value), flagged, "{value:?}");
+        }
+        let imported = import(
+            "c",
+            &[
+                ("connector.name", "postgresql"),
+                ("connection-url", "jdbc:postgresql://h/d"),
+                ("connection-user", "u"),
+                ("connection-password", "s3cr$t #x"),
+            ],
+        )
+        .unwrap();
+        let notes = imported.notes.join("; ");
+        assert!(
+            notes.contains("the value of CODELAKE_C_PASSWORD holds"),
+            "{notes}"
+        );
+        assert!(!notes.contains("s3cr$t"), "{notes}");
     }
 
     #[test]
