@@ -60,8 +60,18 @@ Server 2022, and each is the behavior of Trino 431 itself.
   write `INT96`, so the writer encodes those columns itself and leaves them
   without min/max statistics (undefined sort order must never prune).
 - **Managed tables own their directory.** `DROP TABLE` removes the table
-  directory with its data (a view's directory holds only metadata); `EXTERNAL_TABLE`
-  keeps its data and loses only what the metastore wrote. A `CREATE TABLE AS`
+  directory with its data; `EXTERNAL_TABLE` keeps its data and loses only
+  what the metastore wrote. **A view owns nothing but its metadata**
+  (amended 2026-09-26, ISS-023, deliberate divergence): `DROP VIEW` removes
+  `.trinoSchema`, its checksum and `.trinoPermissions`, and the directory
+  only when nothing else is left in it; `ALTER VIEW … RENAME` moves only
+  those files (new name written whole, `.trinoSchema` last, then the old
+  one removed). Trino 431 lets `CREATE VIEW` take a directory that already
+  holds another writer's files and deletes them all on `DROP VIEW`;
+  `CodeLake` keeps them, byte for byte (`hive::limits_tests::drop_view_*`,
+  `view_rename_and_replace_never_move_foreign_files`). The view's rows are
+  the same in both engines. Any table type other than `MANAGED_TABLE`
+  loses only its metadata on `DROP TABLE`. A `CREATE TABLE AS`
   that fails removes everything it wrote, directory included. A CTAS whose
   target directory already exists fails, as in Trino ("Target directory for
   table … already exists"). `CREATE SCHEMA` creates the schema directory.

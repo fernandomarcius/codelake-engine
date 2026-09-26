@@ -197,6 +197,10 @@ versioning: [SemVer](https://semver.org/).
   one value everywhere, for `double` and `real`. **Deliberate divergence:** joins,
   `IN (subquery)` and `IN` lists of `real` match `0.0` with `-0.0`, as PostgreSQL does and
   Trino 431 does not (ADR 0017, ISS-050).
+- Hive catalog: `DROP VIEW` deleted every file in the view's directory, including files of
+  another writer when the view had been created over an existing directory (as the reference
+  engine does); `ALTER VIEW … RENAME` moved them. Both now touch only the view's metadata
+  (ADR 0007, ISS-023, deliberate divergence).
 - PostgreSQL wire, transactions: `COMMIT` and `ROLLBACK` did not close cursors and portals,
   which kept their admission slot and pool memory (for good on a pooled connection) and
   answered `FETCH` after the `COMMIT`. The end of a transaction (`COMMIT`, `ROLLBACK`, a

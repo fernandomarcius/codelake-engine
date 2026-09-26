@@ -46,6 +46,7 @@ pub(crate) const MANAGED_TABLE: &str = "MANAGED_TABLE";
 pub(crate) const VIRTUAL_VIEW: &str = "VIRTUAL_VIEW";
 /// Data lives at `externalLocation`, owned by someone else: dropping the table
 /// removes only its metadata.
+#[cfg(test)]
 const EXTERNAL_TABLE: &str = "EXTERNAL_TABLE";
 pub(crate) const METADATA_FILE: &str = ".trinoSchema";
 const PERMISSIONS_DIR: &str = ".trinoPermissions";
@@ -878,18 +879,28 @@ impl FileMetastore {
     }
 
     /// Drops a table or view: metadata first (it disappears atomically), then
-    /// its directory. A managed table's data goes with it, as in Trino; an
-    /// external table keeps its data and loses only what the metastore wrote.
+    /// its directory. A managed table's data goes with it, as in Trino. An
+    /// external table keeps its data and loses only what the metastore wrote;
+    /// so does a view (ISS-023): a view owns no data, and one created over a
+    /// directory that already held files (another writer's) must not take
+    /// them with it. Trino 431 deletes that directory on `DROP VIEW`.
     pub(crate) async fn drop_table(&self, schema: &str, table: &str) -> MetastoreResult<()> {
         let Some(metadata) = self.table(schema, table).await? else {
             return Err(MetastoreError::NotFound(format!("table {schema}.{table}")));
         };
         let file = self.table_file(schema, table);
         self.store.delete(&file).await?;
-        if metadata.table_type != EXTERNAL_TABLE {
+        if metadata.table_type == MANAGED_TABLE {
             return self.remove_table_location(schema, table).await;
         }
-        let dir = self.table_dir(schema, table);
+        self.remove_metadata_leftovers(&self.table_dir(schema, table))
+            .await
+    }
+
+    /// Removes what the metastore writes next to `.trinoSchema` (its
+    /// checksum and the permissions) from `dir`, and the directory itself
+    /// only if nothing else is left in it. Any other file stays.
+    async fn remove_metadata_leftovers(&self, dir: &Path) -> MetastoreResult<()> {
         self.delete_all(&dir.clone().join(PERMISSIONS_DIR)).await?;
         match self
             .store
@@ -899,12 +910,58 @@ impl FileMetastore {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
             Err(err) => return Err(err.into()),
         }
-        if let Some(path) = self.local_path(&dir) {
-            // Only empty directories go; data under the table directory stays.
+        if let Some(path) = self.local_path(dir) {
+            // Only empty directories go; any other file under it stays.
             let _ = std::fs::remove_dir(path.join(PERMISSIONS_DIR));
             let _ = std::fs::remove_dir(path);
         }
         Ok(())
+    }
+
+    /// Metadata files of the table or view in `dir`: the `.trinoSchema`
+    /// commit point last, so a copy in that order makes the name visible
+    /// only once everything else is there.
+    async fn metadata_files(&self, dir: &Path) -> MetastoreResult<Vec<Path>> {
+        let file = dir.clone().join(METADATA_FILE);
+        let crc = dir.clone().join(crc_name(METADATA_FILE));
+        let permissions = dir.clone().join(PERMISSIONS_DIR);
+        let mut files: Vec<Path> = self
+            .store
+            .list(Some(&permissions))
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await?;
+        files.sort();
+        for path in [crc, file] {
+            match self.store.head(&path).await {
+                Ok(_) => files.push(path),
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(files)
+    }
+
+    /// `ALTER VIEW … RENAME TO`: moves only the view's metadata (ISS-023),
+    /// never other files in its directory. The new name appears whole
+    /// (its `.trinoSchema` is copied last), then the old one disappears
+    /// (its `.trinoSchema` is deleted first): a failure part way leaves the
+    /// old name, or both names with the same definition.
+    async fn rename_view(
+        &self,
+        (schema, view): (&str, &str),
+        (new_schema, new_view): (&str, &str),
+    ) -> MetastoreResult<()> {
+        let (old_dir, new_dir) = (self.table_dir(schema, view), self.table_dir(new_schema, new_view));
+        let files = self.metadata_files(&old_dir).await?;
+        for location in &files {
+            if let Some(relative) = location.prefix_match(&old_dir) {
+                let to = Path::from_iter(new_dir.parts().chain(relative));
+                self.store.copy(location, &to).await?;
+            }
+        }
+        self.store.delete(&self.table_file(schema, view)).await?;
+        self.remove_metadata_leftovers(&old_dir).await
     }
 
     /// Moves a table or view to a new name, like Trino's file metastore,
@@ -920,7 +977,8 @@ impl FileMetastore {
     /// both names over identical files; never a name without its data.
     ///
     /// A target directory holding any object is refused: its files would
-    /// otherwise become rows of the renamed table.
+    /// otherwise become rows of the renamed table. A view moves only its
+    /// metadata ([`FileMetastore::rename_view`]).
     pub(crate) async fn rename_table(
         &self,
         schema: &str,
@@ -944,6 +1002,9 @@ impl FileMetastore {
             return Err(MetastoreError::AlreadyExists(format!(
                 "table {new_schema}.{new_table}"
             )));
+        }
+        if self.table(schema, table).await?.is_some_and(|m| m.is_view()) {
+            return self.rename_view((schema, table), (new_schema, new_table)).await;
         }
         match self.store.rename(&old_dir, &new_dir).await {
             // A local directory: renamed as a whole.

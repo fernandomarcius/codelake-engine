@@ -24,16 +24,20 @@ use super::crc::hadoop_crc;
 use super::metastore::FileMetastore;
 use super::{HiveConnector, HiveParams};
 
-type Rows = Vec<Vec<String>>;
+pub(super) type Rows = Vec<Vec<String>>;
 
-struct Lake {
-    warehouse: tempfile::TempDir,
+pub(super) struct Lake {
+    pub(super) warehouse: tempfile::TempDir,
     /// Kept alive while the engine spills there.
     _spill: tempfile::TempDir,
-    engine: Engine,
+    pub(super) engine: Engine,
 }
 
-async fn engine_over(warehouse: &FsPath, spill: &FsPath, precision: HiveTimestampPrecision) -> Engine {
+pub(super) async fn engine_over(
+    warehouse: &FsPath,
+    spill: &FsPath,
+    precision: HiveTimestampPrecision,
+) -> Engine {
     let memory = MemoryConfig {
         limit: ByteSize::mib(256),
         spill_dir: spill.to_owned(),
@@ -74,7 +78,7 @@ async fn lake_at(precision: HiveTimestampPrecision) -> Lake {
     lake
 }
 
-async fn lake() -> Lake {
+pub(super) async fn lake() -> Lake {
     lake_at(HiveTimestampPrecision::Milliseconds).await
 }
 
@@ -100,7 +104,7 @@ fn to_rows(batches: &[RecordBatch]) -> Rows {
     rows
 }
 
-fn rows(values: &[&[&str]]) -> Rows {
+pub(super) fn rows(values: &[&[&str]]) -> Rows {
     values
         .iter()
         .map(|r| r.iter().map(|v| (*v).to_owned()).collect())
@@ -108,28 +112,28 @@ fn rows(values: &[&[&str]]) -> Rows {
 }
 
 impl Lake {
-    async fn run(&self, sql: &str) -> Result<Rows, String> {
+    pub(super) async fn run(&self, sql: &str) -> Result<Rows, String> {
         run_on(&self.engine, sql).await
     }
 
-    async fn ok(&self, sql: &str) -> Rows {
+    pub(super) async fn ok(&self, sql: &str) -> Rows {
         self.run(sql)
             .await
             .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"))
     }
 
-    async fn err(&self, sql: &str) -> String {
+    pub(super) async fn err(&self, sql: &str) -> String {
         match self.run(sql).await {
             Ok(rows) => panic!("`{sql}` should fail, returned {rows:?}"),
             Err(err) => err,
         }
     }
 
-    fn dir(&self, table: &str) -> PathBuf {
+    pub(super) fn dir(&self, table: &str) -> PathBuf {
         self.warehouse.path().join("s").join(table)
     }
 
-    fn metastore(&self) -> FileMetastore {
+    pub(super) fn metastore(&self) -> FileMetastore {
         let store = LocalFileSystem::new_with_prefix(self.warehouse.path()).unwrap();
         FileMetastore::new(Arc::new(store), Path::default()).with_local_dir(self.warehouse.path().into())
     }
@@ -146,14 +150,14 @@ impl Lake {
     }
 
     /// Writes a Parquet file into a table directory, as Spark or pandas would.
-    fn put_file(&self, table: &str, name: &str, batch: &RecordBatch) {
+    pub(super) fn put_file(&self, table: &str, name: &str, batch: &RecordBatch) {
         let file = std::fs::File::create(self.dir(table).join(name)).unwrap();
         let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
         writer.write(batch).unwrap();
         writer.close().unwrap();
     }
 
-    fn columns(&self, table: &str) -> Vec<(String, String)> {
+    pub(super) fn columns(&self, table: &str) -> Vec<(String, String)> {
         let metadata: serde_json::Value =
             serde_json::from_slice(&std::fs::read(self.dir(table).join(".trinoSchema")).unwrap()).unwrap();
         metadata["dataColumns"]
@@ -170,7 +174,7 @@ impl Lake {
     }
 }
 
-async fn run_on(engine: &Engine, sql: &str) -> Result<Rows, String> {
+pub(super) async fn run_on(engine: &Engine, sql: &str) -> Result<Rows, String> {
     let frame = engine.sql(sql).await.map_err(|e| e.to_string())?;
     let batches = frame.collect().await.map_err(|e| e.to_string())?;
     Ok(to_rows(&batches))
