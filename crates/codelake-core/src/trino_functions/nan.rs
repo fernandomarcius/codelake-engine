@@ -4,7 +4,7 @@
 //! and `nan() > 1` is true, so `WHERE x > 1` keeps NaN rows. In Trino (and
 //! IEEE 754) every comparison with NaN is false, except `<>`, which is true.
 //! The total order also puts `-0.0` below `0.0`, where IEEE 754, Trino and
-//! PostgreSQL have `-0.0 = 0.0` (ISS-031). [`NanAwareComparison`] wraps a
+//! PostgreSQL have `-0.0 = 0.0` (ISS-050). [`NanAwareComparison`] wraps a
 //! float comparison (and `IS [NOT] DISTINCT FROM`) and corrects the rows
 //! where an operand is NaN or both are zeros; the physical rule in `try_expr`
 //! installs it. Comparisons with a zero constant are rewritten before
@@ -356,7 +356,7 @@ mod tests {
         out.iter().collect()
     }
 
-    /// `-0.0 = 0.0` (IEEE 754, PostgreSQL, Trino's comparisons; ISS-031).
+    /// `-0.0 = 0.0` (IEEE 754, PostgreSQL, Trino's comparisons; ISS-050).
     #[test]
     fn the_two_zeros_are_one_value() {
         let pairs = [

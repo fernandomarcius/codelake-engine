@@ -113,3 +113,60 @@ are non-nullable.
 Workaround used downstream: refuse the statement when a NULL is possible and
 the position is not one where FALSE and UNKNOWN filter the same rows (under
 `AND`/`OR` in a filter, with the right parity of negations).
+
+## Draft 4 — A null-safe hash join's dynamic filter drops the probe side's NULL keys
+
+**Title:** Dynamic filter of a hash join with `NullEqualsNull` prunes NULL
+keys from the probe side (`EXCEPT`, `INTERSECT`, `IS NOT DISTINCT FROM`)
+
+**Body:**
+
+A `HashJoinExec` whose `null_equality` is `NullEqualsNull` matches a NULL
+key with a NULL key, but the dynamic filter it pushes into its probe side
+(bounds or `IN` of the build side's keys) is built from the non-NULL keys
+only. The probe scan then prunes row groups holding only NULL keys, and with
+`pushdown_filters = true` drops NULL rows in any row group; those rows never
+reach the join.
+
+```sql
+COPY (SELECT 1::bigint AS id, 'a' AS v UNION ALL SELECT 2, 'b') TO 't/part-0.parquet';
+COPY (SELECT 3::bigint AS id, CAST(NULL AS varchar) AS v) TO 't/part-1.parquet';
+CREATE EXTERNAL TABLE t STORED AS PARQUET LOCATION 't/';
+SET datafusion.execution.parquet.pushdown_filters = true;
+SELECT count(*) FROM t a JOIN t b ON a.v IS NOT DISTINCT FROM b.v;  -- expected 3; 54.1.0: 2
+SELECT * FROM t EXCEPT SELECT * FROM t;                            -- expected no row; 54.1.0: (3, NULL)
+```
+
+(Reproduced in CodeLake:
+`join_guard::tests::upstream_null_safe_join_still_prunes_null_only_row_groups`;
+through Hive tables written by an `INSERT` per row group, also with default
+settings.)
+
+Suggested fix: when `null_equality` is `NullEqualsNull`, push
+`<filter> OR key IS NULL` for every key, as apache/datafusion#23104 does for
+null-aware anti joins.
+
+## Draft 5 — `IS [NOT] DISTINCT FROM` takes the rest of the expression as its right operand
+
+**Title (apache/datafusion-sqlparser-rs):** `a IS DISTINCT FROM b AND c` is
+parsed as `a IS DISTINCT FROM (b AND c)`
+
+**Body:**
+
+After `IS [NOT] DISTINCT FROM` the parser calls `parse_expr()`, which parses
+the right operand at the lowest precedence, so `AND`/`OR` (and a following
+`IS NULL`) end up inside it. PostgreSQL, Trino and the SQL standard bind the
+operator tighter than `AND`/`OR`. Over booleans the query answers other rows
+(`ON a.f IS NOT DISTINCT FROM b.f AND a.id = b.id` joins every pair whose `f`
+matches `b.f AND a.id = b.id`); over other types planning fails
+(`Utf8 AND Boolean`).
+
+```sql
+SELECT (true IS DISTINCT FROM false AND false);
+-- PostgreSQL: false ((true IS DISTINCT FROM false) AND false)
+-- sqlparser 0.62: true (true IS DISTINCT FROM (false AND false))
+```
+
+Suggested fix: parse the right operand with `parse_subexpr` at the precedence
+of `IS` (`self.dialect.prec_value(Precedence::Is)`), as the other `IS` forms
+are.

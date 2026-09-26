@@ -1,4 +1,4 @@
-//! `0.0` and `-0.0` are one value (ISS-031, ADR 0017).
+//! `0.0` and `-0.0` are one value (ISS-050, ADR 0017).
 //!
 //! The engine orders floats by their bits, which puts `-0.0` below `0.0`:
 //! `x = 0` dropped `-0.0`, `x < 0` and `x IS DISTINCT FROM 0` kept it, and

@@ -309,7 +309,7 @@ async fn timestamps_round_half_up_to_a_smaller_precision() {
     );
 }
 
-/// `0.0` and `-0.0` are one value everywhere (ISS-031): comparisons with a
+/// `0.0` and `-0.0` are one value everywhere (ISS-050): comparisons with a
 /// zero, `IN`, `BETWEEN`, `IS [NOT] DISTINCT FROM`, comparisons of two
 /// columns, joins, `IN (subquery)`, grouping, `CASE x WHEN` and `nullif`;
 /// `double` and `real`. Answers of Trino 431 (PostgreSQL 17 for the joins

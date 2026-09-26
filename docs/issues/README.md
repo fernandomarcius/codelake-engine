@@ -59,3 +59,4 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-047](ISS-047-sqlserver-undefined-cp1252-bytes.md) | Bytes undefined in code page 1252 keep their value (U+0081), the reference replaces them with U+FFFD | expected difference | 2026-09-26 | closed |
 | [ISS-048](ISS-048-shadow-run-minor-findings.md) | Shadow run: minor findings | defect | 2026-09-26 | open |
 | [ISS-049](ISS-049-dbt-row-number-ties-nondeterministic.md) | dbt_pilot numbers CDC rows with ties: output differs between runs | use-case defect | 2026-09-26 | open |
+| [ISS-050](ISS-050-float-zeros-are-one-value.md) | `0.0` and `-0.0` are one value everywhere (joins diverge from Trino 431) | deliberate divergence | 2026-09-26 | open |

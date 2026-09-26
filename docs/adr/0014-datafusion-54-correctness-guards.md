@@ -1,7 +1,7 @@
 # ADR 0014 — Correctness guards for the DataFusion 54 train
 
 - Status: Accepted
-- Date: 2026-09-24
+- Date: 2026-09-24 (defects 13 and 14 added 2026-09-26)
 - Related: ADR 0002 (version train), ADR 0003 (memory model), ADR 0005
   (federation filter guard), ADR 0006 (pushdown policy)
 
@@ -28,6 +28,8 @@ confirmed in the published 54.1.0 source (checksum as in `Cargo.lock`).
 | 10 | `time ± interval` answers an interval (`24 hours 30 mins`) instead of a time of day | type coercion | changed in DataFusion 55 | yes |
 | 11 | `AccountedMergeExec` (engine): a partition task that panics ends the merged stream as if it had finished; the query returns part of its rows | `crates/codelake-core/src/output.rs` | — | yes |
 | 12 | `x [NOT] IN (subquery)` outside a conjunct of a `WHERE`/`HAVING` (under `OR`, in a `CASE`, a function argument, a projection) is answered by a mark join whose mark is FALSE where SQL says UNKNOWN: `x NOT IN (…NULL…) OR x = 99` keeps rows Trino filters out | `decorrelate_predicate_subquery.rs` `mark_join` | none known (draft 3 in `docs/upstream/datafusion-54-joins.md`) | yes |
+| 13 | A hash join whose keys match NULL with NULL (`JOIN … ON a IS NOT DISTINCT FROM b`, `[NOT] EXISTS (… a IS NOT DISTINCT FROM b)`, `INTERSECT`, `EXCEPT`) pushes its dynamic filter, built from the build side's non-NULL keys, into the scan of its probe side, which prunes the row groups holding only NULL keys (what an `INSERT` of a NULL row leaves) and, with `pushdown_filters`, drops the NULL rows: `t EXCEPT t` returns the NULL row, `t INTERSECT t` loses it | `hash_join/exec.rs` `gather_filters_for_pushdown` (the filter ignores `null_equality`) | none known (draft 4 in `docs/upstream/datafusion-54-joins.md`) | no |
+| 14 | `a IS [NOT] DISTINCT FROM b AND c` is parsed as `a IS [NOT] DISTINCT FROM (b AND c)` (the right operand is parsed as a whole expression): over booleans it answers other rows, otherwise the statement fails (`Utf8 AND Boolean`) | `sqlparser` 0.62 `parser/mod.rs` (`parse_expr` after `DISTINCT FROM`) | none known (draft 5) | not run on 53 |
 
 ## Decision
 
@@ -46,8 +48,10 @@ changes a correct answer.
 | 9, 10 | `operand_checks::check_plan` in `Engine::sql` before analysis (the bodies of the views a statement reads included, so a view stored without the check is refused when read): text compared with a number (`=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT] DISTINCT FROM`, `IN` lists, `IN (subquery)`, `BETWEEN`, `CASE x WHEN`) fails with `TYPE_MISMATCH`; `time ± interval` fails with `NOT_SUPPORTED`. On the PostgreSQL wire the same checks run in the wire hooks (`operand_checks::postgres_refusal`; a simple statement is checked by `SimpleRunHook` on the plan it then runs, planned once; an extended one by `PolicyHook` at execute) with PostgreSQL's typing, where a quoted literal or a parameter is untyped and takes the other side's type (`int_col > '20'` answers), and PostgreSQL's errors: SQLSTATE `42883` "operator does not exist: text > integer", `0A000` for `time ± interval` | `codelake_core::operand_checks`, `codelake-server` `hooks.rs` |
 | 11 | A partition task that panics sends an error into the merge (`catch_unwind`) | `codelake_core::output` |
 | 12 | `UnknownMembershipGuard` (logical, right before `decorrelate_predicate_subquery`, after `NullSafeNotIn`): an `IN (subquery)` whose value or subquery column may be NULL is refused (`NOT_SUPPORTED`) unless it sits where FALSE and UNKNOWN filter the same rows: a conjunct of a filter (a semi or null-aware anti join), or inside a filter under `AND`/`OR` with an even number of negations above an `IN` (odd above a `NOT IN`). Non-nullable sides answer everywhere | `codelake_core::join_guard` |
+| 13 | `NullSafeJoinGuard` (physical, right before `FilterPushdown(Post)`, after `JoinSelection` has picked build and probe sides): puts `NullKeysKept` above the probe side of every null-safe hash join; each dynamic filter going through it gets `OR key IS NULL` for every key (the upstream fix of #23104 for null-aware joins), other filters go on as they are, and every filter is reported unsupported so the operators above keep theirs | `codelake_core::join_guard` |
+| 14 | `trino_sql_checks::regroup_distinct_from` regroups the operands of every `IS [NOT] DISTINCT FROM` with `AND`, `OR`, `NOT` and the postfix `IS …` forms by their precedence (Trino's and PostgreSQL's), before planning, on the Trino protocol and in `Engine::sql`; on the PostgreSQL wire the simple protocol plans the regrouped statement and the extended one plans it when regrouping changed it (`hooks.rs`) | `codelake_core::trino_sql_checks`, `codelake-server` `hooks.rs` |
 
-Defects 1, 3, 4, 6 and 12 have a canary unit test that asserts the defect is
+Defects 1, 3, 4, 6, 12 and 13 have a canary unit test that asserts the defect is
 still there without the guard (`upstream_*` in `join_guard.rs`); when upstream
 fixes it, the canary fails and points here. Defects 2, 5, 7 and 8 have none
 yet: 2 shares its guard (and its effect) with 1, 5 is covered by
@@ -86,6 +90,12 @@ tests of `join_regressions.rs` check the rows against Trino 431.
   it); a statement the hook cannot plan is left to `DataFusion`, which
   reports its own error.
 - `time ± interval` is refused until the train reaches DataFusion 55.
+- A null-safe join's dynamic filter still skips the row groups whose keys it
+  excludes, but not those with NULL keys; the rows are those of Trino 431
+  (`join_regressions::null_safe_joins_keep_the_rows_whose_key_is_null`,
+  tables written by Trino and by the engine).
+- `a IS DISTINCT FROM b = c` keeps the parser's reading, `a IS DISTINCT FROM
+  (b = c)` (PostgreSQL's; Trino 431 rejects it).
 - Removing a guard needs the DataFusion release with the fix **and** the
   matching test of `join_regressions.rs` passing without it. Upstream reports
   are drafted in `docs/upstream/datafusion-54-joins.md`; filing them needs

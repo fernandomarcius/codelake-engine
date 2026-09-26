@@ -1,4 +1,4 @@
-//! `0.0` and `-0.0` are one value (ADR 0017, ISS-031), checked by rows over
+//! `0.0` and `-0.0` are one value (ADR 0017, ISS-050), checked by rows over
 //! Hive tables whose zeros sit in files of their own (one `INSERT` each, so a
 //! scan that prunes row groups by statistics would skip them). Trino 431 is
 //! the reference for comparisons, `IS [NOT] DISTINCT FROM`, `IN` lists of
