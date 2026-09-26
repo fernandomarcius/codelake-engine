@@ -30,7 +30,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use codelake_core::governance::{Failure, QueryRecord};
 use datafusion::common::ParamValues;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{
@@ -47,7 +49,7 @@ use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::data::DataRow;
 use datafusion_postgres::pgwire::messages::response::TransactionStatus;
 use futures::stream::BoxStream;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use super::{DfStatement, lock, user_error};
@@ -80,6 +82,8 @@ struct Cursor {
     /// Its stream failed (canceled, killed, past its time limit, an error):
     /// it cannot be read any more, as `PostgreSQL` marks a failed portal.
     failed: AtomicBool,
+    /// The governed statement that declared it.
+    record: Mutex<Option<Arc<QueryRecord>>>,
 }
 
 impl Cursor {
@@ -91,6 +95,7 @@ impl Cursor {
             current: Mutex::new(None),
             columns: Mutex::new(None),
             failed: AtomicBool::new(false),
+            record: Mutex::new(None),
         }
     }
 
@@ -344,18 +349,24 @@ where
 pub(crate) struct CursorHook;
 
 impl CursorHook {
-    async fn observe(statement: &Statement, client: &dyn HookClient) -> Option<PgWireResult<Response>> {
+    async fn observe(
+        statement: &Statement,
+        session_context: &SessionContext,
+        client: &dyn HookClient,
+    ) -> Option<PgWireResult<Response>> {
         let cursors = Cursors::of(client);
         match statement {
             Statement::Close { cursor } => return Some(cursors.close(client.portal_store(), cursor)),
             Statement::Fetch { into: Some(_), .. } => return Some(Err(into_error())),
             // A `FETCH` among other statements: its rows are read before the
-            // next statement runs (a single `FETCH` streams them, [`fetch`]).
+            // next statement runs, held in the pool (a single `FETCH` streams
+            // them, [`fetch`]).
             Statement::Fetch { name, direction, .. } => {
                 let store = Some(client.portal_store());
                 let fetch = open(&cursors, store, &name.value, direction, &Format::UnifiedText).await;
+                let pool = &session_context.runtime_env().memory_pool;
                 return Some(match fetch {
-                    Ok(fetch) => fetch.collected().await,
+                    Ok(fetch) => fetch.collected(pool).await,
                     Err(error) => Err(error),
                 });
             }
@@ -376,10 +387,10 @@ impl QueryHook for CursorHook {
     async fn handle_simple_query(
         &self,
         statement: &Statement,
-        _session_context: &SessionContext,
+        session_context: &SessionContext,
         client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
-        Self::observe(statement, client).await
+        Self::observe(statement, session_context, client).await
     }
 
     async fn handle_extended_parse_query(
@@ -396,10 +407,10 @@ impl QueryHook for CursorHook {
         statement: &Statement,
         _logical_plan: &LogicalPlan,
         _params: &ParamValues,
-        _session_context: &SessionContext,
+        session_context: &SessionContext,
         client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
-        Self::observe(statement, client).await
+        Self::observe(statement, session_context, client).await
     }
 }
 
@@ -469,6 +480,19 @@ impl Declared {
             states.push(portal.state().lock_owned().await);
         }
         states
+    }
+
+    /// Ties the cursors the statement made to its `record`, which a failure
+    /// of theirs fails.
+    pub(super) fn attach<C>(&self, client: &C, record: &Arc<QueryRecord>)
+    where
+        C: ClientInfo + ClientPortalStore + ?Sized,
+        C::PortalStore: PortalStore,
+    {
+        let cursors = Cursors::of(client);
+        for (name, _) in self.made(client) {
+            *lock(&cursors.cursor(name).record) = Some(Arc::clone(record));
+        }
     }
 
     /// `outcome` of the statement; when it failed, the cursors it made are
@@ -572,14 +596,90 @@ impl Fetch {
         Response::Query(response)
     }
 
-    /// The rows, read before the response is made.
-    async fn collected(self) -> PgWireResult<Response> {
-        let (columns, rows) = self.rows();
-        let rows: Vec<DataRow> = rows.try_collect().await?;
-        let mut response = QueryResponse::new(columns, futures::stream::iter(rows.into_iter().map(Ok)));
+    /// The rows, read before the response is made (a `FETCH` among other
+    /// statements of a message: the next one runs before they are sent).
+    /// Until they are sent they are held in `pool`, the engine's memory
+    /// pool; rows that do not fit fail the `FETCH` with `53200`
+    /// (`out_of_memory`) rather than be held outside the pool, and its
+    /// cursor cannot be read again (the rows read are gone).
+    async fn collected(self, pool: &Arc<dyn MemoryPool>) -> PgWireResult<Response> {
+        let cursor = match &self.rows {
+            FetchRows::Read { cursor, .. } => Some(Arc::clone(cursor)),
+            FetchRows::Current(_) => None,
+        };
+        let (columns, mut rows) = self.rows();
+        let reservation = MemoryConsumer::new("PostgreSQL FETCH among other statements").register(pool);
+        let mut held: Vec<DataRow> = Vec::new();
+        let mut bytes = 0_usize;
+        while let Some(row) = rows.next().await {
+            let row = row?;
+            bytes += row.data.capacity();
+            // Room for the row reserved before the vector grows to hold it.
+            let slots = if held.len() == held.capacity() {
+                (held.capacity() * 2).max(8)
+            } else {
+                held.capacity()
+            };
+            let needed = bytes + slots * std::mem::size_of::<DataRow>();
+            if reservation.try_resize(needed).is_err() {
+                let error = out_of_memory(held.len());
+                if let Some(cursor) = cursor {
+                    cursor.failed.store(true, Ordering::SeqCst);
+                    // Its statement fails too: its stream is dropped, its
+                    // slot and memory given back.
+                    if let (Some(record), PgWireError::UserError(info)) =
+                        (lock(&cursor.record).as_ref(), &error)
+                    {
+                        record.fail(Failure::new(
+                            "EXCEEDED_LOCAL_MEMORY_LIMIT",
+                            "INSUFFICIENT_RESOURCES",
+                            info.message.clone(),
+                        ));
+                    }
+                }
+                return Err(error);
+            }
+            held.reserve_exact(slots - held.len());
+            held.push(row);
+        }
+        let rows = HeldRows {
+            rows: held.into_iter(),
+            _reservation: reservation,
+        };
+        let mut response = QueryResponse::new(columns, rows);
         response.set_command_tag(FETCH_TAG);
         Ok(Response::Query(response))
     }
+}
+
+/// Rows a `FETCH` read before its response, with their place in the pool,
+/// given back once they are sent (or the response dropped).
+struct HeldRows {
+    rows: std::vec::IntoIter<DataRow>,
+    _reservation: MemoryReservation,
+}
+
+impl Stream for HeldRows {
+    type Item = PgWireResult<DataRow>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::task::Poll::Ready(self.get_mut().rows.next().map(Ok))
+    }
+}
+
+/// The error of a `FETCH` among other statements whose rows do not fit in
+/// the memory pool, after `rows` did.
+fn out_of_memory(rows: usize) -> PgWireError {
+    user_error(
+        "53200",
+        format!(
+            "out of memory: a FETCH among other statements holds its rows until they are sent, \
+             and the memory pool is full after {rows} rows; send the FETCH alone to stream its rows"
+        ),
+    )
 }
 
 /// Prepares a `FETCH` of the cursor `name`: checked (count, cursor, result
@@ -904,6 +1004,7 @@ mod tests {
     use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
     use datafusion::sql::sqlparser::parser::Parser;
     use datafusion_postgres::pgwire::api::stmt::StoredStatement;
+    use futures::TryStreamExt;
 
     use super::*;
 
@@ -1222,7 +1323,7 @@ mod tests {
             .await
             .unwrap();
             let response = if collected {
-                fetch.collected().await.unwrap()
+                fetch.collected(&pool(1 << 20)).await.unwrap()
             } else {
                 fetch.streamed()
             };
@@ -1248,7 +1349,7 @@ mod tests {
             .await
             .map_err(code)?;
         let response = if collected {
-            fetch.collected().await.map_err(code)?
+            fetch.collected(&pool(1 << 20)).await.map_err(code)?
         } else {
             fetch.streamed()
         };
@@ -1322,6 +1423,59 @@ mod tests {
         assert!(!refused(&Format::UnifiedBinary, 0), "no column to send in binary");
         assert!(!refused(&Format::Individual(vec![0, 0]), 2));
         assert!(refused(&Format::Individual(vec![0, 1]), 2));
+    }
+
+    /// A memory pool of `bytes`.
+    fn pool(bytes: usize) -> Arc<dyn MemoryPool> {
+        Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(bytes))
+    }
+
+    /// A `FETCH` among other statements holds the rows it read in the pool
+    /// until they are sent; rows that do not fit fail it (`53200`) and its
+    /// cursor, never held outside the pool.
+    #[tokio::test]
+    async fn rows_read_before_their_response_are_held_in_the_pool() {
+        let (cursors, store) = cursor_over(100, "DECLARE c CURSOR FOR SELECT 1").await;
+        let pool = pool(1 << 20);
+        let fetch = |sql: &str| {
+            let Statement::Fetch { name, direction, .. } = parse(sql).remove(0) else {
+                panic!("{sql}");
+            };
+            let (cursors, store) = (&cursors, &store);
+            async move {
+                open(
+                    cursors,
+                    Some(store),
+                    &name.value,
+                    &direction,
+                    &Format::UnifiedText,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let response = fetch("FETCH 10 FROM c").await.collected(&pool).await.unwrap();
+        let held = pool.reserved();
+        assert!(
+            held >= 10 * std::mem::size_of::<DataRow>(),
+            "{held} bytes reserved"
+        );
+        let Response::Query(response) = response else {
+            panic!("not a query response");
+        };
+        let values: Vec<u8> = response.data_rows.map(|row| row.unwrap().data[0]).collect().await;
+        assert_eq!(values, (1..=10).collect::<Vec<_>>());
+        assert_eq!(pool.reserved(), 0, "given back once sent");
+
+        // A pool too small for the rows: refused, and the cursor with it.
+        let small = self::pool(2 * std::mem::size_of::<DataRow>() * 8);
+        let refused = fetch("FETCH ALL FROM c").await.collected(&small).await;
+        assert_eq!(refused.map(|_| ()).map_err(code), Err("53200".to_owned()));
+        assert_eq!(small.reserved(), 0);
+        assert_eq!(
+            fetched(&cursors, &store, "FETCH 1 FROM c").await,
+            Err("55000".to_owned())
+        );
     }
 
     fn row(value: u8) -> DataRow {

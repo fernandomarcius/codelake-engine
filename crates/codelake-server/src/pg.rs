@@ -457,14 +457,18 @@ fn failure_of(error: &PgWireError, sql: &str) -> Failure {
 
 /// How the registry records an error the client is sent as is.
 fn failure_of_info(info: &ErrorInfo) -> Failure {
-    if info.code == "57014" {
-        Failure::new(
+    match info.code.as_str() {
+        "57014" => Failure::new(
             EXCEEDED_TIME_LIMIT,
             "INSUFFICIENT_RESOURCES",
             info.message.clone(),
-        )
-    } else {
-        Failure::new("GENERIC_USER_ERROR", "USER_ERROR", info.message.clone())
+        ),
+        "53200" => Failure::new(
+            "EXCEEDED_LOCAL_MEMORY_LIMIT",
+            "INSUFFICIENT_RESOURCES",
+            info.message.clone(),
+        ),
+        _ => Failure::new("GENERIC_USER_ERROR", "USER_ERROR", info.message.clone()),
     }
 }
 
@@ -872,6 +876,7 @@ impl Governed {
             )
             .await;
         let responses = declared.settle(client, responses)?;
+        declared.attach(&*client, &admitted.execution.record);
         let mut cursors = declared.states(client).await;
         Ok(self.run(admitted, responses, &mut cursors))
     }
@@ -996,6 +1001,7 @@ impl ExtendedQueryHandler for Governed {
             )
             .await;
         let response = declared.settle(client, response)?;
+        declared.attach(&*client, &admitted.execution.record);
         let mut cursors = declared.states(client).await;
         Ok(self
             .run(admitted, vec![response], &mut cursors)
@@ -1116,6 +1122,10 @@ mod tests {
         assert_eq!(
             failure_of(&user_error("42601", "bad"), "").name,
             "GENERIC_USER_ERROR"
+        );
+        assert_eq!(
+            failure_of(&user_error("53200", "out of memory"), "").name,
+            "EXCEEDED_LOCAL_MEMORY_LIMIT"
         );
     }
 }

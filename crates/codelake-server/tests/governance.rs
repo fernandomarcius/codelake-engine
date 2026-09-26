@@ -1934,3 +1934,95 @@ async fn extended_protocol_streams_rows_under_governance() {
         [["FINISHED", "-"], ["FAILED", "EXCEEDED_TIME_LIMIT"]]
     );
 }
+
+/// A `FETCH` among other statements of a message reads its rows before the
+/// next statement runs, and holds them until they are sent: in the engine's
+/// memory pool, every row arriving in order; past what the pool gives, the
+/// `FETCH` fails with `53200` (`out_of_memory`) and its cursor cannot be read
+/// again, the rows never held outside the pool. (Found by the F6
+/// re-verification: `FETCH ALL FROM c; CLOSE c` over 6 M rows took the
+/// server from 114 MB to 815 MB of RSS, with a 256 MiB pool.)
+#[tokio::test]
+async fn fetch_among_other_statements_holds_its_rows_in_the_pool() {
+    const ROWS: i64 = 400_000;
+    let dir = tempfile::tempdir().unwrap();
+    let server = start_server(dir.path());
+    server.wait_ready().await;
+    let port = server.pg;
+    let (sent, fetch_sent) = tokio::sync::oneshot::channel();
+    let (read, go_read) = std::sync::mpsc::channel::<()>();
+    let fetching = tokio::task::spawn_blocking(move || {
+        let mut wire = Wire::connect(port, "multi");
+        let declared = wire.query(&format!(
+            "BEGIN; DECLARE big CURSOR FOR SELECT value FROM generate_series(1, {ROWS})"
+        ));
+        assert_eq!(error_code(&declared), None, "{declared:?}");
+        // Sent, not read: the rows wait for this client.
+        wire.send(b'Q', &cstr("FETCH ALL FROM big; CLOSE big"));
+        sent.send(()).unwrap();
+        go_read.recv().unwrap();
+        let fetched = wire.until_ready();
+        let ended = wire.query("COMMIT");
+        (fetched, ended)
+    });
+    fetch_sent.await.unwrap();
+    // Held in the pool while they wait: at least a row's bookkeeping each.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let held = loop {
+        let reserved = server.reserved().await;
+        if reserved >= u64::try_from(ROWS).unwrap() * 32 {
+            break reserved;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the rows waiting for the client are not in the pool ({reserved} bytes)"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    read.send(()).unwrap();
+    let (fetched, ended) = fetching.await.unwrap();
+    assert_eq!(error_code(&fetched), None);
+    assert_eq!(
+        numbers(&data_rows(&fetched)),
+        (1..=ROWS).collect::<Vec<_>>(),
+        "held {held} bytes"
+    );
+    assert_eq!(
+        tags(&fetched),
+        [format!("FETCH {ROWS}"), "CLOSE CURSOR".to_owned()]
+    );
+    assert_eq!(error_code(&ended), None, "{ended:?}");
+    server.slots_free().await;
+    assert_eq!(server.pool_drains().await, 0, "rows kept in the pool once sent");
+
+    // More rows than the pool holds (256 MiB): refused, not held outside it.
+    let client = server.connect("multi").await;
+    client
+        .batch_execute("DECLARE h CURSOR WITH HOLD FOR SELECT value FROM generate_series(1, 100000000)")
+        .await
+        .unwrap();
+    let (outcome, peak) = peak_while(&server, client.simple_query("FETCH ALL FROM h; CLOSE h")).await;
+    let error = outcome.unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::OUT_OF_MEMORY), "{error:?}");
+    assert!(
+        peak > 64 << 20,
+        "the rows were not held in the pool ({peak} bytes)"
+    );
+    assert_eq!(server.pool_drains().await, 0, "reservations left (peak {peak})");
+    // The rows it read are gone: the cursor cannot be read on.
+    let error = client.simple_query("FETCH 1 FROM h").await.unwrap_err();
+    assert_eq!(
+        error.code(),
+        Some(&SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE),
+        "{error:?}"
+    );
+    client.batch_execute("CLOSE h").await.unwrap();
+    server.slots_free().await;
+    let observer = server.connect("observer").await;
+    let states = states_of(&observer, "multi").await;
+    assert_eq!(
+        states.last().map(Vec::as_slice),
+        Some(&["FAILED".to_owned(), "EXCEEDED_LOCAL_MEMORY_LIMIT".to_owned()][..]),
+        "{states:?}"
+    );
+}
