@@ -464,14 +464,27 @@ impl QueryHook for CursorHook {
     }
 }
 
+/// `PostgreSQL`'s longest identifier, in bytes (`NAMEDATALEN - 1`).
+const MAX_IDENTIFIER_BYTES: usize = 63;
+
 /// A cursor's name as `PostgreSQL` reads it: folded to lower case unless
-/// quoted (`DECLARE Big` declares `big`).
+/// quoted (`DECLARE Big` declares `big`), and cut to 63 bytes, on a
+/// character boundary, as it cuts every identifier (a `FETCH` naming the
+/// cursor in full finds it too).
 fn cursor_name(name: &Ident) -> String {
-    if name.quote_style.is_some() {
+    let mut name = if name.quote_style.is_some() {
         name.value.clone()
     } else {
         name.value.to_ascii_lowercase()
+    };
+    if name.len() > MAX_IDENTIFIER_BYTES {
+        let mut end = MAX_IDENTIFIER_BYTES;
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name.truncate(end);
     }
+    name
 }
 
 /// `DECLARE … CURSOR`: each cursor checked ([`Cursors::declare`]), its
@@ -1241,6 +1254,28 @@ mod tests {
         // Folded to lower case unless quoted, as PostgreSQL reads them.
         assert_eq!(declared_names(&statements), ["c1", "Big", "small"]);
         assert!(declared_names(&parse("SELECT 1; FETCH 1 FROM c1")).is_empty());
+    }
+
+    #[test]
+    fn cursor_names_are_cut_as_postgresql_cuts_identifiers() {
+        let name = |sql: &str| declared_names(&parse(sql)).remove(0);
+        let long = "C".repeat(70);
+        assert_eq!(
+            name(&format!("DECLARE {long} CURSOR FOR SELECT 1")),
+            "c".repeat(63)
+        );
+        assert_eq!(
+            name(&format!("DECLARE \"{long}\" CURSOR FOR SELECT 1")),
+            "C".repeat(63)
+        );
+        // Never inside a character: "é" would end at byte 64.
+        let accented = format!("{}é", "a".repeat(62));
+        assert_eq!(
+            name(&format!("DECLARE \"{accented}\" CURSOR FOR SELECT 1")),
+            "a".repeat(62)
+        );
+        let exact = "b".repeat(63);
+        assert_eq!(name(&format!("DECLARE {exact} CURSOR FOR SELECT 1")), exact);
     }
 
     fn declares(sql: &str) -> Vec<Declare> {

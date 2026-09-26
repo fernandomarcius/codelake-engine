@@ -1619,11 +1619,30 @@ fn transactions_script() -> Vec<(String, Want)> {
     ]
 }
 
-/// Cursor names are folded to lower case unless quoted.
+/// Cursor names are folded to lower case unless quoted, and cut to 63
+/// bytes, never inside a character, as PostgreSQL cuts identifiers.
 fn names_script() -> Vec<(String, Want)> {
     use Want::{Code, Rows};
     let none = Want::none;
+    let long = "Long".repeat(18);
+    let cut = "long".repeat(18)[..63].to_owned();
+    let accented = format!("{}é", "a".repeat(62));
+    let accented_cut = "a".repeat(62);
     vec![
+        (
+            format!("BEGIN; DECLARE {long} NO SCROLL CURSOR FOR {TEN}"),
+            none(),
+        ),
+        (format!("FETCH 1 FROM {cut}"), Rows(vec![1])),
+        (format!("FETCH 1 FROM {long}"), Rows(vec![2])),
+        (format!("MOVE 1 IN {long}"), none()),
+        (format!("CLOSE {long}"), none()),
+        (format!("FETCH 1 FROM {cut}"), Code("34000")),
+        ("ROLLBACK".into(), none()),
+        (format!("BEGIN; DECLARE \"{accented}\" CURSOR FOR {TEN}"), none()),
+        (format!("FETCH 1 FROM \"{accented_cut}\""), Rows(vec![1])),
+        (format!("FETCH 1 FROM \"{accented}\""), Rows(vec![2])),
+        ("ROLLBACK".into(), none()),
         (format!("BEGIN; DECLARE Big NO SCROLL CURSOR FOR {TEN}"), none()),
         ("FETCH 1 FROM big".into(), Rows(vec![1])),
         ("FETCH 1 FROM BIG".into(), Rows(vec![2])),
