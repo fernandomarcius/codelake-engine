@@ -197,6 +197,13 @@ impl Query {
 /// checked again right after it for what runs in the engine.
 pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>> {
     let mut rules = datafusion::optimizer::Optimizer::new().rules;
+    // Float comparisons with a zero, before the simplifier folds or
+    // combines them with the bit order (`crate::trino_functions`).
+    let simplify = rules
+        .iter()
+        .position(|r| r.name() == "simplify_expressions")
+        .unwrap_or(0);
+    rules.insert(simplify, crate::trino_functions::float_zeros());
     let position = rules
         .iter()
         .position(|r| r.name() == "scalar_subquery_to_join")
@@ -1728,6 +1735,20 @@ mod tests {
         let guard = names.iter().position(|n| n == "federation_filter_guard").unwrap();
         let pushdown = names.iter().position(|n| n.contains("FilterPushdown")).unwrap();
         assert!(guard < pushdown, "{names:?}");
+    }
+
+    #[test]
+    fn float_zeros_run_right_before_the_simplifier() {
+        let names: Vec<String> = optimizer_rules().iter().map(|r| r.name().to_owned()).collect();
+        let zeros = names
+            .iter()
+            .position(|n| n == crate::trino_functions::FLOAT_ZEROS)
+            .unwrap();
+        assert_eq!(names[zeros + 1], "simplify_expressions", "{names:?}");
+        assert!(
+            !names[..zeros].iter().any(|n| n == "simplify_expressions"),
+            "{names:?}"
+        );
     }
 
     #[test]

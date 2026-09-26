@@ -208,6 +208,7 @@ fn install_try(expr: Arc<dyn PhysicalExpr>, schema: &Schema) -> Result<Transform
         }
         if let Some(binary) = e.downcast_ref::<BinaryExpr>()
             && super::nan::is_float_comparison(binary, schema)
+            && !super::nan::same_in_both_orders(binary)
         {
             let replaced: Arc<dyn PhysicalExpr> = Arc::new(super::nan::NanAwareComparison::new(binary));
             return Ok(Transformed::yes(replaced));
