@@ -950,6 +950,53 @@ async fn fetch_on_the_extended_protocol(server: &Server) {
     server.slots_free().await;
 }
 
+/// A cancel request that arrives while the connection executes nothing (a
+/// late Ctrl-C, JDBC's `Statement.cancel` of another statement) does
+/// nothing, as in PostgreSQL: an open cursor and a portal suspended by a
+/// row limit read on, every row in order. (Found by the F6 re-verification:
+/// it failed them with 57014.)
+async fn cancel_request_between_messages_does_nothing(server: &Server) {
+    let client = server.connect("idle").await;
+    client
+        .batch_execute("BEGIN; DECLARE ci CURSOR FOR SELECT value FROM generate_series(1, 100)")
+        .await
+        .unwrap();
+    assert_eq!(numbers(&text_rows(&client, "FETCH 3 FROM ci").await), [1, 2, 3]);
+    client.cancel_token().cancel_query(NoTls).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(numbers(&text_rows(&client, "FETCH 3 FROM ci").await), [4, 5, 6]);
+    assert_eq!(
+        numbers(&text_rows(&client, "FETCH ALL FROM ci").await),
+        (7..=100).collect::<Vec<_>>()
+    );
+    client.batch_execute("COMMIT").await.unwrap();
+    server.slots_free().await;
+
+    let mut client = server.connect("idle").await;
+    let token = client.cancel_token();
+    let transaction = client.transaction().await.unwrap();
+    let portal = transaction
+        .bind("SELECT value FROM generate_series(1, 100)", &[])
+        .await
+        .unwrap();
+    let mut values = Vec::new();
+    let first = transaction.query_portal(&portal, 5).await.unwrap();
+    values.extend(first.iter().map(|row| row.get::<_, i64>(0)));
+    token.cancel_query(NoTls).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    loop {
+        let rows = transaction.query_portal(&portal, 30).await.unwrap();
+        if rows.is_empty() {
+            break;
+        }
+        values.extend(rows.iter().map(|row| row.get::<_, i64>(0)));
+    }
+    assert_eq!(values, (1..=100).collect::<Vec<_>>());
+    drop(portal);
+    transaction.commit().await.unwrap();
+    server.slots_free().await;
+}
+
 /// A `DECLARE … CURSOR` (psycopg2 named cursors, pandas chunked reads) is
 /// one governed statement until its cursor is read to the end or closed: it
 /// holds its slot, and `FETCH` takes none (the user's only slot is the
@@ -969,6 +1016,7 @@ async fn declared_cursor_runs_under_governance() {
 
     cursors_return_every_row(&server, &client, &observer).await;
     fetch_on_the_extended_protocol(&server).await;
+    cancel_request_between_messages_does_nothing(&server).await;
 
     // `CLOSE` ends it and frees the slot and the memory.
     client

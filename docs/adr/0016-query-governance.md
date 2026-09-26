@@ -82,7 +82,7 @@ Per protocol:
 | session limit | `query_max_run_time`, `query_max_execution_time` | `SET statement_timeout` (as run time) |
 | slot held | from admission to the end of execution (the last batch produced; ≤ 2 buffered batches, reserved, may still wait for the client) | until every row is sent or the stream is dropped |
 | not governed | `USE`, `SET/RESET SESSION`, `PREPARE`, `DEALLOCATE`, `kill_query` | `SET`, `SHOW <variable>`, transaction control, `DISCARD`, `DEALLOCATE`, `kill_query`; `FETCH` and `CLOSE` (governed as their cursor's `DECLARE`) |
-| client cancel | `DELETE` of the query's `nextUri` | cancel request (process id + secret key): every governed statement of the connection, queued, planning or sending rows; SQLSTATE `57014` |
+| client cancel | `DELETE` of the query's `nextUri` | cancel request (process id + secret key), while the connection executes a message: every governed statement of the connection, queued, planning or sending rows (open cursors and suspended portals too, as PostgreSQL's aborted transaction); between messages it does nothing, as in PostgreSQL; SQLSTATE `57014` |
 | `kill_query` errors | as the reference engine 431 (checked against it): `NOT_FOUND`, `NOT_SUPPORTED` (not running), `INVALID_ARGUMENTS`, `INVALID_PROCEDURE_ARGUMENT` (`NULL` id), `TYPE_MISMATCH`; plus `PERMISSION_DENIED` (not the owner) | `42704`, `55000`, `22023`, `22023`, `42804`; `42501` |
 
 On the PostgreSQL wire the server wraps `datafusion-postgres`'s query
@@ -94,7 +94,8 @@ that stopped reading) is stopped at its deadline too, and the reader, when
 waiting, is woken with the error. The same watcher wakes on the record's
 cancellation token, which a cancel request or `kill_query` fires: the
 server's cancel handler maps the request's process id and secret key to the
-connection's live statements (a wrong secret key cancels nothing), then lets
+connection's live statements (a wrong secret key cancels nothing, and so
+does a request that arrives while the connection executes no message), then lets
 `datafusion-postgres` interrupt what it is planning. A hook plans
 `kill_query` as an empty statement on the extended protocol, where
 `DataFusion` could not plan `CALL`. The server also replaces `pgwire`'s

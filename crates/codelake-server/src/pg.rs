@@ -30,9 +30,13 @@
 //!
 //! - a cancel request (`psql`'s Ctrl-C, JDBC `Statement.cancel`,
 //!   `tokio-postgres`' `cancel_query`), which names the connection by its
-//!   process id and secret key: every governed statement of that connection
+//!   process id and secret key: while the connection executes a message (a
+//!   query, an `Execute`), every governed statement of that connection
 //!   fails with `57014`, whether it waits in the queue, is planned, or sends
-//!   rows;
+//!   rows — open cursors and suspended portals too, which `PostgreSQL`'s
+//!   aborted transaction would close. Between messages, as in `PostgreSQL`,
+//!   a cancel request does nothing: an open cursor or a portal suspended by
+//!   a row limit reads on;
 //! - `CALL system.runtime.kill_query(query_id => '…', message => '…')` from
 //!   a connection of the query's owner, for a query of any protocol (its id
 //!   is listed in `system.runtime.queries`); it answers without taking a
@@ -78,6 +82,7 @@ use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
 use datafusion_postgres::pgwire::messages::cancel::CancelRequest;
 use datafusion_postgres::pgwire::messages::data::DataRow;
 use datafusion_postgres::pgwire::messages::extendedquery::Execute;
+use datafusion_postgres::pgwire::messages::simplequery::Query;
 use datafusion_postgres::{DfSessionService, QueryHook};
 use futures::{Sink, Stream};
 use tokio::sync::{Notify, OwnedMutexGuard};
@@ -197,13 +202,45 @@ fn connection_key(client: &(impl ClientInfo + ?Sized)) -> ConnectionKey {
 }
 
 /// The governed statements alive on each connection, so a cancel request
-/// (which names a connection, not a statement) reaches them.
+/// (which names a connection, not a statement) reaches them, and the
+/// connections executing a message, the only ones a cancel request stops.
 #[derive(Default)]
 struct Connections {
     live: Mutex<HashMap<ConnectionKey, Vec<Weak<QueryRecord>>>>,
+    executing: Mutex<HashMap<ConnectionKey, usize>>,
+}
+
+/// A connection executing a message, until dropped.
+struct Executing {
+    key: ConnectionKey,
+    connections: Arc<Connections>,
+}
+
+impl Drop for Executing {
+    fn drop(&mut self) {
+        let mut executing = lock(&self.connections.executing);
+        if let Some(count) = executing.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                executing.remove(&self.key);
+            }
+        }
+    }
 }
 
 impl Connections {
+    fn execute(self: &Arc<Self>, key: ConnectionKey) -> Executing {
+        *lock(&self.executing).entry(key.clone()).or_default() += 1;
+        Executing {
+            key,
+            connections: Arc::clone(self),
+        }
+    }
+
+    fn executing(&self, key: &ConnectionKey) -> bool {
+        lock(&self.executing).contains_key(key)
+    }
+
     fn add(&self, key: &ConnectionKey, record: &Arc<QueryRecord>) {
         lock(&self.live)
             .entry(key.clone())
@@ -234,9 +271,9 @@ impl Connections {
     }
 }
 
-/// Cancel requests: fail the connection's governed statements (their
-/// watchers then drop their streams), then let `datafusion-postgres` stop
-/// what it is planning.
+/// Cancel requests: when the connection executes a message, fail its
+/// governed statements (their watchers then drop their streams), then let
+/// `datafusion-postgres` stop what it is planning.
 struct CancelRequests {
     connections: Arc<Connections>,
     inner: DefaultCancelHandler,
@@ -244,6 +281,9 @@ struct CancelRequests {
 
 impl CancelRequests {
     fn cancel(&self, key: &ConnectionKey) -> usize {
+        if !self.connections.executing(key) {
+            return 0;
+        }
         let records = self.connections.records(key);
         for record in &records {
             record.fail(Failure::new(USER_CANCELED, "USER_ERROR", CANCELED));
@@ -256,6 +296,10 @@ impl CancelRequests {
 impl CancelHandler for CancelRequests {
     async fn on_cancel_request(&self, request: CancelRequest) {
         let key = (request.pid, request.secret_key.to_bytes().to_vec());
+        if !self.connections.executing(&key) {
+            tracing::debug!(pid = request.pid, "PostgreSQL cancel request while idle: ignored");
+            return;
+        }
         let canceled = self.cancel(&key);
         tracing::debug!(pid = request.pid, canceled, "PostgreSQL cancel request");
         self.inner.on_cancel_request(request).await;
@@ -731,6 +775,18 @@ impl Governed {
 
 #[async_trait]
 impl SimpleQueryHandler for Governed {
+    /// `pgwire`'s, with the connection marked as executing while it runs.
+    async fn on_query<C>(&self, client: &mut C, query: Query) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let _executing = self.connections.execute(connection_key(client));
+        self._on_query(client, query).await
+    }
+
     async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -783,6 +839,7 @@ impl ExtendedQueryHandler for Governed {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        let _executing = self.connections.execute(connection_key(client));
         execute::execute(self, client, message).await
     }
 
@@ -957,9 +1014,17 @@ mod tests {
         let other_key = (7, vec![9, 9, 9, 9]);
         connections.add(&key, &mine);
         connections.add(&other_key, &other);
+        // Between messages a cancel request does nothing.
+        assert_eq!(requests.cancel(&key), 0);
+        assert!(mine.failure().is_none());
+        let executing = connections.execute(key.clone());
+        let _other_executing = connections.execute(other_key.clone());
         // Same process id, another secret key: nothing is canceled.
         assert_eq!(requests.cancel(&(7, vec![0, 0, 0, 0])), 0);
         assert_eq!(requests.cancel(&key), 1);
+        drop(executing);
+        assert!(!connections.executing(&key), "the message is done");
+        assert!(connections.executing(&other_key));
         assert_eq!(mine.failure().map(|f| f.message), Some(CANCELED.to_owned()));
         assert!(mine.cancellation().is_cancelled());
         assert!(other.failure().is_none());
