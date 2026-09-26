@@ -965,7 +965,8 @@ impl Governed {
         }
         client.metadata_mut().remove(QUERY_ID);
         if let [statement] = statements.as_slice()
-            && let Some(response) = cursor::fetch(&*client, query, statement, &Format::UnifiedText).await
+            && let Some(response) =
+                cursor::fetch(&*client, query, statement, &Format::UnifiedText, None).await
         {
             return Ok(vec![response?]);
         }
@@ -1082,9 +1083,13 @@ impl ExtendedQueryHandler for Governed {
         if let Some(request) = parsed.as_ref().and_then(|(statement, _)| kill_request(statement)) {
             return self.kill(client, request);
         }
+        // With a row limit the portal may be left suspended: its FETCH reads
+        // its rows at once, held in the pool (cursor::fetch).
+        let pool = Arc::clone(&self.engine.context().runtime_env().memory_pool);
+        let held_in = (max_rows > 0).then_some(&pool);
         if let Some((statement, _)) = parsed
             && let Some(response) =
-                cursor::fetch(&*client, sql, statement, &portal.result_column_format).await
+                cursor::fetch(&*client, sql, statement, &portal.result_column_format, held_in).await
         {
             return response;
         }

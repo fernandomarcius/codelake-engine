@@ -634,11 +634,21 @@ impl Declared {
 /// in the result `format` its client asked for, or `MOVE` when `sql`, the
 /// statement's text, is one ([`moves`]); `None` when `statement` is not a
 /// `FETCH`.
+///
+/// `held_in` is the memory pool when the `FETCH` is a protocol portal
+/// executed with a row limit (JDBC's fetch size), which the client may leave
+/// suspended while it runs other statements, other `FETCH`es of the same
+/// cursor among them: as `PostgreSQL` does, the `FETCH` then reads all its
+/// rows from the cursor at its first `Execute`, held in the pool until they
+/// are sent ([`Fetch::collected`]), so no later statement takes rows that
+/// are its. Read as they were sent, the rows of a `FETCH 4` suspended after
+/// one went to a `FETCH 1` run in between, and the portal resumed past them.
 pub(super) async fn fetch<C>(
     client: &C,
     sql: &str,
     statement: &Statement,
     format: &Format,
+    held_in: Option<&Arc<dyn MemoryPool>>,
 ) -> Option<PgWireResult<Response>>
 where
     C: ClientInfo + ClientPortalStore + ?Sized,
@@ -667,10 +677,11 @@ where
         moving,
     )
     .await;
-    Some(match fetch {
-        Ok(fetch) if moving => fetch.moved().await,
-        Ok(fetch) => Ok(fetch.streamed()),
-        Err(error) => Err(error),
+    Some(match (fetch, held_in) {
+        (Ok(fetch), _) if moving => fetch.moved().await,
+        (Ok(fetch), Some(pool)) => fetch.collected(pool).await,
+        (Ok(fetch), None) => Ok(fetch.streamed()),
+        (Err(error), _) => Err(error),
     })
 }
 
@@ -763,7 +774,9 @@ impl Fetch {
     }
 
     /// The rows, read before the response is made (a `FETCH` among other
-    /// statements of a message: the next one runs before they are sent).
+    /// statements of a message: the next one runs before they are sent; a
+    /// `FETCH` portal with a row limit: another `FETCH` may run before the
+    /// portal is resumed, [`fetch`]).
     /// Until they are sent they are held in `pool`, the engine's memory
     /// pool; rows that do not fit fail the `FETCH` with `53200`
     /// (`out_of_memory`) rather than be held outside the pool, and its
@@ -1627,6 +1640,36 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    /// A `FETCH` read at once (a portal with a row limit): the cursor is
+    /// past its rows before any is sent, and they are held until they are.
+    #[tokio::test]
+    async fn a_fetch_read_at_once_takes_its_rows_first() {
+        let (cursors, store) = cursor_over(5, "DECLARE c CURSOR FOR SELECT 1").await;
+        let Statement::Fetch { name, direction, .. } = &parse("FETCH 3 FROM c")[0] else {
+            unreachable!();
+        };
+        let fetch = open(
+            &cursors,
+            Some(&store),
+            &name.value,
+            direction,
+            &Format::UnifiedText,
+            false,
+        )
+        .await
+        .unwrap();
+        let Ok(Response::Query(mut held)) = fetch.collected(&pool(1 << 20)).await else {
+            panic!("not a query response");
+        };
+        assert_eq!(fetched(&cursors, &store, "FETCH 1 FROM c").await, Ok(vec![4]));
+        let rows: Vec<_> = held
+            .data_rows()
+            .map(|row| row.unwrap().data.to_vec())
+            .collect()
+            .await;
+        assert_eq!(rows.len(), 3);
     }
 
     #[tokio::test]

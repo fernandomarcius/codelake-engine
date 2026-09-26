@@ -2089,6 +2089,7 @@ async fn cursors_answer_like_postgresql() {
     for client in [&postgres, &engine] {
         moves_through_a_driver(client).await;
     }
+    suspended_fetches_answer_like_postgresql(&host, port, server.pg).await;
     // On the extended protocol too, a DECLARE needs a transaction block.
     let declare = format!("DECLARE x CURSOR FOR {TEN}");
     for client in [&postgres, &engine] {
@@ -2101,6 +2102,93 @@ async fn cursors_answer_like_postgresql() {
     }
     server.slots_free().await;
     assert_eq!(server.pool_drains().await, 0);
+}
+
+/// What a client sees of `messages`, in order: the first value of each row,
+/// command tags, `suspended` for a portal suspended by its row limit, and
+/// `E<SQLSTATE>` for an error.
+fn events(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter_map(|message| match message.0 {
+            b'D' => data_rows(std::slice::from_ref(message))
+                .remove(0)
+                .into_iter()
+                .next(),
+            b'C' => tags(std::slice::from_ref(message)).pop(),
+            b's' => Some("suspended".to_owned()),
+            b'E' => error_code(std::slice::from_ref(message)).map(|code| format!("E{code}")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// [`suspended_fetch`] on PostgreSQL (`host`, `port`) and on the engine
+/// (`engine`), in a pipeline and across `Sync`s.
+async fn suspended_fetches_answer_like_postgresql(host: &str, port: u16, engine: u16) {
+    for pipelined in [true, false] {
+        let reference = suspended_fetch(host.to_owned(), port, "postgres", "postgres", pipelined).await;
+        let answered =
+            suspended_fetch("127.0.0.1".to_owned(), engine, "pgcursors", "codelake", pipelined).await;
+        let want = [
+            "3",
+            "suspended",
+            "7",
+            "FETCH 1",
+            "4",
+            "5",
+            "6",
+            "FETCH 3",
+            "8",
+            "FETCH 1",
+            "COMMIT",
+        ];
+        assert_eq!(reference, want, "PostgreSQL, pipelined {pipelined}");
+        assert_eq!(answered, want, "engine, pipelined {pipelined}");
+    }
+}
+
+/// A `FETCH 4` executed as a portal with a row limit of one (JDBC's fetch
+/// size), suspended after its first row while a `FETCH 1` of the same cursor
+/// runs, then resumed: in the same pipeline, or across `Sync`s when not
+/// `pipelined`. As in PostgreSQL, the `FETCH 4` took its four rows (3 to 6)
+/// at its first `Execute`: the `FETCH 1` between gets row 7, and the resumed
+/// portal the rows it had taken. (Found by the third F6 verification: the
+/// portal read the cursor as it sent, so the `FETCH 1` got row 4 and the
+/// portal 5 to 7.)
+async fn suspended_fetch(
+    host: String,
+    port: u16,
+    user: &'static str,
+    database: &'static str,
+    pipelined: bool,
+) -> Vec<String> {
+    tokio::task::spawn_blocking(move || {
+        let mut wire = Wire::connect_to(&host, port, user, database);
+        let declared = wire.query(&format!("BEGIN; DECLARE sf NO SCROLL CURSOR FOR {TEN}"));
+        assert_eq!(error_code(&declared), None, "{declared:?}");
+        assert_eq!(numbers(&data_rows(&wire.query("FETCH 2 FROM sf"))), [1, 2]);
+        let mut seen = Vec::new();
+        wire.parse("four", "FETCH 4 FROM sf");
+        wire.bind_portal("p", "four", 0);
+        wire.execute_portal("p", 1);
+        if !pipelined {
+            seen.extend(events(&wire.sync()));
+        }
+        wire.parse("", "FETCH 1 FROM sf");
+        wire.bind("", 0);
+        wire.execute();
+        if !pipelined {
+            seen.extend(events(&wire.sync()));
+        }
+        wire.execute_portal("p", 0);
+        seen.extend(events(&wire.sync()));
+        seen.extend(events(&wire.query("FETCH 1 FROM sf")));
+        seen.extend(events(&wire.query("COMMIT")));
+        seen
+    })
+    .await
+    .unwrap()
 }
 
 /// `MOVE` through a driver's execute (Parse, Describe, Bind, Execute): its
