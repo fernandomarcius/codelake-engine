@@ -82,6 +82,7 @@ use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
 use datafusion_postgres::pgwire::messages::cancel::CancelRequest;
 use datafusion_postgres::pgwire::messages::data::DataRow;
 use datafusion_postgres::pgwire::messages::extendedquery::{Execute, Sync as PgSync};
+use datafusion_postgres::pgwire::messages::response::TransactionStatus;
 use datafusion_postgres::pgwire::messages::simplequery::Query;
 use datafusion_postgres::{DfSessionService, QueryHook};
 use futures::{Sink, Stream};
@@ -393,6 +394,20 @@ fn answered_by_the_session(statement: &Statement) -> bool {
 fn governed_text(sql: &str) -> bool {
     Parser::parse_sql(&PostgreSqlDialect {}, sql)
         .map_or(true, |statements| !statements.iter().all(answered_by_the_session))
+}
+
+/// In a failed transaction block only its end runs (`COMMIT`, which rolls
+/// it back, or `ROLLBACK`): anything else fails with `25P02`, as in
+/// `PostgreSQL`, before it reads a cursor or takes a slot.
+fn aborted(client: &(impl ClientInfo + ?Sized), first: &Statement) -> PgWireResult<()> {
+    let ends = matches!(first, Statement::Commit { .. } | Statement::Rollback { .. });
+    if client.transaction_status() == TransactionStatus::Error && !ends {
+        return Err(user_error(
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block",
+        ));
+    }
+    Ok(())
 }
 
 fn metadata<'a>(client: &'a (impl ClientInfo + ?Sized), key: &str) -> Option<&'a str> {
@@ -828,6 +843,9 @@ impl Governed {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if let Some(first) = statements.first() {
+            aborted(&*client, first)?;
+        }
         if let Some(request) = kill_request_sql(query) {
             return Ok(vec![self.kill(client, request)?]);
         }
@@ -942,6 +960,9 @@ impl ExtendedQueryHandler for Governed {
     {
         cursor::begin_execute(&*client);
         let (sql, parsed) = &portal.statement.statement;
+        if let Some((statement, _)) = parsed {
+            aborted(&*client, statement)?;
+        }
         if let Some(request) = parsed.as_ref().and_then(|(statement, _)| kill_request(statement)) {
             return self.kill(client, request);
         }

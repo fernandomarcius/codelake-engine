@@ -790,11 +790,16 @@ fn cstr(text: &str) -> Vec<u8> {
 
 impl Wire {
     fn connect(port: u16, user: &str) -> Self {
-        let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        Self::connect_to("127.0.0.1", port, user, "codelake")
+    }
+
+    /// A connection to any PostgreSQL server that trusts `user`.
+    fn connect_to(host: &str, port: u16, user: &str, database: &str) -> Self {
+        let stream = std::net::TcpStream::connect((host, port)).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         let mut wire = Self(stream, BackendKey::default());
         let mut body = 196_608_i32.to_be_bytes().to_vec();
-        for part in ["user", user, "database", "codelake"] {
+        for part in ["user", user, "database", database] {
             body.extend(cstr(part));
         }
         body.push(0);
@@ -917,6 +922,15 @@ fn data_rows(messages: &[Message]) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Command tags of the `CommandComplete`s in `messages` (`FETCH 4`, …).
+fn tags(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|(kind, _)| *kind == b'C')
+        .map(|(_, body)| String::from_utf8_lossy(body.strip_suffix(&[0]).unwrap_or(body)).into_owned())
+        .collect()
+}
+
 /// SQLSTATE of the `ErrorResponse` in `messages`.
 fn error_code(messages: &[Message]) -> Option<String> {
     let (_, body) = messages.iter().find(|(kind, _)| *kind == b'E')?;
@@ -961,12 +975,15 @@ async fn fetch_on_the_extended_protocol(server: &Server) {
         let fetched = wire.sync();
         assert_eq!(described_columns(&fetched), Some(2), "{fetched:?}");
         assert_eq!(data_rows(&fetched), value_and_mod(1, 4));
+        assert_eq!(tags(&fetched), ["FETCH 4"]);
         // Executed again, without a Describe: the next rows.
         wire.bind("f4", 0);
         wire.execute();
         assert_eq!(data_rows(&wire.sync()), value_and_mod(5, 8));
         // The simple protocol reads on from there: no row was lost.
-        assert_eq!(data_rows(&wire.query("FETCH ALL FROM cx")), value_and_mod(9, 20));
+        let rest = wire.query("FETCH ALL FROM cx");
+        assert_eq!(data_rows(&rest), value_and_mod(9, 20));
+        assert_eq!(tags(&rest), ["FETCH 12"]);
         let done = wire.query("COMMIT");
         assert_eq!(error_code(&done), None, "{done:?}");
     })
@@ -974,10 +991,12 @@ async fn fetch_on_the_extended_protocol(server: &Server) {
     .unwrap();
     server.slots_free().await;
 
-    // Results bound in binary: refused, no row read.
+    // Results bound in binary: refused, no row read (a held cursor, outside
+    // a transaction block: the error aborts none, and the next FETCH reads
+    // on).
     let client = server.connect("wire").await;
     client
-        .batch_execute("BEGIN; DECLARE cb CURSOR FOR SELECT value FROM generate_series(1, 5)")
+        .batch_execute("DECLARE cb CURSOR WITH HOLD FOR SELECT value FROM generate_series(1, 5)")
         .await
         .unwrap();
     let error = client.query("FETCH 2 FROM cb", &[]).await.unwrap_err();
@@ -985,6 +1004,20 @@ async fn fetch_on_the_extended_protocol(server: &Server) {
     assert_eq!(
         numbers(&text_rows(&client, "FETCH ALL FROM cb").await),
         [1, 2, 3, 4, 5]
+    );
+    client.batch_execute("CLOSE cb").await.unwrap();
+    // In a transaction block, the error aborts it, as any error does.
+    client
+        .batch_execute("BEGIN; DECLARE cb CURSOR FOR SELECT value FROM generate_series(1, 5)")
+        .await
+        .unwrap();
+    let error = client.query("FETCH 2 FROM cb", &[]).await.unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::FEATURE_NOT_SUPPORTED), "{error:?}");
+    let error = client.simple_query("FETCH ALL FROM cb").await.unwrap_err();
+    assert_eq!(
+        error.code(),
+        Some(&SqlState::IN_FAILED_SQL_TRANSACTION),
+        "{error:?}"
     );
     client.batch_execute("ROLLBACK").await.unwrap();
     server.slots_free().await;
@@ -1411,6 +1444,15 @@ fn cursor_script() -> Vec<(String, Want)> {
         ("FETCH 1 FROM q".into(), Rows(vec![1])),
         ("FETCH BACKWARD 0 FROM q".into(), Code("55000")),
         ("ROLLBACK".into(), none()),
+        // An error aborts the transaction: only its end runs.
+        (format!("BEGIN; {}", declare("f", "NO SCROLL CURSOR")), none()),
+        ("FETCH 1 FROM f".into(), Rows(vec![1])),
+        ("FETCH -1 FROM f".into(), Code("55000")),
+        ("FETCH 1 FROM f".into(), Code("25P02")),
+        ("CLOSE f".into(), Code("25P02")),
+        ("SELECT 1".into(), Code("25P02")),
+        ("COMMIT".into(), none()),
+        ("FETCH 1 FROM f".into(), Code("34000")),
         // A count that is not a whole number.
         (format!("BEGIN; {}", declare("i", "CURSOR")), none()),
         ("FETCH 1.5 FROM i".into(), Code("42601")),
@@ -1479,6 +1521,41 @@ async fn cursors_answer_like_postgresql() {
     }
     // MOVE is not supported: refused at once, not queued.
     assert_eq!(seen(&engine, "MOVE 1 IN c").await, Err("0A000".to_owned()));
+    // FETCH tags and rows on both protocols, message by message.
+    let exchanges = |host: String, port: u16, user: &'static str, database: &'static str| {
+        tokio::task::spawn_blocking(move || {
+            let mut wire = Wire::connect_to(&host, port, user, database);
+            let mut seen = Vec::new();
+            let declared = wire.query(&format!("BEGIN; DECLARE w CURSOR FOR {TEN}"));
+            assert_eq!(error_code(&declared), None, "{declared:?}");
+            seen.push(wire.query("FETCH 2 FROM w"));
+            wire.parse("", "FETCH 3 FROM w");
+            wire.bind("", 0);
+            wire.describe(b'P', "");
+            wire.execute();
+            seen.push(wire.sync());
+            seen.push(wire.query("FETCH 0 FROM w"));
+            seen.push(wire.query("FETCH ALL FROM w"));
+            seen.push(wire.query("COMMIT"));
+            seen.iter()
+                .map(|messages| (tags(messages), data_rows(messages)))
+                .collect::<Vec<_>>()
+        })
+    };
+    let reference = exchanges(host, port, "postgres", "postgres").await.unwrap();
+    let answered = exchanges("127.0.0.1".to_owned(), server.pg, "pgcursors", "codelake")
+        .await
+        .unwrap();
+    let text = |values: &[i64]| -> Vec<Vec<String>> { values.iter().map(|v| vec![v.to_string()]).collect() };
+    let want = vec![
+        (vec!["FETCH 2".to_owned()], text(&[1, 2])),
+        (vec!["FETCH 3".to_owned()], text(&[3, 4, 5])),
+        (vec!["FETCH 1".to_owned()], text(&[5])),
+        (vec!["FETCH 5".to_owned()], text(&[6, 7, 8, 9, 10])),
+        (vec!["COMMIT".to_owned()], text(&[])),
+    ];
+    assert_eq!(reference, want, "PostgreSQL");
+    assert_eq!(answered, want, "engine");
     // On the extended protocol too, a DECLARE needs a transaction block.
     let declare = format!("DECLARE x CURSOR FOR {TEN}");
     for client in [&postgres, &engine] {
@@ -1559,11 +1636,62 @@ async fn cancel_requests_reach_the_extended_protocol() {
     assert_eq!(error_code(&fetched).as_deref(), Some("57014"), "{fetched:?}");
     assert!(data_rows(&fetched).is_empty());
     assert_eq!(server.pool_drains().await, 0, "reservations left (held {held})");
-    let ended = tokio::task::spawn_blocking(move || wire.query("ROLLBACK"))
-        .await
-        .unwrap();
+    // The transaction is aborted, as in PostgreSQL: the next FETCH fails
+    // (it returned no row and no error).
+    let (next, ended) = tokio::task::spawn_blocking(move || {
+        let next = wire.query("FETCH 1 FROM cm");
+        (next, wire.query("ROLLBACK"))
+    })
+    .await
+    .unwrap();
+    assert_eq!(error_code(&next).as_deref(), Some("25P02"), "{next:?}");
+    assert!(data_rows(&next).is_empty());
     assert_eq!(error_code(&ended), None, "{ended:?}");
     server.slots_free().await;
+    canceled_fetches_leave_their_cursor_unreadable(&server).await;
+}
+
+/// A `FETCH` canceled while it executes (simple protocol): in a transaction
+/// block the transaction is aborted (`25P02` for the next statement); a
+/// held cursor, outside one, cannot be read any more (`55000`), as
+/// PostgreSQL marks a portal that failed.
+async fn canceled_fetches_leave_their_cursor_unreadable(server: &Server) {
+    for held in [false, true] {
+        let client = server.connect("ext-cancel").await;
+        let declare = if held {
+            format!("DECLARE cf CURSOR WITH HOLD FOR {HOLDS_MEMORY}")
+        } else {
+            format!("BEGIN; DECLARE cf CURSOR FOR {HOLDS_MEMORY}")
+        };
+        client.batch_execute(&declare).await.unwrap();
+        let token = client.cancel_token();
+        let running = tokio::spawn(async move {
+            let outcome = client.simple_query("FETCH 1 FROM cf").await.map(|_| ());
+            (client, outcome)
+        });
+        let reserved = pool_fills(server).await;
+        token.cancel_query(NoTls).await.unwrap();
+        let (client, outcome) = tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the canceled FETCH ended")
+            .unwrap();
+        let error = outcome.unwrap_err();
+        assert_eq!(error.code(), Some(&SqlState::QUERY_CANCELED), "{error:?}");
+        assert_eq!(
+            server.pool_drains().await,
+            0,
+            "reservations left (held {reserved})"
+        );
+        let error = client.simple_query("FETCH 1 FROM cf").await.unwrap_err();
+        let (want, end) = if held {
+            (SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE, "CLOSE cf")
+        } else {
+            (SqlState::IN_FAILED_SQL_TRANSACTION, "ROLLBACK")
+        };
+        assert_eq!(error.code(), Some(&want), "held {held}: {error:?}");
+        client.batch_execute(end).await.unwrap();
+        server.slots_free().await;
+    }
 }
 
 /// A join that streams rows (2 M, as its probe side advances) while its

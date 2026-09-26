@@ -77,6 +77,9 @@ struct Cursor {
     current: Mutex<Option<DataRow>>,
     /// Its columns, for a `FETCH` once its stream is finished.
     columns: Mutex<Option<Arc<Vec<FieldInfo>>>>,
+    /// Its stream failed (canceled, killed, past its time limit, an error):
+    /// it cannot be read any more, as `PostgreSQL` marks a failed portal.
+    failed: AtomicBool,
 }
 
 impl Cursor {
@@ -87,6 +90,7 @@ impl Cursor {
             pending: AtomicBool::new(true),
             current: Mutex::new(None),
             columns: Mutex::new(None),
+            failed: AtomicBool::new(false),
         }
     }
 
@@ -451,9 +455,11 @@ enum Count {
 /// from.
 struct Fetch {
     columns: Arc<Vec<FieldInfo>>,
-    tag: String,
     rows: FetchRows,
 }
+
+/// A `FETCH`'s command tag (`FETCH n`), as `PostgreSQL`'s.
+const FETCH_TAG: &str = "FETCH";
 
 enum FetchRows {
     /// The row the cursor stands on, when it stands on one.
@@ -467,34 +473,28 @@ enum FetchRows {
 }
 
 impl Fetch {
-    fn rows(
-        self,
-    ) -> (
-        Arc<Vec<FieldInfo>>,
-        String,
-        BoxStream<'static, PgWireResult<DataRow>>,
-    ) {
+    fn rows(self) -> (Arc<Vec<FieldInfo>>, BoxStream<'static, PgWireResult<DataRow>>) {
         let rows = match self.rows {
             FetchRows::Current(row) => futures::stream::iter(row.map(Ok)).boxed(),
             FetchRows::Read { state, max, cursor } => cursor_rows(state, max, cursor).boxed(),
         };
-        (self.columns, self.tag, rows)
+        (self.columns, rows)
     }
 
     /// The rows, sent as the cursor's stream yields them.
     fn streamed(self) -> Response {
-        let (columns, tag, rows) = self.rows();
+        let (columns, rows) = self.rows();
         let mut response = QueryResponse::new(columns, rows);
-        response.set_command_tag(&tag);
+        response.set_command_tag(FETCH_TAG);
         Response::Query(response)
     }
 
     /// The rows, read before the response is made.
     async fn collected(self) -> PgWireResult<Response> {
-        let (columns, tag, rows) = self.rows();
+        let (columns, rows) = self.rows();
         let rows: Vec<DataRow> = rows.try_collect().await?;
         let mut response = QueryResponse::new(columns, futures::stream::iter(rows.into_iter().map(Ok)));
-        response.set_command_tag(&tag);
+        response.set_command_tag(FETCH_TAG);
         Ok(Response::Query(response))
     }
 }
@@ -513,17 +513,17 @@ async fn open(
         .and_then(|store| store.get_portal(name))
         .ok_or_else(|| user_error("34000", format!("cursor \"{name}\" does not exist")))?;
     let cursor = cursors.cursor(name);
+    if cursor.failed.load(Ordering::SeqCst) {
+        return Err(user_error("55000", format!("portal \"{name}\" cannot be run")));
+    }
     let state = portal.state();
-    let (columns, tag) = match &*state.lock().await {
+    let columns = match &*state.lock().await {
         PortalExecutionState::Initial => return Err(PgWireError::PortalNotStarted),
-        PortalExecutionState::Finished => (
-            lock(&cursor.columns).clone().unwrap_or_default(),
-            "SELECT".to_owned(),
-        ),
+        PortalExecutionState::Finished => lock(&cursor.columns).clone().unwrap_or_default(),
         PortalExecutionState::Suspended(response) => {
             let columns = response.row_schema();
             *lock(&cursor.columns) = Some(Arc::clone(&columns));
-            (columns, response.command_tag().to_owned())
+            columns
         }
     };
     text_only(format, columns.len())?;
@@ -552,7 +552,7 @@ async fn open(
             }
         }
     };
-    Ok(Fetch { columns, tag, rows })
+    Ok(Fetch { columns, rows })
 }
 
 /// The columns a `FETCH` answers with, for `Describe`: its cursor's, as
@@ -807,7 +807,10 @@ fn cursor_rows(
                     Some((Ok(row), Some((state, sent))))
                 }
                 // The error is the last item: the governed stream failed.
-                Some(Err(error)) => Some((Err(error), None)),
+                Some(Err(error)) => {
+                    cursor.failed.store(true, Ordering::SeqCst);
+                    Some((Err(error), None))
+                }
             }
         }
     })
@@ -1055,16 +1058,64 @@ mod tests {
 
     /// A cursor `c` over rows `1..=rows`, declared in a transaction block.
     async fn cursor_over(rows: u8, declare: &str) -> (Cursors, Store) {
+        cursor_streaming((1..=rows).map(|value| Ok(row(value))).collect(), declare).await
+    }
+
+    /// A cursor `c` whose stream yields `rows`, declared in a transaction
+    /// block.
+    async fn cursor_streaming(rows: Vec<PgWireResult<DataRow>>, declare: &str) -> (Cursors, Store) {
         let cursors = Cursors::default();
         cursors.begin_message(TransactionStatus::Transaction, 1);
         cursors.declare(&declares(declare)).unwrap();
         let store = store_with(&["c"]);
-        let response = QueryResponse::new(
-            Arc::new(Vec::new()),
-            futures::stream::iter((1..=rows).map(|value| Ok(row(value)))),
-        );
+        let response = QueryResponse::new(Arc::new(Vec::new()), futures::stream::iter(rows));
         store.get_portal("c").unwrap().start(response).await;
         (cursors, store)
+    }
+
+    #[tokio::test]
+    async fn a_failed_cursor_cannot_be_read_again() {
+        let rows = vec![Ok(row(1)), Err(user_error("57014", "canceled")), Ok(row(2))];
+        let (cursors, store) = cursor_streaming(rows, "DECLARE c CURSOR FOR SELECT 1").await;
+        assert_eq!(
+            fetched(&cursors, &store, "FETCH 5 FROM c").await,
+            Err("57014".to_owned())
+        );
+        for sql in ["FETCH 1 FROM c", "FETCH 0 FROM c", "FETCH ALL FROM c"] {
+            assert_eq!(
+                fetched(&cursors, &store, sql).await,
+                Err("55000".to_owned()),
+                "{sql}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fetches_are_tagged_fetch() {
+        let (cursors, store) = cursor_over(3, "DECLARE c CURSOR FOR SELECT 1").await;
+        for collected in [false, true] {
+            let Statement::Fetch { name, direction, .. } = &parse("FETCH 1 FROM c")[0] else {
+                unreachable!();
+            };
+            let fetch = open(
+                &cursors,
+                Some(&store),
+                &name.value,
+                direction,
+                &Format::UnifiedText,
+            )
+            .await
+            .unwrap();
+            let response = if collected {
+                fetch.collected().await.unwrap()
+            } else {
+                fetch.streamed()
+            };
+            let Response::Query(response) = response else {
+                panic!("not a query response");
+            };
+            assert_eq!(response.command_tag(), "FETCH");
+        }
     }
 
     /// Values of the rows `sql` fetches, read as a `FETCH` alone (streamed).
