@@ -2682,6 +2682,72 @@ pub(crate) fn refuse_natural_joins(statement: &DFStatement) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------- PostgreSQL wire
+
+fn is_char_type(data_type: &sql::DataType) -> bool {
+    use sql::DataType as T;
+    match data_type {
+        T::Char(_) | T::Character(_) => true,
+        T::Custom(name, _) => name.to_string().eq_ignore_ascii_case("bpchar"),
+        T::Array(
+            sql::ArrayElemTypeDef::AngleBracket(inner)
+            | sql::ArrayElemTypeDef::SquareBracket(inner, _)
+            | sql::ArrayElemTypeDef::Parenthesis(inner),
+        ) => is_char_type(inner),
+        _ => false,
+    }
+}
+
+/// On the PostgreSQL wire a statement runs on the session as `DataFusion`
+/// plans it, without the engine's preparation of `char(n)`: a `char(5)`
+/// column would be created as unbounded text (read as `varchar` by every
+/// protocol afterwards) and `CAST('ab' AS char(5))` would answer `'ab'`
+/// unpadded. Both are refused there (`0A000`); a `char(n)` table created
+/// through the Trino protocol reads padded on the wire.
+pub fn refuse_char_types_on_postgres(statement: &sql::Statement) -> Result<()> {
+    let refusal = || {
+        Err(DataFusionError::NotImplemented(
+            "the char(n) type is not supported on the PostgreSQL wire yet: use varchar, or create and cast \
+             char(n) values through the Trino protocol"
+                .into(),
+        ))
+    };
+    let columns: Vec<&sql::ColumnDef> = match statement {
+        sql::Statement::CreateTable(create) => create.columns.iter().collect(),
+        sql::Statement::AlterTable(alter) => alter
+            .operations
+            .iter()
+            .filter_map(|op| match op {
+                sql::AlterTableOperation::AddColumn { column_def, .. } => Some(column_def),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    if columns.iter().any(|c| is_char_type(&c.data_type)) {
+        return refusal();
+    }
+    let cast = statement.visit(&mut CharCasts);
+    if cast.is_break() {
+        return refusal();
+    }
+    Ok(())
+}
+
+/// Finds a cast to a char type.
+struct CharCasts;
+
+impl Visitor for CharCasts {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &sql::Expr) -> ControlFlow<()> {
+        match expr {
+            sql::Expr::Cast { data_type, .. } if is_char_type(data_type) => ControlFlow::Break(()),
+            _ => ControlFlow::Continue(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3583,6 +3649,39 @@ mod tests {
         ] {
             let err = rows(&engine, sql).await.unwrap_err();
             assert!(err.contains(message), "{sql}: {err}");
+        }
+    }
+
+    #[test]
+    fn char_types_are_refused_on_the_postgres_wire() {
+        use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+        use datafusion::sql::sqlparser::parser::Parser;
+        let parse = |sql: &str| Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap().remove(0);
+        for sql in [
+            "CREATE TABLE t (id bigint, ch char(5))",
+            "CREATE TABLE t (ch character(2), v varchar)",
+            "CREATE TABLE t (ch char)",
+            "CREATE TABLE t (a char(3)[])",
+            "ALTER TABLE t ADD COLUMN ch char(4)",
+            "SELECT CAST('ab' AS char(5))",
+            "SELECT 'ab'::char(4)",
+            "SELECT 'ab'::bpchar",
+            "SELECT id FROM t WHERE v = CAST(v AS character(3))",
+            "INSERT INTO t SELECT CAST(v AS char(2)) FROM u",
+        ] {
+            let err = refuse_char_types_on_postgres(&parse(sql)).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("char(n) type is not supported on the PostgreSQL wire"),
+                "{sql}: {err}"
+            );
+        }
+        for sql in [
+            "CREATE TABLE t (id bigint, v varchar(5), w text)",
+            "SELECT CAST(x AS varchar), 'ab'::text FROM t",
+            "SELECT ch FROM t WHERE ch = 'ab'",
+        ] {
+            assert!(refuse_char_types_on_postgres(&parse(sql)).is_ok(), "{sql}");
         }
     }
 

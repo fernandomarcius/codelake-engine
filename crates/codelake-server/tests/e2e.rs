@@ -22,6 +22,8 @@ mod otlp;
 #[path = "e2e/f7_acceptance.rs"]
 mod f7_acceptance;
 
+#[path = "e2e/pg_char.rs"]
+mod pg_char;
 #[path = "e2e/pg_operands.rs"]
 mod pg_operands;
 

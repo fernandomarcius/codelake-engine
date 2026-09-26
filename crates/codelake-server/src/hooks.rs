@@ -77,6 +77,8 @@ impl QueryHook for MetricsHook {
 /// (text against a number, `time ± interval`; ADR 0014), with PostgreSQL's
 /// typing rules and errors ([`codelake_core::operand_checks::postgres_refusal`]);
 /// on the simple protocol [`SimpleRunHook`] refuses them on the plan it runs.
+/// It refuses the `char(n)` type in a column or a cast too
+/// ([`codelake_core::char_semantics::refuse_char_types_on_postgres`]).
 #[derive(Debug)]
 pub(crate) struct PolicyHook;
 
@@ -94,7 +96,9 @@ fn refusal(err: &datafusion::error::DataFusionError) -> PgWireError {
 }
 
 fn check(statement: &Statement) -> PgWireResult<()> {
-    statement_policy::check_sql(&statement.to_string(), &PostgreSqlDialect {}).map_err(|err| refusal(&err))
+    statement_policy::check_sql(&statement.to_string(), &PostgreSqlDialect {})
+        .map_err(|err| refusal(&err))?;
+    codelake_core::char_semantics::refuse_char_types_on_postgres(statement).map_err(|err| refusal(&err))
 }
 
 /// Refuses a planned statement whose operands the engine does not combine,

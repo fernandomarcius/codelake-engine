@@ -137,6 +137,12 @@ error naming a way around it):
   `array_distinct`, `array_remove`, `slice`, `reverse`, …) and those that
   pick one (`[i]`, `element_at`, `array_max`, `array_min`: a `char(n)`
   value), not through every array function;
+- on the PostgreSQL wire, a `char(n)` column (`CREATE TABLE`, `ADD COLUMN`)
+  or a cast to `char(n)`/`bpchar` (`0A000`): statements there run on the
+  session as `DataFusion` plans them, without the engine's preparation, so
+  the column would be unbounded text for every protocol and the cast would
+  not pad. A `char(n)` table created through the Trino protocol reads padded
+  on the wire (reported as `text`);
 - a cast to an array, map or row of `char(n)` or `varchar(n)`
   (`CAST(ARRAY[v] AS array(char(3)))`): Trino pads or cuts each value, the
   conversion does not;
