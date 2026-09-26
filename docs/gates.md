@@ -28,6 +28,7 @@ scripts/dev.sh scripts/gates.sh <gate>
 | msrv | `gates.sh msrv` | compiles on Rust 1.94 | every PR |
 | deny | `gates.sh deny` | no RustSec advisory (vulnerable, unmaintained, yanked), only allowed licenses, crates.io only | every PR + weekly |
 | machete | `gates.sh machete` | no unused dependency | every PR |
+| shadow-run harness | `tools/shadow/test.sh` (Docker: the harness image; not in `gates.sh`, which runs inside the toolbelt) | 100% pass | every PR |
 | coverage | `gates.sh coverage` | lines ≥ 75% | every PR |
 | mutation | `gates.sh mutants` | by criticality, below | PR (changed code), nightly (full) |
 | performance | `cargo xtask bench-gate` | < 10% PASS · 10–25% WARNING · > 25% **BLOCK** | every PR |

@@ -56,6 +56,23 @@ versioning: [SemVer](https://semver.org/).
   PostgreSQL cancel requests (`psql` Ctrl-C, JDBC `Statement.cancel`) while a statement waits,
   plans or sends rows (SQLSTATE `57014`), and `DELETE /v1/query/{id}` for PostgreSQL queries
   too. The memory returns to the pool. The PostgreSQL statement span carries `codelake.query_id`.
+- `${ENV:NAME}` references in any string value of `codelake.toml`, resolved when the file is
+  loaded; missing variables are named with their keys, all at once, and resolved values never
+  appear in errors (ADR 0015). Secrets keep their `*_env` keys.
+- `codelake config import --from <dir> --out codelake.toml --env-out codelake.env`: catalog
+  `.properties` files (`sqlserver`, `postgresql`, `hive` with a file metastore) become sources;
+  secrets go to an env file with mode 0600, never to the TOML or the terminal; other catalogs
+  are skipped with a reason (exit 3); `hive.parquet.time-zone` becomes `parquet_time_zone`, and a
+  hive catalog without it needs `--reference-time-zone` (never guessed) (ADR 0015, ISS-027).
+- Shadow-run harness (`scripts/shadow-run.sh`, `tools/shadow`): runs a dbt project against a
+  reference and a candidate engine with the same cutoff, compares every output table with
+  DuckDB (row count, order-insensitive checksum, per-column checksums, differing rows by hash),
+  samples peak RSS per side, and writes JSON and Markdown reports per cycle and cumulative;
+  declared-type and name-case differences are divergent unless an expected-differences rule
+  documents them (a rule file named by the run; ISS-018 and ISS-019 shipped), and no rule
+  covers values;
+  self-test with SQL Server CDC and mutation scenarios (`tools/shadow/selftest.sh`,
+  docs/shadow-run.md).
 
 ### Changed
 - The query registry moved to the core: `system.runtime.queries` lists the queries of both

@@ -89,6 +89,23 @@ async fn reads_types_and_keeps_text_semantics_local() {
     );
     assert!(all.contains("9999-12-31T23:59:59.999999"), "{all}");
 
+    // `SELECT *` keeps the source's column order (ORDINAL_POSITION), not
+    // the alphabetical one: a positional UNION or INSERT depends on it.
+    let star = common::query(&engine, "SELECT * FROM erp1.dbo.contratos WHERE id = 1").await;
+    let header: Vec<&str> = star
+        .lines()
+        .find(|line| line.contains("situacao"))
+        .unwrap_or_default()
+        .split('|')
+        .map(str::trim)
+        .filter(|cell| !cell.is_empty())
+        .collect();
+    assert_eq!(
+        header,
+        ["id", "situacao", "valor", "__$start_lsn", "criadoem"],
+        "{star}"
+    );
+
     // Case- and trailing-space-sensitive, like the engine (SQL Server's CI
     // collation would return all three rows if this filter were pushed).
     let ativo = common::query(

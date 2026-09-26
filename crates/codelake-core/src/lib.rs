@@ -14,6 +14,7 @@ mod ddl;
 mod declared;
 mod dml_guard;
 pub mod engine;
+pub mod env_refs;
 pub mod federation_guard;
 pub mod federation_policy;
 pub mod functions;

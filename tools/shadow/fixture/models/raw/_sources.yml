@@ -1,0 +1,9 @@
+version: 2
+
+sources:
+  - name: src
+    database: src
+    schema: cdc
+    tables:
+      - name: dbo_orders_ct
+      - name: lsn_time_mapping

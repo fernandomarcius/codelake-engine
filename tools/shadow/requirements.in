@@ -1,0 +1,6 @@
+# Top-level dependencies of the shadow-run harness. requirements.txt pins the
+# full closure (regenerate with tools/shadow/lock.sh). dbt-core/dbt-trino
+# follow the minor the acceptance pipelines run (1.8).
+dbt-core~=1.8.0
+dbt-trino~=1.8.0
+duckdb~=1.1.0

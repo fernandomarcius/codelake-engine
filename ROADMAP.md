@@ -98,6 +98,24 @@ Blocking items, in order:
   runs with `dbt build` through dbt-trino against CodeLake, and every output table
   matches the Trino run (row count + `checksum` per table), three consecutive days.
 - Peak RSS of CodeLake during the hourly full run ≤ 50% of Trino's on the same host.
+- 🔧 Tooling for both (F8, ADR 0015, [docs/shadow-run.md](docs/shadow-run.md)):
+  `codelake config import` (catalog `.properties` → `codelake.toml`, secrets to a
+  0600 env file), `${ENV:NAME}` references in `codelake.toml`, and the harness
+  `scripts/shadow-run.sh` (same cutoff on both sides, DuckDB checksums per table
+  and column, declared-type and name-case differences classified by documented
+  rules without ever masking a value, peak RSS per side, reports per cycle and
+  cumulative). Evidence:
+  `tools/shadow/selftest.sh` (SQL Server 2022 CDC, Trino 431, CodeLake) — two
+  cycles without divergence, every injected mutation detected. Findings that
+  block the real run (docs/shadow-run.md): SQL Server `datetime` values are
+  read as the exact 1/300 s tick instead of the millisecond the reference
+  reads (wrong values in filters and `date_diff`), `datetime2(7)` is
+  truncated, and every one arrives as `timestamp(6)`, which a `MILLISECONDS`
+  hive CTAS refuses (F8-1); SQL Server `varchar(n)` loses its length in CTAS
+  (F8-2); window `ORDER BY` on varbinary fails (F8-3); a SQL Server table
+  created after start is not found until a restart (F8-5). Fixed: SQL Server
+  columns in name order instead of the source's (F8-4). Pending: those fixes,
+  then the run itself in homologation (a person, three days).
 
 ## M2 — Production cut-over
 

@@ -1,0 +1,16 @@
+# The harness exports SHADOW_ENGINE_HOST/PORT/HTTP_SCHEME for the side it
+# runs, so one target per side can share the connection settings.
+shadow_fixture:
+  target: reference
+  outputs:
+    reference: &engine
+      type: trino
+      method: none
+      user: dbt
+      host: "{{ env_var('SHADOW_ENGINE_HOST') }}"
+      port: "{{ env_var('SHADOW_ENGINE_PORT') | int }}"
+      http_scheme: "{{ env_var('SHADOW_ENGINE_HTTP_SCHEME') }}"
+      database: hive
+      schema: shadow
+      threads: 2
+    candidate: *engine

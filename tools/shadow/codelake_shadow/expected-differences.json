@@ -1,0 +1,9 @@
+{
+  "differences": [
+    {
+      "id": "ISS-018",
+      "kind": "name_case",
+      "reason": "Names keep the case they were written with; the reference engine folds them to lower case"
+    }
+  ]
+}

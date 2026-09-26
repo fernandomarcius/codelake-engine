@@ -36,3 +36,4 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-024](ISS-024-char-semantics.md) | char(n) semantics instead of refusals | removed limitation | 2026-09-25 | open |
 | [ISS-025](ISS-025-char-wrong-results-merged.md) | Known char(n) wrong results merged into main | known defect | 2026-09-25 | open |
 | [ISS-026](ISS-026-f6-governance-by-recommendation.md) | F6 query governance: owner-only kill, SQLSTATE 53400, default limits, shared runtime | behavior | 2026-09-25 | awaiting-confirmation |
+| [ISS-027](ISS-027-shadow-run-choices-by-recommendation.md) | Shadow-run harness: choices applied by recommendation | behavior | 2026-09-25 | awaiting-confirmation |
