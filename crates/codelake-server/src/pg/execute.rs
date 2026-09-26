@@ -49,7 +49,12 @@ where
     // As `pgwire` reads it: a negative limit is no limit.
     let max_rows = usize::try_from(message.max_rows).unwrap_or(0);
     let Some(portal) = client.portal_store().get_portal(portal_name) else {
-        return Err(PgWireError::PortalNotFound(portal_name.to_owned()));
+        // As `PostgreSQL` answers it (`pgwire` says `26000`): the portal may
+        // have been closed by the end of its transaction.
+        return Err(super::user_error(
+            "34000",
+            format!("portal \"{portal_name}\" does not exist"),
+        ));
     };
 
     let initial = matches!(*portal.state().lock().await, PortalExecutionState::Initial);

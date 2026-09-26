@@ -81,7 +81,7 @@ use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
 use datafusion_postgres::pgwire::messages::cancel::CancelRequest;
 use datafusion_postgres::pgwire::messages::data::DataRow;
-use datafusion_postgres::pgwire::messages::extendedquery::Execute;
+use datafusion_postgres::pgwire::messages::extendedquery::{Execute, Sync as PgSync};
 use datafusion_postgres::pgwire::messages::simplequery::Query;
 use datafusion_postgres::{DfSessionService, QueryHook};
 use futures::{Sink, Stream};
@@ -91,6 +91,8 @@ use crate::trino::{Everything, QueryError};
 
 mod cursor;
 mod execute;
+
+pub(crate) use cursor::CursorHook;
 
 /// Client metadata key where `datafusion-postgres` keeps `SET
 /// statement_timeout` (milliseconds).
@@ -787,7 +789,32 @@ impl SimpleQueryHandler for Governed {
         self._on_query(client, query).await
     }
 
+    /// Runs the message's statements in the connection's transaction: when
+    /// the message is outside a transaction block, its implicit transaction
+    /// ends with it ([`cursor`]).
     async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let statements = Parser::parse_sql(&PostgreSqlDialect {}, query);
+        cursor::begin_simple(&*client, statements.as_ref().map_or(1, Vec::len));
+        let outcome = self.simple(client, query, statements.unwrap_or_default()).await;
+        cursor::end_simple(&*client, outcome.is_ok());
+        outcome
+    }
+}
+
+impl Governed {
+    /// A simple-protocol message, parsed as `statements`.
+    async fn simple<C>(
+        &self,
+        client: &mut C,
+        query: &str,
+        statements: Vec<Statement>,
+    ) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
@@ -798,7 +825,6 @@ impl SimpleQueryHandler for Governed {
             return Ok(vec![self.kill(client, request)?]);
         }
         client.metadata_mut().remove(QUERY_ID);
-        let statements = Parser::parse_sql(&PostgreSqlDialect {}, query).unwrap_or_default();
         if let [statement] = statements.as_slice()
             && let Some(response) = cursor::fetch(&*client, statement, &Format::UnifiedText).await
         {
@@ -829,6 +855,19 @@ impl ExtendedQueryHandler for Governed {
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
         ExtendedQueryHandler::query_parser(&*self.inner)
+    }
+
+    /// Outside a transaction block, closes the portals and cursors of the
+    /// implicit transaction the `Sync` ends ([`cursor`]).
+    async fn on_sync<C>(&self, client: &mut C, message: PgSync) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        cursor::sync(&*client);
+        ExtendedQueryHandler::on_sync(&*self.inner, client, message).await
     }
 
     /// Streams the rows to the client instead of collecting them first.
@@ -894,6 +933,7 @@ impl ExtendedQueryHandler for Governed {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        cursor::begin_execute(&*client);
         let (sql, parsed) = &portal.statement.statement;
         if let Some(request) = parsed.as_ref().and_then(|(statement, _)| kill_request(statement)) {
             return self.kill(client, request);

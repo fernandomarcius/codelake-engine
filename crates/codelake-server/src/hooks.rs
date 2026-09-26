@@ -373,17 +373,21 @@ impl QueryHook for TracingHook {
 /// hook and no `DataFusion` path sees a refused statement; the default hooks
 /// of `datafusion-postgres` (passing a custom list replaces them, so they are
 /// re-added here), after the tracing observer so statements answered by a
-/// default hook (`SET`, `BEGIN`, cursors) are traced too; the metrics
+/// default hook (`SET`, `BEGIN`, cursors) are traced too, with the server's
+/// cursor hook before them ([`crate::pg::CursorHook`]); the metrics
 /// counter; and last [`SimpleRunHook`], which runs every simple-protocol
 /// statement that got that far.
 ///
 /// `session_sampling` is `None` when traces are not exported: no tracing hook.
 pub(crate) fn all(session_sampling: Option<f64>) -> Vec<Arc<dyn QueryHook>> {
-    let mut hooks: Vec<Arc<dyn QueryHook>> = Vec::with_capacity(7);
+    let mut hooks: Vec<Arc<dyn QueryHook>> = Vec::with_capacity(8);
     hooks.push(Arc::new(PolicyHook));
     if let Some(ratio) = session_sampling {
         hooks.push(Arc::new(TracingHook { ratio }));
     }
+    // Before `datafusion-postgres`'s cursor and transaction hooks: it sees
+    // the statements they answer (crate::pg::CursorHook).
+    hooks.push(Arc::new(crate::pg::CursorHook));
     hooks.push(Arc::new(CursorStatementHook));
     hooks.push(Arc::new(SetShowHook));
     hooks.push(Arc::new(TransactionStatementHook));
@@ -595,7 +599,7 @@ mod tests {
 
     #[test]
     fn tracing_hook_only_when_exporting() {
-        assert_eq!(all(Some(1.0)).len(), 7);
-        assert_eq!(all(None).len(), 6, "no tracing hook when traces are not exported");
+        assert_eq!(all(Some(1.0)).len(), 8);
+        assert_eq!(all(None).len(), 7, "no tracing hook when traces are not exported");
     }
 }

@@ -818,6 +818,11 @@ impl Wire {
     /// Binds `statement` to the unnamed portal, results in `format` (0 text,
     /// 1 binary).
     fn bind(&mut self, statement: &str, format: i16) {
+        self.bind_portal("", statement, format);
+    }
+
+    /// Binds `statement` to `portal`, results in `format`.
+    fn bind_portal(&mut self, portal: &str, statement: &str, format: i16) {
         let tail = [
             &0_i16.to_be_bytes()[..],
             &0_i16.to_be_bytes(),
@@ -825,7 +830,7 @@ impl Wire {
             &format.to_be_bytes(),
         ]
         .concat();
-        self.send(b'B', &[cstr(""), cstr(statement), tail].concat());
+        self.send(b'B', &[cstr(portal), cstr(statement), tail].concat());
     }
 
     fn describe(&mut self, kind: u8, name: &str) {
@@ -833,7 +838,12 @@ impl Wire {
     }
 
     fn execute(&mut self) {
-        self.send(b'E', &[cstr(""), 0_i32.to_be_bytes().to_vec()].concat());
+        self.execute_portal("", 0);
+    }
+
+    /// Executes `portal`, `max_rows` at most (`0`: all).
+    fn execute_portal(&mut self, portal: &str, max_rows: i32) {
+        self.send(b'E', &[cstr(portal), max_rows.to_be_bytes().to_vec()].concat());
     }
 
     fn sync(&mut self) -> Vec<Message> {
@@ -1090,6 +1100,179 @@ async fn declared_cursor_runs_under_governance() {
             ["FAILED", "EXCEEDED_TIME_LIMIT"],
         ]
     );
+}
+
+/// `user` (who may run one query) runs one at once: no statement of theirs
+/// holds the slot.
+async fn next_query_runs(server: &Server, user: &str) {
+    let other = server.connect(user).await;
+    let rows = tokio::time::timeout(Duration::from_secs(10), text_rows(&other, "SELECT 1"))
+        .await
+        .expect("the user's slot was not given back");
+    assert_eq!(rows, [["1"]]);
+}
+
+/// A transaction's end closes its cursors and portals, as in PostgreSQL:
+/// after `COMMIT`, `ROLLBACK`, a message outside a transaction block or an
+/// extended-protocol `Sync` outside one, their statements are over — slot
+/// and memory given back, the user's next query runs at once — and reading
+/// them fails with `34000`. Only a `WITH HOLD` cursor outlives the
+/// transaction that commits it, every row in order; a `DECLARE` without it
+/// outside a transaction block fails with `25P01`. (Found by the F6
+/// re-verification: a cursor read halfway kept its slot and 61 MB of the
+/// pool after `COMMIT`, for as long as its pooled connection lived, and a
+/// `FETCH` after the `COMMIT` still returned rows.)
+#[tokio::test]
+async fn transaction_end_closes_cursors_and_portals() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start_server(dir.path());
+    server.wait_ready().await;
+    let client = server.connect("tx").await;
+    commit_and_rollback_close_cursors(&server, &client).await;
+    cursors_need_a_transaction_block(&server, &client).await;
+    held_cursors_outlive_their_commit(&server, &client).await;
+    portals_end_with_their_transaction(&server).await;
+}
+
+async fn commit_and_rollback_close_cursors(server: &Server, client: &Client) {
+    for end in ["COMMIT", "ROLLBACK"] {
+        client
+            .batch_execute(&format!("BEGIN; DECLARE c CURSOR FOR {STREAMS_WITH_MEMORY}"))
+            .await
+            .unwrap();
+        assert_eq!(text_rows(client, "FETCH 2 FROM c").await.len(), 2);
+        let held = pool_fills(server).await;
+        assert_eq!(load(server).await, (1, 0));
+        client.batch_execute(end).await.unwrap();
+        server.slots_free().await;
+        assert_eq!(
+            server.pool_drains().await,
+            0,
+            "{end} left reservations (held {held})"
+        );
+        next_query_runs(server, "tx").await;
+        let error = client.simple_query("FETCH 1 FROM c").await.unwrap_err();
+        assert_eq!(
+            error.code(),
+            Some(&SqlState::INVALID_CURSOR_NAME),
+            "{end}: {error:?}"
+        );
+    }
+}
+
+/// Without `WITH HOLD`, a cursor needs a transaction block, on both
+/// protocols; a message of several statements is one (implicit), whose
+/// cursor closes with the message.
+async fn cursors_need_a_transaction_block(server: &Server, client: &Client) {
+    let error = client
+        .simple_query("DECLARE o CURSOR FOR SELECT 1")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code(),
+        Some(&SqlState::NO_ACTIVE_SQL_TRANSACTION),
+        "{error:?}"
+    );
+    let error = client
+        .execute("DECLARE o CURSOR FOR SELECT 1", &[])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code(),
+        Some(&SqlState::NO_ACTIVE_SQL_TRANSACTION),
+        "{error:?}"
+    );
+    assert_eq!(
+        numbers(
+            &text_rows(
+                client,
+                "DECLARE m CURSOR FOR SELECT value FROM generate_series(1, 5); FETCH 2 FROM m"
+            )
+            .await
+        ),
+        [1, 2]
+    );
+    server.slots_free().await;
+    let error = client.simple_query("FETCH 1 FROM m").await.unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::INVALID_CURSOR_NAME), "{error:?}");
+}
+
+/// `WITH HOLD` outlives its commit, and a later rollback (cursor moves are
+/// not undone), every row arriving once, in order; declared in a
+/// transaction rolled back, it is closed.
+async fn held_cursors_outlive_their_commit(server: &Server, client: &Client) {
+    client
+        .batch_execute("BEGIN; DECLARE h CURSOR WITH HOLD FOR SELECT value FROM generate_series(1, 100)")
+        .await
+        .unwrap();
+    let mut values = numbers(&text_rows(client, "FETCH 10 FROM h").await);
+    client.batch_execute("COMMIT").await.unwrap();
+    assert_eq!(load(server).await, (1, 0), "the held cursor keeps its statement");
+    values.extend(numbers(&text_rows(client, "FETCH 10 FROM h").await));
+    client.batch_execute("BEGIN").await.unwrap();
+    values.extend(numbers(&text_rows(client, "FETCH 5 FROM h").await));
+    client.batch_execute("ROLLBACK").await.unwrap();
+    values.extend(numbers(&text_rows(client, "FETCH ALL FROM h").await));
+    assert_eq!(values, (1..=100).collect::<Vec<_>>());
+    server.slots_free().await;
+    client.batch_execute("CLOSE h").await.unwrap();
+
+    client
+        .batch_execute(&format!(
+            "BEGIN; DECLARE r CURSOR WITH HOLD FOR {STREAMS_WITH_MEMORY}; ROLLBACK"
+        ))
+        .await
+        .unwrap();
+    server.slots_free().await;
+    assert_eq!(server.pool_drains().await, 0);
+    let error = client.simple_query("FETCH 1 FROM r").await.unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::INVALID_CURSOR_NAME), "{error:?}");
+}
+
+/// A portal suspended by a row limit (JDBC's fetch size) is closed by the
+/// `COMMIT` of its transaction; outside a transaction block, by the `Sync`
+/// after its `Execute`, which ends its implicit transaction.
+async fn portals_end_with_their_transaction(server: &Server) {
+    let mut pooled = server.connect("tx").await;
+    let transaction = pooled.transaction().await.unwrap();
+    let portal = transaction.bind(STREAMS_WITH_MEMORY, &[]).await.unwrap();
+    assert_eq!(transaction.query_portal(&portal, 2).await.unwrap().len(), 2);
+    let held = pool_fills(server).await;
+    transaction.commit().await.unwrap();
+    server.slots_free().await;
+    assert_eq!(
+        server.pool_drains().await,
+        0,
+        "the portal kept its reservations (held {held})"
+    );
+    next_query_runs(server, "tx").await;
+    drop(portal);
+
+    let port = server.pg;
+    let wire = tokio::task::spawn_blocking(move || {
+        let mut wire = Wire::connect(port, "tx");
+        wire.parse("s", STREAMS_WITH_MEMORY);
+        wire.bind_portal("p", "s", 0);
+        wire.execute_portal("p", 2);
+        let first = wire.sync();
+        assert_eq!(data_rows(&first).len(), 2, "{first:?}");
+        assert!(kinds(&first).contains('s'), "suspended: {first:?}");
+        wire
+    })
+    .await
+    .unwrap();
+    server.slots_free().await;
+    assert_eq!(server.pool_drains().await, 0, "the portal outlived its Sync");
+    tokio::task::spawn_blocking(move || {
+        let mut wire = wire;
+        wire.execute_portal("p", 2);
+        let again = wire.sync();
+        assert_eq!(error_code(&again).as_deref(), Some("34000"), "{again:?}");
+        assert!(data_rows(&again).is_empty());
+    })
+    .await
+    .unwrap();
+    server.slots_free().await;
 }
 
 /// A join that streams rows (2 M, as its probe side advances) while its
