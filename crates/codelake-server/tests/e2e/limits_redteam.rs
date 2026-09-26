@@ -235,3 +235,97 @@ async fn http_ok(port: u16, sql: &str) {
     let (_, _, error) = http(port, sql).await;
     assert_eq!(error, None, "{sql}");
 }
+
+// Each test below failed before its fix and proves a defect of the tester's
+// report.
+
+/// A client that prepared a statement (a JDBC driver does it after five
+/// runs; psycopg and Npgsql too) runs it again after the table it reads was
+/// replaced by one with the same columns. PostgreSQL re-plans it; the
+/// statement must answer the new table's rows.
+#[tokio::test]
+async fn a_prepared_statement_answers_after_or_replace() {
+    let dir = tempfile::tempdir().unwrap();
+    let warehouse = dir.path().join("warehouse");
+    std::fs::create_dir_all(&warehouse).unwrap();
+    let running = start(dir.path(), &warehouse).await;
+    let client = &running.client;
+    http_ok(running.http, "CREATE SCHEMA hive.s").await;
+    http_ok(
+        running.http,
+        "CREATE TABLE hive.s.t AS SELECT CAST(1 AS BIGINT) AS v",
+    )
+    .await;
+    let statement = client
+        .prepare("SELECT CAST(sum(v) AS VARCHAR) FROM hive.s.t")
+        .await
+        .unwrap();
+    let first: String = client.query_one(&statement, &[]).await.unwrap().get(0);
+    assert_eq!(first, "1");
+    http_ok(
+        running.http,
+        "CREATE OR REPLACE TABLE hive.s.t AS SELECT CAST(2 AS BIGINT) AS v",
+    )
+    .await;
+    let mut answers = Vec::new();
+    for _ in 0..3 {
+        answers.push(match client.query_one(&statement, &[]).await {
+            Ok(row) => Ok(row.get::<_, String>(0)),
+            Err(err) => Err(err.as_db_error().map_or_else(
+                || format!("{err:?}"),
+                |db| format!("{}: {}", db.code().code(), db.message()),
+            )),
+        });
+    }
+    assert_eq!(
+        answers,
+        vec![Ok("2".to_owned()), Ok("2".to_owned()), Ok("2".to_owned())],
+        "the prepared statement after CREATE OR REPLACE"
+    );
+    drop(running.server);
+}
+
+/// A prepared statement whose table was replaced by one with other columns
+/// is refused as `PostgreSQL` refuses it (`0A000`, the columns `Describe`
+/// announced would change), on every run; a statement prepared again
+/// answers the new table.
+#[tokio::test]
+async fn a_prepared_statement_is_refused_when_the_replacement_changes_its_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let warehouse = dir.path().join("warehouse");
+    std::fs::create_dir_all(&warehouse).unwrap();
+    let running = start(dir.path(), &warehouse).await;
+    let client = &running.client;
+    http_ok(running.http, "CREATE SCHEMA hive.s").await;
+    http_ok(
+        running.http,
+        "CREATE TABLE hive.s.t AS SELECT CAST(1 AS BIGINT) AS v",
+    )
+    .await;
+    let statement = client.prepare("SELECT * FROM hive.s.t").await.unwrap();
+    assert_eq!(
+        client.query_one(&statement, &[]).await.unwrap().get::<_, i64>(0),
+        1
+    );
+    http_ok(
+        running.http,
+        "CREATE OR REPLACE TABLE hive.s.t AS SELECT 'two' AS v",
+    )
+    .await;
+    for _ in 0..2 {
+        let err = client.query_one(&statement, &[]).await.unwrap_err();
+        let db = err.as_db_error().unwrap_or_else(|| panic!("{err:?}"));
+        assert_eq!(db.code().code(), "0A000", "{db:?}");
+        assert_eq!(db.message(), "cached plan must not change result type");
+    }
+    let statement = client.prepare("SELECT * FROM hive.s.t").await.unwrap();
+    assert_eq!(
+        client
+            .query_one(&statement, &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "two"
+    );
+    drop(running.server);
+}

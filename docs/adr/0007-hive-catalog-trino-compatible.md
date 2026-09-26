@@ -200,11 +200,17 @@ requires where Trino has no equivalent.
   - under the table's commit lock, cross-process file lock and metadata
     lock (those `DROP TABLE` takes), the staging directory and the table
     directory are **exchanged in one step** (`renameat2(RENAME_EXCHANGE)`,
-    `renamex_np(RENAME_SWAP)` on macOS): every reader, in this process,
-    another node, Trino or the sink, finds the whole old table or the whole
-    new one under the name, never a mix and never nothing. The old table
-    is then in the staging directory and is removed last; a crash before
-    that leaves the new table and a hidden orphan;
+    `renamex_np(RENAME_SWAP)` on macOS): every reader that takes those
+    locks (this process, another `CodeLake` node on the warehouse, the
+    sink) finds the whole old table or the whole new one under the name,
+    never a mix and never nothing. Trino reads the table's `.trinoSchema`
+    and lists its directory in separate steps, without those locks: the
+    exchange guarantees it never finds the table missing, but a Trino query
+    that overlaps the swap may read the new table's files with the old
+    table's metadata (not reproduced; do not replace a table Trino is
+    reading). The old table is then in the staging directory and is removed
+    last; a crash before that leaves the new table and a hidden orphan in
+    `.codelake/staging`, which nothing removes yet (disk only);
   - a free name is a CTAS (a directory without a table is refused, never
     deleted: W1-1); a view, or a table of another type than
     `MANAGED_TABLE` (an `EXTERNAL_TABLE` does not own its data), is
@@ -215,18 +221,33 @@ requires where Trino has no equivalent.
     scan lists files only after checking, under the locks the swap takes,
     that the table still has the identity it was planned with; an `INSERT`
     commits its file under the same check; `OPTIMIZE` checks it before its
-    swap. A statement planned against the replaced table fails ("was
-    replaced … run the query again"): it never reads the new table's files
-    with the old table's columns, nor puts rows planned for one into the
-    other. A query that listed the old files just before the swap fails
-    reading them (file not found: loud, never partial), as a query planned
-    before an `OPTIMIZE` swap does (ADR 0009);
+    swap. A plan made against the replaced table fails ("was replaced
+    (CREATE OR REPLACE) after this statement was planned; plan the statement
+    again"): it never reads the new table's files with the old table's
+    columns, nor puts rows planned for one into the other. A query that
+    listed the old files just before the swap fails reading them (file not
+    found: loud, never partial), as a query planned before an `OPTIMIZE`
+    swap does (ADR 0009);
+  - a client protocol that keeps plans plans the statement again before
+    running it. The PostgreSQL wire keeps the plan of a prepared statement
+    from `Parse` (JDBC after five runs, psycopg3, Npgsql): each `Execute`
+    plans the statement again against the catalogs as they are, as
+    PostgreSQL plans a prepared statement again when a table it reads
+    changed, so a pool keeps working across a dbt run that replaces its
+    tables. When the new plan would answer other columns (names or types)
+    than `Describe` announced, or take other parameter types, the statement
+    is refused as PostgreSQL refuses it (SQLSTATE `0A000`, "cached plan must
+    not change result type") until it is prepared again. The HTTP protocol
+    plans every statement it runs;
   - evidence: `hive::limits_tests` (replacement and self-reading
     replacement, free name, view, foreign directory and external table
     refused, failed query, a crash while writing, a crash before and after
     the swap with a reopened catalog, statements planned before the swap,
     readers of two processes racing twelve replacements, two processes
-    replacing at once), `hive_redteam_w1` (`OR REPLACE` racing `OPTIMIZE`
+    replacing at once), `hive::limits_redteam_tests` (a lock-free reader
+    always finds the table, a kept plan), e2e `limits_redteam` (`SIGKILL` of
+    the binary at 14 points of a replacement; prepared statements across a
+    replacement with the same and with other columns), `hive_redteam_w1` (`OR REPLACE` racing `OPTIMIZE`
     on another node; Trino 431 reads the replaced table with the same rows
     as `CodeLake`).
 - **Stored views are queries.** The SQL of a view is parsed and must be one

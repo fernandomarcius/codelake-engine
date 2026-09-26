@@ -393,3 +393,33 @@ async fn a_lock_free_reader_always_finds_the_table() {
     );
     assert_eq!(lake.ok("SELECT count(*) FROM hive.s.t").await, rows(&[&["15"]]));
 }
+
+// Each test below failed before its fix and proves a defect of the tester's
+// report.
+
+/// A plan kept by a client after `CREATE OR REPLACE` put in a table with
+/// the same columns: the kept plan names the replaced table, so every run of
+/// it is refused with an error that says what to do (plan it again; the
+/// PostgreSQL wire does that itself before running a prepared statement,
+/// e2e `a_prepared_statement_answers_after_or_replace`), and the statement
+/// planned again answers the new table's rows.
+#[tokio::test]
+async fn a_kept_plan_is_refused_after_a_replacement_and_a_new_plan_reads_the_new_table() {
+    let lake = lake().await;
+    lake.ok("CREATE TABLE hive.s.t AS SELECT CAST(1 AS BIGINT) AS v")
+        .await;
+    let sql = "SELECT count(*), sum(v) FROM hive.s.t";
+    let kept = lake.engine.sql(sql).await.unwrap();
+    assert!(kept.clone().collect().await.is_ok());
+    lake.ok("CREATE OR REPLACE TABLE hive.s.t AS SELECT CAST(2 AS BIGINT) AS v")
+        .await;
+    for _ in 0..2 {
+        let err = kept.clone().collect().await.unwrap_err().to_string();
+        assert!(
+            err.contains("was replaced (CREATE OR REPLACE) after this statement was planned")
+                && err.contains("plan the statement again"),
+            "{err}"
+        );
+    }
+    assert_eq!(lake.ok(sql).await, rows(&[&["1", "2"]]));
+}

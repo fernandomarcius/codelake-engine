@@ -455,12 +455,15 @@ impl HiveTable {
             )));
         };
         // Replaced (`CREATE OR REPLACE`, which holds these locks while it
-        // swaps) since the query resolved it: its files belong to another
-        // table, with other columns and rows. An error, never a mix of the
-        // two tables in one query.
+        // swaps) since the statement was planned (while it ran, or before a
+        // kept plan runs again): its files belong to another table, with
+        // other columns and rows. An error, never a mix of the two tables in
+        // one query; a client protocol that keeps plans plans the statement
+        // again before running it (the PostgreSQL wire does, ISS-017).
         if current.table_id() != self.table_id.as_deref() {
             return Err(DataFusionError::Plan(format!(
-                "table {}.{} was replaced (CREATE OR REPLACE) while the query ran; run the query again",
+                "table {}.{} was replaced (CREATE OR REPLACE) after this statement was planned; \
+                 plan the statement again (run it again, or prepare it again)",
                 self.schema_name, self.table
             )));
         }

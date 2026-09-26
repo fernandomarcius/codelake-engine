@@ -984,7 +984,7 @@ impl FileMetastore {
         };
         if metadata.table_id() != table_id {
             return Err(MetastoreError::Conflict(format!(
-                "table {schema}.{table} was replaced while the INSERT ran; nothing was written"
+                "table {schema}.{table} was replaced (CREATE OR REPLACE) after the INSERT was planned; nothing was written"
             )));
         }
         let same = |a: &ColumnMetadata, b: &ColumnMetadata| {
@@ -997,7 +997,7 @@ impl FileMetastore {
                 .all(|(a, b)| same(a, b));
         if !unchanged {
             return Err(MetastoreError::Conflict(format!(
-                "table {schema}.{table} was replaced while the INSERT ran; nothing was written"
+                "table {schema}.{table} was replaced after the INSERT was planned; nothing was written"
             )));
         }
         self.invalidate_statistics_locked(schema, table).await?;

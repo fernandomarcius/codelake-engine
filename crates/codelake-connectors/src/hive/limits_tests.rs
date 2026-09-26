@@ -440,7 +440,10 @@ async fn statements_planned_before_a_replace_never_touch_the_new_table() {
     let err = select.collect().await.unwrap_err().to_string();
     assert!(err.contains("was replaced"), "{err}");
     let err = insert.collect().await.unwrap_err().to_string();
-    assert!(err.contains("was replaced while the INSERT ran"), "{err}");
+    assert!(
+        err.contains("was replaced (CREATE OR REPLACE) after the INSERT was planned"),
+        "{err}"
+    );
     assert_eq!(lake.ok("SELECT v FROM hive.s.t").await, rows(&[&["5"]]));
     // Planned after the replacement: the new table.
     lake.ok("INSERT INTO hive.s.t VALUES (6)").await;

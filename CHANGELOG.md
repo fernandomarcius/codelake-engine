@@ -109,8 +109,10 @@ versioning: [SemVer](https://semver.org/).
   step: readers see the old or the new table, never a mix or nothing; a failure or a crash
   before the swap leaves the old table. Views, external tables, directories without a table
   and warehouses that cannot exchange two directories are refused with nothing changed. A
-  query or `INSERT` planned against the replaced table fails and can be run again
-  (ADR 0007, ISS-017).
+  plan made against the replaced table fails and the statement must be planned again; a
+  PostgreSQL prepared statement is planned again at each `Execute`, as PostgreSQL does, so it
+  reads the new table, and is refused with SQLSTATE `0A000` ("cached plan must not change
+  result type") when the new table changes its columns (ADR 0007, ISS-017).
 - Session properties and table-procedure arguments of type data size
   (`file_size_threshold`, `target_max_file_size`) accept `KiB MiB GiB TiB PiB`
   besides `kB MB GB TB PB`, all powers of 1024 (`MB` keeps its meaning); the
