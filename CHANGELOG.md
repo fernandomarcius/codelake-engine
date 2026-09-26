@@ -119,6 +119,23 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- PostgreSQL wire, transactions: `COMMIT` and `ROLLBACK` did not close cursors and portals,
+  which kept their admission slot and pool memory (for good on a pooled connection) and
+  answered `FETCH` after the `COMMIT`. The end of a transaction (`COMMIT`, `ROLLBACK`, a
+  message or an extended-protocol `Sync` outside a transaction block) now closes them, as in
+  PostgreSQL; `FETCH` afterwards fails with `34000`. **Breaking:** a `DECLARE` without
+  `WITH HOLD` outside a transaction block fails with `25P01`, as in PostgreSQL; a `WITH HOLD`
+  cursor outlives the transaction that commits it (ADR 0016, ISS-030).
+- PostgreSQL wire, `FETCH` (wrong rows): `FETCH 0` and `FETCH FORWARD 0` returned every row
+  left and emptied the cursor, and so did a count that could not be read (`FETCH 1.5`). They
+  now return the row the cursor stands on, as PostgreSQL does, and an unreadable count fails
+  with `42601`. A `FETCH` the SQL parser does not read (`FETCH -1 FROM c`, `FETCH c`) waited
+  60 s in the queue behind its own cursor's slot; it is answered at once (a move backward
+  fails with `55000`, `MOVE` with `0A000`). After a failed `FETCH` in a transaction block the
+  next one returned no row and no error; the transaction is now aborted (`25P02` for anything
+  but `COMMIT`/`ROLLBACK`). `FETCH` answers the tag `FETCH n` (it said `SELECT n`). A
+  `BINARY` cursor (rows would be read as binary) fails with `0A000`; a `DECLARE` of an open
+  name with `42P03`; `CLOSE` of a missing cursor with `34000` (ADR 0016).
 - PostgreSQL wire, cursors (`DECLARE … CURSOR`: psycopg2 named cursors, pandas chunked
   reads): the `DECLARE` finished at once and the cursor's stream lived in the connection with
   no admission slot, time limit or registry entry, holding its memory until `CLOSE`, and

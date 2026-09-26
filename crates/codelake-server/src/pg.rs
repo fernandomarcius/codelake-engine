@@ -23,8 +23,9 @@
 //! control) neither register nor take a slot.
 //!
 //! A cursor (`DECLARE … CURSOR`) is its `DECLARE`'s statement: registered,
-//! holding its slot and its deadline until its rows are all fetched or it is
-//! closed; `FETCH` and `CLOSE` take no slot of their own ([`cursor`]).
+//! holding its slot and its deadline until its rows are all fetched, it is
+//! closed or its transaction ends (unless `WITH HOLD`), as a portal does;
+//! `FETCH` and `CLOSE` take no slot of their own ([`cursor`]).
 //!
 //! Stopping a statement from outside, which also frees its slot and memory:
 //!
