@@ -2938,6 +2938,25 @@ mod tests {
             "SELECT length(v), count(*) FROM (SELECT s AS v FROM vct INTERSECT SELECT ch FROM cht) GROUP BY 1 ORDER BY 1",
             &[&["65536", "2"], &["NULL", "1"]],
         ),
+        // Multiset operations of char values.
+        (
+            "SELECT c FROM c3 INTERSECT ALL SELECT ch FROM cht ORDER BY 1",
+            &[&["a    "], &["ab   "], &["zz   "]],
+        ),
+        (
+            "SELECT c FROM (SELECT c FROM c3 UNION ALL SELECT c FROM c3) EXCEPT ALL SELECT ch FROM cht ORDER BY 1",
+            &[&["a    "], &["ab   "], &["zz   "]],
+        ),
+        (
+            "SELECT length(v), count(*) FROM (SELECT s AS v FROM vct EXCEPT ALL SELECT ch FROM cht WHERE id = 2) \
+             GROUP BY 1 ORDER BY 1",
+            &[&["65536", "4"], &["NULL", "1"]],
+        ),
+        (
+            "SELECT substr(v, 1, 3), count(*) FROM (SELECT s AS v FROM v3 UNION ALL SELECT s FROM v3 INTERSECT ALL \
+             SELECT ch FROM cht) GROUP BY 1 ORDER BY 1",
+            &[&["a  ", "2"], &["ab ", "2"]],
+        ),
         // The trims work on the value without its padding.
         (
             "SELECT id, ltrim(ch), length(ltrim(ch)), ltrim(ch) = 'ab' FROM cht ORDER BY id",

@@ -35,6 +35,7 @@ pub mod runtime;
 #[cfg(test)]
 mod semantics_tests;
 pub mod session_properties;
+mod set_operations;
 pub mod statement_policy;
 pub mod statistics_guard;
 pub mod subquery;

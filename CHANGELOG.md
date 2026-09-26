@@ -291,6 +291,10 @@ versioning: [SemVer](https://semver.org/).
   the pool, before sending the first; the statement then ended (slot freed, time limit over)
   while its client had read nothing. Rows now stream to the client as they are produced, so
   the statement holds its slot and its time limit until they are read (ADR 0016).
+- `INTERSECT ALL` kept every left copy of a row found on the right (`VALUES 1, 1, 1
+  INTERSECT ALL SELECT 1` answered three rows) and `EXCEPT ALL` removed every copy of
+  it (`VALUES 1, 1, 2 EXCEPT ALL SELECT 1` answered `[2]`); they are now the multiset
+  operations Trino 431 answers (ADR 0014, defect 13).
 - Red-team W1 (ADR 0007): a NANOSECONDS hive catalog read `INT96` timestamps outside
   1677–2262 as other instants (1500-06-01 as 2084-12-18) and its `OPTIMIZE` rewrote them
   into the files; `OPTIMIZE` in any other catalog rounded stored nanoseconds to
