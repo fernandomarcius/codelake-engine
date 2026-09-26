@@ -910,3 +910,29 @@ async fn timestamps_of_different_precisions_compare_at_the_finer_one() {
     )
     .await;
 }
+
+/// A window ordered by a `varbinary` key without a frame (the default
+/// `RANGE … CURRENT ROW`, peers included) plans as in Trino 431.
+#[tokio::test]
+async fn windows_ordered_by_varbinary_keep_range_peers() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    assert_same(
+        &engine,
+        &[(
+            "SELECT k, rank() OVER (ORDER BY b), count(*) OVER (ORDER BY b), \
+             count(*) OVER (ORDER BY b RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) \
+             FROM (VALUES (1, X'02'), (2, X'01'), (3, X'01'), (4, X'0100')) t(k, b) ORDER BY k",
+            answer(
+                &["integer", "bigint", "bigint", "bigint"],
+                &[
+                    &["1", "4", "4", "1"],
+                    &["2", "1", "2", "4"],
+                    &["3", "1", "2", "4"],
+                    &["4", "3", "3", "2"],
+                ],
+            ),
+        )],
+    )
+    .await;
+}

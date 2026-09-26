@@ -219,7 +219,8 @@ pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + S
 
 /// `DataFusion`'s analyzer rules with the engine's: the refusal of `char(n)`
 /// comparisons ([`crate::char_comparisons`], which must see only the casts
-/// the statement wrote), then Trino's decimal types and common types (module
+/// the statement wrote), `RANGE` frames without offsets on keys without
+/// range arithmetic as `GROUPS` (module `window_frames`), then Trino's decimal types and common types (module
 /// `coercion`) right before type coercion (which then recomputes every
 /// schema), then checked arithmetic ([`crate::overflow`]) and the one-row
 /// rule of scalar subqueries ([`crate::subquery`]), which need the types
@@ -233,6 +234,7 @@ pub fn analyzer_rules() -> Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Sen
     rules.insert(coercion, Arc::new(crate::coercion::TrinoCommonTypes));
     rules.insert(coercion, Arc::new(crate::overflow::TrinoDecimalTypes));
     rules.insert(coercion, Arc::new(crate::char_comparisons::RefuseCharComparisons));
+    rules.insert(coercion, Arc::new(crate::window_frames::RangeFramesAsGroups));
     rules.push(Arc::new(crate::overflow::CheckedArithmetic));
     rules.push(Arc::new(crate::subquery::EnforceScalarSubqueryRows));
     rules
