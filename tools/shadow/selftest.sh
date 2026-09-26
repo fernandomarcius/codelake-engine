@@ -42,6 +42,11 @@ BIN="/opt/target/$PROFILE/codelake"
 
 log() { printf '[selftest %s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 fail() { log "FAIL: $*"; exit 1; }
+# Any command that stops the script under `set -e` says which one: a failure
+# never ends the self-test without a FAIL line.
+on_error() { local rc=$?; [[ $- == *e* ]] && log "FAIL: exit $rc at line $1: $2"; return 0; }
+set -E
+trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 CHECKS=()
 pass() { CHECKS+=("PASS $*"); log "PASS: $*"; }
 
@@ -86,13 +91,22 @@ sqlcmd() { # file.sql [extra sqlcmd args]
   docker exec "$MSSQL" sh -c '/opt/mssql-tools18/bin/sqlcmd -C -b -f 65001 -S localhost -U sa -P "$MSSQL_SA_PASSWORD" "$@"' \
     sqlcmd -i "/tmp/$(basename "$file")" "$@"
 }
-printf 'SELECT 1;\n' > "$WORK/ping.sql"
+# Ready = accepts a login AND every database is online: a login succeeds
+# while the system databases are still recovering, and CREATE DATABASE or
+# CDC then fail (the self-test used to stop there without a word).
+cat > "$WORK/ping.sql" <<'SQL'
+SET NOCOUNT ON;
+IF EXISTS (SELECT 1 FROM sys.databases WHERE state_desc <> 'ONLINE') OR DB_ID('msdb') IS NULL
+  RAISERROR('databases still recovering', 16, 1);
+SELECT 1;
+SQL
 for i in $(seq 1 90); do
   if sqlcmd "$WORK/ping.sql" -h -1 >/dev/null 2>&1; then break; fi
   [ "$i" = 90 ] && fail "SQL Server did not start"
   sleep 2
 done
-sqlcmd "$FIXTURE/sqlserver/setup.sql" >/dev/null
+sqlcmd "$FIXTURE/sqlserver/setup.sql" > "$WORK/setup.txt" 2>&1 \
+  || { cat "$WORK/setup.txt" >&2; fail "SQL Server setup (setup.sql) failed"; }
 
 wait_captured() { # expected change rows
   local out
