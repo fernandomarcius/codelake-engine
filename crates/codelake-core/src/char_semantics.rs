@@ -38,8 +38,13 @@
 //! - functions keep the padded value: `upper`/`lower` give `char(n)`,
 //!   `rtrim`, `trim`, `substr` give `varchar(n)` of the padded text, `LIKE`
 //!   matches the padded text, `length` counts the padding. Functions the
-//!   reference engine has no char version of (`strpos`, `replace`, …) see
-//!   the padded text, as `CAST(ch AS varchar)` would give it.
+//!   reference engine has no char version of (`strpos`, `replace`, …; it
+//!   refuses them) see the padded text, as `CAST(ch AS varchar)` gives it;
+//! - text functions have the result length the reference engine derives
+//!   from their arguments' (`replace(varchar(x), y, varchar(z))` is
+//!   `varchar(x + z * (x + 1))`, `soundex` is `varchar(4)`, an element of
+//!   `split(varchar(x), …)` is `varchar(x)`, …), so a char
+//!   value output with their result gets the reference's common type.
 //!
 //! A column's type is followed through the plan (a subquery, an aggregate
 //! such as `max(ch)`, a window function, a scalar subquery, one computed
@@ -57,7 +62,7 @@
 //!   `char(n) || NULL`, a concatenation longer than `char(65536)`;
 //! - a value of a common type whose length this rule cannot tell: text from
 //!   a function whose result length it does not know, output together with
-//!   a char value (`CASE WHEN … THEN ch ELSE replace(s, 'a', 'bc') END`);
+//!   a char value (`CASE WHEN … THEN ch ELSE element_at(t.arr, 1) END`);
 //!   compare it, or cast it to `varchar(n)`, instead;
 //! - a char value searched in an array that is not written out
 //!   (`contains(array_agg(s), ch)`): the element type is not followed;
@@ -678,7 +683,98 @@ fn keeps_length(name: &str, arity: usize) -> bool {
             | "reverse"
             | "split_part"
             | "regexp_extract"
-    ) || (name == "replace" && arity == 2)
+            | "json_extract_scalar"
+            | "url_decode"
+            | "url_extract_host"
+            | "url_extract_path"
+            | "url_extract_query"
+            | "url_extract_fragment"
+            | "url_extract_protocol"
+            | "url_extract_parameter"
+    ) || (matches!(name, "replace" | "regexp_replace") && arity == 2)
+}
+
+/// Longest `varchar(n)` of the reference engine: a derived length from
+/// here on is unbounded `varchar`.
+const MAX_VARCHAR: u64 = 2_147_483_646;
+
+/// The length a text argument brings into a derived result length.
+enum Length {
+    Known(u64),
+    Unbounded,
+    Uncertain,
+}
+
+fn argument_length(arg: Option<&Expr>, scope: &Scope<'_>) -> Length {
+    match arg.and_then(|a| infer(a, scope)) {
+        Some(Text::Null) => Length::Known(0),
+        Some(Text::Varchar(Bound::Known(k)) | Text::Char(Some(k))) => Length::Known(u64::from(k)),
+        Some(Text::Varchar(Bound::Unbounded)) => Length::Unbounded,
+        Some(Text::Varchar(Bound::Uncertain) | Text::Char(None) | Text::Array(_)) | None => Length::Uncertain,
+    }
+}
+
+/// `varchar(f(lengths))` from the lengths of `args` (every one known), as
+/// the reference engine derives it: unbounded past its longest `varchar`.
+fn derived_varchar(args: &[Length], f: impl Fn(&[u64]) -> Option<u64>) -> Text {
+    let mut known = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg {
+            Length::Known(n) => known.push(*n),
+            Length::Unbounded => return Text::Varchar(Bound::Unbounded),
+            Length::Uncertain => return Text::Varchar(Bound::Uncertain),
+        }
+    }
+    match f(&known)
+        .filter(|n| *n <= MAX_VARCHAR)
+        .and_then(|n| u32::try_from(n).ok())
+    {
+        Some(n) => Text::Varchar(Bound::Known(n)),
+        None => Text::Varchar(Bound::Unbounded),
+    }
+}
+
+/// Text functions whose result length the reference engine computes from
+/// its arguments' lengths (observed on `trinodb/trino:431` with `typeof`).
+fn computed_length(name: &str, args: &[Expr], scope: &Scope<'_>) -> Option<Text> {
+    let length = |i: usize| argument_length(args.get(i), scope);
+    match (name, args.len()) {
+        // `replace(varchar(x), y, varchar(z))`: `x + z * (x + 1)`.
+        ("replace", 3) => Some(derived_varchar(&[length(0), length(2)], |l| {
+            l[1].checked_mul(l[0] + 1)?.checked_add(l[0])
+        })),
+        // `regexp_replace(varchar(x), pattern, varchar(y))`:
+        // `x + max(x * y / 2, y) * (x + 1)`.
+        ("regexp_replace", 3) => Some(derived_varchar(&[length(0), length(2)], |l| {
+            (l[0].checked_mul(l[1])? / 2)
+                .max(l[1])
+                .checked_mul(l[0] + 1)?
+                .checked_add(l[0])
+        })),
+        ("url_encode", 1) => Some(derived_varchar(&[length(0)], |l| l[0].checked_mul(12))),
+        ("soundex", 1) => Some(Text::Varchar(Bound::Known(4))),
+        // `to_iso8601(date)`: `varchar(16)` (of a timestamp the length
+        // follows its precision, not derived here).
+        ("to_iso8601", 1) => args[0]
+            .get_type(scope.schema.as_ref())
+            .is_ok_and(|t| matches!(t, DataType::Date32 | DataType::Date64))
+            .then_some(Text::Varchar(Bound::Known(16))),
+        // An element of the array `split`, `regexp_split` or
+        // `regexp_extract_all` gives: `array(varchar(x))` of `varchar(x)`.
+        ("element_at" | crate::trino_functions::SUBSCRIPT, 2) => match &args[0] {
+            Expr::ScalarFunction(ScalarFunction { func, args: inner })
+                if matches!(func.name(), "split" | "regexp_split" | "regexp_extract_all") =>
+            {
+                match argument_length(inner.first(), scope) {
+                    Length::Known(n) => u32::try_from(n).ok().map(|n| Text::Varchar(Bound::Known(n))),
+                    Length::Unbounded => Some(Text::Varchar(Bound::Unbounded)),
+                    Length::Uncertain => Some(Text::Varchar(Bound::Uncertain)),
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Functions whose result is unbounded `varchar`.
@@ -700,10 +796,18 @@ fn unbounded_result(name: &str) -> bool {
             | "to_base64"
             | "listagg"
             | "string_agg"
+            | "from_utf8"
+            | "to_base64url"
+            | "human_readable_seconds"
+            | "current_timezone"
+            | "version"
     )
 }
 
 fn function_type(name: &str, args: &[Expr], scope: &Scope<'_>, whole: &Expr) -> Option<Text> {
+    if let Some(text) = computed_length(name, args, scope) {
+        return scope.is_text(whole).then_some(text);
+    }
     let first = || args.first().and_then(|a| infer(a, scope));
     match name {
         crate::declared::TRINO_TYPED | crate::declared::TRINO_TRY_TYPED => typed_as(args, scope),
@@ -2503,6 +2607,100 @@ mod tests {
             "SELECT id, CASE WHEN id = 1 THEN ch END FROM cht ORDER BY id",
             &[&["1", "ab   "], &["2", "NULL"], &["3", "NULL"], &["4", "NULL"]],
         ),
+        (
+            "SELECT id, CASE WHEN id = 1 THEN ch ELSE replace(s, 'a', 'bc') END, length(CASE WHEN id = 1 THEN ch ELSE replace(s, 'a', 'bc') END), typeof(CASE WHEN id = 1 THEN ch ELSE replace(s, 'a', 'bc') END) FROM cht JOIN v3 USING (id) ORDER BY id",
+            &[
+                &["1", "ab         ", "11", "char(11)"],
+                &["2", "bc         ", "11", "char(11)"],
+            ],
+        ),
+        (
+            "SELECT id, length(CASE WHEN id = 1 THEN ch ELSE regexp_replace(s, 'a', 'bc') END), typeof(CASE WHEN id = 1 THEN ch ELSE regexp_replace(s, 'a', 'bc') END) FROM cht JOIN v3 USING (id) ORDER BY id",
+            &[&["1", "15", "char(15)"], &["2", "15", "char(15)"]],
+        ),
+        (
+            "SELECT id, CASE WHEN id = 1 THEN ch ELSE soundex(s) END, typeof(CASE WHEN id = 1 THEN ch ELSE soundex(s) END), length(coalesce(ch, url_encode(s))), typeof(coalesce(ch, url_encode(s))) FROM cht JOIN v3 USING (id) ORDER BY id",
+            &[
+                &["1", "ab   ", "char(5)", "36", "char(36)"],
+                &["2", "A000 ", "char(5)", "36", "char(36)"],
+            ],
+        ),
+        (
+            "SELECT id, CASE WHEN id = 1 THEN ch ELSE element_at(split(s, ','), 1) END, typeof(CASE WHEN id = 1 THEN ch ELSE element_at(split(s, ','), 1) END) FROM cht JOIN v3 USING (id) ORDER BY id",
+            &[&["1", "ab   ", "char(5)"], &["2", "a    ", "char(5)"]],
+        ),
+        (
+            "SELECT id, CASE WHEN id = 1 THEN ch ELSE split(s, ',')[1] END, typeof(CASE WHEN id = 1 THEN ch ELSE split(s, ',')[1] END) FROM cht JOIN v3 USING (id) ORDER BY id",
+            &[&["1", "ab   ", "char(5)"], &["2", "a    ", "char(5)"]],
+        ),
+        (
+            "SELECT id, length(coalesce(ch, regexp_extract_all(s, '.')[1])), typeof(coalesce(ch, regexp_extract_all(s, '.')[1])) FROM cht JOIN v3 USING (id) ORDER BY id",
+            &[&["1", "5", "char(5)"], &["2", "5", "char(5)"]],
+        ),
+        (
+            "SELECT id, CASE WHEN id = 1 THEN ch ELSE to_iso8601(DATE '2020-01-01') END, typeof(CASE WHEN id = 1 THEN ch ELSE to_iso8601(DATE '2020-01-01') END) FROM cht ORDER BY id",
+            &[
+                &["1", "ab              ", "char(16)"],
+                &["2", "2020-01-01      ", "char(16)"],
+                &["3", "2020-01-01      ", "char(16)"],
+                &["4", "2020-01-01      ", "char(16)"],
+            ],
+        ),
+        (
+            "SELECT id, length(CASE WHEN id = 1 THEN ch ELSE human_readable_seconds(id) END), typeof(CASE WHEN id = 1 THEN ch ELSE human_readable_seconds(id) END) FROM cht ORDER BY id",
+            &[
+                &["1", "65536", "char(65536)"],
+                &["2", "65536", "char(65536)"],
+                &["3", "65536", "char(65536)"],
+                &["4", "65536", "char(65536)"],
+            ],
+        ),
+        (
+            "SELECT id, length(coalesce(ch, replace(s, 'a', 'bc'))), typeof(coalesce(ch, replace(s, 'a', 'bc'))) FROM cht JOIN vct USING (id) ORDER BY id",
+            &[
+                &["1", "65536", "char(65536)"],
+                &["2", "65536", "char(65536)"],
+                &["3", "65536", "char(65536)"],
+                &["4", "65536", "char(65536)"],
+            ],
+        ),
+        (
+            "SELECT id FROM cht JOIN v3 USING (id) WHERE ch = replace(s, 'b', 'b  ') ORDER BY id",
+            &[&["1"]],
+        ),
+        (
+            "SELECT v, length(v) FROM (SELECT ch AS v FROM cht UNION SELECT replace(s, 'a', 'x') FROM v3) ORDER BY 1",
+            &[
+                &["a      ", "7"],
+                &["ab     ", "7"],
+                &["x      ", "7"],
+                &["xb     ", "7"],
+                &["zz     ", "7"],
+                &["NULL", "NULL"],
+            ],
+        ),
+        (
+            "SELECT id, coalesce(ch, regexp_replace(s, 'b', 'yy')), length(coalesce(ch, regexp_replace(s, 'b', 'yy'))) FROM (SELECT id, ch, 'abc' AS s FROM cht) ORDER BY id",
+            &[
+                &["1", "ab             ", "15"],
+                &["2", "zz             ", "15"],
+                &["3", "ayyc           ", "15"],
+                &["4", "a              ", "15"],
+            ],
+        ),
+        (
+            "SELECT count(*) FROM (SELECT ch FROM cht UNION SELECT url_decode(s) FROM v3)",
+            &[&["4"]],
+        ),
+        (
+            "SELECT id, CASE WHEN id = 1 THEN ch ELSE replace(NULL, 'a', 'bc') END, typeof(CASE WHEN id = 1 THEN ch ELSE replace(NULL, 'a', 'bc') END) FROM cht ORDER BY id",
+            &[
+                &["1", "ab   ", "char(5)"],
+                &["2", "NULL", "char(5)"],
+                &["3", "NULL", "char(5)"],
+                &["4", "NULL", "char(5)"],
+            ],
+        ),
     ];
 
     #[tokio::test]
@@ -2601,7 +2799,7 @@ mod tests {
                 "concatenating a char(n) value with text of unbounded or unknown length",
             ),
             (
-                "SELECT CASE WHEN id = 1 THEN ch ELSE replace(s, 'a', 'bc') END FROM cht JOIN vct USING (id)",
+                "SELECT CASE WHEN id = 1 THEN ch ELSE element_at(x.a, 1) END FROM cht CROSS JOIN (SELECT split('a,b', ',') AS a) x",
                 "the length of the char(n) type the values share cannot be determined",
             ),
             (

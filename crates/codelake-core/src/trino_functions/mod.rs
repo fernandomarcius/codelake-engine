@@ -69,6 +69,8 @@ mod url;
 mod zeros;
 mod zone;
 
+pub(crate) use collections::SUBSCRIPT;
+
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 

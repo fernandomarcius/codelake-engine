@@ -152,8 +152,14 @@ versioning: [SemVer](https://semver.org/).
   columns ("Natural join not supported"), `char(n) || <unbounded varchar>` and
   `char(n) || NULL`. Refused because the engine cannot guarantee the reference's answer
   (ADR 0015): a char value output together with text of a length it does not derive
-  (`CASE … THEN ch ELSE replace(s, 'a', 'bc') END`), and char values in arrays that are
-  not written out (`contains(array_agg(ch), 'ab')`).
+  (`CASE … THEN ch ELSE element_at(t.arr, 1) END` over an array column,
+  `to_iso8601(timestamp)`), and char values in arrays that are not written out
+  (`contains(array_agg(ch), 'ab')`). The result lengths of `replace`, `regexp_replace`,
+  `url_encode`, `soundex`, `json_extract_scalar`, `url_decode`, the `url_extract_*`
+  functions, `from_utf8`, `to_iso8601(date)`, an element of `split`, `regexp_split` or
+  `regexp_extract_all` (`element_at`, `[i]`), `to_base64url`, `human_readable_seconds`,
+  `current_timezone` and `version` are derived as the reference engine derives them, so
+  a char value output with them is answered.
 - **Breaking:** `TRY_CAST(x AS varchar(n))` cuts to `n` characters and
   `TRY_CAST(x AS timestamp(p))` rounds to `p` digits, as `CAST` does (`NULL` where `CAST`
   fails); they returned the value as it was.

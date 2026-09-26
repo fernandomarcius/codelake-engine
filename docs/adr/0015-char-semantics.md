@@ -73,8 +73,8 @@ gives char values Trino 431's semantics (every rule below observed on
 7. **Functions** see the padded text: `upper`/`lower` are `char(n)`, `rtrim`,
    `trim`, `substr` are `varchar(n)` of the padded text, `LIKE` matches it,
    `length` counts it. Functions Trino has no char version of (`strpos`,
-   `replace`, …) and refuses see the padded text, as `CAST(ch AS varchar)`
-   gives it.
+   `replace`, …; Trino refuses them) see the padded text, as
+   `CAST(ch AS varchar)` gives it.
 8. **Scans** never refuse a filter on a char column any more: the filter is
    applied above the scan (pushdown `Inexact`), and statistics never prune a
    file by it (the scan rewrites the column to its padded value, which the
@@ -97,9 +97,21 @@ Where the engine cannot guarantee Trino's answer (documented, each an
 error naming a way around it):
 
 - a char value output together with text whose length the rule does not
-  know (`CASE WHEN … THEN ch ELSE replace(s, 'a', 'bc') END`): Trino types it
-  `char(max(n, k))` with a `k` the rule does not derive; comparing such
-  values is answered;
+  know (`CASE WHEN … THEN ch ELSE element_at(t.arr, 1) END` over an array
+  column, `to_iso8601(timestamp)`): Trino
+  types it `char(max(n, k))` with a `k` the rule does not derive; comparing
+  such values is answered. The lengths Trino derives for text functions are
+  followed where observed (`typeof` on `trinodb/trino:431`):
+  `replace(varchar(x), y, varchar(z))` is `varchar(x + z·(x + 1))`,
+  `regexp_replace(varchar(x), p, varchar(y))` `varchar(x + max(x·y/2, y)·(x + 1))`,
+  `url_encode(varchar(x))` `varchar(12x)`, `soundex` `varchar(4)`; the two-argument
+  `replace`/`regexp_replace`, `json_extract_scalar`, `url_decode` and the
+  `url_extract_*` functions keep `varchar(x)`; an element (`element_at`,
+  `[i]`) of `split`, `regexp_split` or `regexp_extract_all` of `varchar(x)`
+  is `varchar(x)`; `to_iso8601(date)` is `varchar(16)`; `from_utf8`,
+  `to_base64url`, `human_readable_seconds`, `current_timezone`, `version`
+  and `||` of text without char values are unbounded `varchar`; a length
+  past 2147483646 is unbounded `varchar`;
 - a char value searched in an array not written out, or text in an array
   of char values (`contains(array_agg(ch), 'ab')`), and an array of char
   values compared with, or put in a `UNION` with, another array: element
@@ -132,7 +144,7 @@ error naming a way around it):
 
 ## Verification
 
-- Unit (`char_semantics::tests`): 86 queries over in-memory tables, each with
+- Unit (`char_semantics::tests`): 100 queries over in-memory tables, each with
   the rows Trino 431 answers to the same SQL in its memory catalog; the
   engine's own storage (in-memory `INSERT`/`UPDATE`, CTAS, views); the
   refusals.
@@ -141,5 +153,5 @@ error naming a way around it):
   × operand (`char(3)`, `char(5)`, `varchar`, `varchar(3)`, six literals,
   `NULL`) × origin of the char value (hive table Trino wrote, in-memory
   table, literals, subquery, view Trino wrote, hive table the engine wrote)
-  — 990 row operations and 384 set operations, joins and subqueries, every
+  — 1656 row operations and 384 set operations, joins and subqueries, every
   one Trino's rows or refused by both.
