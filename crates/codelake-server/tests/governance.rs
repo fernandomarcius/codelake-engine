@@ -112,6 +112,14 @@ impl Server {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
+        // The PostgreSQL listener too: it may bind after the HTTP ones.
+        while tokio::net::TcpStream::connect(("127.0.0.1", self.pg))
+            .await
+            .is_err()
+        {
+            assert!(Instant::now() < deadline, "PostgreSQL port {} not open", self.pg);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     async fn connect(&self, user: &str) -> Client {
@@ -1498,6 +1506,128 @@ fn cursor_script() -> Vec<(String, Want)> {
     ]
 }
 
+/// A step of a wire script: a simple-protocol message, or one statement on
+/// the extended protocol (`Parse`, `Bind` with results in text, `Execute`,
+/// `Sync`).
+#[derive(Clone, Debug)]
+enum Step {
+    Simple(String),
+    Extended(String),
+}
+
+/// What a client sees of one step: its command tags, the text of its rows
+/// and its SQLSTATE.
+type Exchange = (Vec<String>, Vec<Vec<String>>, Option<String>);
+
+/// Runs `steps` on a new connection to a PostgreSQL server.
+async fn exchanged(
+    host: String,
+    port: u16,
+    user: &'static str,
+    database: &'static str,
+    steps: &[Step],
+) -> Vec<Exchange> {
+    let steps = steps.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let mut wire = Wire::connect_to(&host, port, user, database);
+        steps
+            .iter()
+            .map(|step| {
+                let messages = match step {
+                    Step::Simple(sql) => wire.query(sql),
+                    Step::Extended(sql) => {
+                        wire.parse("", sql);
+                        wire.bind("", 0);
+                        wire.execute();
+                        wire.sync()
+                    }
+                };
+                (tags(&messages), data_rows(&messages), error_code(&messages))
+            })
+            .collect()
+    })
+    .await
+    .unwrap()
+}
+
+/// Wire scripts, each with what every step answers.
+fn extended_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
+    use Step::{Extended, Simple};
+    let ok = |tag: &str| (vec![tag.to_owned()], Vec::new(), None);
+    let rows = |tag: &str, values: &[i64]| {
+        (
+            vec![tag.to_owned()],
+            values.iter().map(|v| vec![v.to_string()]).collect(),
+            None,
+        )
+    };
+    let failed = |code: &str| (Vec::new(), Vec::new(), Some(code.to_owned()));
+    let declare = |name: &str, how: &str| format!("DECLARE {name} {how} FOR {TEN}");
+    vec![
+        // In a failed transaction block, a FETCH and a CLOSE sent on the
+        // extended protocol fail with 25P02 too, before reading the cursor.
+        (
+            vec![
+                Simple("BEGIN".into()),
+                Simple(declare("a", "NO SCROLL CURSOR")),
+                Extended("FETCH 1 FROM a".into()),
+                Extended("FETCH 1.5 FROM a".into()),
+                Extended("FETCH 1 FROM a".into()),
+                Extended("CLOSE a".into()),
+                Extended("COMMIT".into()),
+                Simple("FETCH 1 FROM a".into()),
+            ],
+            vec![
+                ok("BEGIN"),
+                ok("DECLARE CURSOR"),
+                rows("FETCH 1", &[1]),
+                failed("42601"),
+                failed("25P02"),
+                failed("25P02"),
+                ok("ROLLBACK"),
+                failed("34000"),
+            ],
+        ),
+        // All on the extended protocol: the COMMIT of a failed transaction
+        // block rolls it back, closing the held cursor it declared.
+        (
+            vec![
+                Extended("BEGIN".into()),
+                Extended(declare("h", "NO SCROLL CURSOR WITH HOLD")),
+                Extended("FETCH 1.5 FROM h".into()),
+                Extended("COMMIT".into()),
+                Extended("FETCH 1 FROM h".into()),
+            ],
+            vec![
+                ok("BEGIN"),
+                ok("DECLARE CURSOR"),
+                failed("42601"),
+                ok("ROLLBACK"),
+                failed("34000"),
+            ],
+        ),
+        // Committed, it is read on, on either protocol.
+        (
+            vec![
+                Extended("BEGIN".into()),
+                Extended(declare("h", "NO SCROLL CURSOR WITH HOLD")),
+                Extended("COMMIT".into()),
+                Extended("FETCH 2 FROM h".into()),
+                Simple("FETCH 1 FROM h".into()),
+                Extended("CLOSE h".into()),
+            ],
+            vec![
+                ok("BEGIN"),
+                ok("DECLARE CURSOR"),
+                ok("COMMIT"),
+                rows("FETCH 2", &[1, 2]),
+                rows("FETCH 1", &[3]),
+                ok("CLOSE CURSOR"),
+            ],
+        ),
+    ]
+}
+
 /// Cursors answer as PostgreSQL's (17) do, statement by statement: the
 /// same rows, or the same SQLSTATE. Both are checked against the answers
 /// written down, so neither side is taken on trust. (Found by the F6
@@ -1563,7 +1693,9 @@ async fn cursors_answer_like_postgresql() {
                 .collect::<Vec<_>>()
         })
     };
-    let reference = exchanges(host, port, "postgres", "postgres").await.unwrap();
+    let reference = exchanges(host.clone(), port, "postgres", "postgres")
+        .await
+        .unwrap();
     let answered = exchanges("127.0.0.1".to_owned(), server.pg, "pgcursors", "codelake")
         .await
         .unwrap();
@@ -1582,6 +1714,12 @@ async fn cursors_answer_like_postgresql() {
     ];
     assert_eq!(reference, want, "PostgreSQL");
     assert_eq!(answered, want, "engine");
+    for (steps, want) in extended_scripts() {
+        let reference = exchanged(host.clone(), port, "postgres", "postgres", &steps).await;
+        assert_eq!(reference, want, "PostgreSQL: {steps:?}");
+        let answered = exchanged("127.0.0.1".to_owned(), server.pg, "pgcursors", "codelake", &steps).await;
+        assert_eq!(answered, want, "engine: {steps:?}");
+    }
     // On the extended protocol too, a DECLARE needs a transaction block.
     let declare = format!("DECLARE x CURSOR FOR {TEN}");
     for client in [&postgres, &engine] {
