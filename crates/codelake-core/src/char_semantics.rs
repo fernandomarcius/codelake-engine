@@ -3279,6 +3279,19 @@ mod tests {
              rtrim(CAST('xa  a' AS char(6)), 'a') || '|', length(rtrim(CAST('b a' AS char(4)), 'a'))",
             &[&["", " b", "a", " x", "xa|", "1"]],
         ),
+        // `INTERSECT ALL` / `EXCEPT ALL` of char values of two Arrow text
+        // types (a `VALUES` list and an in-memory table) stay multiset
+        // operations.
+        (
+            "SELECT ch FROM (VALUES CAST('ab' AS char(5)), CAST('ab' AS char(5)), CAST('a' AS char(5))) t(ch) \
+             INTERSECT ALL SELECT c FROM c3 ORDER BY 1",
+            &[&["a    "], &["ab   "]],
+        ),
+        (
+            "SELECT ch FROM (VALUES CAST('ab' AS char(5)), CAST('ab' AS char(5)), CAST('a' AS char(5)), \
+             CAST('zz' AS char(5))) t(ch) EXCEPT ALL SELECT c FROM c3 ORDER BY 1",
+            &[&["ab   "]],
+        ),
         // The type of a constant (folded before `typeof` runs).
         (
             "SELECT typeof('a'), typeof('ab'), typeof(''), typeof(CAST('ab' AS char(3))), typeof(CAST(NULL AS char(3))), \
