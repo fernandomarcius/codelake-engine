@@ -487,6 +487,124 @@ pub(crate) fn rewrite_declared_casts(statement: &mut DFStatement) {
     });
 }
 
+/// A statement of the PostgreSQL wire with the engine's `varchar(n)`.
+///
+/// Statements there are planned by `DataFusion` without the engine's
+/// preparation (`crate::engine::trino_statement`), which reads
+/// `varchar(n)` as unbounded text: `CAST(x AS varchar(n))` would not cut
+/// and a `varchar(n)` column would take any value. [`postgres_statement`]
+/// rewrites the casts to `varchar(n)` as the engine does, and
+/// [`PostgresStatement::record`] records the declared `varchar(n)` of a
+/// `CREATE TABLE`'s columns on the new table (its `INSERT`s are then
+/// checked as the engine checks them, whichever protocol runs them). `char(n)`
+/// is refused on the wire before this
+/// (`crate::char_semantics::refuse_char_types_on_postgres`).
+#[derive(Debug, Clone)]
+pub struct PostgresStatement {
+    /// The statement to plan.
+    pub statement: SqlStatement,
+    /// Whether it differs from the statement as written.
+    pub rewritten: bool,
+    columns: Vec<(String, Declared)>,
+}
+
+/// See [`PostgresStatement`].
+#[must_use]
+pub fn postgres_statement(statement: &SqlStatement) -> PostgresStatement {
+    let mut statement = statement.clone();
+    let columns: Vec<(String, Declared)> = match &statement {
+        SqlStatement::CreateTable(create) => create
+            .columns
+            .iter()
+            .filter_map(|column| match declared_type(&column.data_type) {
+                Some(d @ Declared::Varchar(_)) => Some((column.name.value.clone(), d)),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut rewritten = false;
+    let _ = visit_expressions_mut(&mut statement, |expr| {
+        if let sql::Expr::Cast { kind, data_type, .. } = expr
+            && let Some(declared @ Declared::Varchar(_)) = declared_type(data_type)
+        {
+            let function = match kind {
+                CastKind::TryCast | CastKind::SafeCast => TRINO_TRY_TYPED,
+                CastKind::Cast | CastKind::DoubleColon => TRINO_TYPED,
+            };
+            let cast = std::mem::replace(expr, sql::Expr::value(sql::Value::Null));
+            if let sql::Expr::Cast { expr: value, .. } = cast {
+                *expr = typed_call(function, *value, declared);
+                rewritten = true;
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    PostgresStatement {
+        statement,
+        rewritten,
+        columns,
+    }
+}
+
+impl PostgresStatement {
+    /// Whether planning it differs from planning the statement as written.
+    #[must_use]
+    pub fn differs(&self) -> bool {
+        self.rewritten || !self.columns.is_empty()
+    }
+
+    /// `plan` (of [`Self::statement`]) with the declared `varchar(n)` of a
+    /// `CREATE TABLE`'s columns in the new table's fields.
+    ///
+    /// # Errors
+    /// When the plan's schema cannot be rebuilt.
+    pub fn record(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        use datafusion::logical_expr::{CreateMemoryTable, DdlStatement, EmptyRelation};
+        if self.columns.is_empty() {
+            return Ok(plan);
+        }
+        let LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(create)) = plan else {
+            return Ok(plan);
+        };
+        let LogicalPlan::EmptyRelation(empty) = create.input.as_ref() else {
+            return Ok(LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(create)));
+        };
+        let fields: Vec<(Option<datafusion::sql::TableReference>, Arc<Field>)> = empty
+            .schema
+            .iter()
+            .map(|(qualifier, field)| {
+                let declared = self
+                    .columns
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(field.name()))
+                    .map(|(_, d)| *d)
+                    .filter(|d| d.fits(field.data_type()));
+                let field = match declared {
+                    Some(d) => {
+                        let mut metadata = field.metadata().clone();
+                        metadata.extend(d.metadata());
+                        Arc::new(field.as_ref().clone().with_metadata(metadata))
+                    }
+                    None => Arc::clone(field),
+                };
+                (qualifier.cloned(), field)
+            })
+            .collect();
+        let schema = Arc::new(DFSchema::new_with_metadata(
+            fields,
+            empty.schema.metadata().clone(),
+        )?);
+        let input = Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row: empty.produce_one_row,
+            schema,
+        }));
+        Ok(LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(
+            CreateMemoryTable { input, ..create },
+        )))
+    }
+}
+
 /// The declared types of the columns of a `CREATE TABLE` (`varchar(n)`,
 /// `char(n)`), by column name; the columns become unbounded text, as
 /// `DataFusion` reads them anyway.

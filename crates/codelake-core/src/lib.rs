@@ -61,7 +61,7 @@ pub use connector::{
     WritableCatalog,
 };
 pub use ddl::{RelationKind, update_type as ddl_update_type};
-pub use declared::trino_type_syntax;
+pub use declared::{PostgresStatement, postgres_statement, trino_type_syntax};
 pub use engine::{Attach, Engine, EngineError, Query, QueryOptions, SourceStatus};
 pub use governance::Governance;
 pub use runtime::MemoryStats;
