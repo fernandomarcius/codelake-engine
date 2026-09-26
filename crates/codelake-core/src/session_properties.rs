@@ -19,7 +19,7 @@ pub enum PropertyType {
     Integer,
     /// airlift duration: `1h`, `30m`, `2.5s`.
     Duration,
-    /// data size: `1GB`, `512MB`.
+    /// data size: `1GB`, `512MB`, `512MiB` ([`parse_data_size`]).
     DataSize,
     Varchar,
     /// One of the listed values, case-insensitive; stored upper-case.
@@ -80,7 +80,11 @@ impl SessionProperty {
             }
             PropertyType::Integer => value.parse::<i64>().is_ok(),
             PropertyType::Duration => parse_duration(value).is_some(),
-            PropertyType::DataSize => parse_data_size(value).is_ok(),
+            PropertyType::DataSize => {
+                return parse_data_size(value)
+                    .map(|_| value.to_owned())
+                    .map_err(|reason| format!("{} is invalid: {value}: {reason}", self.name));
+            }
             PropertyType::Varchar => true,
             PropertyType::Enum(allowed) => {
                 let upper = value.to_ascii_uppercase();
@@ -127,14 +131,26 @@ pub fn format_duration(duration: Duration) -> String {
     format!("{value:.2}{unit}")
 }
 
-/// airlift `DataSize`, as Trino parses session and procedure sizes: a decimal
-/// number and a case-sensitive unit (`B kB MB GB TB PB`), powers of 1024.
-/// `"100MB"` is 104 857 600 bytes. Errors carry airlift's messages.
+/// Units a session or procedure size accepts, as error messages list them.
+pub const DATA_SIZE_UNITS: &str = "B, kB, MB, GB, TB, PB, KiB, MiB, GiB, TiB, PiB (case-sensitive; all powers of 1024: 1MB = 1MiB = 1048576 bytes)";
+
+/// Session and procedure sizes: a decimal number and a case-sensitive unit,
+/// powers of 1024. airlift `DataSize` units (`B kB MB GB TB PB`), as Trino
+/// parses them, keep their meaning (`"100MB"` is 104 857 600 bytes); the IEC
+/// names of the same multiples (`KiB MiB GiB TiB PiB`) are accepted too
+/// (ISS-020; Trino refuses them). Errors start with airlift's messages and
+/// list the accepted units.
 pub fn parse_data_size(text: &str) -> Result<u64, String> {
     if text.is_empty() {
-        return Err("size is empty".into());
+        return Err(format!(
+            "size is empty (expected a number and a unit: {DATA_SIZE_UNITS})"
+        ));
     }
-    let invalid = || format!("size is not a valid data size string: {text}");
+    let invalid = || {
+        format!(
+            "size is not a valid data size string: {text} (expected a number and a unit, as in 512MB or 1.5GiB: {DATA_SIZE_UNITS})"
+        )
+    };
     let trimmed = text.trim();
     let split = trimmed
         .find(|c: char| !(c.is_ascii_digit() || c == '.'))
@@ -152,12 +168,12 @@ pub fn parse_data_size(text: &str) -> Result<u64, String> {
     }
     let exponent = match unit {
         "B" => 0,
-        "kB" => 1,
-        "MB" => 2,
-        "GB" => 3,
-        "TB" => 4,
-        "PB" => 5,
-        other => return Err(format!("Unknown unit: {other}")),
+        "kB" | "KiB" => 1,
+        "MB" | "MiB" => 2,
+        "GB" | "GiB" => 3,
+        "TB" | "TiB" => 4,
+        "PB" | "PiB" => 5,
+        other => return Err(format!("Unknown unit: {other} (accepted: {DATA_SIZE_UNITS})")),
     };
     // airlift keeps whole numbers exact and rounds a fraction to the nearest
     // byte, half up (`374.5B` is 375 bytes). Digits past the 19th cannot move
@@ -577,17 +593,22 @@ mod tests {
         assert_eq!(parse_data_size("0.36572265625kB"), Ok(375));
         assert_eq!(parse_data_size("0B"), Ok(0));
         assert_eq!(parse_data_size("1PB"), Ok(1 << 50));
-        assert_eq!(parse_data_size("10mb"), Err("Unknown unit: mb".into()));
-        assert_eq!(parse_data_size("10KB"), Err("Unknown unit: KB".into()));
-        assert_eq!(parse_data_size("1EB"), Err("Unknown unit: EB".into()));
-        for bad in ["abc", "100", "-1MB", ".5MB", "1.MB", "1.2.3MB", "10 M B"] {
-            assert_eq!(
-                parse_data_size(bad),
-                Err(format!("size is not a valid data size string: {bad}")),
-                "{bad}"
+        let unknown = |unit: &str| Err(format!("Unknown unit: {unit} (accepted: {DATA_SIZE_UNITS})"));
+        assert_eq!(parse_data_size("10mb"), unknown("mb"));
+        assert_eq!(parse_data_size("10KB"), unknown("KB"));
+        assert_eq!(parse_data_size("1EB"), unknown("EB"));
+        assert_eq!(parse_data_size("1mib"), unknown("mib"));
+        assert_eq!(parse_data_size("1MIB"), unknown("MIB"));
+        assert_eq!(parse_data_size("1Mi"), unknown("Mi"));
+        for bad in ["abc", "100", "-1MB", ".5MB", "1.MB", "1.2.3MB", "10 M B", "MiB"] {
+            let message = parse_data_size(bad).unwrap_err();
+            assert!(
+                message.starts_with(&format!("size is not a valid data size string: {bad} (")),
+                "{bad}: {message}"
             );
+            assert!(message.contains(DATA_SIZE_UNITS), "{bad}: {message}");
         }
-        assert_eq!(parse_data_size(""), Err("size is empty".into()));
+        assert!(parse_data_size("").unwrap_err().starts_with("size is empty ("));
         assert_eq!(
             parse_data_size("99999999999PB"),
             Err("size is too large to be represented in bytes: 99999999999PB".into())
@@ -599,6 +620,50 @@ mod tests {
             Ok(2 << 50)
         );
         assert_eq!(parse_data_size("0.001kB"), Ok(1));
+    }
+
+    /// ISS-020: the IEC names are the same powers of 1024 as airlift's
+    /// units, which keep their meaning.
+    #[test]
+    fn data_sizes_accept_iec_units_with_the_same_meaning() {
+        for (iec, airlift, bytes) in [
+            ("1KiB", "1kB", 1_u64 << 10),
+            ("512MiB", "512MB", 512 << 20),
+            ("4GiB", "4GB", 4 << 30),
+            ("2TiB", "2TB", 2 << 40),
+            ("1PiB", "1PB", 1 << 50),
+            ("1.5MiB", "1.5MB", 1_572_864),
+            ("10 MiB", "10 MB", 10 << 20),
+            ("0.36572265625KiB", "0.36572265625kB", 375),
+        ] {
+            assert_eq!(parse_data_size(iec), Ok(bytes), "{iec}");
+            assert_eq!(parse_data_size(airlift), Ok(bytes), "{airlift}");
+        }
+        assert_eq!(parse_data_size("8191PiB"), Ok(8191 << 50));
+        assert!(
+            parse_data_size("8192PiB")
+                .unwrap_err()
+                .starts_with("size is too large to be represented in bytes")
+        );
+    }
+
+    #[test]
+    fn data_size_properties_accept_iec_units() {
+        let property = SessionProperty::new(
+            "target_max_file_size",
+            PropertyType::DataSize,
+            "1GB",
+            Effect::Enforced,
+            "",
+        );
+        assert_eq!(property.parse("512MiB"), Ok("512MiB".to_owned()));
+        assert_eq!(property.parse("1GB"), Ok("1GB".to_owned()));
+        let refused = property.parse("512mib").unwrap_err();
+        assert!(
+            refused.contains("target_max_file_size is invalid: 512mib"),
+            "{refused}"
+        );
+        assert!(refused.contains(DATA_SIZE_UNITS), "{refused}");
     }
 
     #[test]

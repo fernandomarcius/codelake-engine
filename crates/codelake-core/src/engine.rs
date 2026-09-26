@@ -2986,6 +2986,14 @@ mod tests {
             .sql_with(&options, "ALTER TABLE t EXECUTE Optimize('2kB')")
             .await
             .unwrap();
+        // ISS-020: the IEC names reach the catalog as written.
+        engine
+            .sql_with(
+                &options,
+                "ALTER TABLE t EXECUTE optimize(file_size_threshold => '1.5MiB')",
+            )
+            .await
+            .unwrap();
 
         let calls = procedures.calls.lock().unwrap().clone();
         let expected = |threshold: &str, enabled: &str| {
@@ -3001,7 +3009,8 @@ mod tests {
             vec![
                 expected("100MB", "false"),
                 expected("1MB", "true"),
-                expected("2kB", "true")
+                expected("2kB", "true"),
+                expected("1.5MiB", "true")
             ]
         );
     }

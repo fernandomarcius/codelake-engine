@@ -29,7 +29,7 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-017](ISS-017-create-or-replace-atomic.md) | CREATE OR REPLACE on hive tables, atomic | removed limitation | 2026-09-25 | open |
 | [ISS-018](ISS-018-case-preserving-names.md) | Case-preserving names, case-insensitive resolution | removed limitation | 2026-09-25 | open |
 | [ISS-019](ISS-019-ctas-literal-unbounded-varchar.md) | CTAS of a literal infers unbounded varchar | removed limitation | 2026-09-25 | open |
-| [ISS-020](ISS-020-datasize-iec-units.md) | Data sizes accept MiB/GiB | removed limitation | 2026-09-25 | open |
+| [ISS-020](ISS-020-datasize-iec-units.md) | Data sizes accept MiB/GiB | removed limitation | 2026-09-25 | closed |
 | [ISS-021](ISS-021-arrow-flight-sql.md) | New front: Arrow Flight SQL | scope | 2026-09-25 | open |
 | [ISS-022](ISS-022-keep-dbt-trino-adapter.md) | Keep the existing dbt adapter until a native one is validated | dependency | 2026-09-25 | open |
 | [ISS-023](ISS-023-drop-view-keeps-files.md) | DROP VIEW never deletes data files | deliberate divergence | 2026-09-25 | open |

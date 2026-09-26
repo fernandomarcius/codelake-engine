@@ -93,6 +93,11 @@ versioning: [SemVer](https://semver.org/).
   fronts' Definition of Done (docs/gates.md).
 
 ### Changed
+- Session properties and table-procedure arguments of type data size
+  (`file_size_threshold`, `target_max_file_size`) accept `KiB MiB GiB TiB PiB`
+  besides `kB MB GB TB PB`, all powers of 1024 (`MB` keeps its meaning); the
+  reference engine refuses the IEC names. Size errors keep the reference
+  engine's message and add the accepted units (ADR 0009, ISS-020).
 - The query registry moved to the core: `system.runtime.queries` lists the queries of both
   protocols and exists on the PostgreSQL wire too; `resource_group_id` is `["global"]` (or
   `["global", "<group>"]`) instead of NULL. `[server.trino] history_size` and
