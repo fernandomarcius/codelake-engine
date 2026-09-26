@@ -70,7 +70,9 @@ Server 2022, and each is the behavior of Trino 431 itself.
   holds another writer's files and deletes them all on `DROP VIEW`;
   `CodeLake` keeps them, byte for byte (`hive::limits_tests::drop_view_*`,
   `view_rename_and_replace_never_move_foreign_files`). The view's rows are
-  the same in both engines. Any table type other than `MANAGED_TABLE`
+  the same in both engines, and after `DROP VIEW` neither finds it
+  (`hive_acceptance::drop_view_keeps_foreign_files_and_trino_reads_the_view`,
+  Trino 431). Any table type other than `MANAGED_TABLE`
   loses only its metadata on `DROP TABLE`. A `CREATE TABLE AS`
   that fails removes everything it wrote, directory included. A CTAS whose
   target directory already exists fails, as in Trino ("Target directory for

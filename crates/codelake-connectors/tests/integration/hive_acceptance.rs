@@ -1755,3 +1755,49 @@ async fn case_preserved_columns_are_read_by_trino_and_openrowset() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// ISS-023: a view owns only its metadata.
+// ---------------------------------------------------------------------------
+
+/// A view created by `CodeLake` over a directory that holds another writer's
+/// file answers the same rows in Trino 431; `DROP VIEW` then removes the
+/// view for both engines and leaves the foreign file as it was (Trino 431
+/// itself would delete it).
+#[tokio::test]
+async fn drop_view_keeps_foreign_files_and_trino_reads_the_view() {
+    let shared = shared().await;
+    let spill = tempfile::tempdir().unwrap();
+    let engine = codelake(&shared.warehouse(), spill.path()).await;
+    cl(&engine, "CREATE SCHEMA hive.vf").await;
+    cl(
+        &engine,
+        "CREATE TABLE hive.vf.base AS SELECT CAST(x AS BIGINT) AS id FROM (VALUES (1), (2), (3)) v(x)",
+    )
+    .await;
+    let foreign_dir = shared.warehouse().join("vf/v");
+    std::fs::create_dir_all(&foreign_dir).unwrap();
+    std::fs::write(foreign_dir.join("export.csv"), b"another writer's data\n").unwrap();
+    cl(
+        &engine,
+        "CREATE VIEW hive.vf.v AS SELECT id FROM hive.vf.base WHERE id >= 2",
+    )
+    .await;
+    let query = "SELECT CAST(id AS varchar) FROM hive.vf.v ORDER BY id";
+    let codelake_rows = cl(&engine, query).await;
+    assert_eq!(codelake_rows, strings(&[&["2"], &["3"]]));
+    let trino = Trino::start(&shared).await;
+    assert_eq!(trino.try_sql(query).await, Ok(codelake_rows));
+    cl(&engine, "DROP VIEW hive.vf.v").await;
+    assert_eq!(
+        std::fs::read(foreign_dir.join("export.csv")).unwrap(),
+        b"another writer's data\n"
+    );
+    assert!(!foreign_dir.join(".trinoSchema").exists());
+    let gone = trino.try_sql(query).await;
+    assert!(
+        gone.as_ref().is_err_and(|e| e.contains("does not exist")),
+        "{gone:?}"
+    );
+    assert!(cl_try(&engine, query).await.is_err());
+}
