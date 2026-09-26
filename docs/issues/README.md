@@ -41,3 +41,12 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-029](ISS-029-extended-binary-fetch-refused.md) | FETCH in binary format on the PostgreSQL extended protocol is refused | limitation | 2026-09-26 | awaiting-confirmation |
 | [ISS-030](ISS-030-cursor-transactions-by-recommendation.md) | PostgreSQL cursors and transactions: choices applied by recommendation | behavior | 2026-09-26 | awaiting-confirmation |
 | [ISS-031](ISS-031-cursor-slots-by-recommendation.md) | PostgreSQL cursors, second round: one slot per connection, FETCH rows in the pool, DISCARD, MOVE | behavior | 2026-09-26 | awaiting-confirmation |
+| [ISS-033](ISS-033-nullsafe-join-branch-unverified.md) | front/nullsafe-join finished but not independently verified | pending work | 2026-09-26 | open |
+| [ISS-034](ISS-034-remove-limits-branch-unfinished.md) | front/remove-limits: verification failed, fix round unfinished | pending work | 2026-09-26 | open |
+| [ISS-035](ISS-035-dev-speed-branch-unreviewed.md) | front/dev-speed (sccache + differential gate) not reviewed | pending work | 2026-09-26 | open |
+| [ISS-036](ISS-036-f6-round3-unverified.md) | F6 round 3 (cursors) implemented, not verified | pending work | 2026-09-26 | open |
+| [ISS-037](ISS-037-char-branch-unmerged.md) | char(n) semantics branch not merged | pending work | 2026-09-26 | open |
+| [ISS-038](ISS-038-roadmap-fronts-not-started.md) | Roadmap fronts not started | pending work | 2026-09-26 | open |
+| [ISS-039](ISS-039-benchmarks-and-global-dod.md) | Benchmarks and global Definition of Done pending | pending work | 2026-09-26 | open |
+| [ISS-040](ISS-040-environment-leftovers.md) | Local environment leftovers after the iCloud move | environment | 2026-09-26 | open |
+| [ISS-041](ISS-041-human-gates-pending.md) | Human gates pending | human decision | 2026-09-26 | open |
