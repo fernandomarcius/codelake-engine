@@ -9,6 +9,8 @@ mod exact_timestamps;
 #[cfg(test)]
 mod f2_tests;
 #[cfg(test)]
+mod limits_redteam_tests;
+#[cfg(test)]
 mod limits_tests;
 mod metastore;
 mod optimize;
