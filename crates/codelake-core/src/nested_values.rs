@@ -353,6 +353,46 @@ fn mode_argument(value: &ColumnarValue) -> Result<String> {
     }
 }
 
+/// The types two nested values are compared in: each value in the common
+/// type of its pair, the rows keeping their own field names (rows compare
+/// by position, and `DataFusion` casts a row to another only field by
+/// name).
+fn coerced_pair(a: &DataType, b: &DataType) -> Option<(DataType, DataType)> {
+    let with = |field: &FieldRef, data_type: DataType| -> FieldRef {
+        Arc::new(
+            field
+                .as_ref()
+                .clone()
+                .with_data_type(data_type)
+                .with_nullable(true),
+        )
+    };
+    match (a, b) {
+        (DataType::Struct(left), DataType::Struct(right)) if left.len() == right.len() => {
+            let mut fields_a = Vec::with_capacity(left.len());
+            let mut fields_b = Vec::with_capacity(right.len());
+            for (x, y) in left.iter().zip(right.iter()) {
+                let (tx, ty) = coerced_pair(x.data_type(), y.data_type())?;
+                fields_a.push(with(x, tx));
+                fields_b.push(with(y, ty));
+            }
+            Some((
+                DataType::Struct(fields_a.into()),
+                DataType::Struct(fields_b.into()),
+            ))
+        }
+        (DataType::List(x), DataType::List(y)) => {
+            let (tx, ty) = coerced_pair(x.data_type(), y.data_type())?;
+            Some((DataType::List(with(x, tx)), DataType::List(with(y, ty))))
+        }
+        (DataType::LargeList(x), DataType::LargeList(y)) => {
+            let (tx, ty) = coerced_pair(x.data_type(), y.data_type())?;
+            Some((DataType::LargeList(with(x, tx)), DataType::LargeList(with(y, ty))))
+        }
+        _ => comparison_coercion(a, b).map(|t| (t.clone(), t)),
+    }
+}
+
 /// `codelake_nested_test(a, b, mode)`: see the module documentation.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct NestedTest {
@@ -372,10 +412,10 @@ impl ScalarUDFImpl for NestedTest {
         let [a, b, mode] = arg_types else {
             return plan_err!("{NESTED_TEST} expects three arguments");
         };
-        let Some(common) = comparison_coercion(a, b) else {
+        let Some((a, b)) = coerced_pair(a, b) else {
             return plan_err!("{NESTED_TEST}: cannot compare {a} with {b}");
         };
-        Ok(vec![common.clone(), common, mode.clone()])
+        Ok(vec![a, b, mode.clone()])
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {

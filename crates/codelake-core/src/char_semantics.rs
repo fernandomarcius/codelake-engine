@@ -4743,6 +4743,47 @@ mod tests {
         }
     }
 
+    /// A row column compared with a row of other field names (rows compare
+    /// by position), and arrays of a table (rows of Trino 431).
+    #[tokio::test]
+    async fn rows_and_arrays_of_a_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path()).await;
+        for statement in [
+            "CREATE TABLE arr (id bigint, a array(bigint), r row(x bigint, y varchar))",
+            "INSERT INTO arr VALUES (1, ARRAY[1, NULL], CAST(ROW(1, NULL) AS row(x bigint, y varchar))), \
+             (2, ARRAY[1, 2], CAST(ROW(1, 'a') AS row(x bigint, y varchar))), (3, NULL, NULL)",
+        ] {
+            rows(&engine, statement)
+                .await
+                .unwrap_or_else(|e| panic!("{statement}: {e}"));
+        }
+        for (sql, answer) in [
+            (
+                "SELECT id FROM arr WHERE r = ROW(BIGINT '1', CAST('a' AS varchar)) ORDER BY id",
+                &[&["2"][..]][..],
+            ),
+            (
+                "SELECT id FROM arr WHERE NOT (r = ROW(BIGINT '1', CAST('b' AS varchar))) ORDER BY id",
+                &[&["2"]],
+            ),
+            (
+                "SELECT id, a = ARRAY[1, 2], a IN (ARRAY[1, 2], ARRAY[3]) FROM arr ORDER BY id",
+                &[
+                    &["1", "NULL", "NULL"],
+                    &["2", "true", "true"],
+                    &["3", "NULL", "NULL"],
+                ],
+            ),
+            (
+                "SELECT id, contains(a, BIGINT '3'), array_position(a, BIGINT '3') FROM arr ORDER BY id",
+                &[&["1", "NULL", "0"], &["2", "false", "0"], &["3", "NULL", "NULL"]],
+            ),
+        ] {
+            assert_eq!(rows(&engine, sql).await, Ok(expected(answer)), "{sql}");
+        }
+    }
+
     /// `INSERT … SELECT` whose select list repeats a name inserts by
     /// position (rows of Trino 431).
     #[tokio::test]
