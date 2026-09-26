@@ -22,6 +22,7 @@ use testcontainers::core::WaitFor;
 use testcontainers::core::wait::ExitWaitStrategy;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
+use testcontainers_modules::postgres::Postgres;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
@@ -1273,6 +1274,170 @@ async fn portals_end_with_their_transaction(server: &Server) {
     .await
     .unwrap();
     server.slots_free().await;
+}
+
+/// What a client sees of a simple-protocol message: the text of its rows, or
+/// its SQLSTATE.
+type Seen = Result<Vec<Vec<String>>, String>;
+
+async fn seen(client: &Client, sql: &str) -> Seen {
+    match client.simple_query(sql).await {
+        Ok(messages) => Ok(messages
+            .into_iter()
+            .filter_map(|message| match message {
+                SimpleQueryMessage::Row(row) => Some(
+                    (0..row.len())
+                        .map(|i| row.get(i).unwrap_or("NULL").to_owned())
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()),
+        Err(error) => Err(error
+            .code()
+            .map_or_else(|| error.to_string(), |code| code.code().to_owned())),
+    }
+}
+
+/// Ten rows, `1` to `10`, that PostgreSQL and the engine both return in
+/// order.
+const TEN: &str = "SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)";
+
+/// A step of [`cursor_script`]: the values of the rows it returns, or its
+/// SQLSTATE.
+enum Want {
+    Rows(Vec<i64>),
+    Code(&'static str),
+}
+
+impl Want {
+    fn none() -> Self {
+        Self::Rows(Vec::new())
+    }
+
+    fn seen(&self) -> Seen {
+        match self {
+            Self::Rows(values) => Ok(values.iter().map(|value| vec![value.to_string()]).collect()),
+            Self::Code(code) => Err((*code).to_owned()),
+        }
+    }
+}
+
+/// Cursors across transactions, as a client sees them, message by message.
+fn cursor_script() -> Vec<(String, Want)> {
+    use Want::{Code, Rows};
+    let none = Want::none;
+    let declare = |name: &str, how: &str| format!("DECLARE {name} {how} FOR {TEN}");
+    vec![
+        ("BEGIN".into(), none()),
+        (declare("c", "CURSOR"), none()),
+        // FETCH 0 reads the row the cursor stands on again: none before
+        // the first row and after the last, never every row.
+        ("FETCH 0 FROM c".into(), none()),
+        ("FETCH 2 FROM c".into(), Rows(vec![1, 2])),
+        ("FETCH 0 FROM c".into(), Rows(vec![2])),
+        ("FETCH FORWARD 0 FROM c".into(), Rows(vec![2])),
+        ("FETCH RELATIVE 0 FROM c".into(), Rows(vec![2])),
+        ("FETCH NEXT FROM c".into(), Rows(vec![3])),
+        ("FETCH 3 FROM c".into(), Rows(vec![4, 5, 6])),
+        ("FETCH 0 FROM c".into(), Rows(vec![6])),
+        ("FETCH ALL FROM c".into(), Rows((7..=10).collect())),
+        ("FETCH 0 FROM c".into(), none()),
+        ("FETCH 1 FROM c".into(), none()),
+        // COMMIT closes it.
+        ("COMMIT".into(), none()),
+        ("FETCH 1 FROM c".into(), Code("34000")),
+        // Among other statements of a message, too.
+        (
+            format!("BEGIN; {}; FETCH 10 FROM e", declare("e", "CURSOR")),
+            Rows((1..=10).collect()),
+        ),
+        (
+            "FETCH 0 FROM e; FETCH 1 FROM e; FETCH 0 FROM e".into(),
+            Rows(vec![10]),
+        ),
+        ("ROLLBACK".into(), none()),
+        ("FETCH 1 FROM e".into(), Code("34000")),
+        // NO SCROLL: the current row cannot be read again.
+        (format!("BEGIN; {}", declare("n", "NO SCROLL CURSOR")), none()),
+        ("FETCH 0 FROM n".into(), none()),
+        ("FETCH 1 FROM n".into(), Rows(vec![1])),
+        ("FETCH 0 FROM n".into(), Code("55000")),
+        ("ROLLBACK".into(), none()),
+        // A count that is not a whole number.
+        (format!("BEGIN; {}", declare("i", "CURSOR")), none()),
+        ("FETCH 1.5 FROM i".into(), Code("42601")),
+        ("ROLLBACK".into(), none()),
+        // Outside a transaction block: refused, unless the message holds
+        // other statements (an implicit block, closed with the message).
+        (declare("o", "CURSOR"), Code("25P01")),
+        (
+            format!("{}; FETCH 2 FROM m", declare("m", "CURSOR")),
+            Rows(vec![1, 2]),
+        ),
+        ("FETCH 1 FROM m".into(), Code("34000")),
+        // WITH HOLD outlives its commit and later rollbacks.
+        (declare("h", "CURSOR WITH HOLD"), none()),
+        ("FETCH 2 FROM h".into(), Rows(vec![1, 2])),
+        ("BEGIN".into(), none()),
+        ("FETCH 1 FROM h".into(), Rows(vec![3])),
+        ("ROLLBACK".into(), none()),
+        ("FETCH 0 FROM h".into(), Rows(vec![3])),
+        ("FETCH ALL FROM h".into(), Rows((4..=10).collect())),
+        ("CLOSE h".into(), none()),
+        ("FETCH 1 FROM h".into(), Code("34000")),
+        (
+            format!("BEGIN; {}; ROLLBACK", declare("r", "CURSOR WITH HOLD")),
+            none(),
+        ),
+        ("FETCH 1 FROM r".into(), Code("34000")),
+    ]
+}
+
+/// Cursors answer as PostgreSQL's (17) do, statement by statement: the
+/// same rows, or the same SQLSTATE. Both are checked against the answers
+/// written down, so neither side is taken on trust. (Found by the F6
+/// re-verification: `FETCH 0` returned every row left and emptied the
+/// cursor; cursors survived `COMMIT`.)
+#[tokio::test]
+async fn cursors_answer_like_postgresql() {
+    let reference = Postgres::default()
+        .with_host_auth()
+        .with_tag("17-alpine")
+        .start()
+        .await
+        .unwrap();
+    let host = std::env::var("TESTCONTAINERS_HOST_OVERRIDE").unwrap_or_else(|_| "127.0.0.1".to_owned());
+    let port = reference.get_host_port_ipv4(5432).await.unwrap();
+    let (postgres, connection) = tokio_postgres::connect(
+        &format!("host={host} port={port} user=postgres dbname=postgres"),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(connection);
+    let dir = tempfile::tempdir().unwrap();
+    let server = start_server(dir.path());
+    server.wait_ready().await;
+    let engine = server.connect("pgcursors").await;
+
+    for (sql, want) in cursor_script() {
+        let want = want.seen();
+        assert_eq!(seen(&postgres, &sql).await, want, "PostgreSQL: {sql}");
+        assert_eq!(seen(&engine, &sql).await, want, "engine: {sql}");
+    }
+    // On the extended protocol too, a DECLARE needs a transaction block.
+    let declare = format!("DECLARE x CURSOR FOR {TEN}");
+    for client in [&postgres, &engine] {
+        let error = client.execute(&declare, &[]).await.unwrap_err();
+        assert_eq!(
+            error.code(),
+            Some(&SqlState::NO_ACTIVE_SQL_TRANSACTION),
+            "{error:?}"
+        );
+    }
+    server.slots_free().await;
+    assert_eq!(server.pool_drains().await, 0);
 }
 
 /// A join that streams rows (2 M, as its probe side advances) while its

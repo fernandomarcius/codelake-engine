@@ -21,8 +21,9 @@
 //! closed or read to the end. So a `DECLARE` without `WITH HOLD` outside a
 //! transaction block fails (SQLSTATE `25P01`), as in `PostgreSQL`, instead of
 //! declaring a cursor its own transaction closes at once. [`Cursors`] keeps
-//! what the portals do not: which cursors are held and whether the
-//! connection is in a transaction block.
+//! what the portals do not: which cursors are held, the row each stands on
+//! (`FETCH 0` reads it again, as in `PostgreSQL`) and whether the connection
+//! is in a transaction block.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,7 +33,9 @@ use async_trait::async_trait;
 use datafusion::common::ParamValues;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
-use datafusion::sql::sqlparser::ast::{Declare, DeclareType, FetchDirection, Statement, Value};
+use datafusion::sql::sqlparser::ast::{
+    Declare, DeclareType, FetchDirection, Statement, Value, ValueWithSpan,
+};
 use datafusion_postgres::hooks::{HookClient, QueryHook};
 use datafusion_postgres::pgwire::api::portal::{Format, Portal, PortalExecutionState};
 use datafusion_postgres::pgwire::api::results::{FieldInfo, QueryResponse, Response};
@@ -41,7 +44,8 @@ use datafusion_postgres::pgwire::api::{ClientInfo, ClientPortalStore, PgWireConn
 use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::data::DataRow;
 use datafusion_postgres::pgwire::messages::response::TransactionStatus;
-use futures::{Stream, StreamExt};
+use futures::stream::BoxStream;
+use futures::{Stream, StreamExt, TryStreamExt};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use super::{DfStatement, lock, user_error};
@@ -62,8 +66,31 @@ where
 struct Cursor {
     /// Declared `WITH HOLD`: outlives the transaction that commits it.
     hold: bool,
+    /// Not declared `NO SCROLL`: `FETCH 0` may read the current row again.
+    scroll: bool,
     /// Declared in the transaction in progress, not committed yet.
     pending: AtomicBool,
+    /// The row the cursor stands on: the last one a `FETCH` returned, unless
+    /// a later `FETCH` moved past it or found the end.
+    current: Mutex<Option<DataRow>>,
+    /// Its columns, for a `FETCH` once its stream is finished.
+    columns: Mutex<Option<Arc<Vec<FieldInfo>>>>,
+}
+
+impl Cursor {
+    fn new(hold: bool, scroll: bool) -> Self {
+        Self {
+            hold,
+            scroll,
+            pending: AtomicBool::new(true),
+            current: Mutex::new(None),
+            columns: Mutex::new(None),
+        }
+    }
+
+    fn stand_on(&self, row: Option<DataRow>) {
+        *lock(&self.current) = row;
+    }
 }
 
 /// A connection's cursors, and where the connection stands in its
@@ -127,16 +154,25 @@ impl Cursors {
                     "DECLARE CURSOR can only be used in transaction blocks",
                 ));
             }
-            made.push((name.value.clone(), hold));
+            made.push((
+                name.value.clone(),
+                Cursor::new(hold, declare.scroll != Some(false)),
+            ));
         }
-        for (name, hold) in made {
-            let cursor = Cursor {
-                hold,
-                pending: AtomicBool::new(true),
-            };
+        for (name, cursor) in made {
             book.cursors.insert(name, Arc::new(cursor));
         }
         Ok(())
+    }
+
+    /// The cursor `name` (a portal of the extended protocol has one too).
+    fn cursor(&self, name: &str) -> Arc<Cursor> {
+        let mut book = lock(&self.0);
+        let cursor = book
+            .cursors
+            .entry(name.to_owned())
+            .or_insert_with(|| Arc::new(Cursor::new(false, true)));
+        Arc::clone(cursor)
     }
 
     /// The transaction in progress ends, committed or rolled back (a failed
@@ -237,9 +273,19 @@ where
 pub(crate) struct CursorHook;
 
 impl CursorHook {
-    fn observe(statement: &Statement, client: &dyn HookClient) -> Option<PgWireResult<Response>> {
+    async fn observe(statement: &Statement, client: &dyn HookClient) -> Option<PgWireResult<Response>> {
         let cursors = Cursors::of(client);
         match statement {
+            // A `FETCH` among other statements: its rows are read before the
+            // next statement runs (a single `FETCH` streams them, [`fetch`]).
+            Statement::Fetch { name, direction, .. } => {
+                let store = Some(client.portal_store());
+                let fetch = open(&cursors, store, &name.value, direction, &Format::UnifiedText).await;
+                return Some(match fetch {
+                    Ok(fetch) => fetch.collected().await,
+                    Err(error) => Err(error),
+                });
+            }
             Statement::StartTransaction { .. } => cursors.begin(),
             Statement::Commit { .. } => cursors.end_transaction(Some(client.portal_store()), true),
             Statement::Rollback { .. } => cursors.end_transaction(Some(client.portal_store()), false),
@@ -258,7 +304,7 @@ impl QueryHook for CursorHook {
         _session_context: &SessionContext,
         client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
-        Self::observe(statement, client)
+        Self::observe(statement, client).await
     }
 
     async fn handle_extended_parse_query(
@@ -278,7 +324,7 @@ impl QueryHook for CursorHook {
         _session_context: &SessionContext,
         client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
-        Self::observe(statement, client)
+        Self::observe(statement, client).await
     }
 }
 
@@ -377,55 +423,147 @@ pub(super) async fn fetch<C>(
     format: &Format,
 ) -> Option<PgWireResult<Response>>
 where
-    C: ClientPortalStore + ?Sized,
+    C: ClientInfo + ClientPortalStore + ?Sized,
     C::PortalStore: PortalStore,
 {
     let Statement::Fetch { name, direction, .. } = statement else {
         return None;
     };
-    Some(fetch_from(client, &name.value, direction, format).await)
+    let cursors = Cursors::of(client);
+    let fetch = open(&cursors, portals(client), &name.value, direction, format).await;
+    Some(fetch.map(Fetch::streamed))
 }
 
-async fn fetch_from<C>(
-    client: &C,
+/// How far a `FETCH` moves a cursor that only scans forward.
+#[derive(Debug, PartialEq, Eq)]
+enum Count {
+    /// Up to this many rows (at least one).
+    Rows(usize),
+    /// Every row left.
+    All,
+    /// None: the current row again (`FETCH 0`, `FETCH RELATIVE 0`).
+    Current,
+}
+
+/// A `FETCH` about to read: its cursor's columns and where its rows come
+/// from.
+struct Fetch {
+    columns: Arc<Vec<FieldInfo>>,
+    tag: String,
+    rows: FetchRows,
+}
+
+enum FetchRows {
+    /// The row the cursor stands on, when it stands on one.
+    Current(Option<DataRow>),
+    /// Rows from the cursor's stream, `max` at most.
+    Read {
+        state: Arc<AsyncMutex<PortalExecutionState>>,
+        max: Option<usize>,
+        cursor: Arc<Cursor>,
+    },
+}
+
+impl Fetch {
+    fn rows(
+        self,
+    ) -> (
+        Arc<Vec<FieldInfo>>,
+        String,
+        BoxStream<'static, PgWireResult<DataRow>>,
+    ) {
+        let rows = match self.rows {
+            FetchRows::Current(row) => futures::stream::iter(row.map(Ok)).boxed(),
+            FetchRows::Read { state, max, cursor } => cursor_rows(state, max, cursor).boxed(),
+        };
+        (self.columns, self.tag, rows)
+    }
+
+    /// The rows, sent as the cursor's stream yields them.
+    fn streamed(self) -> Response {
+        let (columns, tag, rows) = self.rows();
+        let mut response = QueryResponse::new(columns, rows);
+        response.set_command_tag(&tag);
+        Response::Query(response)
+    }
+
+    /// The rows, read before the response is made.
+    async fn collected(self) -> PgWireResult<Response> {
+        let (columns, tag, rows) = self.rows();
+        let rows: Vec<DataRow> = rows.try_collect().await?;
+        let mut response = QueryResponse::new(columns, futures::stream::iter(rows.into_iter().map(Ok)));
+        response.set_command_tag(&tag);
+        Ok(Response::Query(response))
+    }
+}
+
+/// Prepares a `FETCH` of the cursor `name`: checked (count, cursor, result
+/// format) before any row is read.
+async fn open(
+    cursors: &Cursors,
+    store: Option<&Store>,
     name: &str,
     direction: &FetchDirection,
     format: &Format,
-) -> PgWireResult<Response>
-where
-    C: ClientPortalStore + ?Sized,
-    C::PortalStore: PortalStore,
-{
-    let max_rows = fetch_count(direction)?;
-    let portal = portals(client)
+) -> PgWireResult<Fetch> {
+    let count = fetch_count(direction)?;
+    let portal = store
         .and_then(|store| store.get_portal(name))
         .ok_or_else(|| user_error("34000", format!("cursor \"{name}\" does not exist")))?;
+    let cursor = cursors.cursor(name);
     let state = portal.state();
-    let (schema, tag) = match &*state.lock().await {
+    let (columns, tag) = match &*state.lock().await {
         PortalExecutionState::Initial => return Err(PgWireError::PortalNotStarted),
-        PortalExecutionState::Finished => (Arc::new(Vec::new()), "SELECT".to_owned()),
+        PortalExecutionState::Finished => (
+            lock(&cursor.columns).clone().unwrap_or_default(),
+            "SELECT".to_owned(),
+        ),
         PortalExecutionState::Suspended(response) => {
-            (response.row_schema(), response.command_tag().to_owned())
+            let columns = response.row_schema();
+            *lock(&cursor.columns) = Some(Arc::clone(&columns));
+            (columns, response.command_tag().to_owned())
         }
     };
-    text_only(format, schema.len())?;
-    let mut response = QueryResponse::new(schema, cursor_rows(state, max_rows));
-    response.set_command_tag(&tag);
-    Ok(Response::Query(response))
+    text_only(format, columns.len())?;
+    let rows = match count {
+        Count::Current => {
+            let current = lock(&cursor.current).clone();
+            if current.is_some() && !cursor.scroll {
+                return Err(user_error("55000", "cursor can only scan forward"));
+            }
+            FetchRows::Current(current)
+        }
+        Count::Rows(rows) => {
+            cursor.stand_on(None);
+            FetchRows::Read {
+                state,
+                max: Some(rows),
+                cursor,
+            }
+        }
+        Count::All => {
+            cursor.stand_on(None);
+            FetchRows::Read {
+                state,
+                max: None,
+                cursor,
+            }
+        }
+    };
+    Ok(Fetch { columns, tag, rows })
 }
 
 /// The columns a `FETCH` answers with, for `Describe`: its cursor's, as
 /// `PostgreSQL` describes them; none when the cursor does not exist (the
-/// `FETCH` then fails) or was read to the end. `format` is the one the
-/// client asked results in (text for a statement). `None` when `statement`
-/// is not a `FETCH`.
+/// `FETCH` then fails). `format` is the one the client asked results in
+/// (text for a statement). `None` when `statement` is not a `FETCH`.
 pub(super) async fn fetch_fields<C>(
     client: &C,
     statement: &Statement,
     format: &Format,
 ) -> Option<PgWireResult<Vec<FieldInfo>>>
 where
-    C: ClientPortalStore + ?Sized,
+    C: ClientInfo + ClientPortalStore + ?Sized,
     C::PortalStore: PortalStore,
 {
     let Statement::Fetch { name, .. } = statement else {
@@ -436,7 +574,13 @@ where
     };
     let fields = match &*portal.state().lock().await {
         PortalExecutionState::Suspended(response) => response.row_schema().to_vec(),
-        PortalExecutionState::Initial | PortalExecutionState::Finished => Vec::new(),
+        PortalExecutionState::Finished => Cursors::of(client)
+            .cursor(&name.value)
+            .columns
+            .lock()
+            .map(|columns| columns.as_deref().cloned().unwrap_or_default())
+            .unwrap_or_default(),
+        PortalExecutionState::Initial => Vec::new(),
     };
     Some(text_only(format, fields.len()).map(|()| fields))
 }
@@ -459,50 +603,71 @@ fn text_only(format: &Format, columns: usize) -> PgWireResult<()> {
     Ok(())
 }
 
-/// Rows a `FETCH` asks for, `0` for all that are left. As
-/// `datafusion-postgres` reads it: a cursor only scans forward.
-fn fetch_count(direction: &FetchDirection) -> PgWireResult<usize> {
+/// How far a `FETCH` moves its cursor, as `PostgreSQL` reads it; a cursor
+/// here only scans forward. A count that is not a whole number is an error,
+/// never "every row".
+fn fetch_count(direction: &FetchDirection) -> PgWireResult<Count> {
     match direction {
-        FetchDirection::Next | FetchDirection::Forward { limit: None } => Ok(1),
+        FetchDirection::Next | FetchDirection::Forward { limit: None } => Ok(Count::Rows(1)),
         FetchDirection::Forward { limit: Some(count) } | FetchDirection::Count { limit: count } => {
-            Ok(match &count.value {
-                Value::Number(count, _) => count.parse().unwrap_or(0),
-                _ => 0,
-            })
+            match number(count)? {
+                0 => Ok(Count::Current),
+                rows => Ok(Count::Rows(rows)),
+            }
         }
-        FetchDirection::ForwardAll | FetchDirection::All => Ok(0),
+        FetchDirection::Relative { limit } if number(limit)? == 0 => Ok(Count::Current),
+        FetchDirection::ForwardAll | FetchDirection::All => Ok(Count::All),
         _ => Err(user_error("42000", "cursor can only scan forward")),
     }
 }
 
-/// Up to `max_rows` rows (all when `0`) of a cursor, read one at a time
-/// from its stream; the cursor is finished when its stream is.
+/// A `FETCH` count: a whole number of rows.
+fn number(count: &ValueWithSpan) -> PgWireResult<usize> {
+    let invalid = || user_error("42601", format!("invalid FETCH count: {count}"));
+    match &count.value {
+        Value::Number(text, _) => text.parse().map_err(|_| invalid()),
+        _ => Err(invalid()),
+    }
+}
+
+/// Up to `max` rows (all when `None`) of a cursor, read one at a time from
+/// its stream; the cursor is finished when its stream is. `cursor` then
+/// stands on the last row returned, or on none after the end.
 fn cursor_rows(
     state: Arc<AsyncMutex<PortalExecutionState>>,
-    max_rows: usize,
+    max: Option<usize>,
+    cursor: Arc<Cursor>,
 ) -> impl Stream<Item = PgWireResult<DataRow>> + Send + 'static {
-    futures::stream::unfold(Some((state, 0_usize)), move |cursor| async move {
-        let (state, sent) = cursor?;
-        if max_rows != 0 && sent >= max_rows {
-            return None;
-        }
-        let mut guard = state.lock().await;
-        let next = match &mut *guard {
-            PortalExecutionState::Suspended(response) => response.data_rows().next().await,
-            PortalExecutionState::Finished => None,
-            PortalExecutionState::Initial => Some(Err(PgWireError::PortalNotStarted)),
-        };
-        match next {
-            None => {
-                *guard = PortalExecutionState::Finished;
-                None
+    futures::stream::unfold(Some((state, 0_usize)), move |step| {
+        let cursor = Arc::clone(&cursor);
+        async move {
+            let (state, sent) = step?;
+            if max.is_some_and(|max| sent >= max) {
+                return None;
             }
-            Some(Ok(row)) => {
-                drop(guard);
-                Some((Ok(row), Some((state, sent + 1))))
+            let mut guard = state.lock().await;
+            let next = match &mut *guard {
+                PortalExecutionState::Suspended(response) => response.data_rows().next().await,
+                PortalExecutionState::Finished => None,
+                PortalExecutionState::Initial => Some(Err(PgWireError::PortalNotStarted)),
+            };
+            match next {
+                None => {
+                    *guard = PortalExecutionState::Finished;
+                    cursor.stand_on(None);
+                    None
+                }
+                Some(Ok(row)) => {
+                    drop(guard);
+                    let sent = sent + 1;
+                    if max == Some(sent) {
+                        cursor.stand_on(Some(row.clone()));
+                    }
+                    Some((Ok(row), Some((state, sent))))
+                }
+                // The error is the last item: the governed stream failed.
+                Some(Err(error)) => Some((Err(error), None)),
             }
-            // The error is the last item: the governed stream failed.
-            Some(Err(error)) => Some((Err(error), None)),
         }
     })
 }
@@ -546,7 +711,7 @@ mod tests {
         store
     }
 
-    fn open(store: &Store, names: &[&str]) -> Vec<String> {
+    fn open_names(store: &Store, names: &[&str]) -> Vec<String> {
         names
             .iter()
             .filter(|name| store.get_portal(name).is_some())
@@ -605,7 +770,7 @@ mod tests {
             .unwrap();
         cursors.end_transaction(Some(&store), true);
         assert_eq!(
-            open(&store, &all),
+            open_names(&store, &all),
             ["old"],
             "a committed transaction keeps its held cursor"
         );
@@ -620,7 +785,7 @@ mod tests {
             .unwrap();
         cursors.end_transaction(Some(&store), false);
         assert_eq!(
-            open(&store, &all),
+            open_names(&store, &all),
             ["old"],
             "a rollback closes the held cursors it declared, not those committed before"
         );
@@ -631,11 +796,11 @@ mod tests {
             .declare(&declares("DECLARE h CURSOR WITH HOLD FOR SELECT 1"))
             .unwrap();
         cursors.end_transaction(Some(&store), true);
-        assert_eq!(open(&store, &all), ["h", "old"]);
+        assert_eq!(open_names(&store, &all), ["h", "old"]);
         // Committed: a later rollback keeps it.
         cursors.begin_message(TransactionStatus::Transaction, 1);
         cursors.end_transaction(Some(&store), false);
-        assert_eq!(open(&store, &all), ["h", "old"]);
+        assert_eq!(open_names(&store, &all), ["h", "old"]);
 
         // The COMMIT of a failed transaction is a rollback.
         let store = store_with(&all);
@@ -644,7 +809,7 @@ mod tests {
             .declare(&declares("DECLARE c CURSOR WITH HOLD FOR SELECT 1"))
             .unwrap();
         cursors.end_transaction(Some(&store), true);
-        assert_eq!(open(&store, &all), ["h", "old"]);
+        assert_eq!(open_names(&store, &all), ["h", "old"]);
         // A cursor whose portal is gone (closed) is forgotten.
         let store = store_with(&["h"]);
         cursors.end_transaction(Some(&store), true);
@@ -654,17 +819,124 @@ mod tests {
     #[test]
     fn fetch_counts() {
         let count = |sql: &str| match &parse(sql)[0] {
-            Statement::Fetch { direction, .. } => fetch_count(direction).map_err(|e| e.to_string()),
+            Statement::Fetch { direction, .. } => fetch_count(direction).map_err(code),
             other => panic!("{other:?}"),
         };
-        assert_eq!(count("FETCH NEXT FROM c"), Ok(1));
-        assert_eq!(count("FETCH 7 FROM c"), Ok(7));
-        assert_eq!(count("FETCH FORWARD 2000 FROM c"), Ok(2000));
-        assert_eq!(count("FETCH ALL FROM c"), Ok(0));
-        assert_eq!(count("FETCH FORWARD ALL FROM c"), Ok(0));
+        assert_eq!(count("FETCH NEXT FROM c"), Ok(Count::Rows(1)));
+        assert_eq!(count("FETCH 7 FROM c"), Ok(Count::Rows(7)));
+        assert_eq!(count("FETCH FORWARD 2000 FROM c"), Ok(Count::Rows(2000)));
+        assert_eq!(count("FETCH ALL FROM c"), Ok(Count::All));
+        assert_eq!(count("FETCH FORWARD ALL FROM c"), Ok(Count::All));
+        // Zero rows forward: the current row again, never every row.
+        assert_eq!(count("FETCH 0 FROM c"), Ok(Count::Current));
+        assert_eq!(count("FETCH FORWARD 0 FROM c"), Ok(Count::Current));
+        assert_eq!(count("FETCH RELATIVE 0 FROM c"), Ok(Count::Current));
+        // A count that is not a whole number is an error, never every row.
+        assert_eq!(count("FETCH 1.5 FROM c"), Err("42601".to_owned()));
+        assert_eq!(
+            count("FETCH 99999999999999999999999 FROM c"),
+            Err("42601".to_owned())
+        );
+        assert_eq!(count("FETCH FORWARD 2.0 FROM c"), Err("42601".to_owned()));
         assert!(count("FETCH PRIOR FROM c").is_err());
         assert!(count("FETCH BACKWARD 2 FROM c").is_err());
         assert!(count("FETCH ABSOLUTE 3 FROM c").is_err());
+        assert!(count("FETCH RELATIVE 2 FROM c").is_err());
+    }
+
+    /// A cursor `c` over rows `1..=rows`, declared in a transaction block.
+    async fn cursor_over(rows: u8, declare: &str) -> (Cursors, Store) {
+        let cursors = Cursors::default();
+        cursors.begin_message(TransactionStatus::Transaction, 1);
+        cursors.declare(&declares(declare)).unwrap();
+        let store = store_with(&["c"]);
+        let response = QueryResponse::new(
+            Arc::new(Vec::new()),
+            futures::stream::iter((1..=rows).map(|value| Ok(row(value)))),
+        );
+        store.get_portal("c").unwrap().start(response).await;
+        (cursors, store)
+    }
+
+    /// Values of the rows `sql` fetches, read as a `FETCH` alone (streamed).
+    async fn fetched(cursors: &Cursors, store: &Store, sql: &str) -> Result<Vec<u8>, String> {
+        read(cursors, store, sql, false).await
+    }
+
+    /// Values of the rows `sql` fetches, read as a `FETCH` alone (streamed)
+    /// or, when `collected`, among other statements ([`CursorHook`]).
+    async fn read(cursors: &Cursors, store: &Store, sql: &str, collected: bool) -> Result<Vec<u8>, String> {
+        let Statement::Fetch { name, direction, .. } = &parse(sql)[0] else {
+            panic!("{sql}");
+        };
+        let fetch = open(cursors, Some(store), &name.value, direction, &Format::UnifiedText)
+            .await
+            .map_err(code)?;
+        let response = if collected {
+            fetch.collected().await.map_err(code)?
+        } else {
+            fetch.streamed()
+        };
+        let Response::Query(response) = response else {
+            panic!("{sql}");
+        };
+        response
+            .data_rows
+            .map(|row| row.map(|row| row.data[0]).map_err(code))
+            .try_collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn fetch_zero_reads_the_current_row_again() {
+        let (cursors, store) = cursor_over(10, "DECLARE c CURSOR FOR SELECT 1").await;
+        for (sql, collected, rows) in [
+            ("FETCH 0 FROM c", false, vec![]),
+            ("FETCH 2 FROM c", false, vec![1, 2]),
+            ("FETCH 0 FROM c", false, vec![2]),
+            ("FETCH FORWARD 0 FROM c", true, vec![2]),
+            ("FETCH RELATIVE 0 FROM c", false, vec![2]),
+            ("FETCH NEXT FROM c", true, vec![3]),
+            ("FETCH 0 FROM c", true, vec![3]),
+            ("FETCH 3 FROM c", false, vec![4, 5, 6]),
+            ("FETCH 0 FROM c", false, vec![6]),
+            // Exactly the rows left: on the last one, as PostgreSQL.
+            ("FETCH 4 FROM c", false, vec![7, 8, 9, 10]),
+            ("FETCH 0 FROM c", false, vec![10]),
+            // Past the end: on no row.
+            ("FETCH 1 FROM c", false, vec![]),
+            ("FETCH 0 FROM c", false, vec![]),
+            ("FETCH ALL FROM c", false, vec![]),
+        ] {
+            assert_eq!(read(&cursors, &store, sql, collected).await, Ok(rows), "{sql}");
+        }
+        let (cursors, store) = cursor_over(5, "DECLARE c CURSOR FOR SELECT 1").await;
+        assert_eq!(fetched(&cursors, &store, "FETCH 2 FROM c").await, Ok(vec![1, 2]));
+        assert_eq!(
+            read(&cursors, &store, "FETCH ALL FROM c", true).await,
+            Ok(vec![3, 4, 5])
+        );
+        assert_eq!(fetched(&cursors, &store, "FETCH 0 FROM c").await, Ok(vec![]));
+    }
+
+    #[tokio::test]
+    async fn fetch_zero_of_a_no_scroll_cursor_on_a_row_fails() {
+        let (cursors, store) = cursor_over(3, "DECLARE c NO SCROLL CURSOR FOR SELECT 1").await;
+        assert_eq!(fetched(&cursors, &store, "FETCH 0 FROM c").await, Ok(vec![]));
+        assert_eq!(fetched(&cursors, &store, "FETCH 1 FROM c").await, Ok(vec![1]));
+        assert_eq!(
+            fetched(&cursors, &store, "FETCH 0 FROM c").await,
+            Err("55000".to_owned())
+        );
+        assert_eq!(
+            fetched(&cursors, &store, "FETCH 1.5 FROM c").await,
+            Err("42601".to_owned())
+        );
+        assert_eq!(fetched(&cursors, &store, "FETCH 5 FROM c").await, Ok(vec![2, 3]));
+        assert_eq!(
+            fetched(&cursors, &store, "FETCH 1 FROM x").await,
+            Err("34000".to_owned())
+        );
     }
 
     #[test]
@@ -690,7 +962,8 @@ mod tests {
         state: &Arc<AsyncMutex<PortalExecutionState>>,
         max_rows: usize,
     ) -> Vec<Result<Vec<u8>, String>> {
-        cursor_rows(Arc::clone(state), max_rows)
+        let max = (max_rows > 0).then_some(max_rows);
+        cursor_rows(Arc::clone(state), max, Arc::new(Cursor::new(false, true)))
             .map(|row| row.map(|row| row.data.to_vec()).map_err(|e| e.to_string()))
             .collect()
             .await
