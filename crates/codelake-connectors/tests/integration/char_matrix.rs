@@ -4,7 +4,8 @@
 //!
 //! - operations: comparisons (`=`, `<>`, `<`, `>=`, `IS DISTINCT FROM`,
 //!   `IN`, `BETWEEN`, simple `CASE`), values in a common type (`CASE`,
-//!   `coalesce`, `nullif`, `greatest`, `||`), set operations (`UNION`,
+//!   `coalesce`, `nullif`, `greatest`, `||`, and with the result of a text
+//!   function whose length Trino derives), set operations (`UNION`,
 //!   `UNION ALL` + `GROUP BY`, `INTERSECT`, `EXCEPT`), joins (`ON =`, `ON <`,
 //!   `USING`), subqueries (`IN`, `NOT IN`, `= ANY`, scalar);
 //! - the other operand: `char(3)`, `char(5)`, unbounded `varchar`,
@@ -100,6 +101,57 @@ const ROW_OPS: &[(&str, &str)] = &[
     ("greatest", "greatest({a}, {b})"),
     ("||", "{a} || {b}"),
     ("LIKE", "{a} LIKE 'ab%'"),
+];
+
+/// A char value output with the result of a text function of the other
+/// operand: the common type's length comes from the length the function's
+/// result has (Trino has no char version of these, so the other operand is
+/// never char).
+const FUNCTION_OPS: &[(&str, &str)] = &[
+    (
+        "CASE replace",
+        "CASE WHEN x.id = 1 THEN {a} ELSE replace({b}, 'a', 'bc') END",
+    ),
+    ("coalesce replace", "coalesce({a}, replace({b}, 'b'))"),
+    (
+        "CASE regexp_replace",
+        "CASE WHEN x.id = 1 THEN {a} ELSE regexp_replace({b}, 'b', 'yy') END",
+    ),
+    (
+        "coalesce regexp_replace",
+        "coalesce({a}, regexp_replace({b}, 'b'))",
+    ),
+    (
+        "CASE soundex",
+        "CASE WHEN x.id = 1 THEN {a} ELSE soundex({b}) END",
+    ),
+    (
+        "CASE url_encode",
+        "CASE WHEN x.id = 1 THEN {a} ELSE url_encode({b}) END",
+    ),
+    ("coalesce url_decode", "coalesce({a}, url_decode({b}))"),
+    (
+        "coalesce url_extract_host",
+        "coalesce({a}, url_extract_host({b}))",
+    ),
+    (
+        "coalesce json_extract_scalar",
+        "coalesce({a}, json_extract_scalar({b}, '$.a'))",
+    ),
+    ("coalesce from_utf8", "coalesce({a}, from_utf8(to_utf8({b})))"),
+    (
+        "CASE element_at split",
+        "CASE WHEN x.id = 1 THEN {a} ELSE element_at(split({b}, ','), 1) END",
+    ),
+    ("coalesce split subscript", "coalesce({a}, split({b}, ',')[1])"),
+    (
+        "coalesce regexp_extract_all",
+        "coalesce({a}, regexp_extract_all({b}, '.')[1])",
+    ),
+    (
+        "CASE to_iso8601",
+        "CASE WHEN x.id = 1 THEN {a} ELSE to_iso8601(DATE '2020-01-01') END",
+    ),
 ];
 
 /// Operations over sets: `{C}` the char relation (columns `id`, `ch`), `{Y}`
@@ -217,10 +269,22 @@ fn row_cases() -> Vec<Case> {
             }));
         for (other, b, join, ids) in operands {
             let keys = ids.split(", ").count();
-            for group in [
+            let mut groups = vec![
                 ROW_OPS.iter().filter(|(op, _)| *op != "||").collect::<Vec<_>>(),
                 ROW_OPS.iter().filter(|(op, _)| *op == "||").collect(),
-            ] {
+            ];
+            if !other.starts_with("char") {
+                // Trino cannot choose between `json_extract_scalar`'s
+                // varchar and json versions for an untyped `NULL` (it fails
+                // the whole query, not a char question).
+                groups.push(
+                    FUNCTION_OPS
+                        .iter()
+                        .filter(|(op, _)| other != "literal NULL" || !op.contains("json_extract_scalar"))
+                        .collect(),
+                );
+            }
+            for group in groups {
                 let exprs: Vec<String> = group
                     .iter()
                     .map(|(_, e)| e.replace("{a}", "x.ch").replace("{b}", &b))
