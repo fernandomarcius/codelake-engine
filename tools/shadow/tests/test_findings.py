@@ -1,14 +1,17 @@
 """Findings of the F8 audit, pinned: each test failed on the harness that
 reported them as equal (INT96 read as stored, column order, metastore gaps,
-empty tables)."""
+empty tables, silent configuration)."""
 
 from __future__ import annotations
 
 import json
 import os
 import unittest
+from typing import Any
+from unittest import mock
 
-from codelake_shadow import compare, config
+from codelake_shadow import __main__ as main
+from codelake_shadow import compare, config, dbt
 from test_compare import Warehouses
 
 # Written by a real trinodb/trino:431 whose JVM zone is UTC: `ts` is INT96,
@@ -25,6 +28,33 @@ ENV = {
     "SHADOW_DBT_PROFILES_DIR": "/project",
     "SHADOW_TABLES": "s.t",
 }
+
+
+def cycle_with(out_dir: str, env: dict[str, str], table: dict[str, Any], peaks: list[int | None]) -> dict[str, Any]:
+    """One cycle whose table comparison and RSS peaks are given."""
+    it = iter(peaks)
+
+    class Sampler:
+        def __init__(self, meter: object, interval: float) -> None:
+            self.peak = next(it)
+
+        def __enter__(self) -> "Sampler":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            pass
+
+        def result(self) -> dict[str, Any]:
+            return {"meter": None, "peak_bytes": self.peak, "samples": 0 if self.peak is None else 1,
+                    "failed_samples": 0, "interval_ms": 200}
+
+    cfg = config.load(dict(ENV, SHADOW_OUT_DIR=out_dir, **env))
+    with mock.patch.object(compare, "compare_table", return_value=table), \
+         mock.patch.object(main, "cutoff_value", return_value=None), \
+         mock.patch.object(dbt, "run", return_value=dbt.DbtRun(0, 0.0, os.devnull, "/nonexistent")), \
+         mock.patch.object(main, "Sampler", Sampler), \
+         mock.patch.object(main, "connection", return_value=mock.MagicMock()):
+        return main.run_cycle(cfg, 1, "/project")
 
 
 class Int96(unittest.TestCase):
@@ -167,6 +197,27 @@ class Configuration(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.w.dir.cleanup()
+
+    def test_a_table_without_schema_is_refused(self) -> None:
+        for tables in ("orders,s.t", "a.b.c", ".t"):
+            with self.subTest(tables=tables), self.assertRaisesRegex(config.ConfigError, "SHADOW_TABLES"):
+                config.load(dict(ENV, SHADOW_OUT_DIR="/out", SHADOW_TABLES=tables))
+
+    def test_an_rss_gate_needs_a_meter_on_each_side(self) -> None:
+        with self.assertRaisesRegex(config.ConfigError, "SHADOW_RSS_MAX_RATIO needs both"):
+            config.load(dict(ENV, SHADOW_OUT_DIR="/out", SHADOW_RSS_MAX_RATIO="0.5",
+                             SHADOW_REFERENCE_RSS="container:r"))
+
+    def test_an_rss_gate_without_a_measure_fails_the_cycle(self) -> None:
+        env = {"SHADOW_RSS_MAX_RATIO": "0.5", "SHADOW_REFERENCE_RSS": "container:r",
+               "SHADOW_CANDIDATE_RSS": "container:c"}
+        equal = {"table": "s.t", "status": "equal"}
+        for peaks, failures in (([1000, None], ["rss_unmeasured"]), ([None, 100], ["rss_unmeasured"]),
+                                ([1000, 0], ["rss_unmeasured"]), ([1000, 600], ["rss_ratio"]),
+                                ([1000, 400], [])):
+            with self.subTest(peaks=peaks):
+                cycle = cycle_with(self.w.dir.name, env, equal, peaks)
+                self.assertEqual(cycle["failures"], failures, cycle)
 
     def test_the_parquet_time_zone_is_checked(self) -> None:
         cfg = config.load(dict(ENV, SHADOW_OUT_DIR="/out", SHADOW_PARQUET_TIME_ZONE=ZONE))

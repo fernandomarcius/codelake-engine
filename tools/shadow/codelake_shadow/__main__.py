@@ -119,7 +119,8 @@ def run_cycle(config: Config, number: int, project: str) -> dict[str, Any]:
     cycle["model_status_differences"] = model_status_differences(ref_status, cand_status)
 
     if config.tables:
-        tables = [(t.split(".", 1)[0], t.split(".", 1)[1], "") for t in config.tables if "." in t]
+        # Validated as schema.table by config.load.
+        tables = [(t.split(".", 1)[0], t.split(".", 1)[1], "") for t in config.tables]
         skipped: list[dict[str, str]] = []
     else:
         merged = {**cand_status, **ref_status}
@@ -161,12 +162,13 @@ def run_cycle(config: Config, number: int, project: str) -> dict[str, Any]:
         failures.append("dbt_exit")
     if not results:
         failures.append("no_tables_compared")
-    if (
-        config.rss_max_ratio is not None
-        and cycle["rss_ratio"] is not None
-        and cycle["rss_ratio"] > config.rss_max_ratio
-    ):
-        failures.append("rss_ratio")
+    if config.rss_max_ratio is not None:
+        # A configured memory gate that could not measure both sides fails
+        # the cycle: an unmeasured side never passes it.
+        if cycle["rss_ratio"] is None or not cand_peak:
+            failures.append("rss_unmeasured")
+        elif cycle["rss_ratio"] > config.rss_max_ratio:
+            failures.append("rss_ratio")
     cycle["failures"] = failures
     cycle["verdict"] = "equal" if not failures else "divergent"
     cycle["finished_at"] = _now()

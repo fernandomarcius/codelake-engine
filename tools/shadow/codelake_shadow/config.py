@@ -135,6 +135,14 @@ def time_zone(value: str, name: str) -> str:
     return zone
 
 
+def table_names(value: list[str], name: str) -> list[str]:
+    """``schema.table`` entries; anything else is refused, never dropped."""
+    bad = [t for t in value if len(t.split(".")) != 2 or not all(part.strip() for part in t.split("."))]
+    if bad:
+        raise ConfigError(f"{name}: expected schema.table entries, got {', '.join(bad)}")
+    return value
+
+
 def expected_path(value: str) -> str:
     """The rule file: none when unset or ``none``, the shipped one with
     ``default``, else the path given."""
@@ -214,7 +222,7 @@ def load(env: Mapping[str, str] | None = None) -> Config:
         exclude=get("SHADOW_EXCLUDE", ""),
         threads=check(_int, get("SHADOW_THREADS", "0"), "SHADOW_THREADS", 0) or 0,
         output_catalogs=_list(get("SHADOW_OUTPUT_CATALOGS", "hive")),
-        tables=_list(get("SHADOW_TABLES", "")),
+        tables=check(table_names, _list(get("SHADOW_TABLES", "")), "SHADOW_TABLES") or [],
         ignore_columns=_list(get("SHADOW_IGNORE_COLUMNS", "")),
         cycles=check(_int, get("SHADOW_CYCLES", "1"), "SHADOW_CYCLES", 1) or 1,
         interval_secs=float(check(_int, get("SHADOW_INTERVAL_SECS", "0"), "SHADOW_INTERVAL_SECS", 0) or 0),
@@ -233,6 +241,11 @@ def load(env: Mapping[str, str] | None = None) -> Config:
         s3_path_style=bool(check(_bool, get("SHADOW_S3_PATH_STYLE", "false"), "SHADOW_S3_PATH_STYLE")),
     )
     config.parquet_time_zone = check(time_zone, get("SHADOW_PARQUET_TIME_ZONE", ""), "SHADOW_PARQUET_TIME_ZONE") or ""
+    if max_ratio is not None and not (reference.rss and candidate.rss):
+        errors.append(
+            "SHADOW_RSS_MAX_RATIO needs both SHADOW_REFERENCE_RSS and SHADOW_CANDIDATE_RSS: "
+            "a memory gate without a meter on each side would never fail"
+        )
     config.expected_differences = expected_path(get("SHADOW_EXPECTED_DIFFERENCES", ""))
     try:
         config.expected = expected.load(config.expected_differences)
