@@ -93,6 +93,16 @@ versioning: [SemVer](https://semver.org/).
   fronts' Definition of Done (docs/gates.md).
 
 ### Changed
+- **Breaking:** hive tables keep the case a column name was written with: Parquet files written
+  by `CREATE TABLE AS`, `INSERT` and `OPTIMIZE` name a quoted `"CustomerCode"` column
+  `CustomerCode` (it was `customercode`), so readers of the files (SQL Server `OPENROWSET`,
+  pandas) see the name as written; a consumer that expects lower-case Parquet column names under
+  a case-sensitive comparison must follow. The metastore keeps folded names and records the
+  written one as `codelake.name` (column property; table, view and schema parameter), which the
+  reference engine reads and keeps. Queries resolve any spelling. Two names of one level that
+  differ only by case are refused with an error naming both; statistics and reads match file
+  columns without regard to case, and a file with two spellings of one column fails when that
+  column is read (ADR 0007, ISS-018).
 - **Breaking:** `CREATE OR REPLACE TABLE [… AS]` on a hive catalog replaces the table instead
   of failing with "This connector does not support replacing tables" (the reference engine's
   answer). The new table is written aside and exchanged with the old one's directory in one

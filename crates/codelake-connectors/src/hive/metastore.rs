@@ -53,6 +53,13 @@ const EXTERNAL_TABLE: &str = "EXTERNAL_TABLE";
 /// a scan or an `INSERT` planned against the table that was replaced never
 /// reads or writes the new one (ISS-017).
 pub(crate) const TABLE_ID: &str = "codelake.table_id";
+/// Table, schema and column property: the name as the statement that
+/// created (or renamed) it wrote it, when that is not its folded form
+/// (ISS-018). The metastore's names stay folded, as Trino writes and needs
+/// them (its `INSERT` fails on a column name that is not lower case); the
+/// directory, and every lookup, use the folded name; the files a table's
+/// writes produce spell each column as written.
+pub(crate) const WRITTEN_NAME: &str = "codelake.name";
 pub(crate) const METADATA_FILE: &str = ".trinoSchema";
 const PERMISSIONS_DIR: &str = ".trinoPermissions";
 /// Directory of `CodeLake`'s own files at the warehouse root: locks, staging
@@ -81,6 +88,17 @@ pub(crate) struct ColumnMetadata {
     /// Fields this version does not model, kept on rewrite.
     #[serde(flatten)]
     pub(crate) extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl ColumnMetadata {
+    /// The column's name as it was written (ISS-018): its [`WRITTEN_NAME`]
+    /// property, or else its metastore name. Files are written with it.
+    pub(crate) fn written_name(&self) -> &str {
+        self.properties
+            .get(WRITTEN_NAME)
+            .filter(|written| written.to_lowercase() == self.name.to_lowercase())
+            .map_or(self.name.as_str(), String::as_str)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -612,15 +630,27 @@ impl FileMetastore {
         self.read_json(&self.table_file(schema, table)).await
     }
 
-    pub(crate) async fn create_schema(&self, schema: &str, owner: &str) -> MetastoreResult<()> {
+    /// Creates the schema `schema` (folded), recording `written` when the
+    /// statement wrote it with other letter case (ISS-018).
+    pub(crate) async fn create_schema(
+        &self,
+        schema: &str,
+        written: &str,
+        owner: &str,
+    ) -> MetastoreResult<()> {
         if self.schema_exists(schema).await? {
             return Err(MetastoreError::AlreadyExists(format!("schema {schema}")));
         }
+        let parameters = if written == schema {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([(WRITTEN_NAME.to_owned(), written.to_owned())])
+        };
         let metadata = SchemaMetadata {
             writer_version: Some(TRINO_VERSION.into()),
             owner_name: Some(owner.into()),
             owner_type: Some("USER".into()),
-            parameters: BTreeMap::new(),
+            parameters,
             extra: BTreeMap::new(),
         };
         self.write_json(&self.schema_file(schema), &metadata).await?;
@@ -665,6 +695,32 @@ impl FileMetastore {
             .collect();
         let path = dir.clone().join(PERMISSIONS_DIR).join(format!("user_{owner}"));
         self.write_json(&path, &grants).await
+    }
+
+    /// Records `written` as the name of the table or view `schema.table`
+    /// (after a rename), under its metadata lock.
+    pub(crate) async fn record_written_name(
+        &self,
+        schema: &str,
+        table: &str,
+        written: &str,
+    ) -> MetastoreResult<()> {
+        let _metadata = self.lock_metadata(schema, table).await?;
+        let Some(mut metadata) = self.table(schema, table).await? else {
+            return Err(MetastoreError::NotFound(format!("table {schema}.{table}")));
+        };
+        let before = metadata.parameters.clone();
+        if written == table {
+            metadata.parameters.remove(WRITTEN_NAME);
+        } else {
+            metadata
+                .parameters
+                .insert(WRITTEN_NAME.into(), written.to_owned());
+        }
+        if metadata.parameters != before {
+            self.write_table(schema, table, &metadata).await?;
+        }
+        Ok(())
     }
 
     /// Drops statistics after new data files were written, when any exist.
@@ -932,7 +988,7 @@ impl FileMetastore {
             )));
         }
         let same = |a: &ColumnMetadata, b: &ColumnMetadata| {
-            a.name.eq_ignore_ascii_case(&b.name) && a.hive_type.eq_ignore_ascii_case(&b.hive_type)
+            a.name.to_lowercase() == b.name.to_lowercase() && a.hive_type.eq_ignore_ascii_case(&b.hive_type)
         };
         let unchanged = metadata.data_columns.len() >= written.len()
             && written
@@ -966,16 +1022,22 @@ impl FileMetastore {
         if metadata.is_view() {
             return Err(MetastoreError::Conflict(format!("{schema}.{table} is a view")));
         }
-        if metadata
+        let folded = column.name.to_lowercase();
+        if let Some(existing) = metadata
             .data_columns
             .iter()
             .chain(&metadata.partition_columns)
-            .any(|c| c.name.eq_ignore_ascii_case(&column.name))
+            .find(|c| c.name.to_lowercase() == folded)
         {
-            return Err(MetastoreError::Conflict(format!(
-                "column {} already exists in {schema}.{table}",
-                column.name
-            )));
+            let (new, old) = (column.written_name(), existing.written_name());
+            return Err(MetastoreError::Conflict(if new == old {
+                format!("column {new} already exists in {schema}.{table}")
+            } else {
+                format!(
+                    "column {new} cannot be added to {schema}.{table}: column {old} exists, and column names \
+                     that differ only by case are the same column"
+                )
+            }));
         }
         metadata.data_columns.push(column);
         self.write_table(schema, table, &metadata).await
@@ -1203,7 +1265,7 @@ mod tests {
     async fn round_trip_keeps_unknown_fields_and_writes_checksums() {
         let (dir, metastore) = scratch();
         let original = fixture().table("pilot", "t1").await.unwrap().unwrap();
-        metastore.create_schema("pilot", "dbt").await.unwrap();
+        metastore.create_schema("pilot", "pilot", "dbt").await.unwrap();
         metastore.write_table("pilot", "t1", &original).await.unwrap();
         let back = metastore.table("pilot", "t1").await.unwrap().unwrap();
         assert_eq!(back, original);
@@ -1225,7 +1287,7 @@ mod tests {
     #[tokio::test]
     async fn metadata_has_every_field_trino_431_requires() {
         let (dir, metastore) = scratch();
-        metastore.create_schema("raw", "dbt").await.unwrap();
+        metastore.create_schema("raw", "raw", "dbt").await.unwrap();
         let table = TableMetadata::managed_parquet("dbt", Vec::new());
         metastore.write_table("raw", "t", &table).await.unwrap();
         let view = TableMetadata::trino_view("dbt", "/* Presto View: e30= */".into());
@@ -1257,7 +1319,7 @@ mod tests {
         original
             .extra
             .insert("bucketProperty".into(), serde_json::json!({"bucketCount": 4}));
-        metastore.create_schema("pilot", "trino").await.unwrap();
+        metastore.create_schema("pilot", "pilot", "trino").await.unwrap();
         metastore.write_table("pilot", "t1", &original).await.unwrap();
 
         metastore.invalidate_statistics("pilot", "t1").await.unwrap();
@@ -1287,7 +1349,7 @@ mod tests {
     #[tokio::test]
     async fn new_metadata_carries_the_trino_version() {
         let (dir, metastore) = scratch();
-        metastore.create_schema("raw", "dbt").await.unwrap();
+        metastore.create_schema("raw", "raw", "dbt").await.unwrap();
         let table = TableMetadata::managed_parquet("dbt", Vec::new());
         metastore.write_table("raw", "t", &table).await.unwrap();
         for file in [".raw.trinoSchema", "raw/t/.trinoSchema"] {
@@ -1309,7 +1371,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_an_external_table_keeps_its_data() {
         let (dir, metastore) = scratch();
-        metastore.create_schema("raw", "dbt").await.unwrap();
+        metastore.create_schema("raw", "raw", "dbt").await.unwrap();
         let mut table = TableMetadata::managed_parquet("dbt", Vec::new());
         table.table_type = EXTERNAL_TABLE.into();
         metastore.write_table("raw", "ext", &table).await.unwrap();
@@ -1330,7 +1392,7 @@ mod tests {
     #[tokio::test]
     async fn removing_a_table_location_removes_the_directory() {
         let (dir, metastore) = scratch();
-        metastore.create_schema("raw", "dbt").await.unwrap();
+        metastore.create_schema("raw", "raw", "dbt").await.unwrap();
         std::fs::create_dir_all(dir.path().join("raw/t/.hidden")).unwrap();
         std::fs::write(dir.path().join("raw/t/.hidden/x"), b"x").unwrap();
         std::fs::write(dir.path().join("raw/t/f"), b"x").unwrap();
@@ -1356,7 +1418,7 @@ mod tests {
     async fn rename_on_an_object_store() {
         let metastore = FileMetastore::new(Arc::new(object_store::memory::InMemory::new()), Path::from("wh"));
         let table = fixture().table("pilot", "t1").await.unwrap().unwrap();
-        metastore.create_schema("raw", "dbt").await.unwrap();
+        metastore.create_schema("raw", "raw", "dbt").await.unwrap();
         metastore.write_table("raw", "t", &table).await.unwrap();
         metastore
             .write_owner_permissions("raw", "t", "dbt")
@@ -1391,9 +1453,9 @@ mod tests {
     #[tokio::test]
     async fn schema_and_table_lifecycle() {
         let (dir, metastore) = scratch();
-        metastore.create_schema("raw", "dbt").await.unwrap();
+        metastore.create_schema("raw", "raw", "dbt").await.unwrap();
         assert!(matches!(
-            metastore.create_schema("raw", "dbt").await,
+            metastore.create_schema("raw", "raw", "dbt").await,
             Err(MetastoreError::AlreadyExists(_))
         ));
         let mut table = TableMetadata::managed_parquet(
@@ -1433,7 +1495,7 @@ mod tests {
 
         assert!(dir.path().join("raw").is_dir(), "schema directory, as Trino");
         assert!(metastore.table_location_exists("raw", "t").await.unwrap());
-        metastore.create_schema("mart", "dbt").await.unwrap();
+        metastore.create_schema("mart", "mart", "dbt").await.unwrap();
         metastore.rename_table("raw", "t", "mart", "t2").await.unwrap();
         assert!(metastore.table("raw", "t").await.unwrap().is_none());
         assert_eq!(metastore.table("mart", "t2").await.unwrap().unwrap(), table);

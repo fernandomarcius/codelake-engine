@@ -344,6 +344,23 @@ pub(crate) fn fixed_size(data_type: &DataType, rows: u64) -> Option<u64> {
         .checked_mul(rows)
 }
 
+/// The file column holding the table column `name`: the exact name, or
+/// else the one column whose name differs only by case (files keep the
+/// case a name was written with, ISS-018; the engine folds it). `Err` when
+/// several columns differ from `name` only by case.
+fn file_field<'a>(file_schema: &'a Schema, name: &str) -> Option<Result<&'a Field, ()>> {
+    let folded = name.to_lowercase();
+    let mut matches = file_schema
+        .fields()
+        .iter()
+        .filter(|f| f.name().to_lowercase() == folded);
+    match (matches.next(), matches.next()) {
+        (None, _) => None,
+        (Some(only), None) => Some(Ok(only.as_ref())),
+        (Some(_), Some(_)) => Some(Err(())),
+    }
+}
+
 fn column_summary(
     field: &Field,
     rows: u64,
@@ -351,16 +368,22 @@ fn column_summary(
     file_schema: &Schema,
 ) -> ColumnSummary {
     let data_type = field.data_type();
-    let Some((_, file_field)) = file_schema.column_with_name(field.name()) else {
+    let file_field = match file_field(file_schema, field.name()) {
+        Some(Ok(file_field)) => file_field,
         // Added after this file was written: the reader fills it with NULL.
-        return ColumnSummary {
-            null_count: Some(rows),
-            bounds: Bounds::Empty,
-            byte_size: Some(fixed_size(data_type, rows).unwrap_or(rows.saturating_mul(OFFSET_BYTES))),
-        };
+        None => {
+            return ColumnSummary {
+                null_count: Some(rows),
+                bounds: Bounds::Empty,
+                byte_size: Some(fixed_size(data_type, rows).unwrap_or(rows.saturating_mul(OFFSET_BYTES))),
+            };
+        }
+        // Several spellings of the name: the reader decides which (or
+        // refuses); the statistics claim nothing.
+        Some(Err(())) => return ColumnSummary::unknown(fixed_size(data_type, rows)),
     };
     let descriptor = metadata.file_metadata().schema_descr();
-    let Ok(converter) = StatisticsConverter::try_new(field.name(), file_schema, descriptor) else {
+    let Ok(converter) = StatisticsConverter::try_new(file_field.name(), file_schema, descriptor) else {
         return ColumnSummary::unknown(fixed_size(data_type, rows));
     };
     let converter = converter.with_missing_null_counts_as_zero(false);
@@ -578,6 +601,53 @@ mod tests {
             "t",
         )
         .await
+    }
+
+    /// ISS-018: a file stores `ID` for the table's `id` (the case it was
+    /// written with); its statistics are the column's, not "absent, so all
+    /// NULL". Two spellings of one name in a file: nothing is claimed.
+    #[tokio::test]
+    async fn statistics_match_file_columns_without_regard_to_case() {
+        let spelled = |names: &[&str]| {
+            let fields: Vec<Field> = names
+                .iter()
+                .map(|n| Field::new(*n, DataType::Int64, true))
+                .collect();
+            let columns: Vec<ArrayRef> = names
+                .iter()
+                .map(|_| Arc::new(Int64Array::from(vec![Some(4), Some(8)])) as ArrayRef)
+                .collect();
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+        };
+        let table = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let one = files(vec![parquet(&[spelled(&["ID"])], 10)]).await;
+        let one = footer_statistics(
+            &one.store,
+            &one.metas,
+            &table,
+            &runtime(64 << 20),
+            Some(64 * 1024),
+            "t",
+        )
+        .await;
+        let id = &one.column_statistics[0];
+        assert_eq!(id.null_count, Precision::Inexact(0), "{one:?}");
+        assert_eq!(id.min_value, Precision::Inexact(ScalarValue::Int64(Some(4))));
+        assert_eq!(id.max_value, Precision::Inexact(ScalarValue::Int64(Some(8))));
+
+        let two = files(vec![parquet(&[spelled(&["ID", "Id"])], 10)]).await;
+        let two = footer_statistics(
+            &two.store,
+            &two.metas,
+            &table,
+            &runtime(64 << 20),
+            Some(64 * 1024),
+            "t",
+        )
+        .await;
+        let id = &two.column_statistics[0];
+        assert_ne!(id.null_count, Precision::Inexact(2), "never 'all NULL'");
+        assert_eq!(id.min_value, Precision::Absent);
     }
 
     #[tokio::test]

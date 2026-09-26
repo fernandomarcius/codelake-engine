@@ -35,6 +35,7 @@
 //! `nanos_only` adapter reads only the timestamps a file stores in
 //! nanoseconds, every other column as NULL (see `exact_timestamps.rs`).
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -69,6 +70,40 @@ pub(crate) struct HiveColumns {
     /// The catalog's Parquet time zone, unless UTC: `INT96` instants read as
     /// its wall-clock time (not in a `raw` read).
     pub(crate) zone: Option<ParquetTimeZone>,
+    /// Each column's name as the metastore stores it (the case it was
+    /// written with, ISS-018), by the name the engine sees (folded).
+    pub(crate) stored: Arc<HashMap<String, String>>,
+}
+
+/// The column of `physical` that stores the table column `name` (the
+/// engine's folded name) spelled `stored` in the metastore: names match
+/// without regard to case, as the reference engine's Parquet reader matches
+/// them (a file written with `ID` feeds `id`). Several columns of a file
+/// that differ only by case are told apart by the exact stored name, then
+/// the exact folded one; if neither decides, the match is ambiguous
+/// (`Err`, with the file's spellings), never a guess.
+pub(crate) fn file_column<'a>(
+    physical: &'a Schema,
+    name: &str,
+    stored: Option<&str>,
+) -> std::result::Result<Option<(usize, &'a Field)>, Vec<String>> {
+    let folded = name.to_lowercase();
+    let matches: Vec<(usize, &Field)> = physical
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.name().to_lowercase() == folded)
+        .map(|(index, field)| (index, field.as_ref()))
+        .collect();
+    if matches.len() <= 1 {
+        return Ok(matches.into_iter().next());
+    }
+    let exact = |spelling: &str| matches.iter().copied().find(|(_, f)| f.name() == spelling);
+    stored
+        .and_then(exact)
+        .or_else(|| exact(name))
+        .map(Some)
+        .ok_or_else(|| matches.iter().map(|(_, f)| f.name().clone()).collect())
 }
 
 /// Zone the Parquet reader gives `INT96` columns (`coerce_int96_tz`) when the
@@ -367,20 +402,27 @@ impl PhysicalExprAdapterFactory for HiveColumns {
         let mut reads = Vec::with_capacity(logical_file_schema.fields().len());
         let mut nulls = Vec::with_capacity(logical_file_schema.fields().len());
         for field in logical_file_schema.fields() {
-            let stored = if let Ok(index) = physical_file_schema.index_of(field.name()) {
-                Some(index)
-            } else {
-                let mut matches = physical_file_schema
-                    .fields()
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, f)| f.name().eq_ignore_ascii_case(field.name()));
-                match (matches.next(), matches.next()) {
-                    (Some((index, _)), None) => Some(index),
-                    _ => None,
+            let stored = match file_column(
+                &physical_file_schema,
+                field.name(),
+                self.stored.get(field.name()).map(String::as_str),
+            ) {
+                Ok(found) => found.map(|(_, stored)| stored),
+                Err(spellings) => {
+                    // Refused only if the query reads the column.
+                    nulls.push(false);
+                    fields.push(field.as_ref().clone());
+                    reads.push(Vec::new());
+                    refused.push(Some(format!(
+                        "column {} of {} is ambiguous in a data file that stores {}: names that \
+                         differ only by case are one column",
+                        field.name(),
+                        self.table,
+                        spellings.join(", ")
+                    )));
+                    continue;
                 }
             };
-            let stored = stored.map(|index| physical_file_schema.field(index));
             let skipped = self.nanos_only
                 && !stored
                     .is_some_and(|f| matches!(f.data_type(), DataType::Timestamp(TimeUnit::Nanosecond, _)));
@@ -651,6 +693,7 @@ mod tests {
             raw: false,
             nanos_only: false,
             zone: None,
+            stored: Arc::default(),
         };
         let adapter = factory.create(Arc::clone(&table), Arc::clone(&file)).unwrap();
         let nome: Arc<dyn PhysicalExpr> = Arc::new(Column::new("nome", 1));
@@ -673,5 +716,91 @@ mod tests {
         let err = adapter.rewrite(nome).unwrap_err().to_string();
         assert!(err.contains("Unsupported Trino column type"), "{err}");
         assert!(err.contains("s.t"), "{err}");
+    }
+
+    /// ISS-018: a column stored as `CustomerCode` feeds the table's
+    /// `customercode` (the engine's folded name). A foreign file with two
+    /// columns that differ only by case is told apart by the exact stored
+    /// spelling; without one, reading the column fails (never a guess,
+    /// never NULL), and the other columns still read.
+    #[test]
+    fn columns_stored_with_their_case_match_and_ambiguity_is_refused() {
+        let table = Arc::new(Schema::new(vec![
+            Field::new("customercode", DataType::Int64, true),
+            Field::new("valor", DataType::Int64, true),
+        ]));
+        let stored = |spelling: &str| HiveColumns {
+            table: "s.t".into(),
+            raw: false,
+            nanos_only: false,
+            zone: None,
+            stored: Arc::new(HashMap::from([
+                ("customercode".to_owned(), spelling.to_owned()),
+                ("valor".to_owned(), "Valor".to_owned()),
+            ])),
+        };
+        let column = |adapter: &Arc<dyn PhysicalExprAdapter>, name: &str, index: usize| {
+            let rewritten = adapter
+                .rewrite(Arc::new(Column::new(name, index)))
+                .map_err(|e| e.to_string())?;
+            let column = rewritten
+                .downcast_ref::<Column>()
+                .map(|c| (c.name().to_owned(), c.index()));
+            Ok::<_, String>(column)
+        };
+
+        let file = Arc::new(Schema::new(vec![
+            Field::new("Valor", DataType::Int64, true),
+            Field::new("CustomerCode", DataType::Int64, true),
+        ]));
+        let adapter = stored("CustomerCode").create(Arc::clone(&table), file).unwrap();
+        assert_eq!(
+            column(&adapter, "customercode", 0),
+            Ok(Some(("CustomerCode".to_owned(), 1)))
+        );
+        assert_eq!(column(&adapter, "valor", 1), Ok(Some(("Valor".to_owned(), 0))));
+
+        let twice = Arc::new(Schema::new(vec![
+            Field::new("customercode", DataType::Int64, true),
+            Field::new("CUSTOMERCODE", DataType::Int64, true),
+            Field::new("CustomerCode", DataType::Int64, true),
+            Field::new("valor", DataType::Int64, true),
+        ]));
+        let adapter = stored("CustomerCode")
+            .create(Arc::clone(&table), Arc::clone(&twice))
+            .unwrap();
+        assert_eq!(
+            column(&adapter, "customercode", 0),
+            Ok(Some(("CustomerCode".to_owned(), 2))),
+            "the stored spelling decides"
+        );
+        let adapter = stored("CustomerCODE").create(Arc::clone(&table), twice).unwrap();
+        assert_eq!(
+            column(&adapter, "customercode", 0),
+            Ok(Some(("customercode".to_owned(), 0))),
+            "then the folded one"
+        );
+        let foreign = Arc::new(Schema::new(vec![
+            Field::new("CUSTOMERCODE", DataType::Int64, true),
+            Field::new("CustomerCode", DataType::Int64, true),
+            Field::new("valor", DataType::Int64, true),
+        ]));
+        let adapter = stored("customerCode").create(table, foreign).unwrap();
+        let err = column(&adapter, "customercode", 0).unwrap_err();
+        assert!(
+            err.contains("ambiguous") && err.contains("CUSTOMERCODE, CustomerCode"),
+            "{err}"
+        );
+        assert_eq!(column(&adapter, "valor", 1), Ok(Some(("valor".to_owned(), 2))));
+    }
+
+    #[test]
+    fn file_column_folds_unicode_names() {
+        let file = Schema::new(vec![Field::new("CÓDIGO", DataType::Int64, true)]);
+        assert_eq!(
+            file_column(&file, "código", None).unwrap().map(|(i, _)| i),
+            Some(0)
+        );
+        assert_eq!(file_column(&file, "codigo", None).unwrap().map(|(i, _)| i), None);
     }
 }

@@ -25,6 +25,7 @@
 //! Tracing: `hive.scan` records the files a scan selected (count, bytes,
 //! names); `hive.write` records the file an `INSERT`/CTAS wrote and its rows.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -34,7 +35,7 @@ use async_trait::async_trait;
 use codelake_core::trace::{self, TARGET, field};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, Int64Array, StringArray};
 use datafusion::arrow::compute::{CastOptions, cast, cast_with_options};
-use datafusion::arrow::datatypes::{DataType, Int64Type, Schema, SchemaRef, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::config::TableParquetOptions;
@@ -58,7 +59,7 @@ use object_store::{ObjectMeta, ObjectStoreExt};
 use tracing::field::Empty;
 use tracing::{Instrument, Span};
 
-use super::catalog::refuse_unsupported;
+use super::catalog::{hive_name, refuse_unsupported};
 use super::columns::{HiveColumns, INT96_ZONE_MARKER};
 use super::exact_timestamps;
 use super::metastore::{ColumnMetadata, FileMetastore, TableMetadata};
@@ -225,6 +226,18 @@ pub(crate) fn conform(schema: &SchemaRef, batch: &RecordBatch) -> Result<RecordB
     Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
 }
 
+/// `schema` with its fields renamed to the `columns`' stored names (same
+/// order, one column per field).
+pub(crate) fn stored_names(schema: &SchemaRef, columns: &[ColumnMetadata]) -> SchemaRef {
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .zip(columns)
+        .map(|(field, column)| field.as_ref().clone().with_name(column.written_name()))
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
 /// File names listed on a `hive.scan` span; the count is always complete.
 const MAX_TRACED_FILE_NAMES: usize = 50;
 
@@ -331,11 +344,25 @@ impl HiveTable {
                 "{schema}.{table}: partitioned hive tables are not supported yet"
             )));
         }
+        // The engine sees every column by its folded name (identifiers are
+        // case-insensitive); the metastore and the files keep the case it
+        // was written with (ISS-018). Two stored names that fold to one
+        // would be one column read twice: refused, never a guess.
+        let mut seen: HashMap<String, &str> = HashMap::new();
+        for column in &metadata.data_columns {
+            if let Some(other) = seen.insert(hive_name(&column.name), column.written_name()) {
+                return Err(DataFusionError::Plan(format!(
+                    "{schema}.{table} has columns `{other}` and `{}`, which differ only by case: \
+                     column names are case-insensitive, so the table cannot be read",
+                    column.written_name()
+                )));
+            }
+        }
         let precision = metastore.timestamp_precision();
         let fields: Vec<_> = metadata
             .data_columns
             .iter()
-            .map(|c| column_field(&c.name, &c.hive_type, precision))
+            .map(|c| column_field(&hive_name(&c.name), &c.hive_type, precision))
             .collect();
         Ok(Self {
             metastore,
@@ -371,6 +398,22 @@ impl HiveTable {
             &self.table,
             &metadata,
         )
+    }
+
+    /// The table's columns spelled as they were written (ISS-018): the
+    /// column names of the files it writes.
+    pub(crate) fn stored_schema(&self) -> SchemaRef {
+        stored_names(&self.schema, &self.columns)
+    }
+
+    /// Each column's stored name, by the engine's (folded) name.
+    fn stored_names(&self) -> HashMap<String, String> {
+        self.schema
+            .fields()
+            .iter()
+            .zip(&self.columns)
+            .map(|(field, column)| (field.name().clone(), column.written_name().to_owned()))
+            .collect()
     }
 
     pub(crate) fn dir(&self) -> Path {
@@ -519,6 +562,7 @@ impl HiveTable {
             raw: reading != Reading::Table,
             nanos_only: reading == Reading::NanosOnly,
             zone,
+            stored: Arc::new(self.stored_names()),
         };
         Ok(
             FileScanConfigBuilder::new(self.store_url.clone(), Arc::new(source))
@@ -728,9 +772,12 @@ impl HiveSink {
         path: &Path,
     ) -> Result<u64> {
         let store = Arc::clone(self.table.metastore.store());
+        // Files carry each column's stored spelling (ISS-018), so another
+        // reader of the files (SQL Server `OPENROWSET`, pandas) sees the
+        // names as they were written.
         let mut writer = TrinoParquetWriter::try_new(
             ParquetObjectWriter::new(store, path.clone()),
-            Arc::clone(&self.table.schema),
+            self.table.stored_schema(),
             ROW_GROUP_ROWS,
         )?
         .in_time_zone(self.table.metastore.parquet_time_zone());

@@ -1636,3 +1636,122 @@ async fn mixed_case_table_name_stays_visible_to_trino() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// ISS-018: column names keep the case they were written with.
+// ---------------------------------------------------------------------------
+
+/// Columns written as `"CustomerCode"` and `"Valor"` keep that spelling in
+/// the metastore and the files. Trino 431 and SQL Server 2022 `OPENROWSET`
+/// (a case-insensitive collation) must read the right column from them,
+/// row for row, and `CodeLake` must read what Trino appends.
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one scenario, read top to bottom")]
+async fn case_preserved_columns_are_read_by_trino_and_openrowset() {
+    let shared = shared().await;
+    let spill = tempfile::tempdir().unwrap();
+    // SQL Server shows `INT96` as stored: not used here, but keep UTC as the
+    // other OPENROWSET test does.
+    let engine = codelake_in(&shared.warehouse(), spill.path(), ParquetTimeZone::UTC).await;
+    cl(&engine, "CREATE SCHEMA hive.cs").await;
+    cl(
+        &engine,
+        "CREATE TABLE hive.cs.customers AS SELECT CAST(x AS BIGINT) AS \"CustomerCode\", \
+         CAST(x * 10 AS BIGINT) AS \"Valor\", CAST(x * 100 AS BIGINT) AS valor_total \
+         FROM (VALUES (1), (2), (3)) v(x)",
+    )
+    .await;
+    cl(&engine, "INSERT INTO hive.cs.customers VALUES (4, 40, 400)").await;
+    let query = "SELECT CAST(customercode AS varchar), CAST(valor AS varchar), CAST(valor_total AS varchar) \
+                 FROM hive.cs.customers ORDER BY customercode";
+    let codelake_rows = cl(&engine, query).await;
+    assert_eq!(
+        codelake_rows,
+        strings(&[
+            &["1", "10", "100"],
+            &["2", "20", "200"],
+            &["3", "30", "300"],
+            &["4", "40", "400"]
+        ])
+    );
+    let table_dir = shared.warehouse().join("cs/customers");
+    let files: Vec<PathBuf> = data_files(&table_dir)
+        .into_keys()
+        .map(|f| table_dir.join(f))
+        .collect();
+    assert_eq!(files.len(), 2, "{files:?}");
+
+    let trino = Trino::start(&shared).await;
+    let trino_rows = trino.try_sql(query).await;
+    note(
+        "ISS-018 Trino reads the case-preserved table",
+        format!("{trino_rows:?}"),
+    );
+    assert_eq!(
+        trino_rows,
+        Ok(codelake_rows.clone()),
+        "Trino 431 reads other rows"
+    );
+    let quoted = trino
+        .try_sql("SELECT CAST(sum(\"CustomerCode\") AS varchar), CAST(sum(\"VALOR\") AS varchar) FROM hive.cs.customers")
+        .await;
+    assert_eq!(quoted, Ok(strings(&[&["10", "100"]])));
+    trino
+        .sql("INSERT INTO hive.cs.customers VALUES (5, 50, 500)")
+        .await;
+    let after = cl(&engine, query).await;
+    let mut expected = codelake_rows.clone();
+    expected.push(vec!["5".into(), "50".into(), "500".into()]);
+    assert_eq!(after, expected, "CodeLake reads what Trino appended");
+    assert_eq!(trino.sql(query).await, expected);
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(table_dir.join(".trinoSchema")).unwrap()).unwrap();
+    note(
+        "ISS-018 columns after a Trino INSERT",
+        metadata["dataColumns"].to_string(),
+    );
+    drop(trino);
+
+    let mssql = start_mssql(&shared).await;
+    let port = mssql.get_host_port_ipv4(1433).await.unwrap();
+    for file in &files {
+        let names = mssql_query(
+            port,
+            &format!(
+                "SELECT CAST(name AS NVARCHAR(100)) \
+                 FROM sys.dm_exec_describe_first_result_set(N'SELECT * FROM OPENROWSET(BULK N''{}'', \
+                 FORMAT = ''PARQUET'') AS r', NULL, 0) ORDER BY column_ordinal",
+                file.display()
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            names,
+            strings(&[&["CustomerCode"], &["Valor"], &["valor_total"]]),
+            "{}",
+            file.display()
+        );
+        for spelling in [("CustomerCode", "Valor"), ("customercode", "VALOR")] {
+            let read = mssql_query(
+                port,
+                &format!(
+                    "SELECT CONVERT(NVARCHAR(20), {c}), CONVERT(NVARCHAR(20), {v}), CONVERT(NVARCHAR(20), valor_total) \
+                     FROM OPENROWSET(BULK N'{}', FORMAT = 'PARQUET') AS r ORDER BY {c}",
+                    file.display(),
+                    c = spelling.0,
+                    v = spelling.1
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(!read.is_empty());
+            for row in &read {
+                assert!(
+                    codelake_rows.contains(row),
+                    "{spelling:?}: {row:?} not in {codelake_rows:?}"
+                );
+            }
+        }
+    }
+}

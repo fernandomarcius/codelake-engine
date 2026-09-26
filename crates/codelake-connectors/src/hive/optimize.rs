@@ -389,7 +389,8 @@ pub(crate) async fn write_compacted(
     let mut compactor = Compactor {
         table,
         schema,
-        file_schema: file_columns(&table.schema),
+        // The files keep each column's stored spelling (ISS-018).
+        file_schema: file_columns(&table.stored_schema()),
         target,
         reservation: MemoryConsumer::new(format!("HiveOptimize[{}]", table.table))
             .register(context.memory_pool()),

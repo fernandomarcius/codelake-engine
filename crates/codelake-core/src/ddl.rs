@@ -392,7 +392,9 @@ pub(crate) fn prepare(statement: &mut DFStatement, security: ViewSecurity) -> Re
         Statement::AlterTable(alter) => match alter.operations.as_slice() {
             [AlterTableOperation::AddColumn { column_def, .. }] => Ok(Some(Prepared::AddColumn {
                 table: table_reference(&alter.name)?,
-                column: column_def.name.value.to_lowercase(),
+                // As SQL reads it: unquoted folds, quoted keeps its case
+                // (a catalog may keep the case, ISS-018).
+                column: ident_value(&ObjectNamePart::Identifier(column_def.name.clone()))?,
                 sql_type: column_def.data_type.to_string(),
             })),
             [
@@ -524,6 +526,11 @@ mod tests {
                 sql_type: "VARCHAR(10)".into(),
             })
         );
+        let mut quoted = parsed("ALTER TABLE t ADD COLUMN \"CustomerCode\" bigint");
+        assert!(matches!(
+            prepare(&mut quoted, ViewSecurity::Definer).unwrap(),
+            Some(Prepared::AddColumn { column, .. }) if column == "CustomerCode"
+        ));
         let mut other = parsed("ALTER TABLE t DROP COLUMN x");
         assert!(prepare(&mut other, ViewSecurity::Definer).is_err());
     }

@@ -81,12 +81,52 @@ Server 2022, and each is the behavior of Trino 431 itself.
   `CodeLake` plans stored views the same way and records its own session
   catalog/schema when it creates a view. Unknown fields of the view
   definition (`comment`, …) survive a rewrite.
-- **Names are lower case.** Trino folds identifiers to lower case, so the Hive
-  connector only has lower-case schemas, tables and columns. `CodeLake` folds
-  them at every entry of the catalog (DDL, lookup, listing), so a quoted
-  `"MixedCase"` is the table `mixedcase` in the directory, the metadata and
-  every query, from both engines. Two columns that differ only in case are an
-  error.
+- **Names resolve folded; the case written is kept** (amended 2026-09-26,
+  ISS-018, removed limitation, no compatibility mode). Trino folds
+  identifiers to lower case, so its Hive connector only has lower-case
+  schemas, tables and columns, and loses the case a client wrote.
+  `CodeLake` now keeps it where that loses nothing:
+  - **Files:** every Parquet file `CodeLake` writes (`CREATE TABLE AS`,
+    `INSERT`, `OPTIMIZE`) names each column as it was written: a quoted
+    `"CustomerCode"` is the Parquet column `CustomerCode` (an unquoted
+    name is folded, as SQL reads it). Readers of the files see it: SQL
+    Server 2022 `OPENROWSET` (case-insensitive collation) reads the right
+    columns under either spelling, and Trino 431 reads them (its Parquet
+    reader matches names ignoring case).
+  - **Metastore:** names stay folded (`dataColumns[].name`, the directories
+    of schemas and tables); the name as written is recorded in the
+    `codelake.name` property of the column (`properties`) and in the
+    `codelake.name` parameter of the table, view and schema (only when it
+    differs from the folded name; updated by a rename). Checked on Trino
+    431: with a mixed-case name in `dataColumns` it reads the table but its
+    `INSERT` fails (`NullPointerException: "type" is null`), and it finds a
+    table only in its lower-case directory; it keeps the column properties
+    through its own `INSERT`. A `codelake.name` that no longer folds to the
+    column's name (another engine renamed it) is ignored.
+  - **Resolution:** the engine sees every schema, table and column by its
+    folded name, so any spelling resolves (`customercode`, `CUSTOMERCODE`,
+    `"CustomerCode"`); result headers, `information_schema` and `DESCRIBE`
+    show the folded name, as Trino does. Showing the written case there
+    needs case-insensitive column resolution in the planner, which
+    `DataFusion` 54 does not have (ISS-018, awaiting confirmation).
+  - **Ambiguity is refused:** two names of one level that differ only by
+    case (columns of a table, a column added next to another, tables,
+    views, schemas) fail with an error that names both ("differ only by
+    case"). A table whose metadata (another writer's) holds such columns
+    fails when read; a data file with several spellings of one column is
+    read by the exact written spelling, then the folded one, and otherwise
+    fails when the column is read, never NULL nor a guess. Footer
+    statistics match file columns the same way (a column spelled otherwise
+    in the file is no longer taken for absent, "all NULL").
+  - Tables written before (lower-case files and metadata) read and write
+    as before; files of other writers (`ID` for `id`) too.
+  - Evidence: `hive::limits_tests` (`column_names_keep_their_case_…`,
+    `names_that_differ_only_by_case_are_refused`, `schema_and_table_names_…`,
+    stale and ambiguous names), `hive::columns` and `file_statistics` unit
+    tests, `hive_acceptance::case_preserved_columns_are_read_by_trino_and_openrowset`
+    (Trino 431 reads the rows `CodeLake` reads and appends rows `CodeLake`
+    then reads; SQL Server 2022 reads each file's columns by both spellings
+    and reports the written names).
 - **`INT96` time zone per catalog: `parquet_time_zone`** (amended
   2026-09-25). Trino 431 converts `INT96` values with
   `hive.parquet.time-zone` (default: the JVM zone, UTC in the
@@ -218,7 +258,7 @@ requires where Trino has no equivalent.
   only when a query reads it.
 - **Column options** the catalog cannot keep (`NOT NULL`, `DEFAULT`, …) are
   refused with Trino's messages; `COMMENT` is stored.
-- **Views** pad their `char(n)` columns and fold their column names (a quoted `"MixedCol"` is `mixedcol`), and
+- **Views** pad their `char(n)` columns and fold their column names (a quoted `"MixedCol"` is `mixedcol`; a view writes no file, so ISS-018 keeps nothing else), and
   `timestamp(p) with time zone` columns keep their instant (read in UTC: Arrow
   has one zone per column, so each value's own zone is not kept).
 - **Pending, F5.** Owner-based security (R11): Trino with

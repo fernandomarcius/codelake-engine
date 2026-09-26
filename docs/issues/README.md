@@ -27,7 +27,7 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-015](ISS-015-bench-harness-sub-millisecond.md) | Bench harness measures sub-millisecond cases in bursts | measurement | 2026-09-25 | open |
 | [ISS-016](ISS-016-erp-network-shadow-run.md) | Access to the source network authorized for the F8 shadow run | security | 2026-09-25 | open |
 | [ISS-017](ISS-017-create-or-replace-atomic.md) | CREATE OR REPLACE on hive tables, atomic | removed limitation | 2026-09-25 | closed |
-| [ISS-018](ISS-018-case-preserving-names.md) | Case-preserving names, case-insensitive resolution | removed limitation | 2026-09-25 | open |
+| [ISS-018](ISS-018-case-preserving-names.md) | Case-preserving names, case-insensitive resolution | removed limitation | 2026-09-25 | awaiting-confirmation |
 | [ISS-019](ISS-019-ctas-literal-unbounded-varchar.md) | CTAS of a literal infers unbounded varchar | removed limitation | 2026-09-25 | open |
 | [ISS-020](ISS-020-datasize-iec-units.md) | Data sizes accept MiB/GiB | removed limitation | 2026-09-25 | closed |
 | [ISS-021](ISS-021-arrow-flight-sql.md) | New front: Arrow Flight SQL | scope | 2026-09-25 | open |

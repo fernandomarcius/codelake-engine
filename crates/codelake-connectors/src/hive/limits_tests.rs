@@ -569,3 +569,297 @@ fn staging_paths_are_object_store_paths() {
     let path = Path::from(".codelake/staging/abc");
     assert_eq!(path.as_ref(), ".codelake/staging/abc");
 }
+
+// ---------------------------------------------------------------------------
+// ISS-018: names keep the case they were written with
+// ---------------------------------------------------------------------------
+
+/// Each column's `codelake.name` property (the name as written).
+async fn written_names(lake: &Lake, table: &str) -> Vec<Option<String>> {
+    let metadata = lake.metastore().table("s", table).await.unwrap().unwrap();
+    metadata
+        .data_columns
+        .iter()
+        .map(|c| c.properties.get("codelake.name").cloned())
+        .collect()
+}
+
+/// Column names of every visible data file of a table, in file-name order.
+fn file_columns(lake: &Lake, table: &str) -> Vec<Vec<String>> {
+    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    data_files(lake, table)
+        .into_iter()
+        .map(|name| {
+            let file = std::fs::File::open(lake.dir(table).join(name)).unwrap();
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+            builder
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect()
+        })
+        .collect()
+}
+
+fn optimize_options(lake: &Lake) -> codelake_core::QueryOptions {
+    let mut options = codelake_core::QueryOptions::for_user("codelake");
+    options.properties = lake
+        .engine
+        .session_properties()
+        .session(
+            [(
+                "hive.non_transactional_optimize_enabled".to_owned(),
+                "true".to_owned(),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+    options
+}
+
+/// Trino 431 folds every name: a quoted `"CustomerCode"` is stored as
+/// `customercode` in the metastore and the files. `CodeLake` keeps the case
+/// written, in the metastore and in every file it writes (`CREATE TABLE AS`,
+/// `INSERT`, `ADD COLUMN`, `OPTIMIZE`), and resolves the column whatever
+/// case a query uses. An unquoted name is folded, as SQL reads it.
+#[tokio::test]
+async fn column_names_keep_their_case_in_the_metastore_and_the_files() {
+    let lake = lake().await;
+    lake.ok(
+        "CREATE TABLE hive.s.t AS SELECT CAST(x AS BIGINT) AS \"CustomerCode\", \
+         CAST(x * 10 AS BIGINT) AS \"Valor\", CAST(x AS BIGINT) AS Unquoted \
+         FROM (VALUES (1), (2)) v(x)",
+    )
+    .await;
+    // The metastore names stay folded (the reference engine writes only into
+    // those); the name as written is the column's `codelake.name`.
+    assert_eq!(
+        lake.columns("t"),
+        vec![
+            ("customercode".into(), "bigint".into()),
+            ("valor".into(), "bigint".into()),
+            ("unquoted".into(), "bigint".into()),
+        ]
+    );
+    assert_eq!(
+        written_names(&lake, "t").await,
+        vec![Some("CustomerCode".to_owned()), Some("Valor".into()), None]
+    );
+    assert_eq!(
+        file_columns(&lake, "t"),
+        vec![vec!["CustomerCode".to_owned(), "Valor".into(), "unquoted".into()]]
+    );
+    for sql in [
+        "SELECT customercode, valor FROM hive.s.t ORDER BY 1",
+        "SELECT CUSTOMERCODE, VALOR FROM hive.s.t ORDER BY 1",
+        "SELECT \"CustomerCode\", \"Valor\" FROM hive.s.t ORDER BY 1",
+        "SELECT \"customercode\", \"VALOR\" FROM hive.s.t ORDER BY 1",
+    ] {
+        assert_eq!(lake.ok(sql).await, rows(&[&["1", "10"], &["2", "20"]]), "{sql}");
+    }
+    // Filters over the stored spelling prune and answer by the values.
+    assert_eq!(
+        lake.ok("SELECT count(*) FROM hive.s.t WHERE customercode = 2")
+            .await,
+        rows(&[&["1"]])
+    );
+    assert_eq!(
+        lake.ok("SELECT count(*) FROM hive.s.t WHERE \"CustomerCode\" > 100")
+            .await,
+        rows(&[&["0"]])
+    );
+
+    lake.ok("INSERT INTO hive.s.t VALUES (3, 30, 3)").await;
+    lake.ok("ALTER TABLE hive.s.t ADD COLUMN \"DataCadastro\" date")
+        .await;
+    lake.ok("INSERT INTO hive.s.t (customercode, valor, unquoted, datacadastro) VALUES (4, 40, 4, DATE '2026-09-26')")
+        .await;
+    assert_eq!(lake.columns("t")[3], ("datacadastro".into(), "date".into()));
+    assert_eq!(
+        written_names(&lake, "t").await[3].as_deref(),
+        Some("DataCadastro")
+    );
+    let spelled = file_columns(&lake, "t");
+    assert_eq!(spelled.len(), 3);
+    assert_eq!(spelled[1], vec!["CustomerCode", "Valor", "unquoted"]);
+    assert_eq!(
+        spelled[2],
+        vec!["CustomerCode", "Valor", "unquoted", "DataCadastro"]
+    );
+    let all = rows(&[
+        &["1", "10", "NULL"],
+        &["2", "20", "NULL"],
+        &["3", "30", "NULL"],
+        &["4", "40", "2026-09-26"],
+    ]);
+    let query = "SELECT customercode, valor, datacadastro FROM hive.s.t ORDER BY 1";
+    assert_eq!(lake.ok(query).await, all);
+
+    // Compaction keeps the spelling and the rows.
+    run_with_options(&lake, "ALTER TABLE hive.s.t EXECUTE optimize").await;
+    assert_eq!(
+        file_columns(&lake, "t"),
+        vec![vec!["CustomerCode", "Valor", "unquoted", "DataCadastro"]]
+    );
+    assert_eq!(lake.ok(query).await, all);
+    // The engine shows the folded names (what every query resolves).
+    assert_eq!(
+        lake.ok("SELECT column_name FROM hive.information_schema.columns \
+             WHERE table_schema = 's' AND table_name = 't' ORDER BY ordinal_position")
+            .await,
+        rows(&[&["customercode"], &["valor"], &["unquoted"], &["datacadastro"]])
+    );
+}
+
+async fn run_with_options(lake: &Lake, sql: &str) {
+    let options = optimize_options(lake);
+    lake.engine
+        .sql_with(&options, sql)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+}
+
+/// Two names that differ only by case, at the same level, are refused with
+/// an error that says so: columns of one table, a column added next to
+/// another, tables, views and schemas. Nothing is created.
+#[tokio::test]
+async fn names_that_differ_only_by_case_are_refused() {
+    let lake = lake().await;
+    let err = lake
+        .err("CREATE TABLE hive.s.d AS SELECT 1 AS \"Valor\", 2 AS \"VALOR\"")
+        .await;
+    assert!(
+        err.contains("`Valor` and `VALOR`") && err.contains("differ only by case"),
+        "{err}"
+    );
+    assert!(!lake.dir("d").exists());
+    let err = lake.err("CREATE TABLE hive.s.d (\"Id\" bigint, id bigint)").await;
+    assert!(err.contains("differ only by case"), "{err}");
+
+    lake.ok("CREATE TABLE hive.s.t AS SELECT CAST(1 AS BIGINT) AS \"Valor\"")
+        .await;
+    let err = lake.err("ALTER TABLE hive.s.t ADD COLUMN valor bigint").await;
+    assert!(
+        err.contains("column Valor exists") && err.contains("differ only by case"),
+        "{err}"
+    );
+    let err = lake.err("ALTER TABLE hive.s.t ADD COLUMN \"VALOR\" bigint").await;
+    assert!(err.contains("differ only by case"), "{err}");
+    assert_eq!(lake.columns("t"), vec![("valor".into(), "bigint".into())]);
+
+    let err = lake.err("CREATE TABLE hive.s.\"T\" AS SELECT 2 AS x").await;
+    assert!(
+        err.contains("hive.s.T cannot be created") && err.contains("hive.s.t already exists"),
+        "{err}"
+    );
+    lake.ok("CREATE VIEW hive.s.v AS SELECT 1 AS a").await;
+    let err = lake.err("CREATE VIEW hive.s.\"V\" AS SELECT 2 AS a").await;
+    assert!(err.contains("differ only by case"), "{err}");
+    assert_eq!(lake.ok("SELECT a FROM hive.s.v").await, rows(&[&["1"]]));
+    let err = lake.err("CREATE SCHEMA hive.\"S\"").await;
+    assert!(
+        err.contains("hive.S cannot be created") && err.contains("differ only by case"),
+        "{err}"
+    );
+    lake.ok("CREATE TABLE hive.s.u AS SELECT 1 AS x").await;
+    // The engine finds the target taken (resolution ignores case) first.
+    let err = lake.err("ALTER TABLE hive.s.u RENAME TO hive.s.\"T\"").await;
+    assert!(err.contains("Target table 'hive.s.T' already exists"), "{err}");
+    assert_eq!(lake.ok("SELECT x FROM hive.s.u").await, rows(&[&["1"]]));
+    assert_eq!(lake.ok("SELECT \"Valor\" FROM hive.s.t").await, rows(&[&["1"]]));
+}
+
+/// Schema and table names keep their directory in lower case (the only one
+/// the reference engine finds) and every case resolves to it; the name as
+/// written is recorded in the metadata (`codelake.name`), and follows a
+/// rename.
+#[tokio::test]
+async fn schema_and_table_names_record_the_case_written() {
+    let lake = lake().await;
+    lake.ok("CREATE SCHEMA hive.\"Vendas\"").await;
+    lake.ok("CREATE TABLE hive.\"Vendas\".\"PedidoItem\" AS SELECT CAST(1 AS BIGINT) AS id")
+        .await;
+    let warehouse = lake.warehouse.path();
+    assert!(warehouse.join("vendas/pedidoitem/.trinoSchema").exists());
+    let schema: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(warehouse.join(".vendas.trinoSchema")).unwrap()).unwrap();
+    assert_eq!(schema["parameters"]["codelake.name"], "Vendas");
+    let metastore = lake.metastore();
+    let table = metastore.table("vendas", "pedidoitem").await.unwrap().unwrap();
+    assert_eq!(
+        table.parameters.get("codelake.name").map(String::as_str),
+        Some("PedidoItem")
+    );
+    for name in [
+        "hive.vendas.pedidoitem",
+        "hive.VENDAS.PEDIDOITEM",
+        "hive.\"Vendas\".\"PedidoItem\"",
+        "hive.\"vendas\".\"PEDIDOITEM\"",
+    ] {
+        assert_eq!(
+            lake.ok(&format!("SELECT id FROM {name}")).await,
+            rows(&[&["1"]]),
+            "{name}"
+        );
+    }
+    lake.ok("ALTER TABLE hive.vendas.pedidoitem RENAME TO hive.vendas.\"ItemPedido\"")
+        .await;
+    let table = metastore.table("vendas", "itempedido").await.unwrap().unwrap();
+    assert_eq!(
+        table.parameters.get("codelake.name").map(String::as_str),
+        Some("ItemPedido")
+    );
+    lake.ok("ALTER TABLE hive.vendas.itempedido RENAME TO hive.vendas.lower_case")
+        .await;
+    let table = metastore.table("vendas", "lower_case").await.unwrap().unwrap();
+    assert!(!table.parameters.contains_key("codelake.name"));
+    // Unquoted names record nothing: the metadata is what it always was.
+    lake.ok("CREATE TABLE hive.s.plain AS SELECT CAST(1 AS BIGINT) AS id")
+        .await;
+    let plain = metastore.table("s", "plain").await.unwrap().unwrap();
+    assert!(!plain.parameters.contains_key("codelake.name"));
+}
+
+/// Metadata another writer left with two columns that differ only by case
+/// is refused when the table is read, naming both; never one read for the
+/// other.
+#[tokio::test]
+async fn a_table_whose_columns_differ_only_by_case_is_refused() {
+    let lake = lake().await;
+    lake.ok("CREATE TABLE hive.s.t AS SELECT CAST(1 AS BIGINT) AS a, CAST(2 AS BIGINT) AS b")
+        .await;
+    let metastore = lake.metastore();
+    let mut metadata = metastore.table("s", "t").await.unwrap().unwrap();
+    metadata.data_columns[1].name = "A".into();
+    metastore.write_table("s", "t", &metadata).await.unwrap();
+    let err = lake.err("SELECT * FROM hive.s.t").await;
+    assert!(
+        err.contains("`a` and `A`") && err.contains("differ only by case"),
+        "{err}"
+    );
+}
+
+/// A `codelake.name` that no longer spells the column (another engine
+/// renamed it) is ignored: files are written with the metastore's name.
+#[tokio::test]
+async fn a_stale_written_name_is_ignored() {
+    let lake = lake().await;
+    lake.ok("CREATE TABLE hive.s.t AS SELECT CAST(1 AS BIGINT) AS \"CustomerCode\"")
+        .await;
+    let metastore = lake.metastore();
+    let mut metadata = metastore.table("s", "t").await.unwrap().unwrap();
+    metadata.data_columns[0].name = "cod".into();
+    metastore.write_table("s", "t", &metadata).await.unwrap();
+    lake.ok("INSERT INTO hive.s.t VALUES (2)").await;
+    let spelled = file_columns(&lake, "t");
+    assert!(spelled.contains(&vec!["cod".to_owned()]), "{spelled:?}");
+    assert_eq!(
+        lake.ok("SELECT cod FROM hive.s.t ORDER BY 1").await,
+        rows(&[&["2"], &["NULL"]])
+    );
+}
