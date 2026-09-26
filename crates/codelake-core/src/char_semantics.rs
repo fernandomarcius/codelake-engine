@@ -124,6 +124,8 @@ pub(crate) const CHAR_PAD: &str = "codelake_char";
 pub(crate) const CHAR_KEY: &str = "codelake_char_key";
 /// Name of [`CharCompare`].
 pub(crate) const CHAR_COMPARE: &str = "codelake_char_compare";
+/// Name of [`VarcharOf`].
+pub(crate) const VARCHAR_OF: &str = "codelake_varchar_of";
 
 // ---------------------------------------------------------------- functions
 
@@ -335,6 +337,66 @@ impl ScalarUDFImpl for CharCompare {
     }
 }
 
+/// `codelake_varchar_of(x, n)`: `x` as it is, `varchar(n)` recorded in the
+/// result field (text computed from a char value, whose length the rule
+/// derives).
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct VarcharOf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for VarcharOf {
+    fn name(&self) -> &'static str {
+        VARCHAR_OF
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        plan_err!("{VARCHAR_OF} is typed by its arguments")
+    }
+
+    fn return_field_from_args(&self, args: ReturnFieldArgs<'_>) -> Result<FieldRef> {
+        let length = varchar_length(args.scalar_arguments.get(1).copied().flatten())?;
+        let Some(input) = args.arg_fields.first() else {
+            return plan_err!("{VARCHAR_OF} expects two arguments");
+        };
+        Ok(Arc::new(
+            Field::new(
+                VARCHAR_OF,
+                text_result(VARCHAR_OF, input.data_type())?,
+                input.is_nullable(),
+            )
+            .with_metadata(Declared::Varchar(length).metadata()),
+        ))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let Some(value) = args.args.first() else {
+            return exec_err!("{VARCHAR_OF} expects two arguments");
+        };
+        Ok(value.clone())
+    }
+}
+
+/// The length argument of [`VarcharOf`].
+fn varchar_length(scalar: Option<&ScalarValue>) -> Result<u32> {
+    match scalar.map(|s| s.cast_to(&DataType::Int64)).transpose()? {
+        Some(ScalarValue::Int64(Some(n))) => {
+            u32::try_from(n).or_else(|_| plan_err!("{VARCHAR_OF}: invalid length {n}"))
+        }
+        other => plan_err!("{VARCHAR_OF}: invalid length {other:?}"),
+    }
+}
+
+static VARCHAR_OF_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
+    Arc::new(ScalarUDF::new_from_impl(VarcharOf {
+        signature: Signature::any(2, Volatility::Immutable),
+    }))
+});
+
 static CHAR_PAD_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     Arc::new(ScalarUDF::new_from_impl(CharPad {
         signature: Signature::any(2, Volatility::Immutable),
@@ -353,7 +415,7 @@ static CHAR_COMPARE_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
 
 /// The functions this module plans, for the engine to register.
 pub(crate) fn functions() -> Vec<ScalarUDF> {
-    [&CHAR_PAD_UDF, &CHAR_KEY_UDF, &CHAR_COMPARE_UDF]
+    [&CHAR_PAD_UDF, &CHAR_KEY_UDF, &CHAR_COMPARE_UDF, &VARCHAR_OF_UDF]
         .into_iter()
         .map(|udf| udf.as_ref().clone())
         .collect()
@@ -964,6 +1026,12 @@ fn function_type(name: &str, args: &[Expr], scope: &Scope<'_>, whole: &Expr) -> 
     let first = || args.first().and_then(|a| infer(a, scope));
     match name {
         crate::declared::TRINO_TYPED | crate::declared::TRINO_TRY_TYPED => typed_as(args, scope),
+        VARCHAR_OF => args.get(1).and_then(|n| match n {
+            Expr::Literal(value, _) => varchar_length(Some(value))
+                .ok()
+                .map(|n| Text::Varchar(Bound::Known(n))),
+            _ => None,
+        }),
         CHAR_PAD => args.get(1).and_then(|n| match n {
             Expr::Literal(value, _) => length_argument(Some(value)).ok().map(|n| Text::Char(Some(n))),
             _ => None,
@@ -2240,6 +2308,25 @@ fn record_types(projection: Projection, scope: &Scope<'_>) -> Result<Transformed
         let (qualifier, field) = expr.to_field(schema.as_ref())?;
         let recorded = declared(&field);
         let wanted = infer(&expr, scope);
+        // Text computed from a char value (`rtrim(ch)`, `substr(ch, 2)`,
+        // `nullif(v3, ch)`) is `varchar(n)` to the reference: recorded in
+        // the field, the value as it is.
+        if let Some(Text::Varchar(Bound::Known(k))) = wanted
+            && recorded.is_none()
+            && !matches!(expr.clone().unalias(), Expr::Column(_) | Expr::Literal(..))
+            && expr.exists(|e| Ok(matches!(infer(e, scope), Some(Text::Char(_)))))?
+        {
+            changed = true;
+            let typed = Expr::ScalarFunction(ScalarFunction::new_udf(
+                Arc::clone(&VARCHAR_OF_UDF),
+                vec![
+                    expr.unalias(),
+                    Expr::Literal(ScalarValue::Int64(Some(i64::from(k))), None),
+                ],
+            ));
+            exprs.push(typed.alias_qualified(qualifier, field.name()));
+            continue;
+        }
         let value = match wanted {
             Some(Text::Char(Some(n))) if recorded != Some(Declared::Char(n)) => {
                 Some(pad(expr.clone().unalias(), n))
@@ -3562,6 +3649,8 @@ mod tests {
             "UPDATE cht SET ch = 'b' WHERE id = 4",
             "CREATE TABLE made AS SELECT id, ch, CAST('x' AS char(2)) AS two FROM cht",
             "CREATE VIEW chv AS SELECT id, ch FROM cht",
+            "CREATE TABLE made2 AS SELECT id, rtrim(ch) AS a, substr(ch, 2) AS b, ltrim(ch) AS e, nullif(s, ch) AS n, \
+             trim(ch) AS t, ch AS c FROM cht JOIN v3 USING (id)",
         ] {
             rows(&engine, statement)
                 .await
@@ -3585,6 +3674,27 @@ mod tests {
             (
                 "SELECT id FROM chv WHERE ch = 'zz' OR ch = 'b ' ORDER BY id",
                 &[&["2"], &["4"]],
+            ),
+            // Text computed from a char value is `varchar(n)` (Trino 431).
+            (
+                "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'made2' \
+                 ORDER BY ordinal_position",
+                &[
+                    &["id", "bigint"],
+                    &["a", "varchar(5)"],
+                    &["b", "varchar(5)"],
+                    &["e", "varchar(5)"],
+                    &["n", "varchar(3)"],
+                    &["t", "varchar(5)"],
+                    &["c", "char(5)"],
+                ],
+            ),
+            (
+                "SELECT * FROM made2 ORDER BY id",
+                &[
+                    &["1", "ab", "b   ", "ab", "NULL", "ab", "ab   "],
+                    &["2", "zz", "z   ", "zz", "a", "zz", "zz   "],
+                ],
             ),
         ] {
             assert_eq!(rows(&engine, sql).await, Ok(expected(answer)), "{sql}");

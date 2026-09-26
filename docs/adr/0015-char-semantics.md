@@ -45,7 +45,10 @@ gives char values Trino 431's semantics (every rule below observed on
    `first_value`, `min_by`, `max_by`, `array_agg`, the keys and values of
    `map_agg`, the keys of `histogram`, …), `try`, window functions, `CASE` and the functions
    whose result length Trino derives from their arguments (`upper`, `rtrim`,
-   `substr`, `concat`, …). A projection records `char(n)` in the field of
+   `substr`, `concat`, …). A projection records `varchar(n)` in the field
+   of text it computes from a char value (`rtrim(ch)`, `substr(ch, 2)`,
+   `nullif(v3, ch)`: `varchar(5)`, `varchar(3)`, as Trino types them), and
+   `char(n)` in the field of
    each char column it computes (a client, `typeof`, `CREATE TABLE … AS` and
    views see it) and removes it from a text a cast made from a char value. A
    scalar subquery computed ahead (`crate::subquery`) becomes a literal that
