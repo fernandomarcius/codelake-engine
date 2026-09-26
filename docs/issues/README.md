@@ -40,3 +40,4 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-028](ISS-028-memory-ceiling-rss-test-flaky.md) | Memory-ceiling hash-join test measures process RSS with a thin margin | test reliability | 2026-09-26 | open |
 | [ISS-029](ISS-029-extended-binary-fetch-refused.md) | FETCH in binary format on the PostgreSQL extended protocol is refused | limitation | 2026-09-26 | awaiting-confirmation |
 | [ISS-030](ISS-030-cursor-transactions-by-recommendation.md) | PostgreSQL cursors and transactions: choices applied by recommendation | behavior | 2026-09-26 | awaiting-confirmation |
+| [ISS-031](ISS-031-cursor-slots-by-recommendation.md) | PostgreSQL cursors, second round: one slot per connection, FETCH rows in the pool, DISCARD, MOVE | behavior | 2026-09-26 | awaiting-confirmation |

@@ -1,7 +1,9 @@
 //! Cursors (`DECLARE … CURSOR`, `FETCH`, `CLOSE`) under governance.
 //!
-//! `datafusion-postgres` keeps a declared cursor's result stream in a portal
-//! of the connection; `FETCH` reads it and `CLOSE` drops it. The `DECLARE`
+//! The server declares a cursor as `PostgreSQL` names it (folded to lower
+//! case unless quoted) and keeps its result stream in a portal of the
+//! connection, as `datafusion-postgres` would; `FETCH` and `MOVE` read it
+//! and `CLOSE` drops it. The `DECLARE`
 //! is the governed statement: it keeps its record, admission slot and
 //! deadline while the cursor is open ([`super::Governed`] governs the portal's
 //! stream as it does a query's), so `FETCH` and `CLOSE` take none of their

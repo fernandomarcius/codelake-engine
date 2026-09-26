@@ -119,6 +119,34 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- PostgreSQL wire, memory outside the pool: a `FETCH` among other statements of a message
+  (`FETCH ALL FROM c; CLOSE c`) collected its rows in memory outside the pool before sending
+  them (6 M rows took the server from 114 MB to 815 MB of RSS with a 256 MiB pool). The rows
+  are now held in the pool until sent; past what it gives the `FETCH` fails with `53200`, its
+  cursor's statement with `EXCEEDED_LOCAL_MEMORY_LIMIT` (slot and memory given back) and the
+  cursor cannot be read again (`55000`). A `FETCH` sent alone still streams (ADR 0016).
+- PostgreSQL wire, statements queued behind their own cursor: with a cursor or a suspended
+  portal open, a `SELECT`, a second `DECLARE`, `ABORT` or a query beside a JDBC fetch-size
+  portal waited in the queue for the connection's own slot (the whole queue timeout with a
+  per-user limit of one, then `57014`). A connection now holds one admission slot at most, and
+  its other statements run in it at once, each registered with its own deadline; the per-user
+  and per-group limits count connections with work. `ABORT` is read as `ROLLBACK` on both
+  protocols (ADR 0016, ISS-031).
+- PostgreSQL wire, `DISCARD ALL` failed with `XX000` and left every cursor open, held ones
+  included, with their slots and memory (a connection pool resetting a connection kept them
+  for the next client). It now closes every cursor and portal and resets `statement_timeout`,
+  and fails with `25001` inside a transaction block, as PostgreSQL; `DISCARD PLANS`,
+  `SEQUENCES` and `TEMP` answer their tags (ADR 0016, ISS-031).
+- PostgreSQL wire, cursor names: `DECLARE Big` declared `Big`, so `FETCH FROM big` failed with
+  `34000`; unquoted names are now folded to lower case, quoted ones kept, as PostgreSQL does.
+  A cursor's query is planned as the session's queries are (operands checked, ADR 0014; the
+  session's format options) (ADR 0016).
+- PostgreSQL wire, `FETCH` and `MOVE` on the extended protocol: `FETCH FROM c`, `FETCH c`,
+  `FETCH -1` and every `MOVE` failed at `Parse` with `XX000`; they are answered as on the
+  simple protocol (rows, `55000` backward). `MOVE` is implemented on both protocols (it was
+  `0A000`): it moves the cursor as the `FETCH` of the same direction would and answers
+  `MOVE n` as PostgreSQL. A count beyond PostgreSQL's `int4` (`FETCH 9223372036854775807`)
+  fails with `42601` instead of returning every row left (ADR 0016).
 - PostgreSQL wire, transactions: `COMMIT` and `ROLLBACK` did not close cursors and portals,
   which kept their admission slot and pool memory (for good on a pooled connection) and
   answered `FETCH` after the `COMMIT`. The end of a transaction (`COMMIT`, `ROLLBACK`, a
@@ -131,7 +159,7 @@ versioning: [SemVer](https://semver.org/).
   now return the row the cursor stands on, as PostgreSQL does, and an unreadable count fails
   with `42601`. A `FETCH` the SQL parser does not read (`FETCH -1 FROM c`, `FETCH c`) waited
   60 s in the queue behind its own cursor's slot; it is answered at once (a move backward
-  fails with `55000`, `MOVE` with `0A000`). After a failed `FETCH` in a transaction block the
+  fails with `55000`). After a failed `FETCH` in a transaction block the
   next one returned no row and no error; the transaction is now aborted (`25P02` for anything
   but `COMMIT`/`ROLLBACK`). `FETCH` answers the tag `FETCH n` (it said `SELECT n`). A
   `BINARY` cursor (rows would be read as binary) fails with `0A000`; a `DECLARE` of an open

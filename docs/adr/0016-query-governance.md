@@ -80,7 +80,7 @@ Per protocol:
 | refusal | `QUERY_QUEUE_FULL` in the `POST` response itself | SQLSTATE `53400` (`configuration_limit_exceeded`) |
 | time limit | `EXCEEDED_TIME_LIMIT` | SQLSTATE `57014` (`query_canceled`) |
 | session limit | `query_max_run_time`, `query_max_execution_time` | `SET statement_timeout` (as run time) |
-| slot held | from admission to the end of execution (the last batch produced; ≤ 2 buffered batches, reserved, may still wait for the client) | until every row is sent or the stream is dropped |
+| slot held | from admission to the end of execution (the last batch produced; ≤ 2 buffered batches, reserved, may still wait for the client) | until every row is sent or the stream is dropped; one per connection: while a cursor or suspended portal holds it, the connection's other statements run in it |
 | not governed | `USE`, `SET/RESET SESSION`, `PREPARE`, `DEALLOCATE`, `kill_query` | `SET`, `SHOW <variable>`, transaction control, `DISCARD`, `DEALLOCATE`, `kill_query`; `FETCH` and `CLOSE` (governed as their cursor's `DECLARE`, which ends with its transaction unless `WITH HOLD`) |
 | client cancel | `DELETE` of the query's `nextUri` | cancel request (process id + secret key), while the connection executes a message: every governed statement of the connection, queued, planning or sending rows (open cursors and suspended portals too, as PostgreSQL's aborted transaction); between messages it does nothing, as in PostgreSQL; SQLSTATE `57014` |
 | `kill_query` errors | as the reference engine 431 (checked against it): `NOT_FOUND`, `NOT_SUPPORTED` (not running), `INVALID_ARGUMENTS`, `INVALID_PROCEDURE_ARGUMENT` (`NULL` id), `TYPE_MISMATCH`; plus `PERMISSION_DENIED` (not the owner) | `42704`, `55000`, `22023`, `22023`, `42804`; `42501` |
@@ -105,17 +105,41 @@ psycopg3) before sending the first, which would end the statement — slot
 freed, time limit over — while its rows wait in memory outside the pool;
 the replacement sends rows as the stream yields them.
 
+A connection holds one admission slot at most (amended after the second F6
+re-verification, ISS-031). While a statement of the connection holds one —
+an open cursor, a portal suspended by a row limit — the connection's next
+governed statements are registered, each with its own deadline, and run in
+that slot at once (`Governance::admit_alongside`, in the slot's resource
+group) instead of queueing behind it; the slot is given back when the last
+of them ends. Before, a `SELECT`, a second `DECLARE` or a query beside a
+JDBC fetch-size portal waited behind the connection's own cursor, which with
+a per-user limit of one lasted the whole queue timeout and ended in `57014`.
+The connection runs one statement at a time, so the slot still bounds what
+it executes at once, and memory stays bounded by the pool; the per-user and
+per-group limits count connections with work, not their cursors.
+
 A cursor (`DECLARE … CURSOR`, `crates/codelake-server/src/pg/cursor.rs`)
-is its `DECLARE`'s statement: `datafusion-postgres` keeps the cursor's
-stream in a portal of the connection, and the server governs that stream as
-it does a query's, so the `DECLARE` stays `RUNNING`, holding its slot, until
+is its `DECLARE`'s statement: the server's cursor hook plans the cursor's
+query as a query of the session (operands checked, ADR 0014; rows encoded
+with the session's format options) and keeps its stream in a portal of the
+connection, under the name PostgreSQL reads (folded to lower case unless
+quoted: `DECLARE Big` declares `big`; `datafusion-postgres` kept the name as
+written), and the server governs that stream as it does a query's, so the `DECLARE` stays `RUNNING`, holding its slot, until
 the cursor is read to the end, closed, stopped (cancel request,
 `kill_query`) or past its deadline — its time limit counts from the
 `DECLARE`, where PostgreSQL applies `statement_timeout` to each `FETCH`.
 `FETCH` and `CLOSE` take no slot: a `FETCH` queued behind its own cursor's
 slot would never run. `FETCH` is answered by the server, sending rows as the
 cursor yields them (`datafusion-postgres` collects the rows a `FETCH` asks
-for, all that are left for `FETCH ALL`, before sending the first). On the
+for, all that are left for `FETCH ALL`, before sending the first). A `FETCH`
+among other statements of a simple-protocol message must read its rows
+before the next statement runs: they are held in the memory pool until
+sent, and rows beyond what the pool gives fail the `FETCH` with `53200`
+(`out_of_memory`), fail its cursor's statement
+(`EXCEEDED_LOCAL_MEMORY_LIMIT`, slot and memory given back) and leave the
+cursor unreadable (`55000`), never held outside the pool (before, `FETCH
+ALL FROM c; CLOSE c` over 6 M rows took the server from 114 MB to 815 MB of
+RSS with a 256 MiB pool). On the
 extended protocol (psycopg3's server-side cursors) a `FETCH` is described
 with its cursor's columns, as PostgreSQL does (`datafusion-postgres`
 describes it with none: the client failed on the first row, after the
@@ -137,7 +161,13 @@ is read to the end, closed or stopped. A `DECLARE` without `WITH HOLD`
 outside a transaction block fails with `25P01` (a message of several
 statements is an implicit block, whose cursor closes with the message).
 Before, a cursor survived its transaction and a pooled connection kept its
-slot and memory for as long as it lived. A hook ahead of
+slot and memory for as long as it lived. `ABORT`, which the SQL parser does
+not read, is read as `ROLLBACK` on both protocols. `DISCARD ALL` closes
+every cursor and portal, held ones too, and resets `statement_timeout`, as a
+connection pool expects when it resets a connection; inside a transaction
+block (explicit, or a message of several statements) it fails with
+`25001`, as in PostgreSQL. `DISCARD PLANS`, `SEQUENCES` and `TEMP` have
+nothing to discard. A hook ahead of
 `datafusion-postgres`'s cursor and transaction hooks
 (`crates/codelake-server/src/pg/cursor.rs`) tracks the transaction block and
 the held cursors while a message's statements run, so a `COMMIT` among them
@@ -150,13 +180,19 @@ and `FETCH RELATIVE 0` return that row again without moving (none before the
 first row or after the end; `55000` for a `NO SCROLL` cursor on a row, as
 PostgreSQL); a move backward (`FETCH -1`, `PRIOR`, `BACKWARD n`) fails with
 `55000` ("cursor can only scan forward", PostgreSQL's answer for a `NO
-SCROLL` cursor); `ABSOLUTE`, `RELATIVE n`, `FIRST`, `LAST` and `MOVE` fail
-with `0A000`; a count that is not a whole number fails with `42601`, never
-"every row" (`datafusion-postgres` read `0` and unreadable counts as `ALL`).
-A `FETCH` the SQL parser does not read (a signed count, no count, no `FROM`)
-is read by the server with PostgreSQL's grammar, so it is answered at once
-instead of waiting for the slot its own cursor holds. Its tag is `FETCH n`
-on both protocols. In a failed transaction block only `COMMIT` (a rollback)
+SCROLL` cursor); `ABSOLUTE`, `RELATIVE n`, `FIRST` and `LAST` fail with
+`0A000`; a count that is not a whole number, or beyond PostgreSQL's `int4`
+(±2147483647), fails with `42601`, never "every row" (`datafusion-postgres`
+read `0` and unreadable counts as `ALL`). `MOVE` moves the cursor as the
+`FETCH` of the same direction would, dropping the rows it reads at once,
+and answers `MOVE n` as PostgreSQL does (`MOVE 0` answers 1 on a row, 0
+elsewhere, with no error on a `NO SCROLL` cursor). A `FETCH` or `MOVE` the
+SQL parser does not read (a signed count, no count, no `FROM`, every
+`MOVE`) is read by the server with PostgreSQL's grammar on both protocols —
+on the extended one its parser falls back to that reading, keeping the
+statement's text, which tells a `MOVE` from a `FETCH` — so it is answered
+at once (it failed at `Parse` with `XX000`). Its tag is `FETCH n` on both
+protocols. In a failed transaction block only `COMMIT` (a rollback)
 and `ROLLBACK` run; anything else fails with `25P02` before it reads a
 cursor or takes a slot (`datafusion-postgres` answered `25P01`, and a
 `FETCH` after a canceled one returned no row and no error). A cursor whose
@@ -222,6 +258,9 @@ set, they still apply.
   (`crates/codelake-server/tests/governance.rs`: time limits, queue and
   per-user limits, cancel request, `kill_query` across protocols, `DELETE`
   of a PostgreSQL query, pool back at zero after each; cursors across
-  transactions, slot and pool freed at their end; the cancel request on the
-  extended protocol; cursors differentially against PostgreSQL 17); the
+  transactions, slot and pool freed at their end; statements beside an
+  open cursor or suspended portal under a per-user limit of one; a `FETCH`
+  among other statements held in the pool; the cancel request on the
+  extended protocol; cursors differentially against PostgreSQL 17, message
+  by message on both protocols); the
   query id on the PostgreSQL span (`tests/e2e/otlp.rs`).

@@ -25,8 +25,8 @@
    with `55000` for the others. The engine answers it for every plan.
 5. Moves backward (`FETCH -1`, `PRIOR`, `BACKWARD n`) fail with `55000` ("cursor can only
    scan forward", PostgreSQL's answer for a `NO SCROLL` cursor; was `42000`).
-   `FETCH ABSOLUTE`, `RELATIVE n` (n ≠ 0), `FIRST`, `LAST` and `MOVE` fail with `0A000`:
-   not implemented. A `FETCH` the SQL parser does not read inside a message of several
+   `FETCH ABSOLUTE`, `RELATIVE n` (n ≠ 0), `FIRST` and `LAST` fail with `0A000`: not
+   implemented (`MOVE` was too; it is now implemented, ISS-031 item 4). A `FETCH` the SQL parser does not read inside a message of several
    statements fails with `42601` at once instead of queueing.
 6. A cursor whose stream failed (cancel request, `kill_query`, time limit) cannot be read
    again: `25P02` inside the aborted transaction block, `55000` ("portal cannot be run") for
