@@ -18,7 +18,11 @@ Canonical text of a value (see ``canonical_expr``):
 - NULL is ``~``, distinct from every non-NULL value (so NULL != '');
 - a string is itself, exactly: no trimming, no case folding;
 - integers and decimals by value: ``12.500000`` and ``12.5`` are equal;
-- timestamps as microseconds since the epoch, naive values read as UTC;
+- timestamps as nanoseconds since the epoch of the wall-clock value the
+  engines read: an ``INT64`` timestamp as stored (naive values read as UTC),
+  an ``INT96`` timestamp converted from the UTC instant it stores to the
+  Parquet time zone of the hive catalogs (``parquet_time_zone``), as both
+  engines read it. ``INT96`` without a configured zone is not compared;
 - binary as hex; dates, times, booleans and floats as their exact text.
 
 Every non-NULL value is length-prefixed and tagged with its class, so the
@@ -28,13 +32,20 @@ Rows that differ are shown only as hashes with their count on each side.
 Their values are printed only with ``show_rows`` (opt-in), because the
 tables hold production data.
 
-Declared types come from the table's metastore file on both sides (the
-file-metastore's JSON, ``dataColumns``); without it on either side, the
-Parquet types stand for them. A declared type that differs is a divergence
-unless an expected-difference rule documents it (``expected.py``); so is a
-table or column name that differs only by case. Parquet storage types that
-differ under equal declared types (INT96 vs INT64 timestamps) are reported,
-not a divergence: the values are compared by class either way.
+Schema, all of it a divergence when it differs (unless an expected-difference
+rule documents a declared type or a name's case, ``expected.py``):
+
+- the metastore file (``dataColumns``) present on one side only;
+- declared columns: names, order (``SELECT *`` and a positional ``UNION``
+  depend on it) and types, from the metastore file of both sides, or from
+  the Parquet schema of both sides when neither has one; a table without
+  data files is still compared on them;
+- Parquet columns and their type class;
+- Parquet storage of a column: the type DuckDB reads (a decimal's precision
+  and scale, a timestamp's unit) and a timestamp's encoding (``INT96``, or
+  ``INT64`` with its unit and UTC adjustment). Another reader of the files
+  sees another value when it differs, even when both engines do not;
+- a table or column name that differs only by case.
 
 Table directories are found without regard to case. Partitioned tables (files
 in subdirectories, or partition columns in the metastore) are refused, never
@@ -97,21 +108,25 @@ def type_class(duck_type: str) -> str:
     return "O"
 
 
-def _micros(col: str, duck_type: str) -> str:
-    """Microseconds since the epoch, floored, for any timestamp type."""
+def _nanos(col: str, duck_type: str, int96_zone: str | None = None) -> str:
+    """Nanoseconds since the epoch (HUGEINT) of the wall-clock value of any
+    timestamp type. ``int96_zone``: the column is ``INT96``, whose stored UTC
+    instant the engines read as the wall-clock time in that zone."""
     t = duck_type.upper()
+    if int96_zone is not None:
+        wall = f"timezone({quote_literal(int96_zone)}, timezone('UTC', CAST({col} AS TIMESTAMP)))"
+        return f"(CAST(epoch_us({wall}) AS HUGEINT) * 1000)"
     if t.startswith("TIMESTAMP_NS"):
-        ns = f"epoch_ns({col})"
-        return f"(({ns} - ((({ns} % 1000) + 1000) % 1000)) // 1000)"
+        return f"CAST(epoch_ns({col}) AS HUGEINT)"
     if t.startswith("TIMESTAMP_MS"):
-        return f"(epoch_ms({col}) * 1000)"
+        return f"(CAST(epoch_ms({col}) AS HUGEINT) * 1000000)"
     if t.startswith("TIMESTAMP_S"):
-        return f"(epoch({col})::BIGINT * 1000000)"
+        return f"(CAST(epoch({col})::BIGINT AS HUGEINT) * 1000000000)"
     # TIMESTAMP (microseconds) and TIMESTAMP WITH TIME ZONE (UTC instant).
-    return f"epoch_us({col})"
+    return f"(CAST(epoch_us({col}) AS HUGEINT) * 1000)"
 
 
-def canonical_expr(name: str, duck_type: str) -> str:
+def canonical_expr(name: str, duck_type: str, int96_zone: str | None = None) -> str:
     """SQL for the canonical text of one column; never NULL."""
     col = quote_ident(name)
     cls = type_class(duck_type)
@@ -127,7 +142,7 @@ def canonical_expr(name: str, duck_type: str) -> str:
     elif cls == "B":
         text = f"(CASE WHEN {col} THEN '1' ELSE '0' END)"
     elif cls == "T":
-        text = f"CAST({_micros(col, duck_type)} AS VARCHAR)"
+        text = f"CAST({_nanos(col, duck_type, int96_zone)} AS VARCHAR)"
     elif cls == "X":
         text = f"hex({col})"
     else:
@@ -277,15 +292,116 @@ def ignored(table: str, column: str, patterns: list[str]) -> bool:
     return False
 
 
-def _row_expr(columns: list[tuple[str, str]]) -> str:
+def timestamp_encoding(physical: str | None, logical: str | None, converted: str | None) -> str | None:
+    """How a Parquet column stores a timestamp: ``INT96``, or ``INT64 <unit>
+    <utc|local>``; None when the column is not a timestamp."""
+    if physical == "INT96":
+        return "INT96"
+    text = logical or ""
+    if text.startswith("TimestampType"):
+        if "NANOS=NanoSeconds" in text:
+            unit = "NANOS"
+        elif "MICROS=MicroSeconds" in text:
+            unit = "MICROS"
+        else:
+            unit = "MILLIS"
+        return f"{physical} {unit} {'utc' if 'isAdjustedToUTC=1' in text else 'local'}"
+    if converted in {"TIMESTAMP_MICROS", "TIMESTAMP_MILLIS"}:
+        # The legacy converted types are UTC-adjusted by definition.
+        return f"{physical} {converted.split('_', 1)[1]} utc"
+    return None
+
+
+@dataclasses.dataclass
+class FileGroup:
+    """Data files of one side that store the same columns as ``INT96``."""
+
+    files: list[str]
+    columns: dict[str, tuple[str, str]]
+    int96: frozenset[str]
+
+
+@dataclasses.dataclass
+class SideData:
+    """One side's data files: their columns (union by name), the files grouped
+    by ``INT96`` columns, and each timestamp column's storage encodings."""
+
+    files: list[str]
+    columns: dict[str, tuple[str, str]]
+    groups: list[FileGroup]
+    encodings: dict[str, set[str]]
+
+    def storage(self, column: str) -> str:
+        text = self.columns[column][1]
+        if self.encodings.get(column):
+            text += " [" + ", ".join(sorted(self.encodings[column])) + "]"
+        return text
+
+
+def read_side(con: duckdb.DuckDBPyConnection, files: list[str]) -> SideData:
+    """Columns and storage of a side's data files (at least one file)."""
+    columns = describe(con, files)
+    listed = ", ".join(quote_literal(f) for f in files)
+    rows = con.execute(
+        f"SELECT file_name, name, type, logical_type, converted_type FROM parquet_schema([{listed}])"
+    ).fetchall()
+    int96: dict[str, set[str]] = {f: set() for f in files}
+    encodings: dict[str, set[str]] = {}
+    for file_name, name, physical, logical, converted in rows:
+        if file_name not in int96:
+            raise TableError("the Parquet schema names a file that was not listed: not compared")
+        lower = (name or "").lower()
+        if lower not in columns:
+            continue
+        encoding = timestamp_encoding(physical, logical, converted)
+        if encoding is None:
+            continue
+        encodings.setdefault(lower, set()).add(encoding)
+        if encoding == "INT96":
+            int96[file_name].add(lower)
+    by_set: dict[frozenset[str], list[str]] = {}
+    for f in files:
+        by_set.setdefault(frozenset(int96[f]), []).append(f)
+    if len(by_set) == 1:
+        (only, group_files), = by_set.items()
+        groups = [FileGroup(group_files, columns, only)]
+    else:
+        groups = [FileGroup(fs, describe(con, fs), key) for key, fs in by_set.items()]
+    return SideData(files, columns, groups, encodings)
+
+
+def canonical_relation(side: SideData, columns: list[str], zone: str) -> str:
+    """SQL of the side's rows as canonical texts ``k0..kn`` of ``columns``
+    (lower-case names), one SELECT per file group."""
+    parts = []
+    for group in side.groups:
+        items = []
+        for i, column in enumerate(columns):
+            if column not in group.columns:
+                items.append(f"'~' AS k{i}")
+                continue
+            name, duck_type = group.columns[column]
+            int96_zone = None
+            if column in group.int96 and type_class(duck_type) == "T":
+                if not zone:
+                    raise TableError(
+                        f"column {column} is stored as INT96: its value depends on the hive catalogs' "
+                        "Parquet time zone, which is not configured (SHADOW_PARQUET_TIME_ZONE, "
+                        "--parquet-time-zone): not compared"
+                    )
+                int96_zone = zone
+            items.append(f"{canonical_expr(name, duck_type, int96_zone)} AS k{i}")
+        if not items:
+            items.append("1 AS k_")
+        parts.append(f"SELECT {', '.join(items)} FROM {_relation(group.files)}")
+    return " UNION ALL ".join(parts)
+
+
+def _row_expr(columns: list[str]) -> str:
     if not columns:
         return "''"
-    parts = [f"{quote_literal(name + '=')} || {canonical_expr(name, t)}" for name, t in columns]
+    parts = [f"{quote_literal(name + '=')} || k{i}" for i, name in enumerate(columns)]
     return " || '|' || ".join(parts)
-
-
-def _column_list(names: list[str], types: dict[str, str]) -> list[tuple[str, str]]:
-    return [(n, types[n]) for n in names]
 
 
 @dataclasses.dataclass
@@ -296,16 +412,14 @@ class SideStats:
     nulls: dict[str, int]
 
 
-def side_stats(
-    con: duckdb.DuckDBPyConnection, files: list[str], columns: list[tuple[str, str]]
-) -> SideStats:
+def side_stats(con: duckdb.DuckDBPyConnection, relation: str, columns: list[str]) -> SideStats:
     row = _row_expr(columns)
     col_sums = []
     null_counts = []
-    for i, (name, t) in enumerate(columns):
-        piece = f"{quote_literal(name + '=')} || {canonical_expr(name, t)}"
+    for i, name in enumerate(columns):
+        piece = f"{quote_literal(name + '=')} || k{i}"
         col_sums.append(f"sum(md5_number_lower({piece}))::VARCHAR AS c{i}")
-        null_counts.append(f"count(*) FILTER (WHERE {quote_ident(name)} IS NULL) AS n{i}")
+        null_counts.append(f"count(*) FILTER (WHERE k{i} = '~') AS n{i}")
     select = ", ".join(
         [
             "count(*) AS n",
@@ -315,7 +429,7 @@ def side_stats(
         + col_sums
         + null_counts
     )
-    result = con.execute(f"SELECT {select} FROM {_relation(files)}").fetchone()
+    result = con.execute(f"SELECT {select} FROM ({relation}) AS r").fetchone()
     assert result is not None
     n, lo, hi = result[0], result[1], result[2]
     k = len(columns)
@@ -324,31 +438,29 @@ def side_stats(
     return SideStats(
         rows=int(n),
         checksum=f"{lo}:{hi}",
-        columns={name: str(s or 0) for (name, _), s in zip(columns, sums)},
-        nulls={name: int(c) for (name, _), c in zip(columns, nulls)},
+        columns={name: str(s or 0) for name, s in zip(columns, sums)},
+        nulls={name: int(c) for name, c in zip(columns, nulls)},
     )
 
 
 def differing_rows(
     con: duckdb.DuckDBPyConnection,
-    ref_files: list[str],
-    cand_files: list[str],
-    columns_ref: list[tuple[str, str]],
-    columns_cand: list[tuple[str, str]],
+    ref_relation: str,
+    cand_relation: str,
+    columns: list[str],
     limit: int,
     show_rows: bool,
 ) -> tuple[int, list[dict[str, Any]]]:
     """Hashes whose row count differs between sides: (total, sample)."""
-    ref_row = _row_expr(columns_ref)
-    cand_row = _row_expr(columns_cand)
+    row = _row_expr(columns)
     keep = ", any_value(r) AS r" if show_rows else ""
     sql = f"""
         WITH ref AS (
             SELECT md5(r) AS h, count(*) AS n{keep}
-            FROM (SELECT {ref_row} AS r FROM {_relation(ref_files)}) GROUP BY 1
+            FROM (SELECT {row} AS r FROM ({ref_relation}) AS x) GROUP BY 1
         ), cand AS (
             SELECT md5(r) AS h, count(*) AS n{keep}
-            FROM (SELECT {cand_row} AS r FROM {_relation(cand_files)}) GROUP BY 1
+            FROM (SELECT {row} AS r FROM ({cand_relation}) AS x) GROUP BY 1
         ), diff AS (
             SELECT coalesce(ref.h, cand.h) AS h,
                    coalesce(ref.n, 0) AS ref_n,
@@ -376,6 +488,9 @@ class Options:
     sample: int = 10
     show_rows: bool = False
     expected: list[expected_rules.Rule] = dataclasses.field(default_factory=list)
+    # IANA zone the hive catalogs of both engines convert INT96 timestamps
+    # with (``parquet_time_zone`` / ``hive.parquet.time-zone``).
+    parquet_time_zone: str = ""
 
 
 def _classify(
@@ -449,84 +564,120 @@ def _compare_table(
         item = {"object": "table", "reference": ref_table, "candidate": cand_table}
         _classify(options, "name_case", name, "", item, expected, name_case)
 
-    if not ref_files or not cand_files:
-        # A table without data files has no Parquet schema to read; compare
-        # the row counts only.
-        ref_rows = 0 if not ref_files else side_stats(con, ref_files, []).rows
-        cand_rows = 0 if not cand_files else side_stats(con, cand_files, []).rows
-        out["rows"] = {"reference": ref_rows, "candidate": cand_rows}
-        if ref_rows != cand_rows:
-            reasons.append("row_count")
-        return _finish(out, reasons, expected, name_case)
+    # A metastore file on one side only: the declared schema of the other
+    # side is unknown, never replaced by its Parquet types.
+    if (ref_declared is None) != (cand_declared is None):
+        reasons.append("metastore")
+        out["metastore"] = {"reference": ref_declared is not None, "candidate": cand_declared is not None}
 
-    ref_parquet = describe(con, ref_files)
-    cand_parquet = describe(con, cand_files)
-    ref_types = {c: t for c, (_, t) in ref_parquet.items()}
-    cand_types = {c: t for c, (_, t) in cand_parquet.items()}
-    only_ref = sorted(set(ref_types) - set(cand_types))
-    only_cand = sorted(set(cand_types) - set(ref_types))
-    common = sorted(set(ref_types) & set(cand_types))
-    skipped = [c for c in common if ignored(name, c, options.ignore_columns)]
-    compared = [c for c in common if c not in skipped]
-    class_mismatch = [c for c in compared if type_class(ref_types[c]) != type_class(cand_types[c])]
+    ref_side = read_side(con, ref_files) if ref_files else None
+    cand_side = read_side(con, cand_files) if cand_files else None
 
-    # Declared types and names: the metastore of both sides, or else the
-    # Parquet schema of both sides.
+    schema_out: dict[str, Any] = {}
+    class_mismatch: list[str] = []
+    compared: list[str] = []
+    skipped: list[str] = []
+    if ref_side is not None and cand_side is not None:
+        ref_types = {c: t for c, (_, t) in ref_side.columns.items()}
+        cand_types = {c: t for c, (_, t) in cand_side.columns.items()}
+        only_ref = [c for c in ref_types if c not in cand_types]
+        only_cand = [c for c in cand_types if c not in ref_types]
+        common = [c for c in ref_types if c in cand_types]
+        skipped = [c for c in common if ignored(name, c, options.ignore_columns)]
+        compared = [c for c in common if c not in skipped]
+        class_mismatch = [c for c in compared if type_class(ref_types[c]) != type_class(cand_types[c])]
+        if only_ref or only_cand:
+            reasons.append("columns")
+        if class_mismatch:
+            reasons.append("column_types")
+        schema_out.update(
+            {
+                "only_reference": sorted(only_ref),
+                "only_candidate": sorted(only_cand),
+                "type_class_mismatch": [
+                    {"column": c, "reference": ref_types[c], "candidate": cand_types[c]} for c in class_mismatch
+                ],
+            }
+        )
+
+    # Declared columns: the metastore of both sides, else (no metastore on
+    # either side) the Parquet schema of both sides.
     from_metastore = ref_declared is not None and cand_declared is not None
     if from_metastore:
         ref_decl, cand_decl = ref_declared, cand_declared
+    elif ref_side is not None and cand_side is not None:
+        ref_decl, cand_decl = ref_side.columns, cand_side.columns
     else:
-        ref_decl, cand_decl = ref_parquet, cand_parquet
+        ref_decl = cand_decl = None
     type_differences: list[dict[str, Any]] = []
-    for c in common:
-        if c not in ref_decl or c not in cand_decl:
-            continue
-        (ref_name, ref_type), (cand_name, cand_type) = ref_decl[c], cand_decl[c]
-        if ref_name != cand_name:
-            item = {"object": "column", "column": c, "reference": ref_name, "candidate": cand_name}
-            _classify(options, "name_case", name, c, item, expected, name_case)
-        if c in skipped or c in class_mismatch:
-            continue
-        if expected_rules.normalize_type(ref_type) != expected_rules.normalize_type(cand_type):
-            item = {"column": c, "reference": ref_type, "candidate": cand_type}
-            _classify(options, "declared_type", name, c, item, expected, type_differences)
-    physical = (
-        [
-            {"column": c, "reference": ref_types[c], "candidate": cand_types[c]}
-            for c in compared
-            if ref_types[c] != cand_types[c] and c not in class_mismatch
-        ]
-        if from_metastore
-        else []
+    if ref_decl is not None and cand_decl is not None:
+        schema_out["declared_types_from"] = "metastore" if from_metastore else "parquet"
+        decl_only_ref = [c for c in ref_decl if c not in cand_decl]
+        decl_only_cand = [c for c in cand_decl if c not in ref_decl]
+        if decl_only_ref or decl_only_cand:
+            reasons.append("columns")
+        if from_metastore:
+            schema_out["declared_only_reference"] = sorted(decl_only_ref)
+            schema_out["declared_only_candidate"] = sorted(decl_only_cand)
+        ref_order = [c for c in ref_decl if c in cand_decl]
+        cand_order = [c for c in cand_decl if c in ref_decl]
+        if ref_order != cand_order:
+            reasons.append("column_order")
+            schema_out["column_order"] = {"reference": ref_order, "candidate": cand_order}
+        for c in ref_order:
+            (ref_name, ref_type), (cand_name, cand_type) = ref_decl[c], cand_decl[c]
+            if ref_name != cand_name:
+                item = {"object": "column", "column": c, "reference": ref_name, "candidate": cand_name}
+                _classify(options, "name_case", name, c, item, expected, name_case)
+            if c in class_mismatch or ignored(name, c, options.ignore_columns):
+                continue
+            if expected_rules.normalize_type(ref_type) != expected_rules.normalize_type(cand_type):
+                item = {"column": c, "reference": ref_type, "candidate": cand_type}
+                _classify(options, "declared_type", name, c, item, expected, type_differences)
+        if type_differences:
+            reasons.append("declared_types")
+    schema_out["type_differences"] = type_differences
+
+    if ref_side is None or cand_side is None:
+        # A side without data files has no Parquet schema: its rows are
+        # counted, its declared columns compared above.
+        ref_rows = side_stats(con, canonical_relation(ref_side, [], ""), []).rows if ref_side else 0
+        cand_rows = side_stats(con, canonical_relation(cand_side, [], ""), []).rows if cand_side else 0
+        out["rows"] = {"reference": ref_rows, "candidate": cand_rows}
+        if ref_rows != cand_rows:
+            reasons.append("row_count")
+        out["schema"] = schema_out
+        return _finish(out, reasons, expected, name_case)
+
+    differing_declared = {d["column"] for d in type_differences} if not from_metastore else set()
+    storage = [
+        {"column": c, "reference": ref_side.storage(c), "candidate": cand_side.storage(c)}
+        for c in compared
+        if c not in class_mismatch
+        and c not in differing_declared
+        and ref_side.storage(c) != cand_side.storage(c)
+    ]
+    if storage:
+        reasons.append("storage_types")
+    schema_out.update(
+        {
+            "storage_type_differences": storage,
+            "ignored_columns": skipped,
+            "compared_columns": len(compared),
+        }
     )
-    out["schema"] = {
-        "declared_types_from": "metastore" if from_metastore else "parquet",
-        "only_reference": only_ref,
-        "only_candidate": only_cand,
-        "type_class_mismatch": [
-            {"column": c, "reference": ref_types[c], "candidate": cand_types[c]} for c in class_mismatch
-        ],
-        "type_differences": type_differences,
-        "storage_type_differences": physical,
-        "ignored_columns": skipped,
-        "compared_columns": len(compared),
-    }
-    ref_cols = _column_list(compared, ref_types)
-    cand_cols = _column_list(compared, cand_types)
-    ref = side_stats(con, ref_files, ref_cols)
-    cand = side_stats(con, cand_files, cand_cols)
+    out["schema"] = schema_out
+    zone = options.parquet_time_zone
+    ref_relation = canonical_relation(ref_side, compared, zone)
+    cand_relation = canonical_relation(cand_side, compared, zone)
+    ref = side_stats(con, ref_relation, compared)
+    cand = side_stats(con, cand_relation, compared)
     out["rows"] = {"reference": ref.rows, "candidate": cand.rows}
     out["checksum"] = {"reference": ref.checksum, "candidate": cand.checksum}
     if ref.rows != cand.rows:
         reasons.append("row_count")
     if ref.checksum != cand.checksum:
         reasons.append("checksum")
-    if only_ref or only_cand:
-        reasons.append("columns")
-    if class_mismatch:
-        reasons.append("column_types")
-    if type_differences:
-        reasons.append("declared_types")
     diff_columns = [c for c in compared if ref.columns[c] != cand.columns[c]]
     out["columns_differing"] = [
         {
@@ -537,7 +688,7 @@ def _compare_table(
     ]
     if ref.checksum != cand.checksum:
         total, sample = differing_rows(
-            con, ref_files, cand_files, ref_cols, cand_cols, options.sample, options.show_rows
+            con, ref_relation, cand_relation, compared, options.sample, options.show_rows
         )
         out["differing_row_hashes"] = total
         out["sample"] = sample
@@ -552,6 +703,7 @@ def _finish(
 ) -> dict[str, Any]:
     if name_case:
         reasons.append("name_case")
+    reasons = list(dict.fromkeys(reasons))
     out["name_case_differences"] = name_case
     out["expected_differences"] = expected
     out["status"] = "divergent" if reasons else "equal"
@@ -568,6 +720,8 @@ def connect(memory_limit: str, temp_dir: str, s3: dict[str, str] | None = None) 
     if extensions:
         settings["extension_directory"] = extensions
     con = duckdb.connect(database=":memory:", config=settings)
+    # Canonical texts never depend on the session zone; pin it anyway.
+    con.execute("SET TimeZone = 'UTC'")
     if s3 is not None:
         con.execute("LOAD httpfs")
         options = ["TYPE S3"]

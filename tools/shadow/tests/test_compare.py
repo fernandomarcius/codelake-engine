@@ -60,6 +60,21 @@ class Warehouses:
             )
             os.replace(path + ".p", path)
 
+    def place(self, side: str, table: str, sources: list[str], declared: list[tuple[str, str]] | None = None) -> None:
+        """Copies Parquet files as they are (e.g. written by another engine)."""
+        schema, name = table.split(".")
+        directory = os.path.join(self.ref if side == "ref" else self.cand, schema, name)
+        os.makedirs(directory, exist_ok=True)
+        metadata = {} if declared is None else {
+            "dataColumns": [{"name": n, "type": t, "properties": {}} for n, t in declared],
+            "partitionColumns": [],
+        }
+        with open(os.path.join(directory, compare.METASTORE_FILE), "w") as f:
+            json.dump(metadata, f)
+        for index, source in enumerate(sources):
+            with open(source, "rb") as src, open(os.path.join(directory, f"part-{index}"), "wb") as dst:
+                dst.write(src.read())
+
     def compare(self, table: str = "s.t", **options) -> dict:
         if isinstance(options.get("expected"), dict):
             options["expected"] = expected.parse(options["expected"])
@@ -103,8 +118,9 @@ class CompareTests(unittest.TestCase):
     DECLARED = [("id", "int"), ("note", "varchar(10)"), ("amount", "decimal(18,6)"),
                 ("created_at", "timestamp"), ("code", "binary")]
 
-    def test_decimal_by_value_and_timestamp_by_microsecond(self) -> None:
-        # Same declared types, other Parquet storage: equal, storage reported.
+    def test_equal_values_in_another_storage_are_a_storage_divergence(self) -> None:
+        # Same declared types and values, other Parquet storage (decimal
+        # width, timestamp unit): values equal, the storage diverges.
         self.w.write("ref", "s.t", BASE, declared=self.DECLARED)
         self.w.write(
             "cand",
@@ -114,7 +130,9 @@ class CompareTests(unittest.TestCase):
             declared=self.DECLARED,
         )
         result = self.w.compare()
-        self.assertEqual(result["status"], "equal", result)
+        self.assertEqual(result["status"], "divergent", result)
+        self.assertEqual(result["reasons"], ["storage_types"], result)
+        self.assertEqual(result["checksum"]["reference"], result["checksum"]["candidate"])
         self.assertEqual(result["schema"]["declared_types_from"], "metastore")
         self.assertEqual(
             sorted(d["column"] for d in result["schema"]["storage_type_differences"]), ["amount", "created_at"]

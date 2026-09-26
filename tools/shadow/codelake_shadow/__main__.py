@@ -21,7 +21,7 @@ import time
 from typing import Any
 
 from . import compare, dbt, expected, report
-from .config import Config, ConfigError, expected_path, load
+from .config import Config, ConfigError, expected_path, load, time_zone
 from .rss import Meter, MeterError, Sampler
 
 EXIT_EQUAL, EXIT_DIVERGENT, EXIT_CONFIG, EXIT_HARNESS = 0, 1, 2, 3
@@ -125,7 +125,9 @@ def run_cycle(config: Config, number: int, project: str) -> dict[str, Any]:
         merged = {**cand_status, **ref_status}
         tables, skipped = dbt.output_tables(runs["reference"].artifact("manifest.json"), merged, config.output_catalogs)
     cycle["skipped_models"] = skipped
-    options = compare.Options(config.ignore_columns, config.sample, config.show_rows, config.expected)
+    options = compare.Options(
+        config.ignore_columns, config.sample, config.show_rows, config.expected, config.parquet_time_zone
+    )
     cycle["expected_differences_file"] = config.expected_differences or None
     con = connection(config, work)
     results = []
@@ -215,6 +217,11 @@ def cmd_compare(argv: list[str]) -> int:
     parser.add_argument("--ignore-column", action="append", default=[])
     parser.add_argument("--sample", type=int, default=10)
     parser.add_argument("--show-rows", action="store_true")
+    parser.add_argument(
+        "--parquet-time-zone",
+        default="",
+        help="IANA zone the hive catalogs convert INT96 timestamps with (needed to compare INT96 columns)",
+    )
     parser.add_argument("--memory", default="2GB")
     parser.add_argument("--work", default="/tmp/codelake-shadow")
     parser.add_argument("--out", help="write the JSON result here")
@@ -225,12 +232,13 @@ def cmd_compare(argv: list[str]) -> int:
     )
     args = parser.parse_args(argv)
     rules = expected.load(expected_path(args.expected))
-    options = compare.Options(args.ignore_column, args.sample, args.show_rows, rules)
+    zone = time_zone(args.parquet_time_zone, "--parquet-time-zone")
+    options = compare.Options(args.ignore_column, args.sample, args.show_rows, rules, zone)
     con = compare.connect(args.memory, os.path.join(args.work, "duckdb-tmp"))
     results = []
     try:
         for name in args.table:
-            if "." not in name:
+            if len(name.split(".")) != 2 or not all(name.split(".")):
                 print(f"--table {name}: expected schema.table", file=sys.stderr)
                 return EXIT_CONFIG
             schema, table = name.split(".", 1)

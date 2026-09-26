@@ -3,11 +3,15 @@
     python -m codelake_shadow.mutate --from /wh/candidate --to /out/mut/x \\
         --table schema.table --mutation <name>
 
-The table's rows are rewritten as one Parquet file by DuckDB, so every
-mutation also changes the physical layout (file count, INT96 timestamps become
-INT64, decimal encodings change): the ``neutral`` mutation checks that layout
-alone is never reported as a divergence. Every other mutation changes exactly
-one row (or adds/removes one) and must be detected.
+The table's rows are rewritten as one Parquet file by DuckDB, which cannot
+write ``INT96``: an ``INT96`` timestamp is written as ``INT64`` holding the
+wall-clock value the engines read (converted with ``--parquet-time-zone``),
+so values stay the same and only the storage changes. ``neutral`` checks that
+such a rewrite is reported as a storage difference and nothing else;
+``int96_as_stored`` writes the stored UTC instant instead, which every engine
+reads shifted by the zone's offset, and must be a value divergence. Every
+other mutation changes exactly one row (or adds/removes one) and must be
+detected on that column.
 """
 
 from __future__ import annotations
@@ -20,12 +24,13 @@ import sys
 
 import duckdb
 
-from .compare import METASTORE_FILE, Location, data_files, find_table, quote_ident
+from .compare import METASTORE_FILE, Location, data_files, find_table, quote_ident, quote_literal, read_side
 
 # name -> (filter picking the row to change, SQL producing the changed table
 # from `t` with its `__rn` row number and `__pick` = the chosen row).
 MUTATIONS = {
     "neutral": "SELECT * EXCLUDE (__rn) FROM t",
+    "int96_as_stored": "SELECT * EXCLUDE (__rn) FROM t",
     "extra_row": "SELECT * EXCLUDE (__rn) FROM t UNION ALL SELECT * EXCLUDE (__rn) FROM t WHERE __rn = __pick",
     "missing_row": "SELECT * EXCLUDE (__rn) FROM t WHERE __rn <> __pick",
     "decimal": "SELECT * EXCLUDE (__rn) REPLACE (CASE WHEN __rn = __pick THEN {col} + 0.000001 ELSE {col} END AS {col}) FROM t",
@@ -46,7 +51,7 @@ PICK = {
 }
 
 
-def mutate(source: str, dest: str, table: str, mutation: str, column: str | None) -> None:
+def mutate(source: str, dest: str, table: str, mutation: str, column: str | None, zone: str = "") -> None:
     schema, name = table.split(".", 1)
     src = find_table(duckdb.connect(), Location(source), schema, name)
     files = data_files(duckdb.connect(), src) if src is not None else []
@@ -75,9 +80,23 @@ def mutate(source: str, dest: str, table: str, mutation: str, column: str | None
         if os.path.exists(crc):
             os.remove(crc)
     con = duckdb.connect()
+    con.execute("SET TimeZone = 'UTC'")
     listed = ", ".join("'" + f.replace("'", "''") + "'" for f in files)
+    side = read_side(con, files)
+    int96 = sorted({c for g in side.groups for c in g.int96})
+    replace = ""
+    if int96 and mutation != "int96_as_stored":
+        if not zone:
+            raise SystemExit(f"{table}: INT96 columns {', '.join(int96)} need --parquet-time-zone")
+        items = []
+        for c in int96:
+            col_name = quote_ident(side.columns[c][0])
+            items.append(
+                f"timezone({quote_literal(zone)}, timezone('UTC', CAST({col_name} AS TIMESTAMP))) AS {col_name}"
+            )
+        replace = f" REPLACE ({', '.join(items)})"
     con.execute(
-        f"CREATE TABLE t AS SELECT *, row_number() OVER () AS __rn "
+        f"CREATE TABLE t AS SELECT *{replace}, row_number() OVER () AS __rn "
         f"FROM read_parquet([{listed}], union_by_name = true)"
     )
     col = quote_ident(column) if column else ""
@@ -100,10 +119,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--table", required=True)
     parser.add_argument("--mutation", required=True, choices=sorted(MUTATIONS))
     parser.add_argument("--column")
+    parser.add_argument("--parquet-time-zone", default="")
     args = parser.parse_args(argv)
     if ("{col}" in MUTATIONS[args.mutation] or args.mutation == "declared_type") and not args.column:
         parser.error(f"--mutation {args.mutation} needs --column")
-    mutate(args.source, args.dest, args.table, args.mutation, args.column)
+    mutate(args.source, args.dest, args.table, args.mutation, args.column, args.parquet_time_zone)
     return 0
 
 

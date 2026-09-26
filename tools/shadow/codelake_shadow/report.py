@@ -51,9 +51,20 @@ def cycle_markdown(cycle: dict[str, Any]) -> str:
     for t in divergent:
         lines += ["", f"### `{t['table']}`", ""]
         schema = t.get("schema", {})
-        for key in ("only_reference", "only_candidate"):
+        if t.get("metastore"):
+            sides = [side for side, present in t["metastore"].items() if not present]
+            lines.append(f"- Metastore file missing on the {', '.join(sides)} side: declared schema unknown there")
+        for key in ("only_reference", "only_candidate", "declared_only_reference", "declared_only_candidate"):
             if schema.get(key):
                 lines.append(f"- Columns {key.replace('_', ' ')}: {', '.join(schema[key])}")
+        if schema.get("column_order"):
+            order = schema["column_order"]
+            lines.append(
+                f"- Column order differs: reference {', '.join(order['reference'])}; "
+                f"candidate {', '.join(order['candidate'])}"
+            )
+        for m in schema.get("storage_type_differences", []):
+            lines.append(f"- Parquet storage differs: `{m['column']}` {m['reference']} vs {m['candidate']}")
         for m in schema.get("type_class_mismatch", []):
             lines.append(f"- Type class differs: `{m['column']}` {m['reference']} vs {m['candidate']}")
         for m in schema.get("type_differences", []):
@@ -95,13 +106,6 @@ def cycle_markdown(cycle: dict[str, Any]) -> str:
         lines.append("")
         for rule, reason in sorted(reasons.items()):
             lines.append(f"- {rule}: {reason}")
-    warnings = [
-        (t["table"], d) for t in cycle["tables"] for d in t.get("schema", {}).get("storage_type_differences", [])
-    ]
-    if warnings:
-        lines += ["", "## Storage type differences under equal declared types (values compared by class, not a divergence)", ""]
-        for table, d in warnings:
-            lines.append(f"- `{table}.{d['column']}`: {d['reference']} vs {d['candidate']}")
     return "\n".join(lines) + "\n"
 
 

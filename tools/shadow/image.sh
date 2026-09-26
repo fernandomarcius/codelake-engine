@@ -4,7 +4,7 @@
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -n "${CODELAKE_SHADOW_IMAGE:-}" ]; then echo "$CODELAKE_SHADOW_IMAGE"; exit 0; fi
-TAG="$(cat "$DIR/Dockerfile" "$DIR/requirements.txt" "$DIR"/codelake_shadow/*.py "$DIR"/codelake_shadow/*.json "$DIR"/tests/*.py \
+TAG="$(cat "$DIR/Dockerfile" "$DIR/requirements.txt" "$DIR"/codelake_shadow/*.py "$DIR"/codelake_shadow/*.json "$DIR"/tests/*.py "$DIR"/tests/data/* \
   | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-12)"
 IMAGE="codelake-shadow:$TAG"
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then

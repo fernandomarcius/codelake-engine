@@ -11,9 +11,11 @@
 #    between them: both must report zero divergences.
 # 3. Mutations injected into a copy of the candidate's output (a row more, a
 #    row less, a decimal, a timestamp +3h, a trailing space, NULL -> '', a
-#    declared type): each must be detected, on the right column; a
-#    layout-only rewrite must not, and a documented type difference is
-#    reported as expected only with the rule file.
+#    declared type, INT96 copied as the stored instant): each must be
+#    detected, on the right column. The copy is written by DuckDB, which
+#    cannot write INT96: every mutation also shows the timestamps' storage
+#    difference, and a rewrite that keeps the values shows nothing else. A
+#    documented type difference is reported as expected only with a rule.
 #
 # Heavy (three engines): run it under the lock, from the repository root:
 #   CODELAKE_TARGET_VOLUME=… /path/to/heavy.sh tools/shadow/selftest.sh
@@ -196,6 +198,7 @@ SHADOW_REFERENCE_RSS=container:$REFERENCE
 SHADOW_CANDIDATE_RSS=container:$CODELAKE
 SHADOW_CUTOFF_SQL=SELECT max(start_lsn) FROM src.cdc.lsn_time_mapping
 SHADOW_IGNORE_COLUMNS=shadow_pilot.orders.id,shadow_pilot.orders.loaded_at
+SHADOW_PARQUET_TIME_ZONE=America/Sao_Paulo
 SHADOW_DOCKER_NETWORK=$NET
 EOF
 # Strict: the fixture exactly as the acceptance pipelines write it, without
@@ -248,30 +251,36 @@ mutation() { # name column expected-exit expected-text [compare args]
   shift 4
   local col=(); [ -n "$column" ] && col=(--column "$column")
   "$ROOT/scripts/shadow-run.sh" "$CONFIG" mutate --from "$WORK/candidate-wh" --to "$WORK/out/mutations/$name" \
-    --table "$TABLE" --mutation "$name" ${col[@]+"${col[@]}"} 2>&1 | tail -n 1 >&2
+    --table "$TABLE" --mutation "$name" --parquet-time-zone America/Sao_Paulo ${col[@]+"${col[@]}"} 2>&1 | tail -n 1 >&2
   set +e
   "$ROOT/scripts/shadow-run.sh" "$CONFIG" compare --reference-warehouse "$WORK/reference-wh" \
     --candidate-warehouse "$WORK/out/mutations/$name" --table "$TABLE" \
-    --ignore-column "$TABLE.id" --ignore-column "$TABLE.loaded_at" \
+    --ignore-column "$TABLE.id" --ignore-column "$TABLE.loaded_at" --parquet-time-zone America/Sao_Paulo \
     --work "$WORK/out/mutations/tmp" --out "$WORK/out/mutations/$name.json" "$@" > "$WORK/out/mutations/$name.txt"
   status=$?
   set -e
   cat "$WORK/out/mutations/$name.txt" >&2
   [ "$status" = "$expect" ] || fail "mutation $name: exit $status, expected $expect"
-  grep -qF -- "$text" "$WORK/out/mutations/$name.txt" || fail "mutation $name: output lacks '$text'"
+  grep -qxF -- "$text" "$WORK/out/mutations/$name.txt" || fail "mutation $name: output lacks '$text'"
   pass "mutation $name -> exit $status, '$text'"
 }
-mutation neutral        ""           0 "$TABLE: equal"
-mutation extra_row      ""           1 "$TABLE: divergent (row_count, checksum)"
-mutation missing_row    ""           1 "$TABLE: divergent (row_count, checksum)"
-mutation decimal        amount       1 "$TABLE: divergent (checksum) columns: amount"
-mutation timestamp_3h   created_at   1 "$TABLE: divergent (checksum) columns: created_at"
-mutation trailing_space note         1 "$TABLE: divergent (checksum) columns: note"
-mutation null_to_empty  note         1 "$TABLE: divergent (checksum) columns: note"
+# INT96 timestamps of the copy are INT64: a storage divergence, values equal.
+TS_STORAGE="storage_types"
+mutation neutral         ""         1 "$TABLE: divergent ($TS_STORAGE)"
+# The stored UTC instant written as INT64: every engine reads it 3h later.
+mutation int96_as_stored ""         1 "$TABLE: divergent ($TS_STORAGE, checksum) columns: changed_at, recorded_at, created_at"
+# A row more or less changes every compared column's checksum.
+ALL="__start_lsn, __seqval, operation, deleted, changed_at, recorded_at, order_key, order_id, status, amount, created_at, note, code, qty, seqval_number"
+mutation extra_row       ""         1 "$TABLE: divergent ($TS_STORAGE, row_count, checksum) columns: $ALL"
+mutation missing_row     ""         1 "$TABLE: divergent ($TS_STORAGE, row_count, checksum) columns: $ALL"
+mutation decimal         amount     1 "$TABLE: divergent ($TS_STORAGE, checksum) columns: amount"
+mutation timestamp_3h    created_at 1 "$TABLE: divergent ($TS_STORAGE, checksum) columns: created_at"
+mutation trailing_space  note       1 "$TABLE: divergent ($TS_STORAGE, checksum) columns: note"
+mutation null_to_empty   note       1 "$TABLE: divergent ($TS_STORAGE, checksum) columns: note"
 # A declared type that differs (varchar(20) -> string) diverges; the shipped
 # rule file classifies it as ISS-019, expected and documented.
-mutation declared_type  status       1 "$TABLE: divergent (declared_types)"
-mutation declared_type  status       0 "$TABLE: equal expected: ISS-019" --expected default
+mutation declared_type   status     1 "$TABLE: divergent (declared_types, $TS_STORAGE)"
+mutation declared_type   status     1 "$TABLE: divergent ($TS_STORAGE) expected: ISS-019" --expected default
 
 log "summary"
 printf '  %s\n' "${CHECKS[@]}" >&2

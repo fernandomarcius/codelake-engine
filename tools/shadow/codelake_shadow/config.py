@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import zoneinfo
 from typing import Mapping
 from urllib.parse import urlparse
 
@@ -81,6 +82,7 @@ class Config:
     s3_path_style: bool = False
     expected_differences: str = ""
     expected: list[expected.Rule] = dataclasses.field(default_factory=list)
+    parquet_time_zone: str = ""
 
 
 def _bool(value: str, name: str) -> bool:
@@ -119,6 +121,18 @@ def _warehouse(value: str, name: str) -> str:
     if not (value.startswith("/") or value.startswith("s3://")):
         raise ConfigError(f"{name} must be an absolute path or an s3:// URL")
     return value.rstrip("/") or "/"
+
+
+def time_zone(value: str, name: str) -> str:
+    """An IANA zone name (``America/Sao_Paulo``, ``UTC``), or empty."""
+    zone = value.strip()
+    if not zone:
+        return ""
+    try:
+        zoneinfo.ZoneInfo(zone)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+        raise ConfigError(f"{name} must be an IANA time zone name (e.g. America/Sao_Paulo or UTC)") from None
+    return zone
 
 
 def expected_path(value: str) -> str:
@@ -218,6 +232,7 @@ def load(env: Mapping[str, str] | None = None) -> Config:
         s3_region=get("SHADOW_S3_REGION", ""),
         s3_path_style=bool(check(_bool, get("SHADOW_S3_PATH_STYLE", "false"), "SHADOW_S3_PATH_STYLE")),
     )
+    config.parquet_time_zone = check(time_zone, get("SHADOW_PARQUET_TIME_ZONE", ""), "SHADOW_PARQUET_TIME_ZONE") or ""
     config.expected_differences = expected_path(get("SHADOW_EXPECTED_DIFFERENCES", ""))
     try:
         config.expected = expected.load(config.expected_differences)
