@@ -699,7 +699,17 @@ impl CursorHook {
             } => return Some(cursors.rollback_to(client, name)),
             Statement::Commit { chain: true, .. } => return Some(cursors.chain(client, true)),
             Statement::Rollback { chain: true, .. } => return Some(cursors.chain(client, false)),
-            Statement::StartTransaction { .. } => cursors.begin(),
+            // Answered here for its tag: `START TRANSACTION` or `BEGIN`, as
+            // written (`datafusion-postgres` answers `BEGIN` to both).
+            Statement::StartTransaction { begin, .. } => {
+                cursors.begin();
+                let tag = Tag::new(if *begin { "BEGIN" } else { "START TRANSACTION" });
+                return Some(Ok(if client.transaction_status() == TransactionStatus::Idle {
+                    Response::TransactionStart(tag)
+                } else {
+                    Response::Execution(tag)
+                }));
+            }
             Statement::Commit { .. } => cursors.end_transaction(Some(client.portal_store()), true),
             Statement::Rollback { .. } => cursors.end_transaction(Some(client.portal_store()), false),
             Statement::Declare { stmts } => {

@@ -2029,6 +2029,7 @@ fn extended_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
     .chain(move_scripts())
     .chain(parameter_scripts())
     .chain(pipeline_scripts())
+    .chain(tag_scripts())
     .collect()
 }
 
@@ -2202,6 +2203,36 @@ fn pipeline_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
                 vec![vec!["2".to_owned()]],
                 None,
             ),
+        ],
+    )]
+}
+
+/// Tags as PostgreSQL's: `SHOW` without a row count, `START TRANSACTION`
+/// as written. (Found by the third F6 verification: `SELECT 1` and
+/// `BEGIN`.)
+fn tag_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
+    use Step::{Extended, Simple};
+    let ok = |tag: &str| (vec![tag.to_owned()], Vec::new(), None);
+    vec![(
+        vec![
+            Simple("SHOW statement_timeout".into()),
+            Extended("SHOW statement_timeout".into()),
+            Simple("START TRANSACTION".into()),
+            Extended("START TRANSACTION".into()),
+            Extended("COMMIT".into()),
+            Extended("START TRANSACTION".into()),
+            Simple("BEGIN".into()),
+            Simple("ROLLBACK".into()),
+        ],
+        vec![
+            (vec!["SHOW".to_owned()], vec![vec!["0".to_owned()]], None),
+            (vec!["SHOW".to_owned()], vec![vec!["0".to_owned()]], None),
+            ok("START TRANSACTION"),
+            ok("START TRANSACTION"),
+            ok("COMMIT"),
+            ok("START TRANSACTION"),
+            ok("BEGIN"),
+            ok("ROLLBACK"),
         ],
     )]
 }

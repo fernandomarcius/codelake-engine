@@ -82,8 +82,7 @@ use datafusion_postgres::pgwire::api::auth::noop::NoopStartupHandler;
 use datafusion_postgres::pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
 use datafusion_postgres::pgwire::api::portal::{Format, Portal, PortalExecutionState};
 use datafusion_postgres::pgwire::api::query::{
-    ExtendedQueryHandler, SimpleQueryHandler, send_execution_response, send_query_response,
-    send_ready_for_query,
+    ExtendedQueryHandler, SimpleQueryHandler, send_execution_response, send_ready_for_query,
 };
 use datafusion_postgres::pgwire::api::results::FieldInfo;
 use datafusion_postgres::pgwire::api::results::{
@@ -100,6 +99,7 @@ use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
 use datafusion_postgres::pgwire::messages::cancel::CancelRequest;
 use datafusion_postgres::pgwire::messages::data::DataRow;
+use datafusion_postgres::pgwire::messages::data::RowDescription;
 use datafusion_postgres::pgwire::messages::extendedquery::{Execute, Sync as PgSync};
 use datafusion_postgres::pgwire::messages::response::EmptyQueryResponse;
 use datafusion_postgres::pgwire::messages::response::TransactionStatus;
@@ -520,6 +520,61 @@ fn answered_by_the_session(statement: &Statement) -> bool {
 fn governed_text(sql: &str) -> bool {
     Parser::parse_sql(&PostgreSqlDialect {}, sql)
         .map_or(true, |statements| !statements.iter().all(answered_by_the_session))
+}
+
+/// The command tag of a statement that returned `rows` rows: `SHOW` alone,
+/// as `PostgreSQL` tags it; else the statement's tag and its row count
+/// (`SELECT 3`, as `pgwire` tags them).
+fn completion_tag(command_tag: &str, rows: usize) -> Tag {
+    if command_tag == SHOW_TAG {
+        Tag::new(SHOW_TAG)
+    } else {
+        Tag::new(command_tag).with_rows(rows)
+    }
+}
+
+/// `SHOW`'s command tag (`datafusion-postgres` tags it `SELECT 1`).
+const SHOW_TAG: &str = "SHOW";
+
+/// Tags the answers of `SHOW` statements among `statements`, one answer
+/// each, `SHOW` ([`completion_tag`]).
+fn tag_shows(statements: &[Statement], responses: &mut [Response]) {
+    for (statement, response) in statements.iter().zip(responses.iter_mut()) {
+        if let (Statement::ShowVariable { .. }, Response::Query(query)) = (statement, response) {
+            query.set_command_tag(SHOW_TAG);
+        }
+    }
+}
+
+/// `pgwire`'s `send_query_response` for a simple-protocol message, with
+/// the statement's tag as `PostgreSQL`'s ([`completion_tag`]).
+async fn send_query<C>(client: &mut C, results: QueryResponse) -> PgWireResult<()>
+where
+    C: Sink<PgWireBackendMessage> + Unpin + Send,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    use futures::StreamExt;
+    let QueryResponse {
+        command_tag,
+        row_schema,
+        mut data_rows,
+        ..
+    } = results;
+    let description = RowDescription::new(row_schema.iter().map(Into::into).collect());
+    client
+        .feed(PgWireBackendMessage::RowDescription(description))
+        .await?;
+    let mut rows = 0;
+    while let Some(row) = data_rows.next().await {
+        client.feed(PgWireBackendMessage::DataRow(row?)).await?;
+        rows += 1;
+    }
+    let tag = completion_tag(&command_tag, rows);
+    client
+        .feed(PgWireBackendMessage::CommandComplete(tag.into()))
+        .await?;
+    Ok(())
 }
 
 /// In a failed transaction block only its end runs (`COMMIT`, which rolls
@@ -994,7 +1049,7 @@ impl SimpleQueryHandler for Governed {
                             .feed(PgWireBackendMessage::EmptyQueryResponse(EmptyQueryResponse::new()))
                             .await?;
                     }
-                    Response::Query(results) => send_query_response(client, results, true).await?,
+                    Response::Query(results) => send_query(client, results).await?,
                     Response::Execution(tag) => send_execution_response(client, tag).await?,
                     Response::TransactionStart(tag) => {
                         send_execution_response(client, tag).await?;
@@ -1140,7 +1195,9 @@ impl Governed {
             return Ok(vec![response?]);
         }
         if !governed_text(query) {
-            return SimpleQueryHandler::do_query(&*self.inner, client, query).await;
+            let mut responses = SimpleQueryHandler::do_query(&*self.inner, client, query).await?;
+            tag_shows(&statements, &mut responses);
+            return Ok(responses);
         }
         let declared = cursor::Declared::before(&*client, cursor::declared_names(&statements));
         let admitted = self.admit(client, query).await?;
@@ -1151,7 +1208,8 @@ impl Governed {
                 SimpleQueryHandler::do_query(&*self.inner, client, query),
             )
             .await;
-        let responses = declared.settle(client, responses)?;
+        let mut responses = declared.settle(client, responses)?;
+        tag_shows(&statements, &mut responses);
         declared.attach(&*client, &admitted.execution.record);
         let mut cursors = declared.states(client).await;
         Ok(self.run(admitted, responses, &mut cursors, &Running::of(&*client)))
@@ -1305,7 +1363,14 @@ impl ExtendedQueryHandler for Governed {
             .as_ref()
             .is_some_and(|(statement, _)| !answered_by_the_session(statement));
         if !governed {
-            return ExtendedQueryHandler::do_query(&*self.inner, client, portal, max_rows).await;
+            let mut response = ExtendedQueryHandler::do_query(&*self.inner, client, portal, max_rows).await?;
+            if let Some((statement, _)) = parsed {
+                tag_shows(
+                    std::slice::from_ref(statement),
+                    std::slice::from_mut(&mut response),
+                );
+            }
+            return Ok(response);
         }
         let declared = cursor::Declared::before(
             &*client,
