@@ -251,7 +251,7 @@ impl SqlServerResolver {
             .into_first_result()
             .await
             .map_err(|e| metadata_error(&self.source, e))?;
-        let mut by_lower: BTreeMap<String, Vec<Field>> = BTreeMap::new();
+        let mut fields: Vec<Field> = Vec::new();
         let mut real_names = BTreeMap::new();
         for row in rows {
             let column: &str = row.get(0).unwrap_or_default();
@@ -276,20 +276,36 @@ impl SqlServerResolver {
                 SQL_TYPE.to_owned(),
                 sql_type(data_type, max_length, datetime_precision),
             )]));
-            by_lower.entry(column.to_lowercase()).or_default().push(field);
             real_names.insert(column.to_lowercase(), column.to_owned());
+            fields.push(field);
         }
-        let mut fields = Vec::with_capacity(by_lower.len());
-        for (lower, mut same) in by_lower {
-            if same.len() == 1 {
-                fields.extend(same.pop());
-            } else {
-                real_names.remove(&lower);
-                tracing::warn!(source = %self.source, %schema, %table, column = %lower, "columns differ only by case; not exposed");
-            }
+        let (fields, dropped) = unique_in_order(fields);
+        for lower in dropped {
+            real_names.remove(&lower);
+            tracing::warn!(source = %self.source, %schema, %table, column = %lower, "columns differ only by case; not exposed");
         }
         Ok((Schema::new(fields), real_names))
     }
+}
+
+/// The fields in the order given (`ORDINAL_POSITION`: `SELECT *` and a
+/// positional `UNION` depend on it), without the lower-case names that occur
+/// more than once; those names are returned, sorted.
+fn unique_in_order(fields: Vec<Field>) -> (Vec<Field>, Vec<String>) {
+    let mut count: BTreeMap<String, usize> = BTreeMap::new();
+    for field in &fields {
+        *count.entry(field.name().clone()).or_default() += 1;
+    }
+    let kept = fields
+        .into_iter()
+        .filter(|field| count.get(field.name()) == Some(&1))
+        .collect();
+    let dropped = count
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(name, _)| name)
+        .collect();
+    (kept, dropped)
 }
 
 #[async_trait]
@@ -397,6 +413,23 @@ mod tests {
         assert_eq!(sql_type("VARBINARY", Some(-1), None), "varbinary(max)");
         assert_eq!(sql_type("datetime2", None, Some(7)), "datetime2(7)");
         assert_eq!(sql_type("int", None, None), "int");
+    }
+
+    #[test]
+    fn columns_keep_the_source_order_without_case_duplicates() {
+        use datafusion::arrow::datatypes::DataType;
+        let field = |name: &str| Field::new(name, DataType::Int32, true);
+        let (kept, dropped) = unique_in_order(vec![
+            field("__$start_lsn"),
+            field("zeta"),
+            field("dup"),
+            field("alpha"),
+            field("dup"),
+            field("__$command_id"),
+        ]);
+        let names: Vec<&str> = kept.iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["__$start_lsn", "zeta", "alpha", "__$command_id"]);
+        assert_eq!(dropped, ["dup"]);
     }
 
     #[test]
