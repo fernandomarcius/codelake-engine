@@ -926,17 +926,61 @@ impl SimpleQueryHandler for Governed {
         let rewritten = cursor::abort_as_rollback(query);
         let query = rewritten.as_deref().unwrap_or(query);
         let statements = Parser::parse_sql(&PostgreSqlDialect {}, query);
-        cursor::begin_simple(&*client, statements.as_ref().map_or(1, Vec::len));
-        let outcome = match statements {
-            Ok(statements) => self.simple(client, query, statements).await,
-            Err(error) => match cursor::unparsed(query, &error) {
-                Some(Ok(fetch)) => self.simple(client, query, vec![fetch]).await,
-                Some(Err(error)) => Err(error),
-                None => self.simple(client, query, Vec::new()).await,
-            },
+        let read = match &statements {
+            Ok(_) => None,
+            Err(error) => cursor::statements(query, error),
+        };
+        let count = match (&statements, &read) {
+            (Ok(statements), _) => statements.len(),
+            (_, Some(Ok(read))) => read.len(),
+            _ => 1,
+        };
+        cursor::begin_simple(&*client, count);
+        let outcome = match (statements, read) {
+            (Ok(statements), _) => self.simple(client, query, statements).await,
+            (Err(_), Some(Ok(mut read))) if read.len() == 1 => {
+                let (_, fetch) = read.remove(0);
+                self.simple(client, query, vec![fetch]).await
+            }
+            (Err(_), Some(Ok(read))) => self.one_by_one(client, read).await,
+            (Err(_), Some(Err(error))) => Err(error),
+            (Err(_), None) => self.simple(client, query, Vec::new()).await,
         };
         cursor::end_simple(&*client, outcome.is_ok());
         outcome
+    }
+}
+
+impl Governed {
+    /// A simple-protocol message whose statements the SQL parser does not
+    /// all read — a `FETCH` or `MOVE` of the forms it does not read, among
+    /// others — run one after the other, each read on its own
+    /// ([`cursor::statements`]), in the message's transaction, as
+    /// `PostgreSQL` runs them: a `FETCH` among them holds its rows in the
+    /// pool until they are sent ([`cursor::fetch_among`]), as one the parser
+    /// reads does. The first that fails fails the message.
+    async fn one_by_one<C>(
+        &self,
+        client: &mut C,
+        statements: Vec<(String, Statement)>,
+    ) -> PgWireResult<Vec<Response>>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let pool = Arc::clone(&self.engine.context().runtime_env().memory_pool);
+        let mut responses = Vec::new();
+        for (sql, statement) in statements {
+            if matches!(statement, Statement::Fetch { .. }) {
+                aborted(&*client, &statement)?;
+                responses.push(cursor::fetch_among(&*client, &sql, &statement, &pool).await?);
+            } else {
+                responses.extend(self.simple(client, &sql, vec![statement]).await?);
+            }
+        }
+        Ok(responses)
     }
 }
 

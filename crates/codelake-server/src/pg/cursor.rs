@@ -42,7 +42,8 @@ use datafusion::sql::sqlparser::ast::{
     ValueWithSpan,
 };
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use datafusion::sql::sqlparser::tokenizer::{Span, Token, Tokenizer, Word};
+use datafusion::sql::sqlparser::parser::Parser;
+use datafusion::sql::sqlparser::tokenizer::{Span, Token, TokenWithSpan, Tokenizer, Word};
 use datafusion_postgres::arrow_pg::datatypes::df::encode_dataframe;
 use datafusion_postgres::hooks::{HookClient, QueryHook};
 use datafusion_postgres::pgwire::api::portal::{Format, Portal, PortalExecutionState};
@@ -776,6 +777,49 @@ where
     })
 }
 
+/// `FETCH` or `MOVE` among other statements of a simple-protocol message
+/// ([`statements`]): its rows read before the next statement runs, held in
+/// `pool` ([`Fetch::collected`]), as a `FETCH` the SQL parser reads there is
+/// ([`CursorHook`]).
+pub(super) async fn fetch_among<C>(
+    client: &C,
+    sql: &str,
+    statement: &Statement,
+    pool: &Arc<dyn MemoryPool>,
+) -> PgWireResult<Response>
+where
+    C: ClientInfo + ClientPortalStore + ?Sized,
+    C::PortalStore: PortalStore,
+{
+    let Statement::Fetch {
+        name,
+        direction,
+        into,
+        ..
+    } = statement
+    else {
+        return Err(user_error("42601", format!("not a FETCH: {statement}")));
+    };
+    if into.is_some() {
+        return Err(into_error());
+    }
+    let moving = moves(sql);
+    let fetch = open(
+        &Cursors::of(client),
+        portals(client),
+        &cursor_name(name),
+        direction,
+        &Format::UnifiedText,
+        moving,
+    )
+    .await?;
+    if moving {
+        fetch.moved().await
+    } else {
+        fetch.collected(pool).await
+    }
+}
+
 /// Whether `sql` is a `MOVE`: [`unparsed`] reads it as the `FETCH` of the
 /// same direction, and its text tells them apart (a `FETCH` the SQL parser
 /// reads has the text it writes, `FETCH …`).
@@ -1126,35 +1170,82 @@ fn number(count: &ValueWithSpan) -> PgWireResult<i64> {
     }
 }
 
-/// A message the SQL parser does not read (`error`) that holds a `FETCH` or
-/// a `MOVE`, answered at once, on either protocol. A single `FETCH` is read
-/// here as `PostgreSQL` reads it (a negative count, no count, no `FROM`:
-/// `FETCH -1 FROM c`, `FETCH FROM c`, `FETCH c`), and a single `MOVE` as the
-/// `FETCH` of the same direction ([`moves`] tells them apart); among other
-/// statements they are a syntax error (`42601`). `None` when the message
-/// holds neither.
+/// A statement the SQL parser does not read (`error`) that is a `FETCH` or
+/// a `MOVE`, answered at once, on either protocol ([`statements`]); `None`
+/// when it is neither. A message of several statements is refused
+/// (`42601`), as `PostgreSQL` refuses one in a prepared statement.
 pub(super) fn unparsed(sql: &str, error: &impl std::fmt::Display) -> Option<PgWireResult<Statement>> {
-    let tokens: Vec<Token> = Tokenizer::new(&PostgreSqlDialect {}, sql)
-        .tokenize()
-        .ok()?
+    Some(match statements(sql, error)? {
+        Ok(mut statements) if statements.len() == 1 => Ok(statements.remove(0).1),
+        Ok(_) => Err(user_error(
+            "42601",
+            "cannot insert multiple commands into a prepared statement",
+        )),
+        Err(error) => Err(error),
+    })
+}
+
+/// The statements of a message the SQL parser does not read (`error`)
+/// because it holds a `FETCH` or a `MOVE` the parser does not read, each
+/// with its text, to be run one after the other as `PostgreSQL` runs them.
+/// A `FETCH` is read here as `PostgreSQL` reads it when the parser cannot
+/// (a negative count, no count, no `FROM`: `FETCH -1 FROM c`, `FETCH FROM
+/// c`, `FETCH c`), and a `MOVE` as the `FETCH` of the same direction
+/// ([`moves`] tells them apart, from the statement's text). A statement
+/// neither reads fails the whole message (`42601`) before any of it runs,
+/// as `PostgreSQL` parses a message whole. `None` when the message holds no
+/// `FETCH` or `MOVE`.
+pub(super) fn statements(
+    sql: &str,
+    error: &impl std::fmt::Display,
+) -> Option<PgWireResult<Vec<(String, Statement)>>> {
+    let tokens = Tokenizer::new(&PostgreSqlDialect {}, sql)
+        .tokenize_with_location()
+        .ok()?;
+    // Each statement's text and its tokens, empty statements (`;;`) left
+    // out.
+    let mut pieces: Vec<(String, Vec<Token>)> = Vec::new();
+    let mut start = 0;
+    let mut piece = Vec::new();
+    for token in tokens
         .into_iter()
-        .filter(|token| !matches!(token, Token::Whitespace(_)))
-        .collect();
-    let mut tokens = tokens.as_slice();
-    while let [rest @ .., Token::SemiColon] = tokens {
-        tokens = rest;
-    }
-    let statements: Vec<&[Token]> = tokens.split(|token| *token == Token::SemiColon).collect();
-    let starts =
-        |statement: &[Token], keyword: &str| statement.first().is_some_and(|token| is(token, keyword));
-    let cursor = |statement: &[Token]| starts(statement, "FETCH") || starts(statement, "MOVE");
-    match statements.as_slice() {
-        [statement] if cursor(statement) => Some(read_fetch(&statement[1..])),
-        _ if statements.iter().any(|statement| cursor(statement)) => {
-            Some(Err(user_error("42601", format!("syntax error: {error}"))))
+        .chain(std::iter::once(TokenWithSpan::wrap(Token::SemiColon)))
+    {
+        match token.token {
+            Token::Whitespace(_) => {}
+            Token::SemiColon => {
+                let end = if token.span == Span::empty() {
+                    sql.len()
+                } else {
+                    offset(sql, token.span.start.line, token.span.start.column)?
+                };
+                if !piece.is_empty() {
+                    pieces.push((sql[start..end].to_owned(), std::mem::take(&mut piece)));
+                }
+                start = (end + 1).min(sql.len());
+            }
+            other => piece.push(other),
         }
-        _ => None,
     }
+    let starts = |tokens: &[Token], keyword: &str| tokens.first().is_some_and(|token| is(token, keyword));
+    let cursor = |tokens: &[Token]| starts(tokens, "FETCH") || starts(tokens, "MOVE");
+    if !pieces.iter().any(|(_, tokens)| cursor(tokens)) {
+        return None;
+    }
+    let syntax = || user_error("42601", format!("syntax error: {error}"));
+    let read = |(text, tokens): (String, Vec<Token>)| {
+        let parsed = Parser::parse_sql(&PostgreSqlDialect {}, &text)
+            .ok()
+            .filter(|parsed| parsed.len() == 1)
+            .and_then(|mut parsed| parsed.pop());
+        let statement = match parsed {
+            Some(statement) if !starts(&tokens, "MOVE") => statement,
+            _ if cursor(&tokens) => read_fetch(&tokens[1..])?,
+            _ => return Err(syntax()),
+        };
+        Ok((text, statement))
+    };
+    Some(pieces.into_iter().map(read).collect())
 }
 
 /// `sql` with its `ABORT` statements (`PostgreSQL`'s `ROLLBACK`, which the
@@ -1697,6 +1788,42 @@ mod tests {
         assert_eq!(refused("BEGIN; FETCH -1 FROM c"), Some(Err("42601".to_owned())));
         assert_eq!(refused("SELEC 1"), None);
         assert_eq!(refused("SELECT 'FETCH' FROM ("), None);
+    }
+
+    #[test]
+    fn messages_with_unparsed_fetches_are_read_statement_by_statement() {
+        let read = |sql: &str| {
+            statements(sql, &"parse error").map(|outcome| {
+                outcome
+                    .map(|statements| {
+                        statements
+                            .into_iter()
+                            .map(|(text, statement)| {
+                                (
+                                    text.trim().to_owned(),
+                                    matches!(statement, Statement::Fetch { .. }),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .map_err(code)
+            })
+        };
+        let text = |text: &str, fetch: bool| (text.to_owned(), fetch);
+        assert_eq!(
+            read("SELECT 'é;x'; FETCH FROM c ;; MOVE 2 IN c; /* ; */ FETCH 1 FROM c;"),
+            Some(Ok(vec![
+                text("SELECT 'é;x'", false),
+                text("FETCH FROM c", true),
+                text("MOVE 2 IN c", true),
+                text("/* ; */ FETCH 1 FROM c", true),
+            ]))
+        );
+        assert_eq!(read("FETCH c"), Some(Ok(vec![text("FETCH c", true)])));
+        // A statement neither reads fails the message before any of it runs.
+        assert_eq!(read("FETCH c; SELEC 1"), Some(Err("42601".to_owned())));
+        assert_eq!(read("FETCH c; FETCH -x FROM c"), Some(Err("42601".to_owned())));
+        assert_eq!(read("SELECT 1; SELEC 2"), None);
     }
 
     /// A cursor `c` over rows `1..=rows`, declared in a transaction block.

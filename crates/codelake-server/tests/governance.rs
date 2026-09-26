@@ -1514,6 +1514,7 @@ fn cursor_script() -> Vec<(String, Want)> {
         beside_cursors_script(),
         discard_script(),
         names_script(),
+        unparsed_script(),
     ]
     .into_iter()
     .flatten()
@@ -1631,6 +1632,32 @@ fn transactions_script() -> Vec<(String, Want)> {
             none(),
         ),
         ("FETCH 1 FROM r".into(), Code("34000")),
+    ]
+}
+
+/// `FETCH` and `MOVE` the SQL parser does not read, among other statements
+/// of a message: run one by one, as PostgreSQL runs them, a statement
+/// neither reads failing the message before any of it runs. (Found by the
+/// third F6 verification: they failed with 42601.)
+fn unparsed_script() -> Vec<(String, Want)> {
+    use Want::{Code, Rows};
+    let none = Want::none;
+    let declare = |name: &str| format!("DECLARE {name} NO SCROLL CURSOR FOR {TEN}");
+    vec![
+        (format!("BEGIN; {}", declare("u")), none()),
+        ("FETCH FROM u; FETCH 1 FROM u".into(), Rows(vec![1, 2])),
+        ("MOVE 1 IN u; FETCH u".into(), Rows(vec![4])),
+        (
+            "SELECT 5; FETCH NEXT u; MOVE u; FETCH 2 u; ".into(),
+            Rows(vec![5, 5, 7, 8]),
+        ),
+        ("FETCH u; SELEC 1".into(), Code("42601")),
+        ("ROLLBACK".into(), none()),
+        (
+            format!("{}; FETCH w; MOVE 7 IN w; FETCH ALL w", declare("w")),
+            Rows(vec![1, 9, 10]),
+        ),
+        ("FETCH 1 FROM w".into(), Code("34000")),
     ]
 }
 
