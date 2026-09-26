@@ -36,7 +36,8 @@ use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReser
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{
-    CloseCursor, Declare, DeclareType, FetchDirection, FetchPosition, Ident, Statement, Value, ValueWithSpan,
+    CloseCursor, Declare, DeclareType, DiscardObject, FetchDirection, FetchPosition, Ident, Statement, Value,
+    ValueWithSpan,
 };
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::tokenizer::{Span, Token, Tokenizer, Word};
@@ -178,6 +179,34 @@ impl Cursors {
                 Ok(Response::Execution(Tag::new("CLOSE CURSOR")))
             }
         }
+    }
+
+    /// `DISCARD`: `ALL` closes every cursor and portal of the connection,
+    /// held ones too, and resets its `statement_timeout`, outside a
+    /// transaction block only (`25001`), as `PostgreSQL` does; the engine
+    /// keeps no plans, sequences or temporary tables of a connection, so
+    /// the others have nothing to discard.
+    fn discard(&self, client: &mut dyn HookClient, object: DiscardObject) -> PgWireResult<Response> {
+        let tag = match object {
+            DiscardObject::ALL => "DISCARD ALL",
+            DiscardObject::PLANS => "DISCARD PLANS",
+            DiscardObject::SEQUENCES => "DISCARD SEQUENCES",
+            DiscardObject::TEMP => "DISCARD TEMP",
+        };
+        if object == DiscardObject::ALL {
+            let mut book = lock(&self.0);
+            if book.explicit || book.implicit_block {
+                return Err(user_error(
+                    "25001",
+                    "DISCARD ALL cannot run inside a transaction block",
+                ));
+            }
+            client.portal_store().clear_portals();
+            book.cursors.clear();
+            drop(book);
+            client.metadata_mut().remove(super::STATEMENT_TIMEOUT);
+        }
+        Ok(Response::Execution(Tag::new(tag)))
     }
 
     /// The cursor `name` (a portal of the extended protocol has one too).
@@ -352,10 +381,11 @@ impl CursorHook {
     async fn observe(
         statement: &Statement,
         session_context: &SessionContext,
-        client: &dyn HookClient,
+        client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         let cursors = Cursors::of(client);
         match statement {
+            Statement::Discard { object_type } => return Some(cursors.discard(client, *object_type)),
             Statement::Close { cursor } => return Some(cursors.close(client.portal_store(), cursor)),
             Statement::Fetch { into: Some(_), .. } => return Some(Err(into_error())),
             // A `FETCH` among other statements: its rows are read before the
@@ -393,13 +423,15 @@ impl QueryHook for CursorHook {
         Self::observe(statement, session_context, client).await
     }
 
+    /// `DISCARD`, which `DataFusion` does not plan, is answered here when
+    /// it runs.
     async fn handle_extended_parse_query(
         &self,
-        _statement: &Statement,
+        statement: &Statement,
         _session_context: &SessionContext,
         _client: &(dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<LogicalPlan>> {
-        None
+        matches!(statement, Statement::Discard { .. }).then(|| Ok(empty_plan()))
     }
 
     async fn handle_extended_query(
@@ -412,6 +444,14 @@ impl QueryHook for CursorHook {
     ) -> Option<PgWireResult<Response>> {
         Self::observe(statement, session_context, client).await
     }
+}
+
+/// The plan of a statement answered without one.
+pub(super) fn empty_plan() -> LogicalPlan {
+    LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
+        produce_one_row: false,
+        schema: Arc::new(datafusion::common::DFSchema::empty()),
+    })
 }
 
 /// Names of the cursors `statements` declare.

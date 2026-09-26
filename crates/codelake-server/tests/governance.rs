@@ -1378,6 +1378,25 @@ async fn held_cursors_outlive_their_commit(server: &Server, client: &Client) {
     assert_eq!(server.pool_drains().await, 0);
     let error = client.simple_query("FETCH 1 FROM r").await.unwrap_err();
     assert_eq!(error.code(), Some(&SqlState::INVALID_CURSOR_NAME), "{error:?}");
+
+    // DISCARD ALL closes held cursors too, as a connection pool resets its
+    // connections: slot and memory given back.
+    client
+        .batch_execute(&format!("DECLARE d CURSOR WITH HOLD FOR {STREAMS_WITH_MEMORY}"))
+        .await
+        .unwrap();
+    assert_eq!(text_rows(client, "FETCH 2 FROM d").await.len(), 2);
+    let held = pool_fills(server).await;
+    client.batch_execute("DISCARD ALL").await.unwrap();
+    server.slots_free().await;
+    assert_eq!(
+        server.pool_drains().await,
+        0,
+        "DISCARD ALL left reservations (held {held})"
+    );
+    next_query_runs(server, "tx").await;
+    let error = client.simple_query("FETCH 1 FROM d").await.unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::INVALID_CURSOR_NAME), "{error:?}");
 }
 
 /// A portal suspended by a row limit (JDBC's fetch size) is closed by the
@@ -1586,7 +1605,31 @@ fn cursor_script() -> Vec<(String, Want)> {
     ]
     .into_iter()
     .chain(beside_cursors_script())
+    .chain(discard_script())
     .collect()
+}
+
+/// `DISCARD ALL` closes every cursor, held ones too, and resets the
+/// session's `statement_timeout`, outside a transaction block only.
+fn discard_script() -> Vec<(String, Want)> {
+    use Want::{Code, Rows};
+    let none = Want::none;
+    vec![
+        (format!("DECLARE dh CURSOR WITH HOLD FOR {TEN}"), none()),
+        ("FETCH 1 FROM dh".into(), Rows(vec![1])),
+        ("BEGIN".into(), none()),
+        ("DISCARD ALL".into(), Code("25001")),
+        ("ROLLBACK".into(), none()),
+        ("SELECT 1; DISCARD ALL".into(), Code("25001")),
+        ("FETCH 1 FROM dh".into(), Rows(vec![2])),
+        ("SET statement_timeout = '7s'".into(), none()),
+        ("DISCARD ALL".into(), none()),
+        ("FETCH 1 FROM dh".into(), Code("34000")),
+        ("SHOW statement_timeout".into(), Rows(vec![0])),
+        ("DISCARD PLANS".into(), none()),
+        ("DISCARD SEQUENCES".into(), none()),
+        ("DISCARD TEMP".into(), none()),
+    ]
 }
 
 /// The transaction's other statements run beside its open cursors, at
@@ -1728,6 +1771,27 @@ fn extended_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
                 ok("CLOSE CURSOR"),
             ],
         ),
+    ]
+    .into_iter()
+    .chain(session_scripts())
+    .collect()
+}
+
+/// Wire scripts of the statements that end or reset a session's
+/// transaction and cursors, each with what every step answers.
+fn session_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
+    use Step::{Extended, Simple};
+    let ok = |tag: &str| (vec![tag.to_owned()], Vec::new(), None);
+    let rows = |tag: &str, values: &[i64]| {
+        (
+            vec![tag.to_owned()],
+            values.iter().map(|v| vec![v.to_string()]).collect(),
+            None,
+        )
+    };
+    let failed = |code: &str| (Vec::new(), Vec::new(), Some(code.to_owned()));
+    let declare = |name: &str, how: &str| format!("DECLARE {name} {how} FOR {TEN}");
+    vec![
         // FETCH … INTO among other statements: the message fails (it waits
         // for no slot: the cursor holds the user's only one).
         (
@@ -1744,6 +1808,27 @@ fn extended_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
                 ),
                 failed("42601"),
                 ok("ROLLBACK"),
+            ],
+        ),
+        // DISCARD ALL on the extended protocol.
+        (
+            vec![
+                Extended(declare("y", "CURSOR WITH HOLD")),
+                Extended("FETCH 1 FROM y".into()),
+                Extended("BEGIN".into()),
+                Extended("DISCARD ALL".into()),
+                Extended("ROLLBACK".into()),
+                Extended("DISCARD ALL".into()),
+                Extended("FETCH 1 FROM y".into()),
+            ],
+            vec![
+                ok("DECLARE CURSOR"),
+                rows("FETCH 1", &[1]),
+                ok("BEGIN"),
+                failed("25001"),
+                ok("ROLLBACK"),
+                ok("DISCARD ALL"),
+                failed("34000"),
             ],
         ),
         // ABORT on the extended protocol ends the transaction too.
