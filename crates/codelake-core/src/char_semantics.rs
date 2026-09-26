@@ -2516,8 +2516,18 @@ fn join(join: Join, outer: &[&LogicalPlan]) -> Result<Transformed<LogicalPlan>> 
             }
             out
         };
-        let left = pad_columns(Arc::clone(&join.left), &side(&join.left, 0))?;
-        let right = pad_columns(Arc::clone(&join.right), &side(&join.right, 1))?;
+        // Below the `DISTINCT` of `INTERSECT`/`EXCEPT`: values equal once
+        // converted (`'ab'` and `'ab  '` as char) are one row.
+        let pad_side = |plan: &Arc<LogicalPlan>, lengths: &[Option<u32>]| -> Result<Arc<LogicalPlan>> {
+            match plan.as_ref() {
+                LogicalPlan::Distinct(Distinct::All(input)) => Ok(Arc::new(LogicalPlan::Distinct(
+                    Distinct::All(pad_columns(Arc::clone(input), lengths)?),
+                ))),
+                _ => pad_columns(Arc::clone(plan), lengths),
+            }
+        };
+        let left = pad_side(&join.left, &side(&join.left, 0))?;
+        let right = pad_side(&join.right, &side(&join.right, 1))?;
         return Ok(Transformed::yes(LogicalPlan::Join(Join::try_new(
             left,
             right,
@@ -2916,6 +2926,17 @@ mod tests {
         (
             "SELECT map_agg(id, ch)[1] = 'ab', element_at(map_agg(ch, id), 'ab') FROM cht",
             &[&["true", "1"]],
+        ),
+        // INTERSECT and EXCEPT are distinct in the common type: 'ab' and
+        // 'ab  ' are one char(65536) value.
+        (
+            "SELECT length(v), count(*) FROM (SELECT s AS v FROM vct EXCEPT SELECT ch FROM cht WHERE id = 2) \
+             GROUP BY 1 ORDER BY 1",
+            &[&["65536", "3"], &["NULL", "1"]],
+        ),
+        (
+            "SELECT length(v), count(*) FROM (SELECT s AS v FROM vct INTERSECT SELECT ch FROM cht) GROUP BY 1 ORDER BY 1",
+            &[&["65536", "2"], &["NULL", "1"]],
         ),
         // The trims work on the value without its padding.
         (
