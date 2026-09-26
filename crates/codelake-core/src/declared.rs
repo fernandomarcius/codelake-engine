@@ -142,14 +142,17 @@ fn result_type(declared: Option<Declared>, input: &DataType) -> Result<DataType>
     })
 }
 
-fn too_long(mode: Mode, text: &str, declared: Declared) -> ArrowError {
+/// `from_char`: the value is a `char(n)` one (Trino names its source type
+/// `char(n)` in the message, `varchar(n)` otherwise).
+fn too_long(mode: Mode, text: &str, declared: Declared, from_char: bool) -> ArrowError {
     let target = declared.name(&DataType::Utf8);
+    let source = if from_char { "char" } else { "varchar" };
     match mode {
         // Named like the function library's errors (`<errorName>: …`), so
         // every layer reports it the same way, whichever catalog the table
         // is in.
         Mode::Insert => ArrowError::InvalidArgumentError(format!(
-            "INVALID_CAST_ARGUMENT: Cannot truncate non-space characters when casting from varchar({}) to \
+            "INVALID_CAST_ARGUMENT: Cannot truncate non-space characters when casting from {source}({}) to \
              {target} on INSERT",
             text.chars().count()
         )),
@@ -157,9 +160,23 @@ fn too_long(mode: Mode, text: &str, declared: Declared) -> ArrowError {
     }
 }
 
+/// [`bounded_from`] of a value that is not a `char(n)` one.
+#[cfg(test)]
+fn bounded(mode: Mode, text: &str, declared: Declared, length: u32) -> Result<String, ArrowError> {
+    bounded_from(mode, text, declared, length, false)
+}
+
 /// A text as a `varchar(n)` / `char(n)` value (`char` padded with spaces to
 /// `n` characters).
-fn bounded(mode: Mode, text: &str, declared: Declared, length: u32) -> Result<String, ArrowError> {
+///
+/// `from_char`: the value is a `char(n)` one.
+fn bounded_from(
+    mode: Mode,
+    text: &str,
+    declared: Declared,
+    length: u32,
+    from_char: bool,
+) -> Result<String, ArrowError> {
     let length = usize::try_from(length).unwrap_or(usize::MAX);
     let mut value: String = if text.chars().count() <= length {
         text.to_owned()
@@ -168,7 +185,7 @@ fn bounded(mode: Mode, text: &str, declared: Declared, length: u32) -> Result<St
         match mode {
             Mode::Cast => kept.to_owned(),
             Mode::Insert if rest.chars().all(|c| c == ' ') => kept.to_owned(),
-            Mode::Strict | Mode::Insert => return Err(too_long(mode, text, declared)),
+            Mode::Strict | Mode::Insert => return Err(too_long(mode, text, declared, from_char)),
         }
     };
     if matches!(declared, Declared::Char(_)) {
@@ -272,6 +289,10 @@ impl ScalarUDFImpl for TrinoTyped {
             return exec_err!("{TRINO_TYPED} expects a type name as its second argument");
         };
         let declared = declared_of(Some(name))?;
+        let from_char = args
+            .arg_fields
+            .first()
+            .is_some_and(|f| matches!(crate::trino_types::declared(f), Some(Declared::Char(_))));
         let array = value.to_array(args.number_rows)?;
         let result: ArrayRef = match declared {
             None => array,
@@ -282,7 +303,7 @@ impl ScalarUDFImpl for TrinoTyped {
                 for text in texts(&array)? {
                     out.push(match text {
                         None => None,
-                        Some(text) => match bounded(self.mode, &text, declared, n) {
+                        Some(text) => match bounded_from(self.mode, &text, declared, n, from_char) {
                             Ok(value) => Some(value),
                             Err(_) if self.lenient => None,
                             Err(err) => return Err(err.into()),
@@ -713,6 +734,10 @@ mod tests {
             bounded(Mode::Insert, "abcdefghij   ", v10, 10).unwrap(),
             "abcdefghij"
         );
+        let error = bounded_from(Mode::Insert, "ab  yyyy ", Declared::Char(5), 5, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("from char(9) to char(5) on INSERT"), "{error}");
         let c3 = Declared::Char(3);
         assert_eq!(bounded(Mode::Cast, "abcdefg", c3, 3).unwrap(), "abc");
         assert_eq!(bounded(Mode::Cast, "a  ", c3, 3).unwrap(), "a  ");

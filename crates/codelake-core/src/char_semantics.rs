@@ -3626,6 +3626,15 @@ mod tests {
                 "SELECT element_at(x.m, v3.s) FROM (SELECT map_agg(ch, id) AS m FROM cht) x CROSS JOIN v3",
                 "looking up a map keyed by char(n) values",
             ),
+            // Trino 431 names the char source type in the message.
+            (
+                "UPDATE cht SET ch = ch || 'yyyy' WHERE id = 1",
+                "Cannot truncate non-space characters when casting from char(9) to char(5) on INSERT",
+            ),
+            (
+                "UPDATE cht SET ch = 'abcdefg' WHERE id = 1",
+                "Cannot truncate non-space characters when casting from varchar(7) to char(5) on INSERT",
+            ),
             (
                 "SELECT CAST(ARRAY[s] AS array(char(3))) FROM vct",
                 "a cast to an array, map or row of char(3) is not supported yet",
