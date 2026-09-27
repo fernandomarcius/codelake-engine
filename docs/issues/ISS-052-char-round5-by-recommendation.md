@@ -1,4 +1,4 @@
-# ISS-030 — char(n) round 5: choices applied by recommendation
+# ISS-052 — char(n) round 5: choices applied by recommendation
 
 - Kind: behavior · Accepted by: recommendation (implementer, round 5 of front/w1-df54), 2026-09-26 · Status: awaiting-confirmation
 - Context: The fifth verification of the char(n) semantics (HEAD e20fe57) found wrong rows in rows and arrays not written out, in arrays of char values of different lengths, in trims, in `INTERSECT ALL`/`EXCEPT ALL` across hive and in-memory columns and in `varchar(n)` on the PostgreSQL wire. Fixing them took decisions beyond char(n).
