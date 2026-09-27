@@ -2137,6 +2137,16 @@ fn parameter_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
                 vec!["9"],
             ),
             Simple("FETCH 2 FROM pd".into()),
+            // `IS DISTINCT FROM` binds tighter than `AND`, as in PostgreSQL
+            // (the DECLARE is planned apart from the other statements).
+            Bound(
+                format!(
+                    "{} WHERE x IS DISTINCT FROM $1 AND x < 3",
+                    declare("pe", "CURSOR")
+                ),
+                vec!["1"],
+            ),
+            Extended("FETCH ALL FROM pe".into()),
             Simple("ROLLBACK".into()),
         ],
         vec![
@@ -2153,6 +2163,12 @@ fn parameter_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
                 None,
             ),
             rows("FETCH 1", &[9]),
+            (
+                vec!["NoData".to_owned(), "DECLARE CURSOR".to_owned()],
+                Vec::new(),
+                None,
+            ),
+            rows("FETCH 1", &[2]),
             ok("ROLLBACK"),
         ],
     )]

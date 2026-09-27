@@ -744,9 +744,12 @@ impl QueryHook for CursorHook {
         _client: &(dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<LogicalPlan>> {
         if let Some(query) = declares_one(statement) {
-            let query = datafusion::sql::parser::Statement::Statement(Box::new(Statement::Query(Box::new(
-                query.clone(),
-            ))));
+            let mut query = datafusion::sql::parser::Statement::Statement(Box::new(Statement::Query(
+                Box::new(query.clone()),
+            )));
+            // `IS [NOT] DISTINCT FROM` grouped as PostgreSQL groups it, as
+            // every other statement of the session (`hooks::plan_checked`).
+            codelake_core::regroup_distinct_from(&mut query);
             return Some(
                 session_context
                     .state()
