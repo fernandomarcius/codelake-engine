@@ -199,7 +199,10 @@ pub(crate) async fn plan_checked(session_context: &SessionContext, sql: &str) ->
     let dialect = state.config().options().sql_parser.dialect;
     let statement = state.sql_to_statement(sql, &dialect).map_err(api_error)?;
     let (mut statement, prepared) = match statement {
-        datafusion::sql::parser::Statement::Statement(inner) => {
+        datafusion::sql::parser::Statement::Statement(mut inner) => {
+            // Every spelling of a column resolves (ISS-018): the query of a
+            // DECLARE comes here as text, apart from `run_simple`.
+            identifier_case::fold_identifiers(&mut inner);
             let prepared = codelake_core::postgres_statement(&inner);
             (
                 datafusion::sql::parser::Statement::Statement(Box::new(prepared.statement.clone())),

@@ -747,8 +747,12 @@ impl QueryHook for CursorHook {
             let mut query = datafusion::sql::parser::Statement::Statement(Box::new(Statement::Query(
                 Box::new(query.clone()),
             )));
-            // `IS [NOT] DISTINCT FROM` grouped as PostgreSQL groups it, as
-            // every other statement of the session (`hooks::plan_checked`).
+            // Identifiers folded (ISS-018) and `IS [NOT] DISTINCT FROM`
+            // grouped as PostgreSQL groups it, as every other statement of
+            // the session (`hooks::plan_checked`).
+            if let datafusion::sql::parser::Statement::Statement(inner) = &mut query {
+                codelake_core::identifier_case::fold_identifiers(inner);
+            }
             codelake_core::regroup_distinct_from(&mut query);
             return Some(
                 session_context
