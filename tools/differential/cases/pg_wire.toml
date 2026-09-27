@@ -23,8 +23,6 @@ protocol = "pg"
 
 [[case]]
 id = "PG3"
-expect = "WRONG"
-known = "front/w1-df54"
 sql = "SELECT id FROM {c}.pgw.t WHERE d = 0 ORDER BY id"
 compare = "ordered"
 protocol = "pg"
@@ -74,8 +72,6 @@ protocol = "pg"
 
 [[case]]
 id = "VAL1-zero-equal"
-expect = "WRONG"
-known = "ISS-032"
 oracle = "value"
 sql = "SELECT -0.0E0 = 0.0E0, -0.0E0 IS DISTINCT FROM 0.0E0"
 rows_json = "[[true, false]]"
