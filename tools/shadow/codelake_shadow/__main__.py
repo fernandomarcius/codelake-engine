@@ -138,8 +138,8 @@ def run_cycle(config: Config, number: int, project: str) -> dict[str, Any]:
                 results.append(
                     compare.compare_table(
                         con,
-                        compare.Location(config.reference.warehouse),
-                        compare.Location(config.candidate.warehouse),
+                        compare.Location(config.reference.warehouse, config.reference.metastore_file),
+                        compare.Location(config.candidate.warehouse, config.candidate.metastore_file),
                         schema,
                         table,
                         options,
@@ -215,6 +215,8 @@ def cmd_compare(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="codelake_shadow compare")
     parser.add_argument("--reference-warehouse", required=True)
     parser.add_argument("--candidate-warehouse", required=True)
+    parser.add_argument("--reference-metastore-file", default=compare.METASTORE_FILE)
+    parser.add_argument("--candidate-metastore-file", default=compare.CANDIDATE_METASTORE_FILE)
     parser.add_argument("--table", action="append", required=True, help="schema.table (repeatable)")
     parser.add_argument("--ignore-column", action="append", default=[])
     parser.add_argument("--sample", type=int, default=10)
@@ -247,8 +249,8 @@ def cmd_compare(argv: list[str]) -> int:
             results.append(
                 compare.compare_table(
                     con,
-                    compare.Location(args.reference_warehouse),
-                    compare.Location(args.candidate_warehouse),
+                    compare.Location(args.reference_warehouse, args.reference_metastore_file),
+                    compare.Location(args.candidate_warehouse, args.candidate_metastore_file),
                     schema,
                     table,
                     options,

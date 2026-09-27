@@ -218,6 +218,15 @@ target_partitions = $CPUS
 name = "hive"
 kind = "hive"
 warehouse = "/warehouse"
+
+# The reference engine wrote this warehouse: its file metastore names (ISS-011).
+[source.metastore_names]
+metadata_file = ".trinoSchema"
+permissions_dir = ".trinoPermissions"
+view_marker = "Presto View"
+view_parameter = "presto_view"
+version_parameter = "presto_version"
+writer_version = "431"
 EOF
 
 codelake_container() {

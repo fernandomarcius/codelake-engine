@@ -8,6 +8,9 @@ shutdown_grace_secs = 1
 
 [server.trino]
 listen = "0.0.0.0:8080"
+# Clients built for Trino 431 send its header prefix and check its version (ISS-011).
+header_prefix = "X-Trino-"
+reported_version = "431"
 
 [memory]
 limit = "${ENV:CODELAKE_MEMORY_LIMIT}"

@@ -36,6 +36,7 @@ class Side:
     warehouse: str
     rss: str
     container_id: str
+    metastore_file: str = ".trinoSchema"
 
     @property
     def host(self) -> str:
@@ -187,6 +188,11 @@ def load(env: Mapping[str, str] | None = None) -> Config:
                 else warehouse,
                 rss=get(prefix + "RSS", ""),
                 container_id=get(prefix + "CONTAINER_ID", ""),
+                # The reference engine writes Trino's file metastore names;
+                # CodeLake its own unless its metastore_names say otherwise.
+                metastore_file=get(
+                    prefix + "METASTORE_FILE", ".trinoSchema" if side == "reference" else ".codelakeSchema"
+                ),
             )
         )
     reference, candidate = sides

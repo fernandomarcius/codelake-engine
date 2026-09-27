@@ -24,7 +24,7 @@ import sys
 
 import duckdb
 
-from .compare import METASTORE_FILE, Location, data_files, find_table, quote_ident, quote_literal, read_side
+from .compare import Location, data_files, find_table, quote_ident, quote_literal, read_side
 
 # name -> (filter picking the row to change, SQL producing the changed table
 # from `t` with its `__rn` row number and `__pick` = the chosen row).
@@ -63,11 +63,11 @@ def mutate(source: str, dest: str, table: str, mutation: str, column: str | None
     os.makedirs(out_dir)
     # The table's metastore file travels with it: declared types stay the
     # source's, only the data changes.
-    for meta in (METASTORE_FILE, f".{METASTORE_FILE}.crc"):
+    for meta in (src.metastore_file, f".{src.metastore_file}.crc"):
         if os.path.isfile(os.path.join(src.path, meta)):
             shutil.copyfile(os.path.join(src.path, meta), os.path.join(out_dir, meta))
     if mutation == "declared_type":
-        path = os.path.join(out_dir, METASTORE_FILE)
+        path = os.path.join(out_dir, src.metastore_file)
         with open(path, encoding="utf-8") as f:
             metadata = json.load(f)
         changed = [c for c in metadata.get("dataColumns", []) if c.get("name", "").lower() == (column or "").lower()]
@@ -76,7 +76,7 @@ def mutate(source: str, dest: str, table: str, mutation: str, column: str | None
         changed[0]["type"] = "string"
         with open(path, "w", encoding="utf-8") as f:
             json.dump(metadata, f)
-        crc = os.path.join(out_dir, f".{METASTORE_FILE}.crc")
+        crc = os.path.join(out_dir, f".{src.metastore_file}.crc")
         if os.path.exists(crc):
             os.remove(crc)
     con = duckdb.connect()

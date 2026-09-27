@@ -10,6 +10,9 @@ shutdown_grace_secs = 1
 
 [server.trino]
 listen = "0.0.0.0:8081"
+# Clients built for Trino 431 send its header prefix and check its version (ISS-011).
+header_prefix = "X-Trino-"
+reported_version = "431"
 
 [memory]
 limit = "2GiB"
@@ -23,3 +26,12 @@ metadata_cache_limit = "8MiB"
 name = "hive"
 kind = "hive"
 warehouse = "/wh"
+
+# Trino 431 shares this warehouse: its file metastore names (ISS-011).
+[source.metastore_names]
+metadata_file = ".trinoSchema"
+permissions_dir = ".trinoPermissions"
+view_marker = "Presto View"
+view_parameter = "presto_view"
+version_parameter = "presto_version"
+writer_version = "431"
