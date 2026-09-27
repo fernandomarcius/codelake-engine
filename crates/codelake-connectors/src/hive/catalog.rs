@@ -29,7 +29,6 @@ use datafusion::catalog::{CatalogProvider, SchemaProvider, Session, TableProvide
 use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -283,9 +282,8 @@ impl TableProvider for HiveView {
             .filter(|rule| rule.name() != codelake_core::output::ACCOUNTED_OUTPUT)
             .cloned()
             .collect();
-        let mut view_state = SessionStateBuilder::new_from_existing(state.clone())
-            .with_physical_optimizer_rules(rules)
-            .build();
+        let mut view_state =
+            codelake_core::rebuild_state(state, |builder| builder.with_physical_optimizer_rules(rules));
         let defaults = &mut view_state.config_mut().options_mut().catalog;
         if let Some(catalog) = &self.definition.catalog {
             defaults.default_catalog.clone_from(catalog);

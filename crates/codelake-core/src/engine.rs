@@ -693,6 +693,49 @@ pub struct SourceStatus {
     pub error: Option<String>,
 }
 
+/// `state` rebuilt through `f` (`SessionStateBuilder::new_from_existing`),
+/// with the functions `state` resolves kept.
+///
+/// `new_from_existing` re-registers every entry of the function maps, the
+/// alias entries of the built-ins the engine replaced among them
+/// (`datepart` → `DataFusion`'s `date_part`), in hash order (`DataFusion`
+/// 54.1): the built-in can take its name back, and `extract(year …)` turns
+/// into `DataFusion`'s `date_part` (an `int`, not Trino's `bigint`) from one
+/// rebuild to the next. Each function is registered again under its own name,
+/// updated for the rebuilt configuration (the session time zone).
+pub fn rebuild_state(
+    state: &datafusion::execution::SessionState,
+    f: impl FnOnce(SessionStateBuilder) -> SessionStateBuilder,
+) -> datafusion::execution::SessionState {
+    let mut rebuilt = f(SessionStateBuilder::new_from_existing(state.clone())).build();
+    let config = rebuilt.config_options().as_ref().clone();
+    for (name, udf) in state.scalar_functions() {
+        if name == udf.name() {
+            let udf = udf
+                .inner()
+                .with_updated_config(&config)
+                .map_or_else(|| Arc::clone(udf), Arc::new);
+            // Registering replaces; there is no failure to report.
+            let _ = rebuilt.register_udf(udf);
+        }
+    }
+    for (name, udaf) in state.aggregate_functions() {
+        if name == udaf.name() {
+            let _ = rebuilt.register_udaf(Arc::clone(udaf));
+        }
+    }
+    for (name, udwf) in state.window_functions() {
+        if name == udwf.name() {
+            let _ = rebuilt.register_udwf(Arc::clone(udwf));
+        }
+    }
+    rebuilt
+}
+
+/// Last step of every query's session configuration (see
+/// [`Engine::with_session_hook`]).
+pub type SessionHook = Arc<dyn Fn(&mut SessionConfig) + Send + Sync>;
+
 pub struct Engine {
     ctx: SessionContext,
     runtime: EngineRuntime,
@@ -700,6 +743,7 @@ pub struct Engine {
     writable: HashMap<String, Arc<dyn WritableCatalog>>,
     properties: PropertyRegistry,
     governance: Arc<Governance>,
+    session_hook: Option<SessionHook>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -711,6 +755,7 @@ impl std::fmt::Debug for Engine {
             .field("writable", &self.writable.keys().collect::<Vec<_>>())
             .field("properties", &self.properties)
             .field("governance", &self.governance)
+            .field("session_hook", &self.session_hook.is_some())
             .finish()
     }
 }
@@ -794,7 +839,28 @@ impl Engine {
             writable: HashMap::new(),
             properties,
             governance,
+            session_hook: None,
         })
+    }
+
+    /// Rebuilds the engine's session state through `f`, keeping its catalogs,
+    /// functions, rules and runtime: how a layer outside the core (the
+    /// distributed planner, M4) wraps the query planner or adds codecs.
+    pub fn map_state(&mut self, f: impl FnOnce(SessionStateBuilder) -> SessionStateBuilder) {
+        self.ctx = SessionContext::new_with_state(rebuild_state(&self.ctx.state(), f));
+    }
+
+    /// Runs `hook` on the configuration of every query's session, after the
+    /// query's own settings (catalog, schema, time zone, properties): how a
+    /// layer outside the core carries them further (to distributed workers).
+    pub fn with_session_hook(&mut self, hook: SessionHook) {
+        self.session_hook = Some(hook);
+    }
+
+    /// The runtime every query runs in: the node's memory pool, disk manager
+    /// and object stores.
+    pub fn runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
+        self.runtime.env()
     }
 
     /// Admission, time limits and the query registry of this node.
@@ -881,6 +947,9 @@ impl Engine {
         for function in &options.functions {
             // Replacing a built-in is the point; the previous one is not needed.
             state.register_udf(Arc::clone(function))?;
+        }
+        if let Some(hook) = &self.session_hook {
+            hook(state.config_mut());
         }
         Ok(SessionContext::new_with_state(state))
     }
@@ -1727,6 +1796,29 @@ mod tests {
 
     fn source(name: &'static str, behaviour: Behaviour) -> Arc<dyn Connector> {
         Arc::new(FakeSource { name, behaviour })
+    }
+
+    /// Every rebuild of the session state keeps the engine's functions, not
+    /// the built-ins they replaced: `extract(year …)` stays Trino's
+    /// `bigint`, however the rebuild orders the function maps (a distributed
+    /// worker rebuilds the state with each task's configuration).
+    #[tokio::test]
+    async fn a_rebuilt_state_keeps_the_functions_the_engine_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        let base = engine.context().state();
+        for _ in 0..32 {
+            let mut config = base.config().clone();
+            config.options_mut().execution.time_zone = Some("America/Sao_Paulo".to_owned());
+            config.options_mut().execution.batch_size = 1024;
+            let rebuilt = rebuild_state(&base, |builder| builder.with_config(config));
+            let ctx = SessionContext::new_with_state(rebuilt);
+            let df = ctx
+                .sql("SELECT date_part('year', DATE '2020-05-01') AS y")
+                .await
+                .unwrap();
+            assert_eq!(df.schema().field(0).data_type(), &DataType::Int64);
+        }
     }
 
     const FAST: Duration = Duration::from_millis(200);
