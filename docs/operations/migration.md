@@ -56,7 +56,20 @@ Validate with `check-config` ([install.md](install.md#before-you-start)).
 |---|---|
 | dbt (`dbt-trino` adapter) | a new target in `profiles.yml` pointing at CodeLake; keep the old one |
 | JDBC / CLI of the reference engine | host and port of `[server.trino] listen` |
-| Scripts on `POST /v1/statement` | base URL; the protocol, headers and `nextUri` paging are the same |
+| Scripts on `POST /v1/statement` | base URL; the protocol and `nextUri` paging are the same; the header prefix is CodeLake's unless configured (below) |
+
+### Header prefix and version
+
+Clients of the reference engine send `X-Trino-*` headers and some check the
+server version. Until each client is ported to CodeLake's names
+(`X-CodeLake-*`), configure the listener with theirs (ISS-011):
+
+```toml
+[server.trino]
+listen = "0.0.0.0:8081"
+header_prefix = "X-Trino-"
+reported_version = "431"
+```
 | BI tools on PostgreSQL wire | `server.pg_listen` (new capability, not a migration) |
 
 dbt profile, with the previous engine kept as a second target for the way
@@ -97,6 +110,46 @@ Keep the listener on the same port the clients already use when the host
 changes only by DNS: set `[server.trino] listen` to that port and move the
 DNS name. The examples put the ops listener on 8080; move it when the clients
 already use that port.
+
+### Hive warehouse names
+
+A warehouse the reference engine wrote holds its metastore names
+(`.trinoSchema`, `.trinoPermissions`, `Presto View`). Either keep them while
+both engines share the warehouse:
+
+```toml
+[[source]]
+name = "hive"
+kind = "hive"
+warehouse = "/data/warehouse"
+
+[source.metastore_names]
+metadata_file = ".trinoSchema"
+permissions_dir = ".trinoPermissions"
+view_marker = "Presto View"
+view_parameter = "presto_view"
+version_parameter = "presto_version"
+writer_version = "431"
+```
+
+or, once CodeLake alone uses it (after the cut-over and a
+[metastore backup](backup-restore.md#metastore)), rename it to the source's
+names with the servers stopped:
+
+```bash
+codelake hive migrate-names --config codelake.toml --source hive \
+  --from-metadata-file .trinoSchema --from-permissions-dir .trinoPermissions \
+  --from-view-marker "Presto View" --from-view-parameter presto_view \
+  --from-version-parameter presto_version            # prints the plan
+# the same with --apply changes the files
+```
+
+The command rewrites every schema, table and view metadata file under the
+new name with its checksum (writer version, version and view parameters,
+view markers), removes the old one, and renames the permissions
+directories; data files are not touched. It refuses the whole plan, changing
+nothing, when a new name exists or a file does not parse. The reference
+engine cannot read the warehouse afterwards.
 
 ## 4. Side by side
 

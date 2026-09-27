@@ -93,6 +93,11 @@ versioning: [SemVer](https://semver.org/).
   fronts' Definition of Done (docs/gates.md).
 
 ### Changed
+- **Breaking (ISS-011):** CodeLake names by default. The HTTP protocol's headers are `X-CodeLake-*`
+  (`[server.trino] header_prefix`) and the reported version is CodeLake's (`reported_version`); hive
+  metastores write `.codelakeSchema`, `.codelakePermissions` and `CodeLake View` markers
+  (`[source.metastore_names]`). Clients and warehouses of the reference engine set its names in the
+  configuration, or `codelake hive migrate-names` renames a warehouse (docs/operations/migration.md).
 - **Breaking:** hive tables keep the case a column name was written with: Parquet files written
   by `CREATE TABLE AS`, `INSERT` and `OPTIMIZE` name a quoted `"CustomerCode"` column
   `CustomerCode` (it was `customercode`), so readers of the files (SQL Server `OPENROWSET`,
