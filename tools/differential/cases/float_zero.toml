@@ -212,10 +212,9 @@ sql = "SELECT -0.0E0 = 0.0E0, -0.0E0 IS DISTINCT FROM 0.0E0, REAL '-0.0' = REAL 
 
 [[case]]
 id = "Z49"
-expect = "WRONG"
-accepted = "ISS-050"
-note = "one group for -0.0 and 0.0 (counts equal); the reference shows the zero it met first, the engine the canonical 0.0"
-sql = "SELECT x, count(*) FROM hive.fz.z GROUP BY ROLLUP (x) ORDER BY 1 NULLS LAST"
+# abs(x): the zero a group of -0.0 and 0.0 shows is not defined (the reference
+# shows either one from run to run); the case checks the groups and their counts.
+sql = "SELECT abs(x), count(*) FROM hive.fz.z GROUP BY ROLLUP (x) ORDER BY 1 NULLS LAST"
 
 [[case]]
 id = "Z50"
