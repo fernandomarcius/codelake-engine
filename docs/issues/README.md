@@ -43,7 +43,7 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-031](ISS-031-cursor-slots-by-recommendation.md) | PostgreSQL cursors, second round: one slot per connection, FETCH rows in the pool, DISCARD, MOVE | behavior | 2026-09-26 | awaiting-confirmation |
 | [ISS-032](ISS-032-differential-divergences-without-owner.md) | Divergences the first differential run found with no front fixing them | known defect | 2026-09-26 | open |
 | [ISS-033](ISS-033-nullsafe-join-branch-unverified.md) | front/nullsafe-join finished but not independently verified | pending work | 2026-09-26 | closed |
-| [ISS-034](ISS-034-remove-limits-branch-unfinished.md) | front/remove-limits: verification failed, fix round unfinished | pending work | 2026-09-26 | open |
+| [ISS-034](ISS-034-remove-limits-branch-unfinished.md) | front/remove-limits: verification failed, fix round unfinished | pending work | 2026-09-26 | closed |
 | [ISS-035](ISS-035-dev-speed-branch-unreviewed.md) | front/dev-speed (sccache + differential gate) not reviewed | pending work | 2026-09-26 | closed |
 | [ISS-036](ISS-036-f6-round3-unverified.md) | F6 round 3 (cursors) implemented, not verified | pending work | 2026-09-26 | open |
 | [ISS-037](ISS-037-char-branch-unmerged.md) | char(n) semantics branch not merged | pending work | 2026-09-26 | open |
