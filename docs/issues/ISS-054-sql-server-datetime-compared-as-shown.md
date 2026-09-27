@@ -1,6 +1,6 @@
 # ISS-054 — SQL Server `datetime` compared at the value the engine shows
 
-- Kind: deliberate divergence · Applied by recommendation, 2026-09-27 · Status: awaiting-confirmation
+- Kind: deliberate divergence · Accepted by: Fernando Farias, 2026-09-27 · Status: open
 - Context: SQL Server `datetime` stores time in 1/300 s steps, so a value written as
   `17:37:54.173` is stored as `17:37:54.17333…`. Both engines read the column as
   `timestamp(3)` and show `17:37:54.173`. Trino 431 then compares a filter on the column
@@ -8,7 +8,7 @@
   run of 2026-09-27 its `WHERE tran_end_time = TIMESTAMP '2026-09-27 17:37:54.173'` and
   `<=` the same literal returned no row, although the row shows exactly that value. CodeLake
   compares with the value it shows, with or without pushdown, and returns the row.
-- Applied: CodeLake keeps comparing at the value it shows. A row always matches its own
+- Accepted: CodeLake keeps comparing at the value it shows. A row always matches its own
   displayed value, and the answer does not depend on whether the filter was pushed down.
   Not inherited from Trino 431: its behavior loses rows at the boundary and protects no data.
 - Risk: a filter whose literal is the displayed value of a SQL Server `datetime` that is
