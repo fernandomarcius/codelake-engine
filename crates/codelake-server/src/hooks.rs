@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use codelake_core::trace::{self, TARGET, TraceParent};
-use codelake_core::{operand_checks, statement_policy};
+use codelake_core::{identifier_case, operand_checks, statement_policy};
 use datafusion::common::ParamValues;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::context::SQLOptions;
@@ -161,6 +161,11 @@ impl QueryHook for PolicyHook {
 ///
 /// A statement that does not plan gets the planner's error, as it would from
 /// `datafusion-postgres`.
+///
+/// Identifiers are case-insensitive on this protocol too (ISS-018): the
+/// statement is planned with its identifiers folded
+/// ([`codelake_core::identifier_case`]), on both protocols (the extended one
+/// at `Parse`).
 #[derive(Debug)]
 pub(crate) struct SimpleRunHook;
 
@@ -203,7 +208,9 @@ async fn run_simple(
     session_context: &SessionContext,
     client: &mut dyn HookClient,
 ) -> PgWireResult<Response> {
-    let sql = statement.to_string();
+    let mut folded = statement.clone();
+    identifier_case::fold_identifiers(&mut folded);
+    let sql = folded.to_string();
     let planned = plan_checked(session_context, &sql);
     let df = match statement_timeout(client) {
         Some(limit) => tokio::time::timeout(limit, planned).await.map_err(|_| {
@@ -253,21 +260,28 @@ impl QueryHook for SimpleRunHook {
         Some(run_simple(statement, session_context, client).await)
     }
 
-    /// Plans a statement whose `IS [NOT] DISTINCT FROM` the parser grouped
-    /// otherwise than PostgreSQL (see `plan_checked`), as `datafusion-postgres`
-    /// would plan it; every other statement is left to it.
+    /// Plans a statement whose identifiers fold
+    /// ([`codelake_core::identifier_case`]) or whose `IS [NOT] DISTINCT FROM`
+    /// the parser grouped otherwise than PostgreSQL (see `plan_checked`), as
+    /// `datafusion-postgres` plans any other (`statement_to_plan` on the
+    /// session's state); the others are left to it.
     async fn handle_extended_parse_query(
         &self,
         statement: &Statement,
         session_context: &SessionContext,
         _client: &(dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<LogicalPlan>> {
-        let regrouped = codelake_core::regrouped_statement(statement)?;
-        let statement = datafusion::sql::parser::Statement::Statement(Box::new(regrouped));
+        let mut planned = statement.clone();
+        let folded = identifier_case::fold_identifiers(&mut planned);
+        let regrouped = codelake_core::regrouped_statement(&planned);
+        if !folded && regrouped.is_none() {
+            return None;
+        }
+        let planned = regrouped.unwrap_or(planned);
         Some(
             session_context
                 .state()
-                .statement_to_plan(statement)
+                .statement_to_plan(datafusion::sql::parser::Statement::Statement(Box::new(planned)))
                 .await
                 .map_err(api_error),
         )

@@ -217,6 +217,11 @@ versioning: [SemVer](https://semver.org/).
   one value everywhere, for `double` and `real`. **Deliberate divergence:** joins,
   `IN (subquery)` and `IN` lists of `real` match `0.0` with `-0.0`, as PostgreSQL does and
   Trino 431 does not (ADR 0017, ISS-050).
+- Column names resolve in any spelling wherever a statement names a column: a quoted
+  `"CustomerCode"` in an `INSERT` column list or a `JOIN … USING` list, and in any statement on
+  the PostgreSQL wire (simple and extended protocols), failed with `No field named`; an unquoted
+  name with a non-ASCII capital (`DESCRIÇÃO`) was folded to ASCII lower case only
+  (`descriÇÃo`, also the name written to the files) and did not resolve (ADR 0007, ISS-018).
 - Hive catalog: `DROP VIEW` deleted every file in the view's directory, including files of
   another writer when the view had been created over an existing directory (as the reference
   engine does); `ALTER VIEW … RENAME` moved them. Both now touch only the view's metadata

@@ -107,7 +107,14 @@ Server 2022, and each is the behavior of Trino 431 itself.
     column's name (another engine renamed it) is ignored.
   - **Resolution:** the engine sees every schema, table and column by its
     folded name, so any spelling resolves (`customercode`, `CUSTOMERCODE`,
-    `"CustomerCode"`); result headers, `information_schema` and `DESCRIBE`
+    `"CustomerCode"`), on both client protocols (HTTP and the PostgreSQL
+    wire, simple and extended), wherever a statement names a column: in
+    expressions, `INSERT` column lists and `JOIN … USING` lists
+    (`codelake_core::identifier_case`; a name the statement itself defines,
+    an alias, stays as written). An unquoted name with a non-ASCII capital
+    folds as `A`–`Z` do (`DESCRIÇÃO` is `descrição`; the planner alone
+    folds ASCII only, which recorded `descriÇÃo`, a spelling nobody
+    wrote). Result headers, `information_schema` and `DESCRIBE`
     show the folded name, as Trino does. Showing the written case there
     needs case-insensitive column resolution in the planner, which
     `DataFusion` 54 does not have (ISS-018, awaiting confirmation).

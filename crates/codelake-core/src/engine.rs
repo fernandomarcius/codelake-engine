@@ -426,7 +426,7 @@ fn with_schema(
 /// semantics. The function library's literal rewrites come first
 /// ([`crate::trino_functions::rewrite_statement`]: `TIMESTAMP '…'`,
 /// `DECIMAL '…'`, numeric literals, `AT TIME ZONE`, `CAST(… AS varchar(n))`);
-/// then quoted column names, zoned timestamp literals it left, `VALUES`
+/// then the case of identifiers ([`crate::identifier_case`]), zoned timestamp literals it left, `VALUES`
 /// lists, `DECIMAL` without precision, `char(n)` and the `timestamp` types
 /// (see the modules `literals`, `coercion` and `declared`). Every statement
 /// the engine plans goes through it, and so must the SQL of a view a
@@ -437,7 +437,9 @@ pub fn trino_statement(
 ) -> Result<(), DataFusionError> {
     crate::trino_sql_checks::regroup_distinct_from(statement);
     crate::coercion::name_casts_in_aggregates(statement);
-    crate::trino_sql_checks::fold_quoted_columns(statement);
+    if let datafusion::sql::parser::Statement::Statement(inner) = statement {
+        crate::identifier_case::fold_identifiers(inner);
+    }
     crate::trino_functions::rewrite_statement(statement)?;
     crate::literals::rewrite_zoned_timestamps(statement);
     crate::coercion::mark_values(statement);
@@ -642,6 +644,11 @@ fn parse_statement(
         }
     }
     let mut statement = state.sql_to_statement(&sql, &dialect)?;
+    // Before the DDL preparation records declared column names: an unquoted
+    // non-ASCII capital is folded as the planner folds `A`-`Z` (ISS-018).
+    if let datafusion::sql::parser::Statement::Statement(inner) = &mut statement {
+        crate::identifier_case::fold_unquoted(inner);
+    }
     statement_policy::check_statement(&statement)?;
     crate::trino_sql_checks::check_statement(&statement)?;
     ddl::rewrite_show_tables(&mut statement)?;

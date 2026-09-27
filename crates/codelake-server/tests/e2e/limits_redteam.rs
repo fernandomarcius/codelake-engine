@@ -329,3 +329,77 @@ async fn a_prepared_statement_is_refused_when_the_replacement_changes_its_column
     );
     drop(running.server);
 }
+
+/// Mixed-case names over both protocols: every spelling reads the same
+/// rows, and the files carry the written spelling.
+#[tokio::test]
+async fn mixed_case_names_over_both_protocols() {
+    let dir = tempfile::tempdir().unwrap();
+    let warehouse = dir.path().join("warehouse");
+    std::fs::create_dir_all(&warehouse).unwrap();
+    let running = start(dir.path(), &warehouse).await;
+    let client = &running.client;
+    let mut failures: Vec<String> = Vec::new();
+    http_ok(running.http, "CREATE SCHEMA hive.\"Vendas\"").await;
+    http_ok(
+        running.http,
+        "CREATE TABLE hive.\"Vendas\".\"Pedido\" AS SELECT CAST(x AS BIGINT) AS \"CustomerCode\", \
+         CAST(x * 10 AS BIGINT) AS \"Valor\" FROM (VALUES (1), (2), (3)) v(x)",
+    )
+    .await;
+    for sql in [
+        "SELECT CAST(sum(customercode) AS VARCHAR), CAST(sum(valor) AS VARCHAR) FROM hive.vendas.pedido",
+        "SELECT CAST(sum(\"CustomerCode\") AS VARCHAR), CAST(sum(\"Valor\") AS VARCHAR) FROM hive.\"Vendas\".\"Pedido\"",
+        "SELECT CAST(sum(CUSTOMERCODE) AS VARCHAR), CAST(sum(VALOR) AS VARCHAR) FROM hive.VENDAS.PEDIDO",
+    ] {
+        let answer = simple(client, sql).await;
+        if answer != Ok(one(&["6", "60"])) {
+            failures.push(format!("pg simple: {sql}: {answer:?}"));
+        }
+        match client.prepare(sql).await {
+            Ok(statement) => match client.query_one(&statement, &[]).await {
+                Ok(row) => {
+                    let got = (row.get::<_, String>(0), row.get::<_, String>(1));
+                    if got != ("6".to_owned(), "60".to_owned()) {
+                        failures.push(format!("pg extended: {sql}: {got:?}"));
+                    }
+                }
+                Err(err) => failures.push(format!("pg extended: {sql}: {err:?}")),
+            },
+            Err(err) => failures.push(format!("pg extended prepare: {sql}: {err:?}")),
+        }
+        let (_, rows, error) = http(running.http, sql).await;
+        if error.is_some() || rows != vec![serde_json::json!(["6", "60"])] {
+            failures.push(format!("http: {sql}: {rows:?} {error:?}"));
+        }
+    }
+    let quoted = "INSERT INTO hive.vendas.pedido (\"Valor\", \"CustomerCode\") VALUES (50, 5)";
+    let (_, _, error) = http(running.http, quoted).await;
+    if let Some(error) = error {
+        failures.push(format!("http: {quoted}: {error}"));
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+    let (names, _, error) = http(
+        running.http,
+        "SELECT \"CustomerCode\", valor FROM hive.vendas.pedido WHERE customercode = 2",
+    )
+    .await;
+    assert_eq!(error, None);
+    assert_eq!(names, vec!["CustomerCode".to_owned(), "valor".to_owned()]);
+    let (names, rows, error) = http(
+        running.http,
+        "SELECT column_name FROM hive.information_schema.columns WHERE table_schema = 'vendas' AND table_name = 'pedido'",
+    )
+    .await;
+    assert_eq!(error, None);
+    assert_eq!(names, vec!["column_name".to_owned()]);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    http_ok(running.http, "INSERT INTO hive.vendas.pedido VALUES (4, 40)").await;
+    let files: Vec<PathBuf> = std::fs::read_dir(warehouse.join("vendas/pedido"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| !p.file_name().unwrap().to_string_lossy().starts_with(['.', '_']))
+        .collect();
+    assert!(files.len() >= 2, "{files:?}");
+    drop(running.server);
+}

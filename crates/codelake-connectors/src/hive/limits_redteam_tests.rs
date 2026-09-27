@@ -397,6 +397,90 @@ async fn a_lock_free_reader_always_finds_the_table() {
 // Each test below failed before its fix and proves a defect of the tester's
 // report.
 
+/// An `INSERT` column list or a `JOIN … USING` names columns as the
+/// statement that created the table wrote them (quoted): every spelling
+/// resolves, as in a query (and as in the reference engine).
+#[tokio::test]
+async fn insert_column_lists_resolve_quoted_spellings() {
+    let lake = lake().await;
+    lake.ok(
+        "CREATE TABLE hive.s.t AS SELECT CAST(1 AS BIGINT) AS \"CustomerCode\", \
+         CAST(10 AS BIGINT) AS \"Valor\"",
+    )
+    .await;
+    assert_eq!(
+        lake.ok("SELECT \"CustomerCode\", \"Valor\" FROM hive.s.t").await,
+        rows(&[&["1", "10"]])
+    );
+    let mut failures = Vec::new();
+    for (sql, key) in [
+        (
+            "INSERT INTO hive.s.t (\"CustomerCode\", \"Valor\") VALUES (2, 20)",
+            "2",
+        ),
+        (
+            "INSERT INTO hive.s.t (\"Valor\", \"CUSTOMERCODE\") VALUES (30, 3)",
+            "3",
+        ),
+    ] {
+        match lake.run(sql).await {
+            Ok(_) => assert_eq!(
+                lake.ok(&format!("SELECT valor FROM hive.s.t WHERE customercode = {key}"))
+                    .await,
+                rows(&[&[&format!("{key}0")]]),
+                "{sql}"
+            ),
+            Err(err) => failures.push(format!("{sql}: {err}")),
+        }
+    }
+    lake.ok("CREATE TABLE hive.s.u AS SELECT CAST(2 AS BIGINT) AS \"CustomerCode\"")
+        .await;
+    for sql in [
+        "SELECT count(*) FROM hive.s.t JOIN hive.s.u USING (\"CustomerCode\")",
+        "SELECT count(*) FROM hive.s.t JOIN hive.s.u USING (CustomerCode)",
+    ] {
+        if let Err(err) = lake.run(sql).await {
+            failures.push(format!("{sql}: {err}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A non-ASCII capital letter in a column name: an unquoted name folds as
+/// an ASCII one does (`DESCRIÇÃO` is `descrição`, recorded as nothing else),
+/// a quoted one keeps its spelling, and every spelling reads the column.
+#[tokio::test]
+async fn non_ascii_capitals_keep_a_written_spelling_and_resolve() {
+    let lake = lake().await;
+    lake.ok(
+        "CREATE TABLE hive.s.acc AS SELECT CAST(1 AS BIGINT) AS \"CÓDIGO\", CAST(2 AS BIGINT) AS DESCRIÇÃO",
+    )
+    .await;
+    let metadata = lake.metastore().table("s", "acc").await.unwrap().unwrap();
+    let written: Vec<Option<String>> = metadata
+        .data_columns
+        .iter()
+        .map(|c| c.properties.get("codelake.name").cloned())
+        .collect();
+    let names: Vec<String> = metadata.data_columns.iter().map(|c| c.name.clone()).collect();
+    assert_eq!(names, vec!["código".to_owned(), "descrição".to_owned()]);
+    let mut failures = Vec::new();
+    if written != vec![Some("CÓDIGO".to_owned()), None] {
+        failures.push(format!("written spellings recorded: {written:?}"));
+    }
+    for sql in [
+        "SELECT \"CÓDIGO\", \"DESCRIÇÃO\" FROM hive.s.acc",
+        "SELECT código, descrição FROM hive.s.acc",
+        "SELECT CÓDIGO, DESCRIÇÃO FROM hive.s.acc",
+    ] {
+        let answer = lake.run(sql).await;
+        if answer != Ok(rows(&[&["1", "2"]])) {
+            failures.push(format!("{sql}: {answer:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 /// A plan kept by a client after `CREATE OR REPLACE` put in a table with
 /// the same columns: the kept plan names the replaced table, so every run of
 /// it is refused with an error that says what to do (plan it again; the
