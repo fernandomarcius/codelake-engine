@@ -22,10 +22,11 @@ pub(crate) const SAMPLE_EVERY: Duration = Duration::from_millis(20);
 /// Spill is polled less often: over HTTP it costs a request.
 const SPILL_EVERY_N_SAMPLES: u32 = 5;
 
-/// cgroup v2 directory of one container.
+/// cgroup v2 directories of the engine: one container, or every pod of a
+/// distributed engine (coordinator and workers), read as one sum.
 #[derive(Debug, Clone)]
 pub(crate) struct Cgroup {
-    dir: PathBuf,
+    dirs: Vec<PathBuf>,
 }
 
 fn stat_field(text: &str, field: &str) -> Option<u64> {
@@ -35,9 +36,18 @@ fn stat_field(text: &str, field: &str) -> Option<u64> {
     })
 }
 
+fn read(dir: &Path, file: &str) -> Option<String> {
+    std::fs::read_to_string(dir.join(file)).ok()
+}
+
 impl Cgroup {
     pub(crate) fn at(dir: PathBuf) -> Self {
-        Self { dir }
+        Self { dirs: vec![dir] }
+    }
+
+    /// Several cgroups summed (`--cgroup-dir`, repeated).
+    pub(crate) fn sum(dirs: Vec<PathBuf>) -> Self {
+        Self { dirs }
     }
 
     /// Finds the cgroup of container `id` under a mounted cgroup root, for the
@@ -50,26 +60,27 @@ impl Cgroup {
         ]
         .into_iter()
         .find(|dir| dir.join("memory.stat").exists())
-        .map(|dir| Self { dir })
+        .map(Self::at)
     }
 
-    fn read(&self, file: &str) -> Option<String> {
-        std::fs::read_to_string(self.dir.join(file)).ok()
+    /// The sum of `value` over every directory; `None` when one is missing.
+    fn total(&self, value: impl Fn(&Path) -> Option<u64>) -> Option<u64> {
+        self.dirs.iter().map(|dir| value(dir)).sum()
     }
 
     /// Anonymous memory of the container, bytes.
     pub(crate) fn anon_bytes(&self) -> Option<u64> {
-        stat_field(&self.read("memory.stat")?, "anon")
+        self.total(|dir| stat_field(&read(dir, "memory.stat")?, "anon"))
     }
 
     /// Container-lifetime high-water mark including page cache, bytes.
     pub(crate) fn peak_bytes(&self) -> Option<u64> {
-        self.read("memory.peak")?.trim().parse().ok()
+        self.total(|dir| read(dir, "memory.peak")?.trim().parse().ok())
     }
 
     /// Total CPU time consumed by the container, microseconds.
     pub(crate) fn cpu_usec(&self) -> Option<u64> {
-        stat_field(&self.read("cpu.stat")?, "usage_usec")
+        self.total(|dir| stat_field(&read(dir, "cpu.stat")?, "usage_usec"))
     }
 }
 
