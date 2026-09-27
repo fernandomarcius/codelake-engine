@@ -13,6 +13,7 @@ mod limits_redteam_tests;
 #[cfg(test)]
 mod limits_tests;
 mod metastore;
+pub mod migrate;
 mod optimize;
 #[cfg(test)]
 mod optimize_tests;
