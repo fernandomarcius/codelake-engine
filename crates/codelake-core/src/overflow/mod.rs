@@ -647,5 +647,54 @@ impl AnalyzerRule for TrinoDecimalTypes {
     }
 }
 
+/// The functions the overflow rules put in plans, for plans that cross a
+/// process boundary (`crate::portable`). They are not in the session's
+/// registry, and the aggregates share the names of the ones they replace.
+#[cfg(feature = "portable")]
+pub(crate) mod portable {
+    use std::sync::Arc;
+
+    use datafusion::logical_expr::{AggregateUDF, Operator, ScalarUDF};
+
+    pub(crate) use super::arith::{CheckedAbs, CheckedBinary, CheckedNegate};
+    pub(crate) use super::avg::TrinoAvg;
+    pub(crate) use super::decimal::DecimalBinary;
+    pub(crate) use super::real::RealResult;
+    pub(crate) use super::sum::CheckedSum;
+
+    pub(crate) fn checked_op(op: Operator) -> Option<Arc<ScalarUDF>> {
+        super::checked_op(op).map(Arc::clone)
+    }
+
+    pub(crate) fn decimal_op(op: Operator) -> Option<Arc<ScalarUDF>> {
+        super::decimal_op(op).map(Arc::clone)
+    }
+
+    pub(crate) fn checked_negate() -> Arc<ScalarUDF> {
+        Arc::clone(&super::CHECKED_NEGATE)
+    }
+
+    pub(crate) fn checked_abs() -> Arc<ScalarUDF> {
+        Arc::clone(&super::CHECKED_ABS)
+    }
+
+    /// `sum` checked, typed like Trino when `trino`.
+    pub(crate) fn checked_sum(trino: bool) -> Arc<AggregateUDF> {
+        Arc::clone(if trino {
+            &super::TRINO_SUM
+        } else {
+            &super::CHECKED_SUM
+        })
+    }
+
+    pub(crate) fn trino_avg() -> Arc<AggregateUDF> {
+        Arc::clone(&super::TRINO_AVG)
+    }
+
+    pub(crate) fn real_result(inner: Arc<AggregateUDF>) -> Arc<AggregateUDF> {
+        Arc::new(AggregateUDF::new_from_impl(RealResult::new(inner)))
+    }
+}
+
 #[cfg(test)]
 mod tests;

@@ -821,6 +821,30 @@ pub(crate) fn check_insert(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>
     ))))
 }
 
+/// Parameters of a [`TrinoTyped`] and its rebuild, for plans that cross a
+/// process boundary (`crate::portable`).
+#[cfg(feature = "portable")]
+impl TrinoTyped {
+    pub(crate) fn portable(&self) -> (u8, bool) {
+        let mode = match self.mode {
+            Mode::Cast => 0,
+            Mode::Strict => 1,
+            Mode::Insert => 2,
+        };
+        (mode, self.lenient)
+    }
+
+    pub(crate) fn from_portable(mode: u8, lenient: bool) -> Option<ScalarUDF> {
+        let mode = match mode {
+            0 => Mode::Cast,
+            1 => Mode::Strict,
+            2 => Mode::Insert,
+            _ => return None,
+        };
+        Some(ScalarUDF::new_from_impl(Self::new(mode, lenient)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

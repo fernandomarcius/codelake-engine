@@ -439,6 +439,32 @@ pub(crate) fn uncheck_cast(expr: Expr) -> Transformed<Expr> {
     Transformed::no(Expr::ScalarFunction(ScalarFunction { func, args }))
 }
 
+/// Parameters of a [`TimestampCast`] and its rebuild, for plans that cross a
+/// process boundary (`crate::portable`).
+#[cfg(feature = "portable")]
+impl TimestampCast {
+    pub(crate) fn portable(&self) -> (u8, &DataType, bool) {
+        let kind = match self.kind {
+            Kind::ZonedToLocal => 0,
+            Kind::LocalToZoned => 1,
+            Kind::Rescale => 2,
+            Kind::ToText => 3,
+        };
+        (kind, &self.target, self.safe)
+    }
+
+    pub(crate) fn from_portable(kind: u8, target: DataType, safe: bool) -> Option<ScalarUDF> {
+        let kind = match kind {
+            0 => Kind::ZonedToLocal,
+            1 => Kind::LocalToZoned,
+            2 => Kind::Rescale,
+            3 => Kind::ToText,
+            _ => return None,
+        };
+        Some(ScalarUDF::new_from_impl(Self::new(kind, target, safe)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "xtask"]
-exclude = ["fuzz"]
+exclude = ["fuzz", "vendor"]
 default-members = ["crates/*"]
 
 [workspace.package]
@@ -37,6 +37,15 @@ datafusion-table-providers-common = { version = "=0.13.1", default-features = fa
 datafusion-table-providers-postgres = { version = "=0.13.1", default-features = false }
 datafusion-table-providers-mysql = { version = "=0.13.1", default-features = false }
 datafusion-table-providers-mongodb = { version = "=0.13.1", default-features = false }
+# Distributed execution (M4, ADR 0011): exact pins, part of the train block.
+# datafusion-distributed 3.0.0 is the last release on DataFusion 54.
+datafusion-distributed = { version = "=3.0.0", default-features = false, features = ["grpc", "parquet", "sql"] }
+datafusion-proto = { version = "=54.1.0", default-features = false }
+# The worker service is a tonic server (datafusion-distributed's transport).
+tonic = { version = "0.14", default-features = false, features = ["transport"] }
+url = "2.5"
+# Encoding of the core's plan codec (the version datafusion-proto uses).
+prost = { version = "0.14", default-features = false, features = ["std"] }
 # Iceberg is out of the build: no iceberg-datafusion release targets
 # DataFusion 54 (docs/adr/0013-iceberg-out-of-the-datafusion-54-train.md).
 datafusion-postgres = "=0.18.0"
@@ -157,3 +166,8 @@ panic = "unwind"
 [profile.bench]
 inherits = "release"
 debug = true
+
+# datafusion-distributed 3.0.0 with CodeLake's patch (vendor/datafusion-distributed/PATCHES.md):
+# the DataFusion 54 line of the library is frozen upstream (ADR 0011).
+[patch.crates-io]
+datafusion-distributed = { path = "vendor/datafusion-distributed" }

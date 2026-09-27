@@ -489,3 +489,11 @@ impl AggregateUDFImpl for CheckedSum {
         self.inner.set_monotonicity(data_type)
     }
 }
+
+#[cfg(feature = "portable")]
+impl CheckedSum {
+    /// Whether this is [`CheckedSum::trino`] (`crate::portable`).
+    pub(crate) fn is_trino(&self) -> bool {
+        self.trino_decimal
+    }
+}

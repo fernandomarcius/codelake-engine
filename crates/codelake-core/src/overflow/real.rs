@@ -192,3 +192,11 @@ impl GroupsAccumulator for RealGroups {
         self.0.size()
     }
 }
+
+#[cfg(feature = "portable")]
+impl RealResult {
+    /// The aggregate this one answers `real` for (`crate::portable`).
+    pub(crate) fn inner(&self) -> &Arc<AggregateUDF> {
+        &self.inner
+    }
+}

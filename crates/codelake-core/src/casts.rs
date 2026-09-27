@@ -378,6 +378,19 @@ pub(crate) fn uncheck_cast(expr: Expr) -> Transformed<Expr> {
     Transformed::no(Expr::ScalarFunction(ScalarFunction { func, args }))
 }
 
+/// Parameters of a [`ToDecimal`] and its rebuild, for plans that cross a
+/// process boundary (`crate::portable`).
+#[cfg(feature = "portable")]
+impl ToDecimal {
+    pub(crate) fn portable(&self) -> (u8, i8, bool) {
+        (self.precision, self.scale, self.safe)
+    }
+
+    pub(crate) fn from_portable(precision: u8, scale: i8, safe: bool) -> ScalarUDF {
+        ScalarUDF::new_from_impl(Self::new(precision, scale, safe))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

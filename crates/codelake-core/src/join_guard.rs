@@ -981,6 +981,14 @@ impl ExecutionPlan for NullKeysKept {
     }
 }
 
+#[cfg(feature = "portable")]
+impl NullKeysKept {
+    /// The join keys whose NULLs are kept (`crate::portable`).
+    pub(crate) fn keys(&self) -> &[Arc<dyn PhysicalExpr>] {
+        &self.keys
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
