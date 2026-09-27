@@ -5,9 +5,6 @@ oracle = "postgres"
 
 [[case]]
 id = "case-folding"
-expect = "RECUSA"
-known = "front/f6-fixes"
-diverges_at = [3, 4, 5, 9, 10]
 steps = [
   "BEGIN",
   "DECLARE Big CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
@@ -90,9 +87,6 @@ steps = [
 
 [[case]]
 id = "discard-all"
-expect = "EXTRA"
-known = "front/f6-fixes"
-diverges_at = [3, 4]
 steps = [
   "DECLARE h CURSOR WITH HOLD FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
   "FETCH 1 FROM h",
@@ -103,9 +97,6 @@ steps = [
 
 [[case]]
 id = "counts"
-expect = "EXTRA"
-known = "front/f6-fixes"
-diverges_at = [5]
 steps = [
   "BEGIN",
   "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
@@ -155,9 +146,6 @@ steps = [
 
 [[case]]
 id = "aborted"
-expect = "ERRO"
-known = "front/f6-fixes"
-diverges_at = [8]
 steps = [
   "BEGIN",
   "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
