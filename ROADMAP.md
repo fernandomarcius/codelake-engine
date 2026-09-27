@@ -201,6 +201,9 @@ TB-scale joins need scale-out.
   DataFusion 54 train) makes `datafusion-distributed` 3.0.0 the candidate and
   Ballista 54.1 the fallback, and sets the benchmark plan and decision gates;
   single-node stays the default, and nothing merges before the benchmark runs.
+  Spike S1 done (branch `front/m4-distributed`): the 22 TPC-H queries on a
+  coordinator and three workers match single-node; two library defects and
+  one DataFusion defect found and patched (docs/upstream/datafusion-distributed-3.md).
 - Coordinator/worker split; the core is already stateless per node.
 - Memory ceiling per worker plus a cluster-wide admission budget.
 

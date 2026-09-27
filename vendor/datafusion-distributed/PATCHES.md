@@ -21,4 +21,20 @@ The patch puts the user codecs first. A user codec that writes nothing for a
 function it does not own keeps the encoded definition empty (position 0, empty
 blob), so the worker resolves the function by name in its registry, as before.
 
-Upstream: not reported (ADR 0005); draft in docs/upstream/.
+
+## 2. Broadcast build sides reserved within the limit (`src/execution_plans/broadcast.rs`)
+
+`BroadcastExec` holds the whole build side of a broadcast join, for every
+consumer task, and reserved it with `MemoryReservation::grow`, which no pool
+refuses: a large build side took the worker past its memory ceiling.
+It reserves with `try_grow`, so a build side the pool cannot hold fails the
+query with a resources error, as a single-node hash join's build side does
+(ADR 0003: fail the query, not the node).
+
+The library's other buffers stay on `grow` because they are bounded by
+construction: `NetworkBoundary` (two messages per input stream),
+`WorkerConnection` (the per-connection budget, which CodeLake sizes from the
+node's memory limit) and `PartitionSampler` (only with dynamic task counts,
+off by default).
+
+Upstream: neither patch is reported (ADR 0005); drafts in docs/upstream/.

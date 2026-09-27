@@ -177,7 +177,12 @@ impl ExecutionPlan for BroadcastExec {
                     match msg {
                         Ok(record_batch) => {
                             let reservation = mem_consumer.clone_with_new_id().register(&pool);
-                            reservation.grow(record_batch.get_array_memory_size());
+                            // CodeLake patch (PATCHES.md §2): the build side is
+                            // reserved within the pool's limit, as a hash join's is.
+                            if let Err(err) = reservation.try_grow(record_batch.get_array_memory_size()) {
+                                queue.push(Err(Arc::new(err)));
+                                break;
+                            }
                             queue.push(Ok((record_batch, Arc::new(reservation))));
                         }
                         Err(err) => {

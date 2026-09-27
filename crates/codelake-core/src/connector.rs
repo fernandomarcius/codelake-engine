@@ -65,6 +65,12 @@ pub trait Connector: Send + Sync + Debug {
     fn session_properties(&self) -> Vec<crate::session_properties::SessionProperty> {
         Vec::new()
     }
+
+    /// Registers the object stores its scans read in `runtime`, once the
+    /// catalog is built. A node that executes plans another node planned (a
+    /// distributed worker) never scans the tables itself, so it would not
+    /// register them lazily.
+    fn register_object_stores(&self, _runtime: &datafusion::execution::runtime_env::RuntimeEnv) {}
 }
 
 /// Field metadata key: the column type as the client declared it in DDL

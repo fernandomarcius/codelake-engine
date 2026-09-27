@@ -27,6 +27,12 @@ pub(crate) enum ServeError {
     Metrics(#[from] metrics_exporter_prometheus::BuildError),
     #[error("PostgreSQL listener stopped: {0}")]
     PgListener(String),
+    #[cfg(not(feature = "distributed"))]
+    #[error("[distributed] is configured but this build has no `distributed` feature")]
+    NotDistributed,
+    #[cfg(feature = "distributed")]
+    #[error("distributed: {0}")]
+    Distributed(String),
 }
 
 /// `session_sampling`: share of PostgreSQL sessions traced (see
@@ -59,9 +65,32 @@ async fn serve(validated: ValidatedConfig, session_sampling: Option<f64>) -> Res
         Some(config.query_history()),
     )?;
     let timeout = Duration::from_secs(config.execution.source_startup_timeout_secs);
+    let worker = config
+        .distributed
+        .as_ref()
+        .is_some_and(|d| d.role == codelake_core::config::DistributedRole::Worker);
     for source in &config.sources {
+        // A worker only reads the files of the stages it runs: federated
+        // sources stay on the coordinator (no pools or credentials here).
+        if worker && !matches!(source.kind, codelake_core::SourceKind::Hive { .. }) {
+            continue;
+        }
         let connector = codelake_connectors::build(source, &secrets)?;
         engine.attach(connector, source.required, timeout).await?;
+    }
+    if let Some(distributed) = &config.distributed {
+        #[cfg(feature = "distributed")]
+        {
+            if worker {
+                return serve_worker(engine, distributed.listen, &config, prometheus).await;
+            }
+            coordinate(&mut engine, distributed, &config)?;
+        }
+        #[cfg(not(feature = "distributed"))]
+        {
+            let _ = distributed;
+            return Err(ServeError::NotDistributed);
+        }
     }
     let engine = Arc::new(engine);
     info!(memory_limit = %config.memory.limit, sources = config.sources.len(), "engine ready");
@@ -122,6 +151,67 @@ async fn serve(validated: ValidatedConfig, session_sampling: Option<f64>) -> Res
     }
     info!("shutdown complete");
     Ok(())
+}
+
+/// Makes `engine` the coordinator of `distributed.workers`. A connection to a
+/// worker buffers at most 1/16 of the memory limit (the library's default is
+/// a fixed 64 MiB per connection).
+#[cfg(feature = "distributed")]
+fn coordinate(
+    engine: &mut Engine,
+    distributed: &codelake_core::config::DistributedConfig,
+    config: &codelake_core::Config,
+) -> Result<(), ServeError> {
+    use datafusion_distributed::DistributedExt as _;
+    let urls = distributed
+        .workers
+        .iter()
+        .map(|url| url::Url::parse(url).map_err(|e| ServeError::Distributed(format!("{url}: {e}"))))
+        .collect::<Result<Vec<_>, _>>()?;
+    let budget = (config.memory.limit.as_usize() / 16).max(8 << 20);
+    codelake_server::distributed::coordinate(
+        engine,
+        codelake_server::distributed::StaticWorkers(urls),
+        |builder| builder.with_distributed_worker_connection_buffer_budget_bytes(budget),
+    )
+    .map_err(|e| ServeError::Distributed(e.to_string()))?;
+    info!(workers = distributed.workers.len(), "distributed coordinator");
+    Ok(())
+}
+
+/// A worker: its execution service and the operational HTTP listener
+/// (probes, metrics), until SIGTERM. No client listeners.
+#[cfg(feature = "distributed")]
+async fn serve_worker(
+    engine: Engine,
+    listen: std::net::SocketAddr,
+    config: &codelake_core::Config,
+    prometheus: metrics_exporter_prometheus::PrometheusHandle,
+) -> Result<(), ServeError> {
+    let engine = Arc::new(engine);
+    let state = Arc::new(ops::OpsState::new(Arc::clone(&engine), prometheus));
+    let shutdown = CancellationToken::new();
+    let http_listener = TcpListener::bind(config.server.http_listen).await?;
+    let http = tokio::spawn(
+        axum::serve(http_listener, ops::router(Arc::clone(&state)))
+            .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+            .into_future(),
+    );
+    info!(addr = %listen, "distributed worker listening");
+    let stop = shutdown.clone();
+    let served = codelake_server::distributed::serve_worker(&engine, listen, async move {
+        tokio::select! {
+            () = shutdown_signal() => {}
+            () = stop.cancelled() => {}
+        }
+    })
+    .await;
+    state.start_draining();
+    shutdown.cancel();
+    if let Ok(Err(err)) = http.await {
+        warn!(error = %err, "ops HTTP server ended with error");
+    }
+    served.map_err(|e| ServeError::Distributed(e.to_string()))
 }
 
 /// Starts the HTTP statement protocol listener; its catalog `system` adds the

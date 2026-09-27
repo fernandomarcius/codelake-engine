@@ -237,9 +237,13 @@ async fn register_tpch(engine: &Engine, data: &Path) {
     }
 }
 
-/// Starts a worker engine's gRPC service on a loopback port.
-async fn start_worker(spill: &Path) -> url::Url {
-    let engine = Engine::new(&memory(spill), &ExecutionConfig::default()).unwrap();
+/// Starts a worker engine's gRPC service on a loopback port; with the Hive
+/// source over `warehouse` attached (its object store) when given.
+async fn start_worker(spill: &Path, warehouse: Option<&Path>) -> url::Url {
+    let mut engine = Engine::new(&memory(spill), &ExecutionConfig::default()).unwrap();
+    if let Some(warehouse) = warehouse {
+        attach_hive(&mut engine, warehouse).await;
+    }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let service = worker(&engine).into_worker_server();
@@ -298,15 +302,14 @@ async fn tpch_on_three_workers_returns_what_one_node_returns() {
     let single = engine_with_tpch(data.path(), spill.path()).await;
     let mut urls = Vec::new();
     for _ in 0..3 {
-        urls.push(start_worker(spill.path()).await);
+        urls.push(start_worker(spill.path(), None).await);
     }
     let mut coordinator = Engine::new(&memory(spill.path()), &ExecutionConfig::default()).unwrap();
     // Small tasks so SF 0.01 is split across the workers.
     coordinate(&mut coordinator, StaticWorkers(urls), |builder| {
-        builder
-            .with_distributed_file_scan_config_bytes_per_partition(8 * 1024)
-            .unwrap()
-    });
+        builder.with_distributed_file_scan_config_bytes_per_partition(8 * 1024)
+    })
+    .unwrap();
     register_tpch(&coordinator, data.path()).await;
 
     let mut report = String::new();
@@ -351,4 +354,121 @@ async fn tpch_on_three_workers_returns_what_one_node_returns() {
         distributed_queries >= 18,
         "only {distributed_queries} of 22 queries were distributed:\n{report}"
     );
+}
+
+/// A Hive source over `warehouse`, attached to `engine`.
+async fn attach_hive(engine: &mut Engine, warehouse: &Path) {
+    let source: codelake_core::config::SourceConfig = toml::from_str(&format!(
+        "name = \"hive\"\nkind = \"hive\"\nwarehouse = \"{}\"\n",
+        warehouse.display()
+    ))
+    .unwrap();
+    let connector = codelake_connectors::build(&source, &codelake_core::config::Secrets::default()).unwrap();
+    engine
+        .attach(connector, true, std::time::Duration::from_secs(30))
+        .await
+        .unwrap();
+}
+
+async fn distributed_plan(engine: &Engine, sql: &str) -> bool {
+    let plan = engine
+        .sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    display_plan_ascii(plan.as_ref(), false).contains("DistributedExec")
+}
+
+/// Hive tables are split across the workers; a query that also reads a
+/// source the workers cannot scan (here an in-memory table, as federated
+/// sources) stays on the coordinator, with the same answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hive_tables_are_distributed_and_other_sources_stay_on_the_coordinator() {
+    let data = tempfile::tempdir().unwrap();
+    let warehouse = tempfile::tempdir().unwrap();
+    let spill = tempfile::tempdir().unwrap();
+    write_tpch(data.path()).await;
+
+    let mut single = engine_with_tpch(data.path(), spill.path()).await;
+    attach_hive(&mut single, warehouse.path()).await;
+    single
+        .sql("CREATE SCHEMA hive.tpch")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    for table in ["customer", "orders", "lineitem"] {
+        single
+            .sql(&format!(
+                "CREATE TABLE hive.tpch.{table} AS SELECT * FROM bench.tpch.{table}"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+
+    let mut urls = Vec::new();
+    for _ in 0..3 {
+        urls.push(start_worker(spill.path(), Some(warehouse.path())).await);
+    }
+    let mut coordinator = Engine::new(&memory(spill.path()), &ExecutionConfig::default()).unwrap();
+    coordinate(&mut coordinator, StaticWorkers(urls), |builder| {
+        builder.with_distributed_file_scan_config_bytes_per_partition(8 * 1024)
+    })
+    .unwrap();
+    attach_hive(&mut coordinator, warehouse.path()).await;
+    let nations = Arc::new(
+        datafusion::datasource::MemTable::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Int64, false),
+                Field::new("label", DataType::Utf8, false),
+            ])),
+            vec![vec![
+                datafusion::arrow::array::RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("key", DataType::Int64, false),
+                        Field::new("label", DataType::Utf8, false),
+                    ])),
+                    vec![
+                        Arc::new(datafusion::arrow::array::Int64Array::from(vec![1, 2, 3])),
+                        Arc::new(datafusion::arrow::array::StringArray::from(vec!["a", "b", "c"])),
+                    ],
+                )
+                .unwrap(),
+            ]],
+        )
+        .unwrap(),
+    );
+    for engine in [&single, &coordinator] {
+        let catalog = MemoryCatalogProvider::new();
+        let schema = MemorySchemaProvider::new();
+        datafusion::catalog::SchemaProvider::register_table(
+            &schema,
+            "labels".to_owned(),
+            Arc::clone(&nations) as Arc<dyn datafusion::catalog::TableProvider>,
+        )
+        .unwrap();
+        catalog.register_schema("public", Arc::new(schema)).unwrap();
+        engine.context().register_catalog("mem", Arc::new(catalog));
+    }
+
+    let q3 = query(3).replace("bench.tpch", "hive.tpch");
+    assert!(
+        distributed_plan(&coordinator, &q3).await,
+        "Hive tables are distributed"
+    );
+    assert_eq!(rows(&coordinator, &q3).await, rows(&single, &q3).await);
+
+    let mixed = "SELECT l.label, count(*) FROM hive.tpch.orders o \
+                 JOIN mem.public.labels l ON o.o_shippriority + 1 = l.key GROUP BY l.label";
+    assert!(
+        !distributed_plan(&coordinator, mixed).await,
+        "a source workers cannot scan stays local"
+    );
+    assert_eq!(rows(&coordinator, mixed).await, rows(&single, mixed).await);
 }

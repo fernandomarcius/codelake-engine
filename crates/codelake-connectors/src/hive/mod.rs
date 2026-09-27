@@ -54,6 +54,7 @@ use tokio::sync::OnceCell;
 pub use self::catalog::HiveCatalog;
 use self::catalog::HiveCatalogProvider;
 use self::metastore::FileMetastore;
+pub(crate) use self::table::HiveTable;
 
 #[derive(Debug, Clone)]
 pub struct HiveParams {
@@ -245,6 +246,12 @@ impl Connector for HiveConnector {
                 cause: e.into(),
             })?;
         Ok(Arc::new(HiveCatalogProvider(hive)))
+    }
+
+    fn register_object_stores(&self, runtime: &datafusion::execution::runtime_env::RuntimeEnv) {
+        if let Some(hive) = self.catalog.get() {
+            hive.register_store(runtime);
+        }
     }
 
     async fn ping(&self) -> Result<(), ConnectorError> {

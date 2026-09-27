@@ -114,28 +114,35 @@ impl WorkerResolver for StaticWorkers {
 /// Makes `engine` a coordinator: its planner distributes queries to the
 /// workers `resolver` names. `customize` adds what the deployment needs on
 /// top (a channel resolver, tuning), and runs last.
+///
+/// # Errors
+///
+/// What `customize` returns (an invalid setting).
 pub fn coordinate<R: WorkerResolver + 'static>(
     engine: &mut Engine,
     resolver: R,
-    customize: impl FnOnce(SessionStateBuilder) -> SessionStateBuilder,
-) {
-    engine.map_state(|mut builder| {
+    customize: impl FnOnce(SessionStateBuilder) -> Result<SessionStateBuilder>,
+) -> Result<()> {
+    engine.try_map_state(|mut builder| {
         // The output rule turns every `CoalescePartitionsExec` into an
         // `AccountedMergeExec`; the distributed planner cuts stages at the
-        // former. It runs after distribution instead, on every stage.
+        // former. It runs after planning instead, on every stage.
         if let Some(rules) = builder.physical_optimizer_rules() {
             rules.retain(|rule| rule.name() != ACCOUNTED_OUTPUT);
         }
+        let local = builder.query_planner().clone();
         let mut builder = customize(
             builder
                 .with_distributed_option_extension(SessionOptions::default())
                 .with_distributed_user_codec(CoreCodec)
                 .with_distributed_worker_resolver(resolver)
                 .with_distributed_planner(),
-        );
+        )?;
         let distributed = std::mem::take(builder.query_planner());
-        builder.with_query_planner(Arc::new(AccountedAfterDistribution { distributed }))
-    });
+        Ok::<_, DataFusionError>(
+            builder.with_query_planner(Arc::new(CoordinatorPlanner { local, distributed })),
+        )
+    })?;
     let base = entries(engine.context().state().config_options());
     engine.with_session_hook(Arc::new(move |config: &mut SessionConfig| {
         let encoded = encode_difference(&base, config.options());
@@ -143,23 +150,65 @@ pub fn coordinate<R: WorkerResolver + 'static>(
             options.entries = encoded;
         }
     }));
+    Ok(())
 }
 
-/// The distributed planner, then the output rule (`AccountedOutput`) on the
-/// distributed plan: merges reserve their batches on every node (ADR 0003).
+/// Whether `plan` may run on workers: it reads only file tables the workers
+/// can split (Parquet listings, Hive tables, see
+/// [`codelake_connectors::distributable`]), and it neither writes nor changes
+/// the catalog. Federated scans (extension nodes), views and statements stay
+/// on the coordinator.
+fn distributable(plan: &LogicalPlan) -> bool {
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::datasource::listing::ListingTable;
+    use datafusion::datasource::source_as_provider;
+    let mut distributable = true;
+    let _ = plan.apply_with_subqueries(|node| {
+        let ok = match node {
+            LogicalPlan::TableScan(scan) => source_as_provider(&scan.source).is_ok_and(|provider| {
+                provider.downcast_ref::<ListingTable>().is_some()
+                    || codelake_connectors::distributable(provider.as_ref())
+            }),
+            LogicalPlan::Extension(_)
+            | LogicalPlan::Dml(_)
+            | LogicalPlan::Ddl(_)
+            | LogicalPlan::Copy(_)
+            | LogicalPlan::Statement(_) => false,
+            _ => true,
+        };
+        if ok {
+            Ok(TreeNodeRecursion::Continue)
+        } else {
+            distributable = false;
+            Ok(TreeNodeRecursion::Stop)
+        }
+    });
+    distributable
+}
+
+/// The coordinator's planner: the engine's own for what must stay on the
+/// coordinator ([`distributable`]), the distributed one otherwise, then the
+/// output rule (`AccountedOutput`) on the result: merges reserve their
+/// batches on every node (ADR 0003).
 #[derive(Debug)]
-struct AccountedAfterDistribution {
+struct CoordinatorPlanner {
+    local: Option<Arc<dyn QueryPlanner + Send + Sync>>,
     distributed: Option<Arc<dyn QueryPlanner + Send + Sync>>,
 }
 
 #[async_trait::async_trait]
-impl QueryPlanner for AccountedAfterDistribution {
+impl QueryPlanner for CoordinatorPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
         session_state: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let plan = match &self.distributed {
+        let planner = if distributable(logical_plan) {
+            &self.distributed
+        } else {
+            &self.local
+        };
+        let plan = match planner {
             Some(planner) => planner.create_physical_plan(logical_plan, session_state).await?,
             None => {
                 DefaultPhysicalPlanner::default()

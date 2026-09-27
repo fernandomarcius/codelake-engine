@@ -6,6 +6,10 @@ versioning: [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Distributed execution (M4, ADR 0011), behind the `distributed` feature: a `[distributed]` coordinator
+  plans every query and sends the stages of those that read only Hive tables to its workers
+  (datafusion-distributed 3.0.0, patched in `vendor/`); each node keeps its memory ceiling. Single node
+  stays the default.
 - Engine core with hard memory ceiling (`FairSpillPool`) and bounded spill.
 - Fail-fast configuration validation reporting every problem at once; secrets via environment variables only.
 - Connectors: PostgreSQL and MySQL (federated pushdown), MongoDB.
@@ -184,6 +188,8 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- A session state rebuilt with another configuration could resolve `extract(...)` to DataFusion's
+  `date_part` (an `int`) instead of the engine's (`bigint`): `rebuild_state` keeps the engine's functions.
 - SQL Server `datetime`, `smalldatetime`, `datetime2(p)` and `datetimeoffset(p)` keep the precision they declare
   (`datetime` rounded to the millisecond); a CTAS into a millisecond hive catalog no longer fails (ISS-042).
 - Timestamps of different precisions compare at the finer one; the simplifier no longer truncates the literal (ISS-042).

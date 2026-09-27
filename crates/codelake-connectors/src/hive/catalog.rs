@@ -400,6 +400,13 @@ impl HiveCatalog {
         &self.metastore
     }
 
+    /// Registers the warehouse's object store (`codelake://<name>`) in `runtime`.
+    pub(crate) fn register_store(&self, runtime: &datafusion::execution::runtime_env::RuntimeEnv) {
+        if runtime.object_store(&self.store_url).is_err() {
+            runtime.register_object_store(self.store_url.as_ref(), Arc::clone(self.metastore.store()));
+        }
+    }
+
     /// Reloads schema and table names from the metastore.
     pub(crate) async fn refresh(&self) -> Result<()> {
         let mut tables = BTreeMap::new();

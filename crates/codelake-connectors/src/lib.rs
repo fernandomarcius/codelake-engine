@@ -170,6 +170,22 @@ pub fn build(source: &SourceConfig, secrets: &Secrets) -> Result<Arc<dyn Connect
     }
 }
 
+/// Whether scans of `provider` can run on distributed workers (M4, ADR
+/// 0011): a Hive table read as plain Parquet. Its scan is a file scan the
+/// workers split among themselves. Everything else stays on the coordinator:
+/// federated sources (the credentials, pools and pushdown stay on one node),
+/// Hive views (planned when scanned), and Hive tables with nanosecond
+/// timestamps (read through a pairing node that is not split across tasks).
+#[must_use]
+pub fn distributable(provider: &dyn datafusion::catalog::TableProvider) -> bool {
+    #[cfg(feature = "hive")]
+    if let Some(table) = provider.downcast_ref::<hive::HiveTable>() {
+        return table.distributable();
+    }
+    let _ = provider;
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use codelake_core::config::{Secrets, SourceConfig};

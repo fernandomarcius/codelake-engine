@@ -36,6 +36,38 @@ pub struct Config {
     pub governance: GovernanceConfig,
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
+    /// Distributed execution (ROADMAP M4, ADR 0011): this node's role.
+    /// Absent: a single node. Needs a build with the `distributed` feature.
+    pub distributed: Option<DistributedConfig>,
+}
+
+/// A node of a distributed deployment. Coordinator and workers read the same
+/// configuration file apart from this section.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DistributedConfig {
+    pub role: DistributedRole,
+    /// Worker: the address its execution service listens on. Unauthenticated,
+    /// like the PostgreSQL listener: beyond loopback only with
+    /// `server.allow_unauthenticated_network`.
+    #[serde(default = "default_worker_listen")]
+    pub listen: SocketAddr,
+    /// Coordinator: the workers' service URLs (`http://host:port`).
+    #[serde(default)]
+    pub workers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistributedRole {
+    /// Plans every query and serves clients; distributes what workers can run.
+    Coordinator,
+    /// Runs the stages coordinators send; serves no clients.
+    Worker,
+}
+
+fn default_worker_listen() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 50051))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -859,6 +891,7 @@ impl Config {
         self.validate_execution(&mut errors);
         self.validate_telemetry(&mut errors);
         self.validate_governance(&mut errors);
+        self.validate_distributed(&mut errors);
         let secrets = self.validate_sources(env, &mut errors);
         if errors.is_empty() {
             Ok(ValidatedConfig {
@@ -952,6 +985,41 @@ impl Config {
                 .and_then(|t| t.history_retention_secs)
                 .unwrap_or(self.governance.history_retention_secs),
         )
+    }
+
+    fn validate_distributed(&self, errors: &mut Vec<String>) {
+        let Some(distributed) = &self.distributed else {
+            return;
+        };
+        match distributed.role {
+            DistributedRole::Coordinator => {
+                if distributed.workers.is_empty() {
+                    errors.push("distributed.workers must name at least one worker for a coordinator".into());
+                }
+                for url in &distributed.workers {
+                    let scheme_ok = url.starts_with("http://") || url.starts_with("https://");
+                    if !scheme_ok || url.len() <= "https://".len() {
+                        errors.push(format!(
+                            "distributed.workers: {url} is not an http(s)://host:port URL"
+                        ));
+                    }
+                }
+            }
+            DistributedRole::Worker => {
+                if !distributed.workers.is_empty() {
+                    errors.push("distributed.workers is for coordinators; a worker lists none".into());
+                }
+                // The execution service has no client authentication: whoever
+                // reaches it can run plans over every file the node can read.
+                if !distributed.listen.ip().is_loopback() && !self.server.allow_unauthenticated_network {
+                    errors.push(format!(
+                        "distributed.listen {} is not loopback and workers do not authenticate their callers; \
+                         bind to 127.0.0.1 or set server.allow_unauthenticated_network = true inside an isolated network",
+                        distributed.listen
+                    ));
+                }
+            }
+        }
     }
 
     fn validate_governance(&self, errors: &mut Vec<String>) {
@@ -1672,6 +1740,30 @@ mod tests {
                 "missing `{expected}` in {errors:#?}"
             );
         }
+    }
+
+    #[test]
+    fn distributed_roles_are_checked() {
+        let coordinator = format!(
+            "{VALID}\n[distributed]\nrole = \"coordinator\"\nworkers = [\"http://worker-0:50051\", \"worker-1\"]\n"
+        );
+        let errors = errors_of(&coordinator, &full_env);
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(errors[0].contains("worker-1 is not an http(s)"), "{errors:#?}");
+        let lonely = format!("{VALID}\n[distributed]\nrole = \"coordinator\"\n");
+        assert!(errors_of(&lonely, &full_env)[0].contains("at least one worker"));
+        let exposed = format!("{VALID}\n[distributed]\nrole = \"worker\"\nlisten = \"0.0.0.0:50051\"\n");
+        assert!(
+            errors_of(&exposed, &full_env)
+                .iter()
+                .any(|e| e.contains("workers do not authenticate")),
+        );
+        let worker = format!("{VALID}\n[distributed]\nrole = \"worker\"\n");
+        assert!(parse(&worker).validate(&full_env, &|_| true).is_ok());
+        assert_eq!(
+            parse(&worker).distributed.map(|d| (d.role, d.listen.port())),
+            Some((DistributedRole::Worker, 50051))
+        );
     }
 
     #[test]

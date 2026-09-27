@@ -850,6 +850,31 @@ impl Engine {
         self.ctx = SessionContext::new_with_state(rebuild_state(&self.ctx.state(), f));
     }
 
+    /// [`Engine::map_state`] with a step that can fail; the engine is left
+    /// unchanged when it does.
+    ///
+    /// # Errors
+    ///
+    /// What `f` returns.
+    pub fn try_map_state<E>(
+        &mut self,
+        f: impl FnOnce(SessionStateBuilder) -> Result<SessionStateBuilder, E>,
+    ) -> Result<(), E> {
+        let mut failure = None;
+        let rebuilt = rebuild_state(&self.ctx.state(), |builder| match f(builder) {
+            Ok(builder) => builder,
+            Err(err) => {
+                failure = Some(err);
+                SessionStateBuilder::new()
+            }
+        });
+        if let Some(err) = failure {
+            return Err(err);
+        }
+        self.ctx = SessionContext::new_with_state(rebuilt);
+        Ok(())
+    }
+
     /// Runs `hook` on the configuration of every query's session, after the
     /// query's own settings (catalog, schema, time zone, properties): how a
     /// layer outside the core carries them further (to distributed workers).
@@ -1655,6 +1680,7 @@ impl Engine {
         let failure = match tokio::time::timeout(timeout, connector.catalog()).await {
             Ok(Ok(catalog)) => {
                 self.ctx.register_catalog(&name, catalog);
+                connector.register_object_stores(&self.runtime.env());
                 if let Some(writable) = connector.writable() {
                     self.writable.insert(name.clone(), writable);
                 }

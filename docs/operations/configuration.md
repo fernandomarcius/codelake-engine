@@ -140,6 +140,36 @@ sources' credentials. Therefore:
   `system.runtime.queries` and traces; it is **not** authenticated and grants
   nothing.
 
+## Distributed execution: `[distributed]`
+
+Absent: a single node, which stays the default (ADR 0011). Needs a build
+with the `distributed` feature (`--features codelake-server/distributed`);
+a node that reads the section without it refuses to start.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `role` | — | `coordinator` (plans every query, serves clients) or `worker` (runs the stages coordinators send, serves no clients) |
+| `listen` | `127.0.0.1:50051` | Worker: its execution service. **Unauthenticated**: beyond loopback only with `server.allow_unauthenticated_network = true`, on an isolated network |
+| `workers` | — | Coordinator: the workers' URLs, `http://host:port` |
+
+Coordinator and workers read the same file apart from this section. A worker
+attaches only its Hive sources (the files the stages it runs read; no
+federated pools or credentials), and keeps the operational HTTP listener
+for probes and metrics.
+
+What runs where:
+
+- A query reading only Hive tables (and Parquet listings) is distributed when
+  its input is large enough to split; a small one stays on the coordinator.
+- A query that reads a federated source, a Hive view or a Hive table with
+  nanosecond timestamps, and every statement that writes or changes the
+  catalog, runs on the coordinator.
+- Every node keeps its own memory ceiling (`[memory]`): a stage the pool
+  cannot hold fails the query with a resources error, as on one node. A
+  connection between two nodes buffers at most 1/16 of `memory.limit`.
+- A worker lost during a query fails that query; the next query plans with
+  the workers that answer.
+
 ## Telemetry: `[telemetry]`
 
 Off unless `otlp_endpoint` is set. `otlp_endpoint` is a plain `http://`
