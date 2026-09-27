@@ -109,6 +109,12 @@ The cutoff comes from `SHADOW_CUTOFF_SQL` (one value, run on the reference;
 varbinary as upper-case hex, timestamps in ISO 8601) or `SHADOW_CUTOFF_VALUE`.
 Without a cutoff, rows arriving between the two runs show up as divergences.
 
+Take a cutoff both engines represent exactly. A SQL Server `datetime` stores
+1/300 s steps, and the reference compares a pushed-down filter with the stored
+value while showing milliseconds (ISS-054): truncate a timestamp cutoff to the
+second, for example
+`SELECT CAST(date_trunc('second', MAX(tran_end_time)) AS varchar) FROM src.cdc.lsn_time_mapping`.
+
 ## 3. Run
 
 ```bash
