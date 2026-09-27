@@ -396,14 +396,10 @@ sql = "SELECT count(*) FROM (SELECT x FROM {c}.fzm.f INTERSECT SELECT y FROM {c}
 
 [[case]]
 id = "ZM11"
-expect = "WRONG"
-known = "front/w1-df54"
 sql = "SELECT x FROM {c}.fzm.f EXCEPT ALL SELECT -0.0E0"
 
 [[case]]
 id = "ZM12"
-expect = "WRONG"
-known = "front/w1-df54"
 sql = "SELECT count(*) FROM (SELECT x FROM {c}.fzm.f EXCEPT ALL SELECT -0.0E0)"
 
 [[case]]

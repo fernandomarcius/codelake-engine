@@ -77,6 +77,8 @@ impl QueryHook for MetricsHook {
 /// (text against a number, `time ± interval`; ADR 0014), with PostgreSQL's
 /// typing rules and errors ([`codelake_core::operand_checks::postgres_refusal`]);
 /// on the simple protocol [`SimpleRunHook`] refuses them on the plan it runs.
+/// It refuses the `char(n)` type in a column or a cast too
+/// ([`codelake_core::char_semantics::refuse_char_types_on_postgres`]).
 #[derive(Debug)]
 pub(crate) struct PolicyHook;
 
@@ -94,7 +96,9 @@ fn refusal(err: &datafusion::error::DataFusionError) -> PgWireError {
 }
 
 fn check(statement: &Statement) -> PgWireResult<()> {
-    statement_policy::check_sql(&statement.to_string(), &PostgreSqlDialect {}).map_err(|err| refusal(&err))
+    statement_policy::check_sql(&statement.to_string(), &PostgreSqlDialect {})
+        .map_err(|err| refusal(&err))?;
+    codelake_core::char_semantics::refuse_char_types_on_postgres(statement).map_err(|err| refusal(&err))
 }
 
 /// Refuses a planned statement whose operands the engine does not combine,
@@ -186,15 +190,33 @@ fn api_error(err: datafusion::error::DataFusionError) -> PgWireError {
     PgWireError::ApiError(Box::new(err))
 }
 
-/// What `SessionContext::sql` does, with `IS [NOT] DISTINCT FROM` grouped as
+/// What `SessionContext::sql` does, with the engine's `varchar(n)`
+/// ([`codelake_core::PostgresStatement`]), `IS [NOT] DISTINCT FROM` grouped as
 /// PostgreSQL groups it (`codelake_core::regroup_distinct_from`) and the
 /// operand check between planning and running.
 pub(crate) async fn plan_checked(session_context: &SessionContext, sql: &str) -> PgWireResult<DataFrame> {
     let state = session_context.state();
     let dialect = state.config().options().sql_parser.dialect;
-    let mut statement = state.sql_to_statement(sql, &dialect).map_err(api_error)?;
+    let statement = state.sql_to_statement(sql, &dialect).map_err(api_error)?;
+    let (mut statement, prepared) = match statement {
+        datafusion::sql::parser::Statement::Statement(mut inner) => {
+            // Every spelling of a column resolves (ISS-018): the query of a
+            // DECLARE comes here as text, apart from `run_simple`.
+            identifier_case::fold_identifiers(&mut inner);
+            let prepared = codelake_core::postgres_statement(&inner);
+            (
+                datafusion::sql::parser::Statement::Statement(Box::new(prepared.statement.clone())),
+                Some(prepared),
+            )
+        }
+        other => (other, None),
+    };
     codelake_core::regroup_distinct_from(&mut statement);
     let plan = state.statement_to_plan(statement).await.map_err(api_error)?;
+    let plan = match &prepared {
+        Some(prepared) => prepared.record(plan).map_err(api_error)?,
+        None => plan,
+    };
     run_checked(session_context, plan).await
 }
 
@@ -269,30 +291,31 @@ impl QueryHook for SimpleRunHook {
     }
 
     /// Plans a statement whose identifiers fold
-    /// ([`codelake_core::identifier_case`]) or whose `IS [NOT] DISTINCT FROM`
-    /// the parser grouped otherwise than PostgreSQL (see `plan_checked`), as
-    /// `datafusion-postgres` plans any other (`statement_to_plan` on the
-    /// session's state); the others are left to it.
+    /// ([`codelake_core::identifier_case`]), with a cast to `varchar(n)` or
+    /// `varchar(n)` columns (the engine's `varchar(n)`,
+    /// [`codelake_core::PostgresStatement`]) or whose `IS [NOT] DISTINCT FROM`
+    /// the parser grouped otherwise than PostgreSQL (see `plan_checked`); any
+    /// other as `datafusion-postgres` plans it.
     async fn handle_extended_parse_query(
         &self,
         statement: &Statement,
         session_context: &SessionContext,
         _client: &(dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<LogicalPlan>> {
-        let mut planned = statement.clone();
-        let folded = identifier_case::fold_identifiers(&mut planned);
-        let regrouped = codelake_core::regrouped_statement(&planned);
-        if !folded && regrouped.is_none() {
+        let mut folded = statement.clone();
+        let changed = identifier_case::fold_identifiers(&mut folded);
+        let prepared = codelake_core::postgres_statement(&folded);
+        let regrouped = codelake_core::regrouped_statement(&prepared.statement);
+        if !changed && !prepared.differs() && regrouped.is_none() {
             return None;
         }
-        let planned = regrouped.unwrap_or(planned);
-        Some(
-            session_context
-                .state()
-                .statement_to_plan(datafusion::sql::parser::Statement::Statement(Box::new(planned)))
-                .await
-                .map_err(api_error),
-        )
+        let planned = regrouped.unwrap_or_else(|| prepared.statement.clone());
+        let planned = session_context
+            .state()
+            .statement_to_plan(datafusion::sql::parser::Statement::Statement(Box::new(planned)))
+            .await
+            .and_then(|plan| prepared.record(plan));
+        Some(planned.map_err(api_error))
     }
 
     async fn handle_extended_query(

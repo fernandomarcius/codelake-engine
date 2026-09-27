@@ -605,9 +605,8 @@ async fn w1_nanosecond_optimize_never_rewrites_other_instants() {
 }
 
 /// Trino compares `char(n)` padded: for a `char(5)` holding `'ab'`,
-/// `ch = 'ab'` is true. The F2 correction refuses char comparisons pushed to
-/// the scan; a comparison the optimizer keeps above the scan (volatile
-/// predicate, `LIMIT` or window below it) must not answer differently.
+/// `ch = 'ab'` is true, wherever the optimizer keeps the comparison (a
+/// volatile predicate, a `LIMIT` or a window below it).
 #[tokio::test]
 async fn w1_char_comparisons_above_the_scan_never_drop_rows() {
     let l = Local::new().await;
@@ -623,12 +622,8 @@ async fn w1_char_comparisons_above_the_scan_never_drop_rows() {
     for q in queries {
         let got = cl_try(&l.engine, q).await;
         note("w1_char_comparisons", q, &got);
-        // Trino 431 answers [[1]] to each; refusing is acceptable.
-        let right = match &got {
-            Ok(r) => *r == rows(&[&["1"]]),
-            Err(e) => e.contains("comparing the char column ch is not supported yet"),
-        };
-        if !right {
+        // Trino 431 answers [[1]] to each.
+        if got != Ok(rows(&[&["1"]])) {
             wrong.push((q, got));
         }
     }
@@ -865,6 +860,26 @@ fn cell(value: &Value) -> String {
     }
 }
 
+/// One line of the client: the rows of a statement, or its error.
+fn answer(line: &str) -> Result<Result<Rows, String>, String> {
+    let value: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+    if let Some(Value::String(message)) = value.get("error") {
+        return Ok(Err(message.clone()));
+    }
+    Ok(Ok(value["rows"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|r| r.iter().map(cell).collect())
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default()))
+}
+
 impl Trino {
     async fn start(name: &str, warehouse: &Path, mount: Mount) -> Self {
         // Every catalog in `CodeLake`'s default Parquet time zone, but
@@ -926,6 +941,28 @@ impl Trino {
         panic!("trino did not list an active worker");
     }
 
+    /// Several statements in few client runs, one answer each, in order.
+    async fn sql_batch(&self, statements: &[String]) -> Vec<Result<Rows, String>> {
+        let mut answers = Vec::with_capacity(statements.len());
+        for chunk in statements.chunks(100) {
+            let request = json!({"user": "root", "statements": chunk}).to_string();
+            let mut result = self
+                .container
+                .exec(ExecCommand::new(vec![
+                    "python3".to_owned(),
+                    "/tmp/client.py".to_owned(),
+                    request,
+                ]))
+                .await
+                .unwrap_or_else(|e| panic!("trino client: {e}"));
+            let stdout = String::from_utf8_lossy(&result.stdout_to_vec().await.unwrap()).into_owned();
+            for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
+                answers.push(answer(line).unwrap_or_else(|e| panic!("trino client: {e}")));
+            }
+        }
+        answers
+    }
+
     async fn try_sql_as(&self, user: &str, sql: &str) -> Result<Result<Rows, String>, String> {
         let request = json!({"user": user, "statements": [sql]}).to_string();
         let mut result = self
@@ -943,22 +980,7 @@ impl Trino {
             .lines()
             .find(|l| !l.trim().is_empty())
             .ok_or_else(|| format!("no answer: {stdout}"))?;
-        let value: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
-        if let Some(Value::String(message)) = value.get("error") {
-            return Ok(Err(message.clone()));
-        }
-        Ok(Ok(value["rows"]
-            .as_array()
-            .map(|rows| {
-                rows.iter()
-                    .map(|row| {
-                        row.as_array()
-                            .map(|r| r.iter().map(cell).collect())
-                            .unwrap_or_default()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()))
+        answer(line)
     }
 
     async fn sql_as(&self, user: &str, sql: &str) -> Result<Rows, String> {
@@ -2171,29 +2193,134 @@ async fn w1t_in_memory_update_never_escapes_the_pool() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// The refusal of a comparison of char values (`codelake_core::char_comparisons`).
-const CHAR_REFUSAL: &[&str] = &["comparing the char column ", " is not supported yet"];
+/// CH1–CH16 and P1–P15 (see
+/// [`w1t_char_values_compared_outside_predicates_like_trino_431`]).
+const CHAR_PROBES: &[(&str, &str)] = &[
+    (
+        "CH1",
+        "SELECT count(*) FROM hive.s.cht JOIN hive.s.vct USING (ch)",
+    ),
+    (
+        "CH2",
+        "SELECT count(*) FROM (SELECT ch FROM hive.s.cht INTERSECT SELECT ch FROM hive.s.vct)",
+    ),
+    (
+        "CH3",
+        "SELECT count(*) FROM (SELECT ch FROM hive.s.cht EXCEPT SELECT ch FROM hive.s.vct)",
+    ),
+    (
+        "CH4",
+        "SELECT count(*) FROM (SELECT ch FROM hive.s.cht UNION SELECT ch FROM hive.s.vct)",
+    ),
+    (
+        "CH5",
+        "SELECT id FROM hive.s.cht WHERE nullif(ch, 'ab') IS NULL ORDER BY 1",
+    ),
+    (
+        "CH6",
+        "SELECT count(DISTINCT c) FROM (SELECT ch AS c FROM hive.s.cht UNION ALL SELECT CAST('ab' AS char(5)))",
+    ),
+    (
+        "CH7",
+        "SELECT id FROM hive.s.cht WHERE (ch, id) = ('ab', 1) ORDER BY 1",
+    ),
+    (
+        "CH8",
+        "SELECT id FROM hive.s.cht WHERE ch = ANY (SELECT ch FROM hive.s.vct) ORDER BY 1",
+    ),
+    (
+        "CH9",
+        "SELECT count(*) FROM (SELECT 'ab ' UNION SELECT CAST('ab' AS char(5)))",
+    ),
+    ("CH10", "SELECT CAST('ab' AS char(5)) = 'ab '"),
+    (
+        "CH11",
+        "SELECT count(DISTINCT x) FROM (VALUES ('ab '), (CAST('ab' AS char(5)))) AS t(x)",
+    ),
+    ("CH12", "SELECT TRY_CAST('ab' AS char(5)) = 'ab '"),
+    (
+        "CH13",
+        "SELECT count(*) FROM (SELECT max(ch) FROM hive.s.cht UNION SELECT ch FROM hive.s.vct)",
+    ),
+    (
+        "CH14",
+        "SELECT count(*) FROM (SELECT coalesce(ch, 'x') FROM hive.s.cht UNION SELECT ch FROM hive.s.vct)",
+    ),
+    (
+        "CH15",
+        "SELECT id FROM (SELECT id, max(ch) AS m FROM hive.s.cht GROUP BY id) WHERE m = 'ab' ORDER BY 1",
+    ),
+    (
+        "CH16",
+        "SELECT id FROM hive.s.cht WHERE upper(ch) = 'AB ' ORDER BY 1",
+    ),
+    (
+        "P1",
+        "SELECT id FROM hive.s.vct WHERE ch IN (SELECT ch FROM hive.s.cht) ORDER BY 1",
+    ),
+    (
+        "P2",
+        "SELECT id FROM hive.s.vct WHERE ch NOT IN (SELECT ch FROM hive.s.cht) ORDER BY 1",
+    ),
+    (
+        "P3",
+        "SELECT id FROM hive.s.vct WHERE ch = ANY (SELECT ch FROM hive.s.cht) ORDER BY 1",
+    ),
+    (
+        "P4",
+        "SELECT id FROM hive.s.vct WHERE ch = (SELECT max(ch) FROM hive.s.cht WHERE id = 1) ORDER BY 1",
+    ),
+    (
+        "P5",
+        "SELECT (SELECT max(ch) FROM hive.s.cht WHERE id = 1) = 'ab'",
+    ),
+    (
+        "P6",
+        "SELECT count(*) FROM (SELECT (SELECT CAST('ab' AS char(5))) UNION SELECT 'ab ')",
+    ),
+    (
+        "P7",
+        "SELECT count(DISTINCT CASE WHEN id = 1 THEN ch ELSE 'ab' END) FROM hive.s.cht",
+    ),
+    (
+        "P8",
+        "SELECT id, CASE WHEN id = 1 THEN ch ELSE 'ab' END FROM hive.s.cht ORDER BY 1",
+    ),
+    (
+        "P9",
+        "SELECT count(*) FROM (SELECT max(ch) FROM hive.s.cht UNION SELECT 'ab')",
+    ),
+    (
+        "P10",
+        "SELECT id FROM hive.s.vct WHERE ch IN (SELECT coalesce(ch, 'x') FROM hive.s.cht) ORDER BY 1",
+    ),
+    (
+        "P11",
+        "SELECT count(DISTINCT coalesce(CASE WHEN id = 2 THEN NULL ELSE ch END, 'ab')) FROM hive.s.cht",
+    ),
+    ("P12", "SELECT CAST(CAST('ab' AS char(5)) AS varchar) = 'ab   '"),
+    ("P13", "SELECT TRY_CAST('abcdef' AS varchar(3))"),
+    (
+        "P14",
+        "SELECT count(*) FROM (SELECT DISTINCT c FROM (SELECT (SELECT ch FROM hive.s.cht WHERE id = 1) AS c \
+         UNION ALL SELECT 'ab'))",
+    ),
+    (
+        "P15",
+        "SELECT id FROM hive.s.vct WHERE ch IN (SELECT max(ch) FROM hive.s.cht GROUP BY id) ORDER BY 1",
+    ),
+    (
+        "P13b",
+        "SELECT TRY_CAST(TIMESTAMP '2020-01-01 00:00:00.99' AS timestamp(1)) = TIMESTAMP '2020-01-01 00:00:01.0', \
+         TRY_CAST('xx' AS timestamp(1)) IS NULL, TRY_CAST(12345 AS varchar(3)), TRY_CAST('abcdef' AS char(3))",
+    ),
+];
 
-/// Same rows as Trino, or `CodeLake`'s refusal: an error holding every one
-/// of `refusal` (any other error is a difference).
-fn same_or_refused(
-    checks: &mut Checks,
-    (id, what): (&str, &str),
-    codelake: &Result<Rows, String>,
-    trino: &Result<Rows, String>,
-    refusal: &[&str],
-) {
-    match codelake {
-        Err(err) if refusal.iter().all(|part| err.contains(part)) => {
-            note(checks.probe, &format!("{id} {what} (refused)"), (codelake, trino));
-        }
-        _ => checks.same(id, what, codelake, trino),
-    }
-}
-
-/// `char(n)` values compared where the W1-4 rule does not look: set
-/// operations, `USING` joins and functions that compare, over tables Trino
-/// 431 wrote. Each answer must be Trino's, or a refusal.
+/// `char(n)` values compared where the first char rules did not look (set
+/// operations, `USING` joins, functions that compare: CH1–CH16) and where
+/// three independent verifications found wrong rows (P1–P16), over tables
+/// Trino 431 wrote: each answer is Trino's. The matrix of every operation
+/// is `char_matrix`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w1t_char_values_compared_outside_predicates_like_trino_431() {
     let s = Shared::new("codelake-w1t-trino-char").await;
@@ -2211,87 +2338,21 @@ async fn w1t_char_values_compared_outside_predicates_like_trino_431() {
     s.trino
         .ok("INSERT INTO hive.s.vct VALUES (1, 'ab'), (3, 'cd')")
         .await;
-    for (id, q, refusal) in [
-        (
-            "CH1",
-            "SELECT count(*) FROM hive.s.cht JOIN hive.s.vct USING (ch)",
-            CHAR_REFUSAL,
-        ),
-        (
-            "CH2",
-            "SELECT count(*) FROM (SELECT ch FROM hive.s.cht INTERSECT SELECT ch FROM hive.s.vct)",
-            CHAR_REFUSAL,
-        ),
-        (
-            "CH3",
-            "SELECT count(*) FROM (SELECT ch FROM hive.s.cht EXCEPT SELECT ch FROM hive.s.vct)",
-            CHAR_REFUSAL,
-        ),
-        (
-            "CH4",
-            "SELECT count(*) FROM (SELECT ch FROM hive.s.cht UNION SELECT ch FROM hive.s.vct)",
-            CHAR_REFUSAL,
-        ),
-        (
-            "CH5",
-            "SELECT id FROM hive.s.cht WHERE nullif(ch, 'ab') IS NULL ORDER BY 1",
-            CHAR_REFUSAL,
-        ),
-        (
-            "CH6",
-            "SELECT count(DISTINCT c) FROM (SELECT ch AS c FROM hive.s.cht UNION ALL SELECT CAST('ab' AS char(5)))",
-            CHAR_REFUSAL,
-        ),
-        (
-            "CH7",
-            "SELECT id FROM hive.s.cht WHERE (ch, id) = ('ab', 1) ORDER BY 1",
-            CHAR_REFUSAL,
-        ),
-        (
-            "CH8",
-            "SELECT id FROM hive.s.cht WHERE ch = ANY (SELECT ch FROM hive.s.vct) ORDER BY 1",
-            CHAR_REFUSAL,
-        ),
-        (
-            "CH9",
-            "SELECT count(*) FROM (SELECT 'ab ' UNION SELECT CAST('ab' AS char(5)))",
-            CHAR_REFUSAL,
-        ),
-        ("CH10", "SELECT CAST('ab' AS char(5)) = 'ab '", CHAR_REFUSAL),
-        (
-            "CH11",
-            "SELECT count(DISTINCT x) FROM (VALUES ('ab '), (CAST('ab' AS char(5)))) AS t(x)",
-            CHAR_REFUSAL,
-        ),
-        (
-            "CH12",
-            "SELECT TRY_CAST('ab' AS char(5)) = 'ab '",
-            &["TRY_CAST to char(5) is not supported yet"],
-        ),
-        (
-            "CH13",
-            "SELECT count(*) FROM (SELECT max(ch) FROM hive.s.cht UNION SELECT ch FROM hive.s.vct)",
-            CHAR_REFUSAL,
-        ),
-        (
-            "CH14",
-            "SELECT count(*) FROM (SELECT coalesce(ch, 'x') FROM hive.s.cht UNION SELECT ch FROM hive.s.vct)",
-            CHAR_REFUSAL,
-        ),
-        (
-            "CH15",
-            "SELECT id FROM (SELECT id, max(ch) AS m FROM hive.s.cht GROUP BY id) WHERE m = 'ab' ORDER BY 1",
-            CHAR_REFUSAL,
-        ),
-        (
-            "CH16",
-            "SELECT id FROM hive.s.cht WHERE upper(ch) = 'AB ' ORDER BY 1",
-            CHAR_REFUSAL,
-        ),
-    ] {
+    for (id, q) in CHAR_PROBES {
         let (codelake, trino) = (cl_try(&s.engine, q).await, s.trino.sql(q).await);
-        same_or_refused(&mut checks, (id, q), &codelake, &trino, refusal);
+        checks.same(id, q, &codelake, &trino);
     }
+    // P16: Trino 431 fails on a scalar subquery in `VALUES` ("Unexpected
+    // subquery expression in logical plan"); the engine answers what the
+    // same `VALUES` answers without the subquery.
+    let p16 = "SELECT count(*) FROM (VALUES ((SELECT CAST('ab' AS char(5)))), ('ab ')) AS t(x) GROUP BY x";
+    let plain = "SELECT count(*) FROM (VALUES (CAST('ab' AS char(5))), ('ab ')) AS t(x) GROUP BY x";
+    checks.same(
+        "P16",
+        p16,
+        &cl_try(&s.engine, p16).await,
+        &s.trino.sql(plain).await,
+    );
     checks.assert_none();
 }
 
@@ -2354,3 +2415,8 @@ async fn w1t_parquet_time_zone_east_of_greenwich_like_trino_431() {
     );
     checks.assert_none();
 }
+
+#[path = "char_matrix.rs"]
+mod char_matrix;
+#[path = "char_whitespace.rs"]
+mod char_whitespace;

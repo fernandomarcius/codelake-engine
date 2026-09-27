@@ -430,13 +430,16 @@ pub(crate) fn concat_operator() -> ScalarUDF {
             let DataType::List(field) = call.return_type else {
                 return Err(DataFusionError::Internal("concat of an array".into()));
             };
-            // The element as a one-element array.
+            // The element as a one-element array, NULL where the element is
+            // NULL: Trino 431 answers NULL for `ARRAY[1] || CAST(NULL AS
+            // integer)`, as for any NULL argument of `concat`.
             let element = Arc::clone(call.arg(side)?);
+            let nulls = element.logical_nulls();
             let single: ArrayRef = Arc::new(ListArray::try_new(
                 Arc::clone(field),
                 datafusion::arrow::buffer::OffsetBuffer::from_lengths(std::iter::repeat_n(1, element.len())),
                 element,
-                None,
+                nulls,
             )?);
             let mut args = call.args.clone();
             args[side] = single;

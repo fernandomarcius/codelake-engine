@@ -46,7 +46,7 @@ use super::metastore::{
     ColumnMetadata, FileMetastore, MetastoreError, Staging, TABLE_ID, TableMetadata, WRITTEN_NAME,
 };
 use super::optimize::{self, OPTIMIZE, Settings};
-use super::table::{HiveSink, HiveTable, refuse_char_comparisons};
+use super::table::{HiveSink, HiveTable};
 use super::types::{UNSUPPORTED, arrow_type, char_column, hive_type, stored_type, unsupported};
 
 const VIEW_PREFIX: &str = "/* Presto View: ";
@@ -266,7 +266,6 @@ impl TableProvider for HiveView {
             .downcast_ref::<SessionState>()
             .ok_or_else(|| DataFusionError::Internal("hive views need a SessionState".into()))?;
         refuse_unsupported(&self.schema, projection)?;
-        refuse_char_comparisons(&self.schema, filters)?;
         // The view's plan becomes part of the outer one, which merges and
         // reserves the output of the whole query (`codelake_core::output`).
         let rules = state
@@ -329,12 +328,17 @@ impl TableProvider for HiveView {
             .map(|index| {
                 let field = &fields[*index];
                 let value = cast(Expr::Column(columns[*index].clone()), field.data_type().clone());
-                // A char(n) column shows its values padded, as Trino.
-                let value = match char_column(field) {
-                    Some(length) => expr_fn::rpad(vec![
-                        expr_fn::rtrim(vec![value]),
-                        Expr::Literal(ScalarValue::Int64(i64::try_from(length).ok()), None),
-                    ]),
+                // A char(n) column holds its values padded, as Trino shows
+                // them (`codelake_core::char_semantics`): only trailing
+                // spaces are padding, a trailing tab or line feed is text.
+                let value = match char_column(field).and_then(|n| u32::try_from(n).ok()) {
+                    Some(length) => codelake_core::char_semantics::pad(
+                        expr_fn::rtrim(vec![
+                            value,
+                            Expr::Literal(ScalarValue::Utf8(Some(" ".into())), None),
+                        ]),
+                        length,
+                    ),
                     None => value,
                 };
                 value.alias(field.name())

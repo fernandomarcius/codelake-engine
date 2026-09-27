@@ -1,8 +1,9 @@
 # ISS-037 — char(n) semantics branch not merged (round 5 failed, round 6 not run)
 
-- Kind: pending work / known defects · Recorded: 2026-09-26 · Status: open
+- Kind: pending work / known defects · Recorded: 2026-09-26 · Status: closed
 - Branch: `front/w1-df54`, HEAD `4a9ad90`, 31 commits over main: char(n) with the reference engine's padded semantics instead of refusals (ISS-024), TRY_CAST, trims, typeof, varchar(n) on the PostgreSQL wire, multiset set operations.
 - Round 5 verdict (independent): fixes correct (14/14 mutants caught) but new wrong rows — arrays/rows of char stored by CTAS/INSERT compare unpadded (typed `array(varchar)`), `CAST(ch AS varchar)` loses trailing spaces on the PostgreSQL wire, set operations / `IS NOT DISTINCT FROM` on hive lose NULL rows (overlaps ISS-033), `-0.0` divergences, and a regression from `c4a9c35`: `WHERE real_col = 0` → internal error (fixed differently in ISS-033's branch).
 - Owner's decision (2026-09-26): resolve these, not refuse them.
 - Main still carries the ISS-025 char wrong results.
 - Next: round 6 (containers of char typed `array(char(n))`, PG CAST), reconcile the `-0.0` work with ISS-033, verification with the differential gate (ISS-035), merge; then ISS-019.
+- Closed 2026-09-27: rebased on main. Its own `-0.0` change (c4a9c35) gave way to main's ADR 0017 (kept: its regression tests of multiset operations over floats, which pass on main's approach); `EXCEPT ALL`/`INTERSECT ALL` multiplicity kept (ADR 0014 item 15). Round 5 findings checked against Trino 431 with new differential cases: stored char containers compared with char values, `ROW` equality, `contains`, `DISTINCT` over arrays and `CAST(ch AS varchar)` on the PostgreSQL wire all match; the only remaining difference is the element type name of char containers (ISS-051). Evidence: fast gate 824/824; differential 296/296 as expected (51 char cases fixed; answers where the reference refuses accepted under ISS-024). Integration 293 + the 6 client tests that failed while the host had no internet (pip) passed on rerun (299/299); shadow run 2 cycles, verdict equal (120/120 tables).

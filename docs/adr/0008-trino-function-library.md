@@ -75,15 +75,23 @@ categories for any client.
      keys and conditions and sort keys (a `PhysicalExpr` that bisects the
      batch and returns NULL for the rows failing with a user error) and turns
      on `fail_on_overflow` for `+`, `-`, `*` (`DataFusion` wraps around
-     silently; Trino fails) and IEEE NaN semantics for float comparisons
-     (`DataFusion` uses a total order: `nan() > 1` is true). New hash-join
+     silently; Trino fails) and IEEE semantics for float comparisons
+     (`DataFusion` uses a total order: `nan() > 1` is true, `-0.0 = 0.0`
+     false). An `=`/`<>` with a float literal that is neither NaN nor a
+     zero is left to the plain comparison, which answers the same: wrapped,
+     the filter would no longer tell the planner that the column is
+     constant, and a window partitioned by it, planned unsorted for that
+     constant, would fail ("Expects PARTITION BY expression to be ordered").
+     New hash-join
      keys drop the join's dynamic filter (the pushed copy stays `true`);
    - a logical optimizer rule, run after every other rule (after federation,
      so remote plans are untouched): float equi-join keys become
      `codelake_trino_float_key(k)` (`-0.0` is `0.0`, NaN matches nothing),
      grouping keys, window partitions and `DISTINCT` arguments
      `codelake_trino_float_group_key(k)` (`-0.0` is `0.0`, one NaN group)
-     under their original names, and integer
+     under their original names, `x = 0` of a float in a filter
+     `codelake_trino_ieee_eq(x, 0)` (both zeros pass it, so the planner does
+     not take `x` for a constant), and integer
      `+ - *` in window function arguments become checked functions (the
      window operator evaluates them where the physical rule cannot reach).
    `Engine::sql` runs the analyzer before building the `DataFrame`, so the

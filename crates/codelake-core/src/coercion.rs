@@ -239,7 +239,7 @@ pub(crate) fn mark_values(statement: &mut DFStatement) {
 // ---------------------------------------------------------------- cast names
 
 /// Name of the identity that names a cast in an aggregate's arguments.
-const NAMED_CAST: &str = "codelake_named_cast";
+pub(crate) const NAMED_CAST: &str = "codelake_named_cast";
 
 /// `codelake_named_cast(CAST(x AS T), 'T')`: the cast, named with its type.
 ///
@@ -1296,7 +1296,7 @@ fn unify_union_numbers(union: Union) -> Result<Transformed<LogicalPlan>> {
 
 /// The join `INTERSECT` or `EXCEPT` is planned as: a left semi (anti) join
 /// of every column, `NULL` equal to `NULL`, answering the left input.
-fn is_set_operation(join: &datafusion::logical_expr::Join) -> bool {
+pub(crate) fn is_set_operation(join: &datafusion::logical_expr::Join) -> bool {
     use datafusion::common::NullEquality;
     use datafusion::logical_expr::JoinType;
     let (left, right) = (join.left.schema(), join.right.schema());
@@ -1335,6 +1335,22 @@ fn cast_columns(plan: Arc<LogicalPlan>, targets: &[Option<DataType>]) -> Result<
     )))
 }
 
+/// One Arrow type for text of two different ones (`Utf8` of a hive table,
+/// `Utf8View` of an in-memory one): left to type coercion, the key would
+/// become a cast, and the join no longer one of columns (see
+/// [`is_set_operation`]).
+fn common_text_type(left: &DataType, right: &DataType) -> Option<DataType> {
+    let text = |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
+    if left == right || !text(left) || !text(right) {
+        return None;
+    }
+    Some(if left == &DataType::Utf8View || right == &DataType::Utf8View {
+        DataType::Utf8View
+    } else {
+        DataType::LargeUtf8
+    })
+}
+
 /// `INTERSECT` and `EXCEPT` answer Trino's common type of each column, like
 /// `UNION` (`decimal(5,1) INTERSECT decimal(6,2)` is `decimal(6,2)`,
 /// `integer INTERSECT bigint` is `bigint`); `DataFusion` keeps the left
@@ -1347,7 +1363,10 @@ fn unify_set_operation(join: datafusion::logical_expr::Join) -> Result<Transform
         .fields()
         .iter()
         .zip(join.right.schema().fields())
-        .map(|(l, r)| common_numeric_type(&[l.data_type().clone(), r.data_type().clone()]))
+        .map(|(l, r)| {
+            common_numeric_type(&[l.data_type().clone(), r.data_type().clone()])
+                .or_else(|| common_text_type(l.data_type(), r.data_type()))
+        })
         .collect();
     if targets.iter().all(Option::is_none) {
         return Ok(Transformed::no(LogicalPlan::Join(join)));

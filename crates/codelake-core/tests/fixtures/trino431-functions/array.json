@@ -392,6 +392,22 @@
       }
     },
     {
+      "name": "concat_array_null_element",
+      "sql": "SELECT ARRAY[1] || CAST(NULL AS integer), CAST(NULL AS integer) || ARRAY[1]",
+      "trino": {
+        "types": [
+          "array(integer)",
+          "array(integer)"
+        ],
+        "rows": [
+          [
+            null,
+            null
+          ]
+        ]
+      }
+    },
+    {
       "name": "reverse_array",
       "sql": "SELECT reverse(ARRAY[1, 2, 3]), reverse(ARRAY['a', NULL])",
       "trino": {

@@ -69,6 +69,9 @@ mod url;
 mod zeros;
 mod zone;
 
+pub(crate) use collections::SUBSCRIPT;
+pub(crate) use try_expr::{BARRIER, GUARDED_TRY, TRY};
+
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 

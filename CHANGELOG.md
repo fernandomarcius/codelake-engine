@@ -137,15 +137,32 @@ versioning: [SemVer](https://semver.org/).
 - **Breaking:** hive `INT96` timestamps convert through the catalog's `parquet_time_zone`,
   `America/Sao_Paulo` by default; they were stored and read as UTC. Set
   `parquet_time_zone = "UTC"` to keep the former behavior (ADR 0007, ISS-003).
-- **Breaking:** a comparison of a `char(n)` value (`=`, `<`, `IN`, `LIKE`, `BETWEEN`,
-  `CASE x WHEN`, join conditions) fails with `NOT_SUPPORTED` wherever it is in the plan,
-  until the engine compares char values padded; `CAST(ch AS varchar)` compares text
-  (ADR 0007, red-team W1-4). So do char values as join keys (`USING`, `NATURAL`,
-  `INTERSECT`, `EXCEPT`), in a `UNION` (with or without `ALL`) and as arguments of
-  `nullif`, `greatest` and `least` (DEFECT-W1T-2), and in a `VALUES` list that puts
-  them with other text; `TRY_CAST(x AS char(n))` fails with `NOT_SUPPORTED`. A value
-  computed from a char value (`max(ch)`, `lag(ch)`, `coalesce(ch, …)`, `upper(ch)`,
-  `ch || 'x'`) counts as one.
+- **Breaking:** `char(n)` values follow the reference engine's semantics instead of being
+  refused (ADR 0015, ISS-024): every char value is held padded to `n` (so
+  `length(CAST('ab' AS char(5)))` is 5 and `CAST(CAST('ab' AS char(5)) AS varchar)` is
+  `'ab   '`), and where it meets other text both are converted to the common char type:
+  comparisons (`=`, `<`, `IN`, `BETWEEN`, `LIKE`, `CASE x WHEN`, `nullif`, `greatest`,
+  `least`, join conditions, `IN`/`ANY`/`ALL` subqueries, scalar subqueries) answer what
+  Trino 431 answers, and `CASE`, `coalesce`, `UNION`, `INTERSECT`, `EXCEPT`, `VALUES`,
+  `USING` and `||` output the common type, padded (`char(65536)` against unbounded
+  `varchar`). The refusals of W1-4 and DEFECT-W1T-2 are gone; `TRY_CAST(x AS char(n))`
+  is answered. `typeof`, the client protocol and `CREATE TABLE … AS` see `char(n)` for
+  computed char values (`max(ch)`, `coalesce(ch, 'x')`, `ch || 'x'`).
+- **Breaking:** refused like the reference engine refuses them: `NATURAL JOIN` over any
+  columns ("Natural join not supported"), `char(n) || <unbounded varchar>` and
+  `char(n) || NULL`. Refused because the engine cannot guarantee the reference's answer
+  (ADR 0015): a char value output together with text of a length it does not derive
+  (`CASE … THEN ch ELSE element_at(t.arr, 1) END` over an array column,
+  `to_iso8601(timestamp)`), and char values in arrays that are not written out
+  (`contains(array_agg(ch), 'ab')`). The result lengths of `replace`, `regexp_replace`,
+  `url_encode`, `soundex`, `json_extract_scalar`, `url_decode`, the `url_extract_*`
+  functions, `from_utf8`, `to_iso8601(date)`, an element of `split`, `regexp_split` or
+  `regexp_extract_all` (`element_at`, `[i]`), `to_base64url`, `human_readable_seconds`,
+  `current_timezone` and `version` are derived as the reference engine derives them, so
+  a char value output with them is answered.
+- **Breaking:** `TRY_CAST(x AS varchar(n))` cuts to `n` characters and
+  `TRY_CAST(x AS timestamp(p))` rounds to `p` digits, as `CAST` does (`NULL` where `CAST`
+  fails); they returned the value as it was.
 - **Breaking:** text compared with a number (`varchar_col > 9`, `x IN ('1.0')`) fails with
   `TYPE_MISMATCH` on the engine's client protocols, as on Trino; cast explicitly
   (ADR 0014). It answered rows before, through DataFusion's coercion.
@@ -274,21 +291,61 @@ versioning: [SemVer](https://semver.org/).
   the pool, before sending the first; the statement then ended (slot freed, time limit over)
   while its client had read nothing. Rows now stream to the client as they are produced, so
   the statement holds its slot and its time limit until they are read (ADR 0016).
+- Rows and arrays not written out (a subquery's or a CTE's column, `array_agg`, a `CASE`
+  of rows) were compared by DataFusion as one value: `ROW(1, NULL) = ROW(1, NULL)` was
+  true where Trino 431 answers `NULL`, a join on such keys matched `NULL` with `NULL`, and
+  char values inside were compared unpadded. They are now compared value by value (a
+  join on them runs as a nested-loop join), and char values inside rows and arrays of
+  different lengths are padded to their common type (`arrays_overlap`, `array_intersect`,
+  `array_union`, `array_except`, `flatten`, `CASE`/`coalesce`/`if` of rows or arrays,
+  `UNION` columns) (ADR 0015). A row column compared with a row of other field names
+  (`r = ROW(1, 'a')` over `row(x bigint, y varchar)`) failed ("Unsupported CAST"); rows
+  compare by position.
+- `rtrim(ch, x)`, `trim(ch, x)` and `trim(TRAILING|BOTH x FROM ch)` of a `char(n)` value
+  kept the spaces that ended up last; `typeof` of a constant answered `varchar`
+  (`typeof('a')` is `varchar(1)`, `typeof(CAST('ab' AS char(3)))` `char(3)`).
+- `INTERSECT ALL` and `EXCEPT ALL` between a hive column and an in-memory one (Arrow
+  `Utf8` and `Utf8View`) kept, or dropped, every copy of a row again: the multiset rewrite
+  did not see the set operation behind type coercion's cast.
+- Floats: `WHERE x = 0` of a `double` dropped `-0.0` and `x < 0` kept it (Trino 431:
+  `-0.0 = 0.0`); a window partitioned by a float column under a filter `x = <constant>`
+  failed ("Expects PARTITION BY expression to be ordered"), also in `INTERSECT ALL`
+  (ADR 0008).
+- On the PostgreSQL wire `varchar(n)` was unbounded text: `CAST(v AS varchar(1))` did not
+  cut, a `varchar(2)` column created there took `'abcdef'`, and `CREATE TABLE … AS SELECT
+  CAST(v AS varchar(2))` kept whole values. Casts now cut and the column's `INSERT`s are
+  checked, as on the Trino protocol (ADR 0015).
+- `INSERT INTO t SELECT id, s, s FROM u` failed ("Projections require unique expression
+  names"); it inserts by position, as Trino 431.
+- `char(n)` values still answered other rows than Trino 431 in shapes the matrix did not
+  cover (ADR 0015): a view over a char column dropped a trailing tab or line feed before
+  padding; `ltrim(ch)` kept the padding; rows written out (`ROW(ch, c3) = ROW('ab',
+  'ab')`, `(ch, id) IN (...)`) compared without char semantics in a select list and made
+  a `NULL` field equal; elements of arrays of char values (`ARRAY[ch, c3][2]`,
+  `array_max`, `array_agg(ch)[1]`), `array_remove`, array concatenation, `min_by`,
+  `max_by`, `map_agg`, `histogram` lookups and `try` lost the char type; `INTERSECT` and
+  `EXCEPT` kept values equal as char apart. They now answer Trino's rows; a cast to an
+  array, map or row of `char(n)`/`varchar(n)` and `char(n)` on the PostgreSQL wire are
+  refused instead of answering unpadded values. Text computed from a char value is
+  typed `varchar(n)` (clients, `typeof`, `CREATE TABLE AS`).
+- `ARRAY[1] || CAST(NULL AS integer)` answered `[1, NULL]`; Trino 431 answers `NULL`.
+- `INTERSECT ALL` kept every left copy of a row found on the right (`VALUES 1, 1, 1
+  INTERSECT ALL SELECT 1` answered three rows) and `EXCEPT ALL` removed every copy of
+  it (`VALUES 1, 1, 2 EXCEPT ALL SELECT 1` answered `[2]`); they are now the multiset
+  operations Trino 431 answers (ADR 0014, defect 13).
 - Red-team W1 (ADR 0007): a NANOSECONDS hive catalog read `INT96` timestamps outside
   1677–2262 as other instants (1500-06-01 as 2084-12-18) and its `OPTIMIZE` rewrote them
   into the files; `OPTIMIZE` in any other catalog rounded stored nanoseconds to
   microseconds. Timestamps are now read and compacted exactly; an instant Arrow
   nanoseconds cannot hold is an error naming it (ADR 0009).
-- `char(n)` comparisons above the hive scan (over `LIMIT`, a window, a volatile predicate)
-  dropped rows the reference engine returns; they are refused (see Changed).
-- `TRY_CAST('ab' AS char(5)) = 'ab '` answered false and `VALUES ('ab '),
-  (CAST('ab' AS char(5)))` held two distinct values (the reference: true, one value):
-  the engine held the char value as unpadded text. Both are refused (see Changed).
-- A char value passed through an aggregate, a window function, a function, a `CASE` or
-  `||` (`max(ch)`, `lag(ch)`, `coalesce(ch, …)`, `upper(ch)`) was compared as plain text:
-  `SELECT max(ch) FROM t UNION SELECT s FROM v` held two rows where the reference holds
-  one. Such values are followed through the plan and refused like the column (see
-  Changed).
+- `char(n)` values answered other rows than the reference engine wherever the refusals did
+  not see them (P1–P16 of the W1 verification): `IN`/`NOT IN`/`= ANY` with the char value
+  in the subquery, scalar subqueries of char values, `CASE`/`coalesce` mixing char and
+  text, `CAST … AS char(n)` held unpadded; and over the hive scan (under `LIMIT`, a
+  window). They now answer the reference's rows (ADR 0015).
+- `max(ch)` over a char column of an in-memory table panicked (`Utf8`×`Utf8View`) and
+  `CAST(ch AS varchar)` failed ("expected Utf8View but found Utf8"): `INSERT` wrote
+  `Utf8` values into a `Utf8View` column. Values keep the column's Arrow type.
 - Tables of the in-memory catalog (`CREATE TABLE datafusion.…`) kept their rows outside
   the memory pool; they are reserved in it for as long as the table exists. `UPDATE` and
   `DELETE` of such a table run when the plan executes (they changed the rows while

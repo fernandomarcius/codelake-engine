@@ -54,6 +54,25 @@ fn timestamp_unit(precision: Option<&str>) -> Result<TimeUnit> {
     })
 }
 
+/// Arrow type of the element (field, key, value) type `text` of an array,
+/// a map or a row. `char(n)` and `varchar(n)` are refused there: their
+/// values would have to be padded or cut one by one (`CAST(ARRAY['ab  ']
+/// AS array(char(3)))` is `['ab ']` in Trino 431), which the conversion
+/// does not do.
+fn element_type(text: &str, zone: &str) -> Result<DataType> {
+    let lower = text.trim().to_ascii_lowercase();
+    let head = lower.split('(').next().unwrap_or_default().trim();
+    if head == "char" || (head == "varchar" && lower.contains('(')) {
+        return Err(DataFusionError::NotImplemented(format!(
+            "a cast to an array, map or row of {} is not supported yet: cast to one of varchar, then \
+             the values to {}",
+            text.trim(),
+            text.trim()
+        )));
+    }
+    parse_type(text, zone)
+}
+
 /// Arrow type of a Trino type text; `zone` is the session zone.
 pub(crate) fn parse_type(text: &str, zone: &str) -> Result<DataType> {
     let text = text.trim();
@@ -94,9 +113,9 @@ pub(crate) fn parse_type(text: &str, zone: &str) -> Result<DataType> {
             let unit = timestamp_unit(p)?;
             DataType::Timestamp(unit, zoned.then(|| Arc::from(zone)))
         }
-        ("array", Some(a)) => DataType::List(Arc::new(Field::new_list_field(parse_type(a, zone)?, true))),
+        ("array", Some(a)) => DataType::List(Arc::new(Field::new_list_field(element_type(a, zone)?, true))),
         ("map", Some(a)) => match split_args(a).as_slice() {
-            [k, v] => super::collections::map_type(parse_type(k, zone)?, parse_type(v, zone)?),
+            [k, v] => super::collections::map_type(element_type(k, zone)?, element_type(v, zone)?),
             _ => return Err(type_error(text)),
         },
         ("row", Some(a)) => {
@@ -106,10 +125,12 @@ pub(crate) fn parse_type(text: &str, zone: &str) -> Result<DataType> {
                 .map(|(i, field)| {
                     // `name type` or just `type` (an anonymous field).
                     match field.split_once(char::is_whitespace) {
-                        Some((name, rest)) if parse_type(field, zone).is_err() => {
-                            Ok(Field::new(name.trim_matches('"'), parse_type(rest, zone)?, true))
-                        }
-                        _ => Ok(Field::new(format!("c{i}"), parse_type(field, zone)?, true)),
+                        Some((name, rest)) if parse_type(field, zone).is_err() => Ok(Field::new(
+                            name.trim_matches('"'),
+                            element_type(rest, zone)?,
+                            true,
+                        )),
+                        _ => Ok(Field::new(format!("c{i}"), element_type(field, zone)?, true)),
                     }
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -246,6 +267,26 @@ pub(crate) fn udfs() -> Vec<ScalarUDF> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bounded text inside a container is refused, never converted as
+    /// unbounded text (Trino 431 pads or cuts each value).
+    #[test]
+    fn bounded_text_inside_containers_is_refused() {
+        for text in [
+            "array(char(3))",
+            "array(char)",
+            "array(varchar(1))",
+            "row(a char(4), b integer)",
+            "row(char(4))",
+            "map(varchar, varchar(2))",
+            "array(array(char(2)))",
+        ] {
+            let err = parse_type(text, "UTC").unwrap_err();
+            assert!(matches!(err, DataFusionError::NotImplemented(_)), "{text}: {err}");
+        }
+        assert!(parse_type("array(varchar)", "UTC").is_ok());
+        assert!(parse_type("row(a varchar, b array(varchar))", "UTC").is_ok());
+    }
 
     #[test]
     fn trino_types_map_to_arrow() {

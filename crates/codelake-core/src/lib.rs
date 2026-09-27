@@ -5,7 +5,7 @@
 pub mod bytes;
 mod casts;
 pub mod catalog;
-pub mod char_comparisons;
+pub mod char_semantics;
 mod coercion;
 pub mod computed_batches;
 pub mod config;
@@ -25,6 +25,7 @@ pub mod join_guard;
 pub mod join_spill;
 mod literals;
 mod memory_tables;
+mod nested_values;
 pub mod operand_checks;
 pub mod output;
 pub mod overflow;
@@ -35,6 +36,7 @@ pub mod runtime;
 #[cfg(test)]
 mod semantics_tests;
 pub mod session_properties;
+mod set_operations;
 pub mod statement_policy;
 pub mod statistics_guard;
 pub mod subquery;
@@ -60,7 +62,7 @@ pub use connector::{
     WritableCatalog,
 };
 pub use ddl::{RelationKind, update_type as ddl_update_type};
-pub use declared::trino_type_syntax;
+pub use declared::{PostgresStatement, postgres_statement, trino_type_syntax};
 pub use engine::{Attach, Engine, EngineError, Query, QueryOptions, SourceStatus};
 pub use governance::Governance;
 pub use runtime::MemoryStats;

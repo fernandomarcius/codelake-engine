@@ -277,8 +277,6 @@ codelake_session = "enable_dynamic_filtering=false"
 # Findings of the interrupted ISS-033 verification (multiplicity, combined conditions).
 [[case]]
 id = "V33-except-all"
-expect = "WRONG"
-known = "front/w1-df54"
 sql = "SELECT id, v FROM (SELECT * FROM hive.nrg.n1 UNION ALL SELECT * FROM hive.nrg.n1 UNION ALL SELECT * FROM hive.nrg.n1) EXCEPT ALL SELECT * FROM hive.nrg.n1 ORDER BY id"
 
 [[case]]
