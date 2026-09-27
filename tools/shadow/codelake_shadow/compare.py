@@ -126,10 +126,16 @@ def _nanos(col: str, duck_type: str, int96_zone: str | None = None) -> str:
     return f"(CAST(epoch_us({col}) AS HUGEINT) * 1000)"
 
 
-def canonical_expr(name: str, duck_type: str, int96_zone: str | None = None) -> str:
-    """SQL for the canonical text of one column; never NULL."""
+def canonical_expr(
+    name: str, duck_type: str, int96_zone: str | None = None, replace_class: str = ""
+) -> str:
+    """SQL for the canonical text of one column; never NULL. ``replace_class``
+    (a regular expression): each matching character of a text value becomes
+    U+FFFD first (a ``replaced_characters`` rule, ``expected.py``)."""
     col = quote_ident(name)
     cls = type_class(duck_type)
+    if replace_class and cls == "S":
+        col = f"regexp_replace({col}, {quote_literal(replace_class)}, {quote_literal(chr(0xFFFD))}, 'g')"
     if cls == "N":
         text = f"CAST({col} AS VARCHAR)"
         # Drop trailing zeros of the fraction, then a bare point; -0 is 0.
@@ -370,9 +376,12 @@ def read_side(con: duckdb.DuckDBPyConnection, files: list[str]) -> SideData:
     return SideData(files, columns, groups, encodings)
 
 
-def canonical_relation(side: SideData, columns: list[str], zone: str) -> str:
+def canonical_relation(
+    side: SideData, columns: list[str], zone: str, replace: dict[str, str] | None = None
+) -> str:
     """SQL of the side's rows as canonical texts ``k0..kn`` of ``columns``
-    (lower-case names), one SELECT per file group."""
+    (lower-case names), one SELECT per file group; ``replace``: column ->
+    character class replaced with U+FFFD (see ``canonical_expr``)."""
     parts = []
     for group in side.groups:
         items = []
@@ -390,7 +399,8 @@ def canonical_relation(side: SideData, columns: list[str], zone: str) -> str:
                         "--parquet-time-zone): not compared"
                     )
                 int96_zone = zone
-            items.append(f"{canonical_expr(name, duck_type, int96_zone)} AS k{i}")
+            replace_class = (replace or {}).get(column, "")
+            items.append(f"{canonical_expr(name, duck_type, int96_zone, replace_class)} AS k{i}")
         if not items:
             items.append("1 AS k_")
         parts.append(f"SELECT {', '.join(items)} FROM {_relation(group.files)}")
@@ -669,7 +679,29 @@ def _compare_table(
     out["schema"] = schema_out
     zone = options.parquet_time_zone
     ref_relation = canonical_relation(ref_side, compared, zone)
-    cand_relation = canonical_relation(cand_side, compared, zone)
+    replace: dict[str, str] = {}
+    for c in compared:
+        rule = expected_rules.replacements(options.expected, name, c)
+        if rule is None or type_class(cand_side.columns[c][1]) != "S":
+            continue
+        pattern = expected_rules.CHARACTER_CLASSES[rule.characters]
+        replace[c] = pattern
+        column_sql = quote_ident(cand_side.columns[c][0])
+        changed = con.execute(
+            f"SELECT count(*) FROM {_relation(cand_side.files)} "
+            f"WHERE regexp_matches({column_sql}, {quote_literal(pattern)})"
+        ).fetchone()[0]
+        expected.append(
+            {
+                "column": c,
+                "kind": "replaced_characters",
+                "rule": rule.id,
+                "reason": rule.reason,
+                "reference": "U+FFFD",
+                "candidate": f"{rule.characters} ({changed} rows)",
+            }
+        )
+    cand_relation = canonical_relation(cand_side, compared, zone, replace)
     ref = side_stats(con, ref_relation, compared)
     cand = side_stats(con, cand_relation, compared)
     out["rows"] = {"reference": ref.rows, "candidate": cand.rows}
