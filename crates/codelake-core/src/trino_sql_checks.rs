@@ -27,8 +27,8 @@ use std::ops::ControlFlow;
 use datafusion::error::DataFusionError;
 use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
-    BinaryOperator, DataType, Expr, Statement as SqlStatement, TimezoneInfo, UnaryOperator, Value,
-    ValueWithSpan, visit_expressions, visit_expressions_mut,
+    BinaryOperator, DataType, Expr, Ident, SelectItem, SetExpr, Statement as SqlStatement, TimezoneInfo,
+    UnaryOperator, Value, ValueWithSpan, visit_expressions, visit_expressions_mut,
 };
 use datafusion::sql::sqlparser::parser::ParserError;
 
