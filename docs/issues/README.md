@@ -47,6 +47,8 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-035](ISS-035-dev-speed-branch-unreviewed.md) | front/dev-speed (sccache + differential gate) not reviewed | pending work | 2026-09-26 | closed |
 | [ISS-036](ISS-036-f6-round3-unverified.md) | F6 round 3 (cursors) implemented, not verified | pending work | 2026-09-26 | closed |
 | [ISS-037](ISS-037-char-branch-unmerged.md) | char(n) semantics branch not merged | pending work | 2026-09-26 | open |
+| [ISS-036](ISS-036-f6-round3-unverified.md) | F6 round 3 (cursors) implemented, not verified | pending work | 2026-09-26 | open |
+| [ISS-037](ISS-037-char-branch-unmerged.md) | char(n) semantics branch not merged | pending work | 2026-09-26 | closed |
 | [ISS-038](ISS-038-roadmap-fronts-not-started.md) | Roadmap fronts not started | pending work | 2026-09-26 | open |
 | [ISS-039](ISS-039-benchmarks-and-global-dod.md) | Benchmarks and global Definition of Done pending | pending work | 2026-09-26 | open |
 | [ISS-040](ISS-040-environment-leftovers.md) | Local environment leftovers after the iCloud move | environment | 2026-09-26 | open |
@@ -63,3 +65,4 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-024](ISS-024-char-semantics.md) | char(n) semantics instead of refusals | removed limitation | 2026-09-25 | closed |
 | [ISS-025](ISS-025-char-wrong-results-merged.md) | Known char(n) wrong results merged into main | known defect | 2026-09-25 | closed |
 | [ISS-030](ISS-030-char-round5-by-recommendation.md) | char(n) round 5: choices applied by recommendation | behavior | 2026-09-26 | awaiting-confirmation |
+| [ISS-051](ISS-051-char-container-type-names.md) | Containers of char(n) are typed with varchar elements | known defect | 2026-09-27 | open |
