@@ -345,16 +345,6 @@ async fn the_two_zeros_are_one_value_everywhere() {
         ("SELECT count(*) FROM t WHERE 0 = x", 2),
         ("SELECT count(*) FROM t WHERE x <> 0", 3),
         ("SELECT count(*) FROM t WHERE NOT (x = 0)", 3),
-        // Negations of float comparisons keep NaN (every comparison with it
-        // is false, so its negation is true), as in Trino.
-        ("SELECT count(*) FROM t WHERE NOT (x > 1)", 5),
-        ("SELECT count(*) FROM t WHERE NOT (r < 0)", 4),
-        ("SELECT count(*) FROM t WHERE x NOT BETWEEN -0.5E0 AND 0.5E0", 3),
-        // The two zeros are peers in a window ordered by them.
-        (
-            "SELECT count(*) FROM (SELECT rank() OVER (ORDER BY x) AS rk FROM t WHERE id <= 2) WHERE rk = 1",
-            2,
-        ),
         ("SELECT count(*) FROM t WHERE x < 0", 1),
         ("SELECT count(*) FROM t WHERE x <= -0.0E0", 3),
         ("SELECT count(*) FROM t WHERE x > -0.0E0", 1),
@@ -427,4 +417,43 @@ async fn the_two_zeros_are_one_value_everywhere() {
     )
     .await;
     assert_eq!(int64s(&out, 0), [Some(2), Some(2)]);
+}
+
+/// Negations of float comparisons keep NaN (every comparison with it is
+/// false, so its negation is true), and the two zeros are peers in a window
+/// ordered by them. Answers of Trino 431.
+#[tokio::test]
+async fn float_negations_keep_nan_and_zeros_are_window_peers() {
+    use datafusion::arrow::array::Float32Array;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    let id: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6]));
+    let x: ArrayRef = Arc::new(Float64Array::from(vec![
+        Some(0.0),
+        Some(-0.0),
+        Some(1.0),
+        Some(-1.0),
+        Some(f64::NAN),
+        None,
+    ]));
+    let r: ArrayRef = Arc::new(Float32Array::from(vec![
+        Some(0.0),
+        Some(-0.0),
+        Some(1.0),
+        Some(-1.0),
+        Some(f32::NAN),
+        None,
+    ]));
+    register(&engine, &[("id", id), ("x", x), ("r", r)], 3);
+    for (sql, expected) in [
+        ("SELECT count(*) FROM t WHERE NOT (x > 1)", 5),
+        ("SELECT count(*) FROM t WHERE NOT (r < 0)", 4),
+        ("SELECT count(*) FROM t WHERE x NOT BETWEEN -0.5E0 AND 0.5E0", 3),
+        (
+            "SELECT count(*) FROM (SELECT rank() OVER (ORDER BY x) AS rk FROM t WHERE id <= 2) WHERE rk = 1",
+            2,
+        ),
+    ] {
+        assert_eq!(int64s(&rows(&engine, sql).await, 0), [Some(expected)], "{sql}");
+    }
 }
