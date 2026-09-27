@@ -13,6 +13,10 @@
 //!   - with `datafusion.optimizer.prefer_hash_join = false` the planner routes
 //!     it to `SortMergeJoinExec`, which is not null-aware
 //!     (apache/datafusion#22810, not in 54.1.0).
+//! - A null-safe join (`IS NOT DISTINCT FROM`, `INTERSECT`, `EXCEPT`) must
+//!   match a NULL key with a NULL key although the NULLs sit in a row group of
+//!   their own: the join's dynamic filter (bounds of the build side's
+//!   non-NULL keys) pruned that row group from the probe side's scan.
 //! - `x [NOT] IN (subquery)` outside a conjunct of the `WHERE` is a mark join,
 //!   which answers FALSE where SQL says UNKNOWN: the engine must answer
 //!   Trino's rows where FALSE and UNKNOWN filter the same rows, and refuse
@@ -686,6 +690,212 @@ async fn in_subquery_answers_trinos_rows_or_is_refused() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Null-safe joins over a row group that holds only NULL keys.
+// ---------------------------------------------------------------------------
+
+/// `ns_tr`, written by Trino: (1, 'a', 10) and (2, 'b', 20) in one file, then
+/// (3, NULL, NULL) in a file of its own (a second `INSERT`), so the NULL keys
+/// are a row group of their own.
+const NULL_SAFE_SETUP: [&str; 6] = [
+    "CREATE SCHEMA hive.jr",
+    "CREATE TABLE hive.jr.ns_tr (id bigint, v varchar, k bigint) WITH (format = 'PARQUET')",
+    "INSERT INTO hive.jr.ns_tr VALUES (1, 'a', 10), (2, 'b', 20)",
+    "INSERT INTO hive.jr.ns_tr VALUES (3, NULL, NULL)",
+    "CREATE TABLE hive.jr.flags (id bigint, f boolean) WITH (format = 'PARQUET')",
+    "INSERT INTO hive.jr.flags VALUES (1, true), (2, false), (3, NULL)",
+];
+
+/// `IS [NOT] DISTINCT FROM` binds tighter than `AND` and `OR`; the parser
+/// took the rest of the condition as its right operand, and over booleans
+/// that answered other rows.
+const DISTINCT_FROM_PRECEDENCE: [Case; 4] = [
+    Case {
+        label: "IS NOT DISTINCT FROM … AND, join condition",
+        sql: "SELECT a.id, b.id FROM hive.jr.flags a JOIN hive.jr.flags b \
+              ON a.f IS NOT DISTINCT FROM b.f AND a.id = b.id",
+        operator: "",
+        must_spill: false,
+    },
+    Case {
+        label: "IS DISTINCT FROM … OR",
+        sql: "SELECT a.id, b.id FROM hive.jr.flags a, hive.jr.flags b \
+              WHERE a.f IS DISTINCT FROM b.f OR a.id = b.id",
+        operator: "",
+        must_spill: false,
+    },
+    Case {
+        label: "IS DISTINCT FROM … AND",
+        sql: "SELECT id FROM hive.jr.flags WHERE f IS DISTINCT FROM true AND id > 1",
+        operator: "",
+        must_spill: false,
+    },
+    Case {
+        label: "NOT … IS DISTINCT FROM … OR",
+        sql: "SELECT id FROM hive.jr.flags WHERE NOT f IS DISTINCT FROM false OR id = 3",
+        operator: "",
+        must_spill: false,
+    },
+];
+
+/// `ns_cl`: the same rows, written by the engine the same way.
+const NULL_SAFE_ENGINE_SETUP: [&str; 3] = [
+    "CREATE TABLE hive.jr.ns_cl (id bigint, v varchar, k bigint)",
+    "INSERT INTO hive.jr.ns_cl VALUES (1, 'a', 10), (2, 'b', 20)",
+    "INSERT INTO hive.jr.ns_cl VALUES (3, NULL, NULL)",
+];
+
+/// Every join below matches NULL with NULL; the NULL row must match itself.
+/// Each must run through the guard (`NullKeysKept` in the plan). Only the
+/// `id`s are compared, which are never NULL.
+macro_rules! null_safe_cases {
+    ($t:literal, $u:literal) => {
+        [
+            Case {
+                label: concat!("EXCEPT, ", $t, " and ", $u),
+                sql: concat!(
+                    "SELECT id FROM (SELECT * FROM hive.jr.",
+                    $t,
+                    " EXCEPT SELECT * FROM hive.jr.",
+                    $u,
+                    ")"
+                ),
+                operator: "NullKeysKept",
+                must_spill: false,
+            },
+            Case {
+                label: concat!("INTERSECT, ", $t, " and ", $u),
+                sql: concat!(
+                    "SELECT id FROM (SELECT * FROM hive.jr.",
+                    $t,
+                    " INTERSECT SELECT * FROM hive.jr.",
+                    $u,
+                    ")"
+                ),
+                operator: "NullKeysKept",
+                must_spill: false,
+            },
+            Case {
+                label: concat!("JOIN ON IS NOT DISTINCT FROM, varchar, ", $t, " and ", $u),
+                sql: concat!(
+                    "SELECT a.id, b.id FROM hive.jr.",
+                    $t,
+                    " a JOIN hive.jr.",
+                    $u,
+                    " b ON a.v IS NOT DISTINCT FROM b.v"
+                ),
+                operator: "NullKeysKept",
+                must_spill: false,
+            },
+            Case {
+                label: concat!("JOIN ON IS NOT DISTINCT FROM, bigint, ", $t, " and ", $u),
+                sql: concat!(
+                    "SELECT a.id, b.id FROM hive.jr.",
+                    $t,
+                    " a JOIN hive.jr.",
+                    $u,
+                    " b ON a.k IS NOT DISTINCT FROM b.k"
+                ),
+                operator: "NullKeysKept",
+                must_spill: false,
+            },
+            Case {
+                label: concat!("LEFT JOIN ON IS NOT DISTINCT FROM, ", $t, " and ", $u),
+                sql: concat!(
+                    "SELECT a.id, b.id FROM hive.jr.",
+                    $t,
+                    " a LEFT JOIN hive.jr.",
+                    $u,
+                    " b ON a.v IS NOT DISTINCT FROM b.v"
+                ),
+                operator: "NullKeysKept",
+                must_spill: false,
+            },
+            Case {
+                label: concat!("NOT EXISTS with IS NOT DISTINCT FROM, ", $t, " and ", $u),
+                sql: concat!(
+                    "SELECT id FROM hive.jr.",
+                    $t,
+                    " a WHERE NOT EXISTS (SELECT 1 FROM hive.jr.",
+                    $u,
+                    " b WHERE b.v IS NOT DISTINCT FROM a.v)"
+                ),
+                operator: "NullKeysKept",
+                must_spill: false,
+            },
+            Case {
+                label: concat!("EXISTS with IS NOT DISTINCT FROM, ", $t, " and ", $u),
+                sql: concat!(
+                    "SELECT id FROM hive.jr.",
+                    $t,
+                    " a WHERE EXISTS (SELECT 1 FROM hive.jr.",
+                    $u,
+                    " b WHERE b.v IS NOT DISTINCT FROM a.v)"
+                ),
+                operator: "NullKeysKept",
+                must_spill: false,
+            },
+        ]
+    };
+}
+
+/// apache/datafusion 54.1: a null-safe hash join pushes its dynamic filter
+/// (bounds of the build side's non-NULL keys) into the scan of its probe
+/// side, which prunes the row group holding only the NULL keys: `t EXCEPT t`
+/// returned the NULL row, `t INTERSECT t` and the joins lost it. Tables
+/// written by Trino and by the engine, alone and against each other, with
+/// default settings and with row-level Parquet filtering; and the grouping of
+/// `IS [NOT] DISTINCT FROM` with `AND`/`OR` (`DISTINCT_FROM_PRECEDENCE`).
+#[tokio::test]
+async fn null_safe_joins_keep_the_rows_whose_key_is_null() {
+    let shared = shared().await;
+    let trino = Trino::start(&shared, "nullsafe").await;
+    trino.batch(&NULL_SAFE_SETUP).await;
+    let spill = tempfile::tempdir().unwrap();
+    let writer = open(
+        &shared.warehouse(),
+        spill.path(),
+        ByteSize::mib(256),
+        &ExecutionConfig::default(),
+        &[],
+    )
+    .await;
+    for sql in NULL_SAFE_ENGINE_SETUP {
+        try_cl(&writer, sql)
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}`: {e}"));
+    }
+    drop(writer);
+    let cases: Vec<Case> = [
+        null_safe_cases!("ns_tr", "ns_tr"),
+        null_safe_cases!("ns_cl", "ns_cl"),
+        null_safe_cases!("ns_tr", "ns_cl"),
+        null_safe_cases!("ns_cl", "ns_tr"),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(DISTINCT_FROM_PRECEDENCE)
+    .collect();
+    let mut failures = Vec::new();
+    for settings in [
+        &[][..],
+        &[("datafusion.execution.parquet.pushdown_filters", "true")][..],
+    ] {
+        let engine = open(
+            &shared.warehouse(),
+            spill.path(),
+            ByteSize::mib(256),
+            &ExecutionConfig::default(),
+            settings,
+        )
+        .await;
+        for failure in compare(&engine, &trino, &cases).await {
+            failures.push(format!("settings {settings:?}: {failure}"));
+        }
+    }
+    assert!(failures.is_empty(), "rows differ:\n{}", failures.join("\n"));
 }
 
 // ---------------------------------------------------------------------------

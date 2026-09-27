@@ -66,6 +66,7 @@ mod support;
 mod syntax;
 mod try_expr;
 mod url;
+mod zeros;
 mod zone;
 
 use std::collections::HashSet;
@@ -164,6 +165,15 @@ pub fn install(ctx: &mut SessionContext) -> Result<()> {
     ctx.add_analyzer_rule(Arc::new(cast::TrinoCasts));
     Ok(())
 }
+
+/// The rule that must run before `simplify_expressions` (see `zeros`): the
+/// engine inserts it there.
+pub fn float_zeros() -> Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync> {
+    Arc::new(zeros::FloatZeros)
+}
+
+/// Name of the rule [`float_zeros`] returns.
+pub const FLOAT_ZEROS: &str = zeros::FLOAT_ZEROS;
 
 /// Logical optimizer rules of the library, to run after the engine's own
 /// (float keys and window arguments, see `keys`).

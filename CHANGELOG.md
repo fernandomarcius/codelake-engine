@@ -174,6 +174,24 @@ versioning: [SemVer](https://semver.org/).
   `0A000`): it moves the cursor as the `FETCH` of the same direction would and answers
   `MOVE n` as PostgreSQL. A count beyond PostgreSQL's `int4` (`FETCH 9223372036854775807`)
   fails with `42601` instead of returning every row left (ADR 0016).
+- Joins that match NULL with NULL lost the rows whose key is NULL when those NULLs sat in a
+  row group of their own (what an `INSERT` of a NULL row leaves): `t EXCEPT t` returned the
+  NULL row, and `t INTERSECT t`, `JOIN … ON a IS NOT DISTINCT FROM b`, `LEFT JOIN` on it and
+  `[NOT] EXISTS (… WHERE b IS NOT DISTINCT FROM a)` lost it (DataFusion 54.1 pushed the join's
+  dynamic filter, built from the non-NULL keys, into the probe side's scan). The filter now
+  keeps NULL keys; rows match Trino 431 over tables written by Trino and by the engine
+  (ADR 0014, defect 13).
+- `a IS [NOT] DISTINCT FROM b AND c` was parsed as `a IS [NOT] DISTINCT FROM (b AND c)`:
+  over booleans it answered other rows (`JOIN … ON a.f IS NOT DISTINCT FROM b.f AND a.id =
+  b.id`), otherwise it failed with `Utf8 AND Boolean`. It now binds tighter than `AND`,
+  `OR` and `NOT`, as in Trino and PostgreSQL, on both client protocols (ADR 0014, defect 14).
+- `0.0` and `-0.0` compared as different values: `x = 0` dropped `-0.0` rows, `x < 0`,
+  `x <> 0` and `x IS DISTINCT FROM 0` kept them, and so did `IN (0, …)`, `BETWEEN 0 AND …`,
+  `CASE x WHEN 0`, `nullif(x, 0)`, comparisons of two columns and `GROUP BY ROLLUP`/`CUBE`/
+  `GROUPING SETS`; a scan could skip a row group holding only `-0.0`. The two zeros are now
+  one value everywhere, for `double` and `real`. **Deliberate divergence:** joins,
+  `IN (subquery)` and `IN` lists of `real` match `0.0` with `-0.0`, as PostgreSQL does and
+  Trino 431 does not (ADR 0017, ISS-050).
 - PostgreSQL wire, transactions: `COMMIT` and `ROLLBACK` did not close cursors and portals,
   which kept their admission slot and pool memory (for good on a pooled connection) and
   answered `FETCH` after the `COMMIT`. The end of a transaction (`COMMIT`, `ROLLBACK`, a

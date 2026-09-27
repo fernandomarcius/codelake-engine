@@ -10,8 +10,9 @@
 //!   (NaN → NULL, which matches nothing; for `IS NOT DISTINCT FROM` and
 //!   null-aware joins only the zero is normalized), grouping keys and
 //!   `DISTINCT` aggregate arguments `codelake_trino_float_group_key(k)`, both
-//!   under the original output name.
-//!   Window `PARTITION BY` keys get the grouping form too.
+//!   under the original output name (in `GROUPING SETS`, `ROLLUP` and
+//!   `CUBE` too). Window `PARTITION BY` and `ORDER BY` keys get the grouping
+//!   form too (`-0.0` and `0.0` are peers).
 //! - **Window function arguments.** `lag(x + 1)` evaluates `x + 1` inside
 //!   the window operator, where the physical rule cannot make it fail on
 //!   overflow: integer `+ - *` there becomes Trino's checked functions.
@@ -22,7 +23,7 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DFSchema, NullEquality, Result};
-use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction};
+use datafusion::logical_expr::expr::{AggregateFunction, GroupingSet, ScalarFunction};
 use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, Operator, ScalarUDF};
 use datafusion::optimizer::optimizer::ApplyOrder;
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
@@ -99,6 +100,9 @@ impl TrinoKeys {
         let output = Arc::clone(&aggregate.schema);
         let mut changed = false;
         let groups = aggregate.group_expr.len();
+        if let [Expr::GroupingSet(set)] = aggregate.group_expr.as_mut_slice() {
+            changed |= self.grouping_set(set, &input, &output);
+        }
         for (i, expr) in aggregate.group_expr.iter_mut().enumerate() {
             if matches!(expr, Expr::GroupingSet(_)) || is_key_call(expr) {
                 continue;
@@ -119,6 +123,38 @@ impl TrinoKeys {
             }
         }
         Transformed::new_transformed(LogicalPlan::Aggregate(aggregate), changed)
+    }
+
+    /// The float expressions of `GROUPING SETS`, `ROLLUP` and `CUBE` as
+    /// grouping keys, under the name of the output column each one is.
+    fn grouping_set(&self, set: &mut GroupingSet, input: &DFSchema, output: &DFSchema) -> bool {
+        let keyed: Vec<(Expr, Expr)> = set
+            .distinct_expr()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, e)| !is_key_call(e) && e.get_type(input).is_ok_and(|t| is_float(&t)))
+            .map(|(i, e)| {
+                let (qualifier, field) = output.qualified_field(i);
+                let key =
+                    Self::wrap(&self.group_key, e.clone()).alias_qualified(qualifier.cloned(), field.name());
+                (e.clone(), key)
+            })
+            .collect();
+        if keyed.is_empty() {
+            return false;
+        }
+        let replace = |exprs: &mut Vec<Expr>| {
+            for expr in exprs {
+                if let Some((_, key)) = keyed.iter().find(|(original, _)| original == expr) {
+                    *expr = key.clone();
+                }
+            }
+        };
+        match set {
+            GroupingSet::Rollup(exprs) | GroupingSet::Cube(exprs) => replace(exprs),
+            GroupingSet::GroupingSets(sets) => sets.iter_mut().for_each(replace),
+        }
+        true
     }
 
     /// `count(DISTINCT x)` of a float: the argument as a grouping key.
@@ -207,6 +243,18 @@ impl TrinoKeys {
                     let original =
                         std::mem::replace(key, Expr::Literal(datafusion::common::ScalarValue::Null, None));
                     *key = Self::wrap(&self.group_key, original);
+                    touched = true;
+                }
+            }
+            // `ORDER BY` a float: `-0.0` and `0.0` are peers (ranks, frames),
+            // as they are one value everywhere (ADR 0017).
+            for sort in &mut function.params.order_by {
+                if !is_key_call(&sort.expr) && sort.expr.get_type(&input).is_ok_and(|t| is_float(&t)) {
+                    let original = std::mem::replace(
+                        &mut sort.expr,
+                        Expr::Literal(datafusion::common::ScalarValue::Null, None),
+                    );
+                    sort.expr = Self::wrap(&self.group_key, original);
                     touched = true;
                 }
             }

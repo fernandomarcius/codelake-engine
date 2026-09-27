@@ -3,8 +3,12 @@
 //! `DataFusion` compares floats with a total order: `nan() = nan()` is true
 //! and `nan() > 1` is true, so `WHERE x > 1` keeps NaN rows. In Trino (and
 //! IEEE 754) every comparison with NaN is false, except `<>`, which is true.
-//! [`NanAwareComparison`] wraps a float comparison and corrects the rows where
-//! an operand is NaN; the physical rule in `try_expr` installs it.
+//! The total order also puts `-0.0` below `0.0`, where IEEE 754, Trino and
+//! PostgreSQL have `-0.0 = 0.0` (ISS-050). [`NanAwareComparison`] wraps a
+//! float comparison (and `IS [NOT] DISTINCT FROM`) and corrects the rows
+//! where an operand is NaN or both are zeros; the physical rule in `try_expr`
+//! installs it. Comparisons with a zero constant are rewritten before
+//! planning (`zeros`), so scans and the planner see them right too.
 
 use std::fmt;
 use std::sync::Arc;
@@ -27,9 +31,34 @@ pub(crate) fn is_float_comparison(binary: &BinaryExpr, schema: &Schema) -> bool 
     };
     matches!(
         binary.op(),
-        Operator::Eq | Operator::NotEq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+            | Operator::IsDistinctFrom
+            | Operator::IsNotDistinctFrom
     ) && float(binary.left())
         && float(binary.right())
+}
+
+/// Whether the engine's total order answers `binary` as IEEE 754 does:
+/// `=` and `<>` with a literal that is neither NaN nor a zero. Left as it
+/// is, the planner keeps reading `x = 1.5` in a filter as a constant `x`
+/// (a window partitioned by `x` above it is not sorted); wrapped, the
+/// operator would no longer say so, and the window would fail.
+pub(crate) fn same_in_both_orders(binary: &BinaryExpr) -> bool {
+    use datafusion::physical_expr::expressions::Literal;
+    let plain = |e: &Arc<dyn PhysicalExpr>| {
+        e.downcast_ref::<Literal>()
+            .is_some_and(|literal| match literal.value() {
+                ScalarValue::Float64(Some(v)) => !v.is_nan() && *v != 0.0,
+                ScalarValue::Float32(Some(v)) => !v.is_nan() && *v != 0.0,
+                _ => false,
+            })
+    };
+    matches!(binary.op(), Operator::Eq | Operator::NotEq) && (plain(binary.left()) || plain(binary.right()))
 }
 
 /// Rows where the value is NaN (false for NULL).
@@ -46,7 +75,23 @@ pub(crate) fn nan_mask(array: &ArrayRef) -> Result<BooleanArray> {
     )))
 }
 
-/// A float comparison with NaN handled as in IEEE 754.
+/// Rows where the value is `0.0` or `-0.0` (false for NULL).
+fn zero_mask(array: &ArrayRef) -> Result<BooleanArray> {
+    if let Some(values) = array.as_any().downcast_ref::<Float64Array>() {
+        return Ok(values.iter().map(|v| Some(v == Some(0.0))).collect());
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Float32Array>() {
+        return Ok(values.iter().map(|v| Some(v == Some(0.0))).collect());
+    }
+    Err(DataFusionError::Internal(format!(
+        "not a float: {}",
+        array.data_type()
+    )))
+}
+
+/// A float comparison with NaN and the zeros handled as in IEEE 754; for `IS
+/// [NOT] DISTINCT FROM`, the zeros are one value and so are all NaNs (as
+/// `GROUP BY` has them).
 #[derive(Debug, Clone)]
 pub(crate) struct NanAwareComparison {
     inner: Arc<dyn PhysicalExpr>,
@@ -98,9 +143,30 @@ impl PhysicalExpr for NanAwareComparison {
             self.left.evaluate(batch)?.into_array(rows)?,
             self.right.evaluate(batch)?.into_array(rows)?,
         );
+        // `-0.0` and `0.0` are equal (the total order puts `-0.0` first).
+        let zeros = and(&zero_mask(&left)?, &zero_mask(&right)?)?;
+        let result = if zeros.true_count() == 0 {
+            result
+        } else {
+            let equal = matches!(
+                self.op,
+                Operator::Eq | Operator::LtEq | Operator::GtEq | Operator::IsNotDistinctFrom
+            );
+            zip(&zeros, &ScalarValue::Boolean(Some(equal)).to_scalar()?, &result)?
+        };
+        let (left_nan, right_nan) = (nan_mask(&left)?, nan_mask(&right)?);
+        if matches!(self.op, Operator::IsDistinctFrom | Operator::IsNotDistinctFrom) {
+            // Every NaN is one value, whatever its bits.
+            let both_nan = and(&left_nan, &right_nan)?;
+            if both_nan.true_count() == 0 {
+                return Ok(ColumnarValue::Array(result));
+            }
+            let same = ScalarValue::Boolean(Some(self.op == Operator::IsNotDistinctFrom)).to_scalar()?;
+            return Ok(ColumnarValue::Array(zip(&both_nan, &same, &result)?));
+        }
         // Only rows where both sides are present: NaN against NULL stays NULL.
         let both = BooleanArray::from_iter((0..rows).map(|i| Some(left.is_valid(i) && right.is_valid(i))));
-        let nan = and(&or(&nan_mask(&left)?, &nan_mask(&right)?)?, &both)?;
+        let nan = and(&or(&left_nan, &right_nan)?, &both)?;
         if nan.true_count() == 0 {
             return Ok(ColumnarValue::Array(result));
         }
@@ -266,6 +332,70 @@ mod tests {
             .unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
         out.iter().collect()
+    }
+
+    fn compare_pairs(op: Operator, pairs: &[(Option<f64>, Option<f64>)]) -> Vec<Option<bool>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Float64, true),
+            Field::new("y", DataType::Float64, true),
+        ]));
+        let (xs, ys): (Vec<_>, Vec<_>) = pairs.iter().copied().unzip();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Float64Array::from(xs)), Arc::new(Float64Array::from(ys))],
+        )
+        .unwrap();
+        let binary = BinaryExpr::new(Arc::new(Column::new("x", 0)), op, Arc::new(Column::new("y", 1)));
+        assert!(is_float_comparison(&binary, &schema));
+        let out = NanAwareComparison::new(&binary)
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(pairs.len())
+            .unwrap();
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        out.iter().collect()
+    }
+
+    /// `-0.0 = 0.0` (IEEE 754, PostgreSQL, Trino's comparisons; ISS-050).
+    #[test]
+    fn the_two_zeros_are_one_value() {
+        let pairs = [
+            (Some(-0.0), Some(0.0)),
+            (Some(0.0), Some(-0.0)),
+            (Some(-0.0), None),
+        ];
+        for (op, expected) in [
+            (Operator::Eq, [Some(true), Some(true), None]),
+            (Operator::NotEq, [Some(false), Some(false), None]),
+            (Operator::Lt, [Some(false), Some(false), None]),
+            (Operator::LtEq, [Some(true), Some(true), None]),
+            (Operator::Gt, [Some(false), Some(false), None]),
+            (Operator::GtEq, [Some(true), Some(true), None]),
+            (Operator::IsDistinctFrom, [Some(false), Some(false), Some(true)]),
+            (Operator::IsNotDistinctFrom, [Some(true), Some(true), Some(false)]),
+        ] {
+            assert_eq!(compare_pairs(op, &pairs), expected, "{op}");
+        }
+    }
+
+    /// `IS [NOT] DISTINCT FROM` has every NaN as one value (bits aside), and
+    /// NaN distinct from a number.
+    #[test]
+    fn nans_are_not_distinct_from_each_other() {
+        let other_nan = f64::from_bits(f64::NAN.to_bits() | 1 | (1 << 63));
+        let pairs = [
+            (Some(f64::NAN), Some(other_nan)),
+            (Some(f64::NAN), Some(1.0)),
+            (Some(f64::NAN), None),
+        ];
+        assert_eq!(
+            compare_pairs(Operator::IsNotDistinctFrom, &pairs),
+            [Some(true), Some(false), Some(false)]
+        );
+        assert_eq!(
+            compare_pairs(Operator::IsDistinctFrom, &pairs),
+            [Some(false), Some(true), Some(true)]
+        );
     }
 
     #[test]

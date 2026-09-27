@@ -197,6 +197,13 @@ impl Query {
 /// checked again right after it for what runs in the engine.
 pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>> {
     let mut rules = datafusion::optimizer::Optimizer::new().rules;
+    // Float comparisons with a zero, before the simplifier folds or
+    // combines them with the bit order (`crate::trino_functions`).
+    let simplify = rules
+        .iter()
+        .position(|r| r.name() == "simplify_expressions")
+        .unwrap_or(0);
+    rules.insert(simplify, crate::trino_functions::float_zeros());
     let position = rules
         .iter()
         .position(|r| r.name() == "scalar_subquery_to_join")
@@ -269,8 +276,10 @@ fn trino_literal(value: &ScalarValue) -> String {
 /// [`crate::federation_guard`] and [`crate::join_guard`]), with
 /// aggregates answered from statistics only over exact sources (see
 /// [`crate::statistics_guard`]), hash joins too large for the pool planned as
-/// sort-merge joins right after `EnforceSorting` ([`crate::join_spill`]), and
-/// followed by
+/// sort-merge joins right after `EnforceSorting` ([`crate::join_spill`]), the
+/// null-safe join guard right before `FilterPushdown(Post)` (it must see the
+/// build and probe sides `JoinSelection` picked; see [`crate::join_guard`]),
+/// and followed by
 /// [`PlainViews`], which keeps string views out of operators that retain rows
 /// (ADR 0003), [`ComputedBatches`], which sizes the batches of computed values
 /// in bytes, the nested loop join spill guard ([`crate::join_guard`]), and
@@ -281,6 +290,7 @@ pub(crate) fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Syn
         vec![Arc::new(FederationFilterGuard), Arc::new(NullAwareAntiJoinGuard)];
     rules.extend(PhysicalOptimizer::new().rules);
     let rules = crate::join_spill::with_sort_merge_oversized_joins(rules);
+    let rules = crate::join_guard::with_null_safe_join_guard(rules);
     let mut rules = guard_aggregate_statistics(rules);
     rules.extend(crate::trino_functions::physical_rules());
     rules.push(Arc::new(PlainViews));
@@ -425,6 +435,7 @@ pub fn trino_statement(
     statement: &mut datafusion::sql::parser::Statement,
     session_zone: &str,
 ) -> Result<(), DataFusionError> {
+    crate::trino_sql_checks::regroup_distinct_from(statement);
     crate::coercion::name_casts_in_aggregates(statement);
     crate::trino_sql_checks::fold_quoted_columns(statement);
     crate::trino_functions::rewrite_statement(statement)?;
@@ -1724,6 +1735,32 @@ mod tests {
         let guard = names.iter().position(|n| n == "federation_filter_guard").unwrap();
         let pushdown = names.iter().position(|n| n.contains("FilterPushdown")).unwrap();
         assert!(guard < pushdown, "{names:?}");
+    }
+
+    #[test]
+    fn float_zeros_run_right_before_the_simplifier() {
+        let names: Vec<String> = optimizer_rules().iter().map(|r| r.name().to_owned()).collect();
+        let zeros = names
+            .iter()
+            .position(|n| n == crate::trino_functions::FLOAT_ZEROS)
+            .unwrap();
+        assert_eq!(names[zeros + 1], "simplify_expressions", "{names:?}");
+        assert!(
+            !names[..zeros].iter().any(|n| n == "simplify_expressions"),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn null_safe_join_guard_runs_after_join_selection_right_before_dynamic_filters() {
+        let names: Vec<String> = physical_rules().iter().map(|r| r.name().to_owned()).collect();
+        let guard = names
+            .iter()
+            .position(|n| n == crate::join_guard::NULL_SAFE_JOIN_GUARD)
+            .unwrap();
+        let selection = names.iter().position(|n| n == "join_selection").unwrap();
+        assert!(selection < guard, "{names:?}");
+        assert_eq!(names[guard + 1], "FilterPushdown(Post)", "{names:?}");
     }
 
     #[test]

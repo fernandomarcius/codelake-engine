@@ -308,3 +308,123 @@ async fn timestamps_round_half_up_to_a_smaller_precision() {
         ]
     );
 }
+
+/// `0.0` and `-0.0` are one value everywhere (ISS-050): comparisons with a
+/// zero, `IN`, `BETWEEN`, `IS [NOT] DISTINCT FROM`, comparisons of two
+/// columns, joins, `IN (subquery)`, grouping, `CASE x WHEN` and `nullif`;
+/// `double` and `real`. Answers of Trino 431 (PostgreSQL 17 for the joins
+/// and the `IN` list of `real`s, where Trino does not match the zeros; NaN
+/// keeps IEEE 754's semantics, as in Trino, where PostgreSQL has it equal to
+/// itself and above every number).
+#[tokio::test]
+async fn the_two_zeros_are_one_value_everywhere() {
+    use datafusion::arrow::array::Float32Array;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    let id: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6]));
+    let x: ArrayRef = Arc::new(Float64Array::from(vec![
+        Some(0.0),
+        Some(-0.0),
+        Some(1.0),
+        Some(-1.0),
+        Some(f64::NAN),
+        None,
+    ]));
+    let r: ArrayRef = Arc::new(Float32Array::from(vec![
+        Some(0.0),
+        Some(-0.0),
+        Some(1.0),
+        Some(-1.0),
+        Some(f32::NAN),
+        None,
+    ]));
+    register(&engine, &[("id", id), ("x", x), ("r", r)], 3);
+    for (sql, expected) in [
+        ("SELECT count(*) FROM t WHERE x = 0", 2),
+        ("SELECT count(*) FROM t WHERE x = -0.0E0", 2),
+        ("SELECT count(*) FROM t WHERE 0 = x", 2),
+        ("SELECT count(*) FROM t WHERE x <> 0", 3),
+        ("SELECT count(*) FROM t WHERE NOT (x = 0)", 3),
+        // Negations of float comparisons keep NaN (every comparison with it
+        // is false, so its negation is true), as in Trino.
+        ("SELECT count(*) FROM t WHERE NOT (x > 1)", 5),
+        ("SELECT count(*) FROM t WHERE NOT (r < 0)", 4),
+        ("SELECT count(*) FROM t WHERE x NOT BETWEEN -0.5E0 AND 0.5E0", 3),
+        // The two zeros are peers in a window ordered by them.
+        (
+            "SELECT count(*) FROM (SELECT rank() OVER (ORDER BY x) AS rk FROM t WHERE id <= 2) WHERE rk = 1",
+            2,
+        ),
+        ("SELECT count(*) FROM t WHERE x < 0", 1),
+        ("SELECT count(*) FROM t WHERE x <= -0.0E0", 3),
+        ("SELECT count(*) FROM t WHERE x > -0.0E0", 1),
+        ("SELECT count(*) FROM t WHERE x >= 0", 3),
+        ("SELECT count(*) FROM t WHERE x = 0 AND x >= 0 AND x <= -0.0E0", 2),
+        ("SELECT count(*) FROM t WHERE x IN (0, 1)", 3),
+        ("SELECT count(*) FROM t WHERE x NOT IN (0, 1)", 2),
+        (
+            "SELECT count(*) FROM t WHERE x IN (-0.0E0, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26)",
+            2,
+        ),
+        ("SELECT count(*) FROM t WHERE x BETWEEN 0 AND 1", 3),
+        ("SELECT count(*) FROM t WHERE x IS NOT DISTINCT FROM -0.0E0", 2),
+        ("SELECT count(*) FROM t WHERE x IS DISTINCT FROM 0", 4),
+        ("SELECT count(*) FROM t WHERE r = 0", 2),
+        ("SELECT count(*) FROM t WHERE r = REAL '-0.0'", 2),
+        ("SELECT count(*) FROM t WHERE r >= 0", 3),
+        ("SELECT count(*) FROM t WHERE r IN (0, 1)", 3),
+        (
+            "SELECT count(*) FROM t WHERE r IS NOT DISTINCT FROM REAL '-0.0'",
+            2,
+        ),
+        (
+            "SELECT count(*) FROM (VALUES REAL '0.0', REAL '-0.0', REAL '1.0') v(r) WHERE r = 0",
+            2,
+        ),
+        (
+            "SELECT count(*) FROM (VALUES REAL '0.0', REAL '-0.0', REAL '1.0') v(r) WHERE r = REAL '0.0'",
+            2,
+        ),
+        ("SELECT count(*) FROM t a, t b WHERE a.x = b.x", 6),
+        ("SELECT count(*) FROM t a, t b WHERE a.x < b.x", 5),
+        (
+            "SELECT count(*) FROM t a, t b WHERE a.x IS NOT DISTINCT FROM b.x",
+            8,
+        ),
+        ("SELECT count(*) FROM t a, t b WHERE a.x IS DISTINCT FROM b.x", 28),
+        (
+            "SELECT count(*) FROM t a, t b WHERE a.r IS NOT DISTINCT FROM b.r",
+            8,
+        ),
+        ("SELECT count(*) FROM t a JOIN t b ON a.x = b.x", 6),
+        ("SELECT count(*) FROM t a JOIN t b ON a.r = b.r", 6),
+        (
+            "SELECT count(*) FROM t WHERE x IN (SELECT x FROM t WHERE id = 1)",
+            2,
+        ),
+        ("SELECT count(*) FROM (SELECT x FROM t GROUP BY x)", 5),
+        ("SELECT count(*) FROM (SELECT x FROM t GROUP BY ROLLUP (x))", 6),
+        ("SELECT count(DISTINCT x) FROM t", 4),
+        (
+            "SELECT count(*) FROM (SELECT x FROM t INTERSECT SELECT -x FROM t)",
+            5,
+        ),
+        ("SELECT sum(CASE x WHEN 0 THEN 1 ELSE 0 END) FROM t", 2),
+        ("SELECT count(*) FROM t WHERE nullif(x, 0) IS NULL", 3),
+        ("SELECT count_if(x = 0) FROM t", 2),
+        (
+            "SELECT sum(CAST(-0.0E0 IS DISTINCT FROM 0.0E0 AS bigint)) FROM t",
+            0,
+        ),
+        ("SELECT sum(CAST(REAL '-0.0' = 0 AS bigint)) FROM t", 6),
+    ] {
+        assert_eq!(int64s(&rows(&engine, sql).await, 0), [Some(expected)], "{sql}");
+    }
+    // `x = 0` does not make `x` a constant: the window sorts its partitions.
+    let out = rows(
+        &engine,
+        "SELECT count(*) OVER (PARTITION BY x) FROM t WHERE x = 0 ORDER BY id",
+    )
+    .await;
+    assert_eq!(int64s(&out, 0), [Some(2), Some(2)]);
+}

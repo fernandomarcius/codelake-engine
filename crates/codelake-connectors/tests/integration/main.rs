@@ -15,6 +15,8 @@ mod common;
 mod f4_acceptance;
 #[cfg(feature = "hive")]
 mod f9_acceptance;
+#[cfg(all(feature = "hive", feature = "postgres"))]
+mod float_zeros;
 #[cfg(feature = "hive")]
 mod hash_join_spill;
 #[cfg(feature = "hive")]

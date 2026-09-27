@@ -2,7 +2,8 @@
 //! (ADR 0014, ISS-006): refused with PostgreSQL's SQLSTATE and wording on
 //! both the simple and the extended protocol, while what PostgreSQL accepts
 //! (an untyped quoted literal, explicit casts, numbers against numbers)
-//! still answers the right rows.
+//! still answers the right rows; and `IS [NOT] DISTINCT FROM` grouped as
+//! PostgreSQL groups it.
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -157,4 +158,43 @@ async fn postgres_wire_keeps_untyped_literals_casts_and_numbers() {
         .await
         .unwrap();
     assert_eq!(rows.iter().map(|r| r.get(0)).collect::<Vec<String>>(), ["9"]);
+}
+
+/// `IS [NOT] DISTINCT FROM` binds tighter than `AND` and `OR` in PostgreSQL;
+/// the parser took the rest of the condition as its right operand, and over
+/// booleans answered other rows. Rows as PostgreSQL 17 answers them.
+#[tokio::test]
+async fn postgres_wire_groups_is_distinct_from_like_postgresql() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_server, client) = serve(dir.path()).await;
+    client
+        .batch_execute("CREATE TABLE flags (id int, f boolean); INSERT INTO flags VALUES (1, true), (2, false), (3, NULL)")
+        .await
+        .unwrap();
+    let text = |values: &[&str]| values.iter().map(|v| Some((*v).to_owned())).collect::<Vec<_>>();
+    for (sql, rows) in [
+        (
+            "SELECT CAST(a.id AS varchar) AS v FROM flags a JOIN flags b \
+             ON a.f IS NOT DISTINCT FROM b.f AND a.id = b.id ORDER BY a.id",
+            text(&["1", "2", "3"]),
+        ),
+        (
+            "SELECT CAST(id AS varchar) AS v FROM flags WHERE f IS DISTINCT FROM true AND id > 1 ORDER BY id",
+            text(&["2", "3"]),
+        ),
+        (
+            "SELECT CAST(id AS varchar) AS v FROM flags WHERE NOT f IS DISTINCT FROM false OR id = 3 ORDER BY id",
+            text(&["2", "3"]),
+        ),
+    ] {
+        assert_eq!(simple(&client, sql).await, rows, "{sql}");
+        let extended: Vec<Option<String>> = client
+            .query(sql, &[])
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(extended, rows, "extended: {sql}");
+    }
 }

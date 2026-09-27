@@ -181,14 +181,15 @@ fn api_error(err: datafusion::error::DataFusionError) -> PgWireError {
     PgWireError::ApiError(Box::new(err))
 }
 
-/// What `SessionContext::sql` does, with the operand check between planning
-/// and running.
+/// What `SessionContext::sql` does, with `IS [NOT] DISTINCT FROM` grouped as
+/// PostgreSQL groups it (`codelake_core::regroup_distinct_from`) and the
+/// operand check between planning and running.
 pub(crate) async fn plan_checked(session_context: &SessionContext, sql: &str) -> PgWireResult<DataFrame> {
-    let plan = session_context
-        .state()
-        .create_logical_plan(sql)
-        .await
-        .map_err(api_error)?;
+    let state = session_context.state();
+    let dialect = state.config().options().sql_parser.dialect;
+    let mut statement = state.sql_to_statement(sql, &dialect).map_err(api_error)?;
+    codelake_core::regroup_distinct_from(&mut statement);
+    let plan = state.statement_to_plan(statement).await.map_err(api_error)?;
     SQLOptions::new().verify_plan(&plan).map_err(api_error)?;
     check_operands(&plan)?;
     session_context
@@ -252,13 +253,24 @@ impl QueryHook for SimpleRunHook {
         Some(run_simple(statement, session_context, client).await)
     }
 
+    /// Plans a statement whose `IS [NOT] DISTINCT FROM` the parser grouped
+    /// otherwise than PostgreSQL (see `plan_checked`), as `datafusion-postgres`
+    /// would plan it; every other statement is left to it.
     async fn handle_extended_parse_query(
         &self,
-        _statement: &Statement,
-        _session_context: &SessionContext,
+        statement: &Statement,
+        session_context: &SessionContext,
         _client: &(dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<LogicalPlan>> {
-        None
+        let regrouped = codelake_core::regrouped_statement(statement)?;
+        let statement = datafusion::sql::parser::Statement::Statement(Box::new(regrouped));
+        Some(
+            session_context
+                .state()
+                .statement_to_plan(statement)
+                .await
+                .map_err(api_error),
+        )
     }
 
     async fn handle_extended_query(
