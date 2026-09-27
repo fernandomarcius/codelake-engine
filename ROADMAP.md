@@ -196,9 +196,10 @@ A single node with 32–64 cores and NVMe spill handles hundreds of GB per query
 TB-scale joins need scale-out.
 
 - Evaluate Ballista vs `datafusion-distributed` (Arrow Flight shuffle) with TPC-H
-  SF100/SF1000; ADR with the numbers. ADR 0011 (Proposed) makes
-  `datafusion-distributed` the candidate and Ballista the fallback, and sets the
-  benchmark plan and decision gates; nothing merges before the benchmark runs.
+  SF100/SF1000; ADR with the numbers. ADR 0011 (Proposed, revised for the
+  DataFusion 54 train) makes `datafusion-distributed` 3.0.0 the candidate and
+  Ballista 54.1 the fallback, and sets the benchmark plan and decision gates;
+  single-node stays the default, and nothing merges before the benchmark runs.
 - Coordinator/worker split; the core is already stateless per node.
 - Memory ceiling per worker plus a cluster-wide admission budget.
 
