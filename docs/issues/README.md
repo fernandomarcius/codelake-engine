@@ -33,8 +33,8 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-021](ISS-021-arrow-flight-sql.md) | New front: Arrow Flight SQL | scope | 2026-09-25 | open |
 | [ISS-022](ISS-022-keep-dbt-trino-adapter.md) | Keep the existing dbt adapter until a native one is validated | dependency | 2026-09-25 | open |
 | [ISS-023](ISS-023-drop-view-keeps-files.md) | DROP VIEW never deletes data files | deliberate divergence | 2026-09-25 | closed |
-| [ISS-024](ISS-024-char-semantics.md) | char(n) semantics instead of refusals | removed limitation | 2026-09-25 | open |
-| [ISS-025](ISS-025-char-wrong-results-merged.md) | Known char(n) wrong results merged into main | known defect | 2026-09-25 | open |
+| [ISS-024](ISS-024-char-semantics.md) | char(n) semantics instead of refusals | removed limitation | 2026-09-25 | closed |
+| [ISS-025](ISS-025-char-wrong-results-merged.md) | Known char(n) wrong results merged into main | known defect | 2026-09-25 | closed |
 | [ISS-026](ISS-026-f6-governance-by-recommendation.md) | F6 query governance: owner-only kill, SQLSTATE 53400, default limits, shared runtime | behavior | 2026-09-25 | awaiting-confirmation |
 | [ISS-027](ISS-027-shadow-run-choices-by-recommendation.md) | Shadow-run harness: choices applied by recommendation | behavior | 2026-09-25 | awaiting-confirmation |
 | [ISS-028](ISS-028-memory-ceiling-rss-test-flaky.md) | Memory-ceiling hash-join test measures process RSS with a thin margin | test reliability | 2026-09-26 | open |
@@ -46,8 +46,6 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-034](ISS-034-remove-limits-branch-unfinished.md) | front/remove-limits: verification failed, fix round unfinished | pending work | 2026-09-26 | closed |
 | [ISS-035](ISS-035-dev-speed-branch-unreviewed.md) | front/dev-speed (sccache + differential gate) not reviewed | pending work | 2026-09-26 | closed |
 | [ISS-036](ISS-036-f6-round3-unverified.md) | F6 round 3 (cursors) implemented, not verified | pending work | 2026-09-26 | closed |
-| [ISS-037](ISS-037-char-branch-unmerged.md) | char(n) semantics branch not merged | pending work | 2026-09-26 | open |
-| [ISS-036](ISS-036-f6-round3-unverified.md) | F6 round 3 (cursors) implemented, not verified | pending work | 2026-09-26 | open |
 | [ISS-037](ISS-037-char-branch-unmerged.md) | char(n) semantics branch not merged | pending work | 2026-09-26 | closed |
 | [ISS-038](ISS-038-roadmap-fronts-not-started.md) | Roadmap fronts not started | pending work | 2026-09-26 | open |
 | [ISS-039](ISS-039-benchmarks-and-global-dod.md) | Benchmarks and global Definition of Done pending | pending work | 2026-09-26 | open |
@@ -62,7 +60,5 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-048](ISS-048-shadow-run-minor-findings.md) | Shadow run: minor findings | defect | 2026-09-26 | open |
 | [ISS-049](ISS-049-dbt-row-number-ties-nondeterministic.md) | dbt_pilot numbers CDC rows with ties: output differs between runs | use-case defect | 2026-09-26 | open |
 | [ISS-050](ISS-050-float-zeros-are-one-value.md) | `0.0` and `-0.0` are one value everywhere (joins diverge from Trino 431) | deliberate divergence | 2026-09-26 | open |
-| [ISS-024](ISS-024-char-semantics.md) | char(n) semantics instead of refusals | removed limitation | 2026-09-25 | closed |
-| [ISS-025](ISS-025-char-wrong-results-merged.md) | Known char(n) wrong results merged into main | known defect | 2026-09-25 | closed |
-| [ISS-030](ISS-030-char-round5-by-recommendation.md) | char(n) round 5: choices applied by recommendation | behavior | 2026-09-26 | awaiting-confirmation |
 | [ISS-051](ISS-051-char-container-type-names.md) | Containers of char(n) are typed with varchar elements | known defect | 2026-09-27 | open |
+| [ISS-052](ISS-052-char-round5-by-recommendation.md) | char(n) round 5: choices applied by recommendation | behavior | 2026-09-26 | awaiting-confirmation |
