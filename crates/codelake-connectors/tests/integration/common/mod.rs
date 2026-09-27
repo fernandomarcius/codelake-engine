@@ -61,3 +61,17 @@ pub fn counts_a_worker(first_cell: Option<&str>) -> bool {
         .and_then(|cell| cell.trim().trim_matches('"').parse::<u64>().ok())
         .is_some_and(|workers| workers > 0)
 }
+
+/// The names Trino 431's file metastore writes: the reference engine these
+/// tests run in containers shares the warehouse (ISS-011).
+#[cfg(feature = "hive")]
+pub fn reference_names() -> codelake_core::config::MetastoreNames {
+    codelake_core::config::MetastoreNames {
+        metadata_file: ".trinoSchema".into(),
+        permissions_dir: ".trinoPermissions".into(),
+        view_marker: "Presto View".into(),
+        view_parameter: "presto_view".into(),
+        version_parameter: "presto_version".into(),
+        writer_version: "431".into(),
+    }
+}

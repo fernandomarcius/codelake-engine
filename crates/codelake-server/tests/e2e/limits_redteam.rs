@@ -100,7 +100,7 @@ fn leftovers(warehouse: &Path) -> (usize, usize) {
         return (0, 0);
     };
     let dirs: Vec<PathBuf> = entries.map(|e| e.unwrap().path()).collect();
-    let tables = dirs.iter().filter(|d| d.join(".trinoSchema").exists()).count();
+    let tables = dirs.iter().filter(|d| d.join(".codelakeSchema").exists()).count();
     (dirs.len(), tables)
 }
 

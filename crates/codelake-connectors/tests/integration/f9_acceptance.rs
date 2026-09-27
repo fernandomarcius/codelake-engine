@@ -60,7 +60,10 @@ async fn try_open(warehouse: &Path, spill: &Path, catalog: &str, limit: ByteSize
     let mut engine = Engine::new(&memory, &ExecutionConfig::default()).map_err(|e| e.to_string())?;
     engine
         .attach(
-            Arc::new(HiveConnector::new(catalog.into(), params(warehouse))),
+            Arc::new(
+                HiveConnector::new(catalog.into(), params(warehouse))
+                    .with_metastore_names(crate::common::reference_names()),
+            ),
             true,
             Duration::from_secs(60),
         )

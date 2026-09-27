@@ -21,6 +21,20 @@ mod table;
 mod trino_parquet;
 mod types;
 
+/// The names Trino 431's file metastore writes, for tests over warehouses it
+/// wrote or shares (fixtures, the reference engine in containers).
+#[cfg(test)]
+pub(crate) fn reference_names() -> codelake_core::config::MetastoreNames {
+    codelake_core::config::MetastoreNames {
+        metadata_file: ".trinoSchema".into(),
+        permissions_dir: ".trinoPermissions".into(),
+        view_marker: "Presto View".into(),
+        view_parameter: "presto_view".into(),
+        version_parameter: "presto_version".into(),
+        writer_version: "431".into(),
+    }
+}
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -86,6 +100,7 @@ pub struct HiveConnector {
     precision: HiveTimestampPrecision,
     /// The reference engine's `hive.parquet.time-zone` for this catalog.
     zone: ParquetTimeZone,
+    names: codelake_core::config::MetastoreNames,
     catalog: OnceCell<Arc<HiveCatalog>>,
 }
 
@@ -105,6 +120,7 @@ impl HiveConnector {
             params,
             precision: HiveTimestampPrecision::default(),
             zone: ParquetTimeZone::default(),
+            names: codelake_core::config::MetastoreNames::default(),
             catalog: OnceCell::new(),
         }
     }
@@ -124,6 +140,14 @@ impl HiveConnector {
     #[must_use]
     pub fn with_parquet_time_zone(mut self, zone: ParquetTimeZone) -> Self {
         self.zone = zone;
+        self
+    }
+
+    /// Sets the names of the metastore's files and markers (ISS-011; default
+    /// `CodeLake`'s).
+    #[must_use]
+    pub fn with_metastore_names(mut self, names: codelake_core::config::MetastoreNames) -> Self {
+        self.names = names;
         self
     }
 
@@ -172,7 +196,8 @@ impl HiveConnector {
         };
         let metastore = FileMetastore::new(store, root)
             .with_timestamp_precision(self.precision)
-            .with_parquet_time_zone(self.zone);
+            .with_parquet_time_zone(self.zone)
+            .with_names(self.names.clone());
         Ok(match local {
             Some(dir) => metastore.with_local_dir(dir),
             None => metastore,

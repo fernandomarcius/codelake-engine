@@ -49,8 +49,13 @@ use super::optimize::{self, OPTIMIZE, Settings};
 use super::table::{HiveSink, HiveTable};
 use super::types::{UNSUPPORTED, arrow_type, char_column, hive_type, stored_type, unsupported};
 
-const VIEW_PREFIX: &str = "/* Presto View: ";
 const VIEW_SUFFIX: &str = " */";
+
+/// Start of a view's SQL text: `/* <marker>: ` (the source's
+/// `metastore_names.view_marker`).
+fn view_prefix(marker: &str) -> String {
+    format!("/* {marker}: ")
+}
 
 fn metastore_error(err: MetastoreError) -> DataFusionError {
     match err {
@@ -92,11 +97,11 @@ pub(crate) struct TrinoViewColumn {
 }
 
 impl TrinoView {
-    pub(crate) fn decode(text: &str) -> Result<Self> {
+    pub(crate) fn decode(text: &str, marker: &str) -> Result<Self> {
         let encoded = text
-            .strip_prefix(VIEW_PREFIX)
+            .strip_prefix(view_prefix(marker).as_str())
             .and_then(|rest| rest.strip_suffix(VIEW_SUFFIX))
-            .ok_or_else(|| DataFusionError::Plan("not a Presto view definition".into()))?;
+            .ok_or_else(|| DataFusionError::Plan(format!("not a `{marker}` view definition")))?;
         let json = BASE64
             .decode(encoded.trim())
             .map_err(|e| DataFusionError::Plan(format!("invalid view encoding: {e}")))?;
@@ -104,9 +109,13 @@ impl TrinoView {
             .map_err(|e| DataFusionError::Plan(format!("invalid view definition: {e}")))
     }
 
-    pub(crate) fn encode(&self) -> Result<String> {
+    pub(crate) fn encode(&self, marker: &str) -> Result<String> {
         let json = serde_json::to_vec(self).map_err(|e| DataFusionError::External(Box::new(e)))?;
-        Ok(format!("{VIEW_PREFIX}{}{VIEW_SUFFIX}", BASE64.encode(json)))
+        Ok(format!(
+            "{}{}{VIEW_SUFFIX}",
+            view_prefix(marker),
+            BASE64.encode(json)
+        ))
     }
 }
 
@@ -431,7 +440,7 @@ impl HiveCatalog {
                 .view_original_text
                 .as_deref()
                 .ok_or_else(|| DataFusionError::Plan(format!("view {schema}.{table} has no definition")))?;
-            let definition = TrinoView::decode(text)?;
+            let definition = TrinoView::decode(text, &self.metastore.names().view_marker)?;
             let fields: Vec<Field> = definition
                 .columns
                 .iter()
@@ -877,7 +886,7 @@ impl HiveCatalog {
                 self.name
             )));
         }
-        let mut metadata = TableMetadata::managed_parquet(owner, columns);
+        let mut metadata = TableMetadata::managed_parquet(owner, columns, self.metastore.names());
         record_written_name(&mut metadata.parameters, written);
         if existing == Existing::Replace {
             metadata
@@ -1058,7 +1067,8 @@ impl WritableCatalog for HiveCatalog {
             path: Vec::new(),
             extra: BTreeMap::new(),
         };
-        let mut metadata = TableMetadata::trino_view(owner, trino_view.encode()?);
+        let names = self.metastore.names();
+        let mut metadata = TableMetadata::view(owner, trino_view.encode(&names.view_marker)?, names);
         record_written_name(&mut metadata.parameters, written);
         let _metadata = self
             .metastore
@@ -1207,6 +1217,9 @@ impl WritableCatalog for HiveCatalog {
 
 #[cfg(test)]
 mod tests {
+    /// The view marker Trino 431 writes (views shared with it).
+    const REFERENCE_MARKER: &str = "Presto View";
+
     use super::*;
 
     const FIXTURE_VIEW: &str = include_str!("../../tests/fixtures/trino431/warehouse/pilot/v1/.trinoSchema");
@@ -1214,7 +1227,8 @@ mod tests {
     #[test]
     fn decodes_the_view_trino_wrote_and_round_trips() {
         let metadata: TableMetadata = serde_json::from_str(FIXTURE_VIEW).unwrap();
-        let view = TrinoView::decode(metadata.view_original_text.as_deref().unwrap()).unwrap();
+        let view =
+            TrinoView::decode(metadata.view_original_text.as_deref().unwrap(), REFERENCE_MARKER).unwrap();
         assert!(
             view.original_sql.contains("hive.pilot.t1"),
             "{}",
@@ -1236,8 +1250,11 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(TrinoView::decode(&view.encode().unwrap()).unwrap(), view);
-        assert!(TrinoView::decode("SELECT 1").is_err());
+        assert_eq!(
+            TrinoView::decode(&view.encode(REFERENCE_MARKER).unwrap(), REFERENCE_MARKER).unwrap(),
+            view
+        );
+        assert!(TrinoView::decode("SELECT 1", REFERENCE_MARKER).is_err());
     }
 
     #[test]
@@ -1252,8 +1269,12 @@ mod tests {
             "runAsInvoker": false,
             "path": []
         });
-        let text = format!("{VIEW_PREFIX}{}{VIEW_SUFFIX}", BASE64.encode(json.to_string()));
-        let view = TrinoView::decode(&text).unwrap();
+        let text = format!(
+            "{}{}{VIEW_SUFFIX}",
+            view_prefix(REFERENCE_MARKER),
+            BASE64.encode(json.to_string())
+        );
+        let view = TrinoView::decode(&text, REFERENCE_MARKER).unwrap();
         assert_eq!(
             (view.catalog.as_deref(), view.schema.as_deref()),
             (Some("hive"), Some("vw"))
@@ -1261,9 +1282,9 @@ mod tests {
         let back: serde_json::Value = serde_json::from_slice(
             &BASE64
                 .decode(
-                    view.encode()
+                    view.encode(REFERENCE_MARKER)
                         .unwrap()
-                        .strip_prefix(VIEW_PREFIX)
+                        .strip_prefix(view_prefix(REFERENCE_MARKER).as_str())
                         .unwrap()
                         .strip_suffix(VIEW_SUFFIX)
                         .unwrap(),

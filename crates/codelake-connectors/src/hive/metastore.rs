@@ -60,20 +60,18 @@ pub(crate) const TABLE_ID: &str = "codelake.table_id";
 /// directory, and every lookup, use the folded name; the files a table's
 /// writes produce spell each column as written.
 pub(crate) const WRITTEN_NAME: &str = "codelake.name";
-pub(crate) const METADATA_FILE: &str = ".trinoSchema";
-const PERMISSIONS_DIR: &str = ".trinoPermissions";
 /// Directory of `CodeLake`'s own files at the warehouse root: locks, staging
 /// of new tables and files. Trino lists
-/// schemas by their `.<schema>.trinoSchema` files and ignores it.
+/// schemas by their `.<schema>` metadata files and ignores it.
 const CODELAKE_DIR: &str = ".codelake";
 /// How many times a read retries a metadata file whose checksum does not
 /// match: a writer replaces the checksum first and the file right after.
 const CHECKSUM_RETRIES: u32 = 10;
-/// Trino's file metastore refuses metadata whose `writerVersion` is not its own
-/// version ("File metastore provides no compatibility for metadata written with
-/// a different version"). `CodeLake` shares the warehouse with Trino 431, so new
-/// metadata carries 431; rewrites keep the version already in the file.
-pub(crate) const TRINO_VERSION: &str = "431";
+// Names of the metastore's files and markers, and the `writerVersion` of new
+// metadata, come from the source's `metastore_names` (ISS-011): an engine
+// sharing the warehouse may refuse metadata written with another version, so
+// rewrites keep the version already in the file.
+pub(crate) use codelake_core::config::MetastoreNames;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -145,15 +143,15 @@ impl TableMetadata {
     /// New managed Parquet table, the only kind `CodeLake` creates. Same fields
     /// as Trino 431 writes for `CREATE TABLE … WITH (format = 'PARQUET')`;
     /// statistics start unknown (Trino then treats them as missing).
-    pub(crate) fn managed_parquet(owner: &str, columns: Vec<ColumnMetadata>) -> Self {
+    pub(crate) fn managed_parquet(owner: &str, columns: Vec<ColumnMetadata>, names: &MetastoreNames) -> Self {
         Self {
-            writer_version: Some(TRINO_VERSION.into()),
+            writer_version: Some(names.writer_version.clone()),
             owner: Some(owner.into()),
             table_type: MANAGED_TABLE.into(),
             data_columns: columns,
             partition_columns: Vec::new(),
             parameters: BTreeMap::from([
-                ("presto_version".into(), TRINO_VERSION.into()),
+                (names.version_parameter.clone(), names.writer_version.clone()),
                 ("transactional".into(), "false".into()),
                 ("auto.purge".into(), "false".into()),
             ]),
@@ -167,10 +165,11 @@ impl TableMetadata {
         }
     }
 
-    /// New Trino view (`VIRTUAL_VIEW`), laid out as Trino 431 writes it.
-    pub(crate) fn trino_view(owner: &str, original_text: String) -> Self {
+    /// New view (`VIRTUAL_VIEW`), laid out as the reference engine writes
+    /// one, with the source's markers.
+    pub(crate) fn view(owner: &str, original_text: String, names: &MetastoreNames) -> Self {
         Self {
-            writer_version: Some(TRINO_VERSION.into()),
+            writer_version: Some(names.writer_version.clone()),
             owner: Some(owner.into()),
             table_type: VIRTUAL_VIEW.into(),
             data_columns: vec![ColumnMetadata {
@@ -182,14 +181,14 @@ impl TableMetadata {
             }],
             partition_columns: Vec::new(),
             parameters: BTreeMap::from([
-                ("comment".into(), "Presto View".into()),
-                ("presto_view".into(), "true".into()),
-                ("presto_version".into(), TRINO_VERSION.into()),
+                ("comment".into(), names.view_marker.clone()),
+                (names.view_parameter.clone(), "true".into()),
+                (names.version_parameter.clone(), names.writer_version.clone()),
             ]),
             storage_format: None,
             external_location: None,
             view_original_text: Some(original_text),
-            view_expanded_text: Some("/* Presto View */".into()),
+            view_expanded_text: Some(format!("/* {} */", names.view_marker)),
             serde_parameters: BTreeMap::new(),
             column_statistics: BTreeMap::new(),
             extra: BTreeMap::from([("originalStorageFormat".into(), serde_json::json!({}))]),
@@ -314,6 +313,8 @@ pub(crate) struct FileMetastore {
     precision: HiveTimestampPrecision,
     /// The catalog's `hive.parquet.time-zone`.
     zone: ParquetTimeZone,
+    /// Names of the metadata files and markers (ISS-011).
+    names: Arc<MetastoreNames>,
 }
 
 /// Removes a local directory tree; absent is fine. Retries briefly because an
@@ -358,7 +359,7 @@ fn parent(path: &Path) -> Path {
 
 /// Names of the direct subdirectories of `dir` that hold a `.trinoSchema`,
 /// read from the local file system.
-fn local_tables(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
+fn local_tables(dir: &std::path::Path, metadata_file: &str) -> std::io::Result<Vec<String>> {
     let mut tables = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -368,7 +369,7 @@ fn local_tables(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
         if name.starts_with('.') || !entry.file_type()?.is_dir() {
             continue;
         }
-        if entry.path().join(METADATA_FILE).is_file() {
+        if entry.path().join(metadata_file).is_file() {
             tables.push(name);
         }
     }
@@ -385,7 +386,19 @@ impl FileMetastore {
             local_dir: None,
             precision: HiveTimestampPrecision::default(),
             zone: ParquetTimeZone::default(),
+            names: Arc::default(),
         }
+    }
+
+    /// Sets the names of the metadata files and markers (ISS-011).
+    pub(crate) fn with_names(mut self, names: MetastoreNames) -> Self {
+        self.names = Arc::new(names);
+        self
+    }
+
+    /// The names of the metadata files and markers.
+    pub(crate) fn names(&self) -> &MetastoreNames {
+        &self.names
     }
 
     /// Sets the catalog's timestamp precision.
@@ -499,7 +512,9 @@ impl FileMetastore {
     }
 
     fn schema_file(&self, schema: &str) -> Path {
-        self.root.clone().join(format!(".{schema}{METADATA_FILE}"))
+        self.root
+            .clone()
+            .join(format!(".{schema}{}", self.names.metadata_file))
     }
 
     pub(crate) fn table_dir(&self, schema: &str, table: &str) -> Path {
@@ -507,7 +522,8 @@ impl FileMetastore {
     }
 
     fn table_file(&self, schema: &str, table: &str) -> Path {
-        self.table_dir(schema, table).join(METADATA_FILE)
+        self.table_dir(schema, table)
+            .join(self.names.metadata_file.as_str())
     }
 
     async fn read_bytes(&self, path: &Path) -> MetastoreResult<Option<bytes::Bytes>> {
@@ -586,7 +602,7 @@ impl FileMetastore {
             .filter_map(|o| o.location.filename())
             .filter_map(|f| {
                 f.strip_prefix('.')?
-                    .strip_suffix(METADATA_FILE)
+                    .strip_suffix(self.names.metadata_file.as_str())
                     .map(str::to_owned)
             })
             .filter(|s| !s.is_empty() && !s.starts_with('.'))
@@ -613,7 +629,12 @@ impl FileMetastore {
             if name.starts_with('.') {
                 continue;
             }
-            if self.store.head(&prefix.clone().join(METADATA_FILE)).await.is_ok() {
+            if self
+                .store
+                .head(&prefix.clone().join(self.names.metadata_file.as_str()))
+                .await
+                .is_ok()
+            {
                 tables.push(name.to_owned());
             }
         }
@@ -647,7 +668,7 @@ impl FileMetastore {
             BTreeMap::from([(WRITTEN_NAME.to_owned(), written.to_owned())])
         };
         let metadata = SchemaMetadata {
-            writer_version: Some(TRINO_VERSION.into()),
+            writer_version: Some(self.names.writer_version.clone()),
             owner_name: Some(owner.into()),
             owner_type: Some("USER".into()),
             parameters,
@@ -693,7 +714,10 @@ impl FileMetastore {
                 },
             })
             .collect();
-        let path = dir.clone().join(PERMISSIONS_DIR).join(format!("user_{owner}"));
+        let path = dir
+            .clone()
+            .join(self.names.permissions_dir.as_str())
+            .join(format!("user_{owner}"));
         self.write_json(&path, &grants).await
     }
 
@@ -784,7 +808,7 @@ impl FileMetastore {
             .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
             .filter_map(|file| {
                 file.strip_prefix('.')?
-                    .strip_suffix(METADATA_FILE)
+                    .strip_suffix(self.names.metadata_file.as_str())
                     .map(str::to_owned)
             })
             .filter(|s| !s.is_empty() && !s.starts_with('.'))
@@ -797,7 +821,7 @@ impl FileMetastore {
     /// (see [`FileMetastore::local_schemas`]).
     pub(crate) fn local_tables(&self, schema: &str) -> Option<Vec<String>> {
         let dir = self.local_path(&self.root.clone().join(schema))?;
-        Some(local_tables(&dir).unwrap_or_default())
+        Some(local_tables(&dir, &self.names.metadata_file).unwrap_or_default())
     }
 
     /// A new private directory for one statement's files.
@@ -835,8 +859,11 @@ impl FileMetastore {
         metadata: &TableMetadata,
         owner: &str,
     ) -> MetastoreResult<()> {
-        self.write_json(&staging.dir.clone().join(METADATA_FILE), metadata)
-            .await?;
+        self.write_json(
+            &staging.dir.clone().join(self.names.metadata_file.as_str()),
+            metadata,
+        )
+        .await?;
         self.write_owner_grants(&staging.dir, owner).await
     }
 
@@ -878,7 +905,7 @@ impl FileMetastore {
                 continue;
             };
             let destination = relative.fold(target.clone(), Path::join);
-            if destination.filename() == Some(METADATA_FILE) {
+            if destination.filename() == Some(self.names.metadata_file.as_str()) {
                 metadata.push((object.location, destination));
                 continue;
             }
@@ -1066,10 +1093,11 @@ impl FileMetastore {
     /// checksum and the permissions) from `dir`, and the directory itself
     /// only if nothing else is left in it. Any other file stays.
     async fn remove_metadata_leftovers(&self, dir: &Path) -> MetastoreResult<()> {
-        self.delete_all(&dir.clone().join(PERMISSIONS_DIR)).await?;
+        self.delete_all(&dir.clone().join(self.names.permissions_dir.as_str()))
+            .await?;
         match self
             .store
-            .delete(&dir.clone().join(crc_name(METADATA_FILE)))
+            .delete(&dir.clone().join(crc_name(&self.names.metadata_file)))
             .await
         {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
@@ -1077,7 +1105,7 @@ impl FileMetastore {
         }
         if let Some(path) = self.local_path(dir) {
             // Only empty directories go; any other file under it stays.
-            let _ = std::fs::remove_dir(path.join(PERMISSIONS_DIR));
+            let _ = std::fs::remove_dir(path.join(self.names.permissions_dir.as_str()));
             let _ = std::fs::remove_dir(path);
         }
         Ok(())
@@ -1087,9 +1115,9 @@ impl FileMetastore {
     /// commit point last, so a copy in that order makes the name visible
     /// only once everything else is there.
     async fn metadata_files(&self, dir: &Path) -> MetastoreResult<Vec<Path>> {
-        let file = dir.clone().join(METADATA_FILE);
-        let crc = dir.clone().join(crc_name(METADATA_FILE));
-        let permissions = dir.clone().join(PERMISSIONS_DIR);
+        let file = dir.clone().join(self.names.metadata_file.as_str());
+        let crc = dir.clone().join(crc_name(&self.names.metadata_file));
+        let permissions = dir.clone().join(self.names.permissions_dir.as_str());
         let mut files: Vec<Path> = self
             .store
             .list(Some(&permissions))
@@ -1215,13 +1243,66 @@ mod tests {
             Arc::new(LocalFileSystem::new_with_prefix(root).unwrap()),
             Path::default(),
         )
+        .with_names(crate::hive::reference_names())
+    }
+
+    /// Without configured names, the metastore writes `CodeLake`'s (ISS-011):
+    /// its own metadata file, permissions directory, view marker and
+    /// version; none of the reference engine's names.
+    #[tokio::test]
+    async fn default_names_are_codelakes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let metastore =
+            FileMetastore::new(Arc::new(store), Path::default()).with_local_dir(dir.path().into());
+        let names = metastore.names().clone();
+        metastore.create_schema("raw", "raw", "dbt").await.unwrap();
+        let table = TableMetadata::managed_parquet("dbt", Vec::new(), &names);
+        metastore.write_table("raw", "t", &table).await.unwrap();
+        let view = TableMetadata::view("dbt", "/* CodeLake View: e30= */".into(), &names);
+        metastore.write_table("raw", "v", &view).await.unwrap();
+        assert!(dir.path().join(".raw.codelakeSchema").is_file());
+        let json = written_json(&dir, "raw/t/.codelakeSchema");
+        assert_eq!(json["writerVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(json["parameters"]["codelake_version"], env!("CARGO_PKG_VERSION"));
+        let json = written_json(&dir, "raw/v/.codelakeSchema");
+        assert_eq!(json["parameters"]["codelake_view"], "true");
+        assert_eq!(json["parameters"]["comment"], "CodeLake View");
+        assert_eq!(json["viewExpandedText"], "/* CodeLake View */");
+        let mut written = Vec::new();
+        for entry in walkdir(dir.path()) {
+            written.push(entry);
+        }
+        assert!(
+            written
+                .iter()
+                .all(|name| !name.to_lowercase().contains("trino") && !name.contains("presto")),
+            "{written:?}"
+        );
+        assert_eq!(metastore.list_tables("raw").await.unwrap(), ["t", "v"]);
+    }
+
+    fn walkdir(root: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                out.push(path.strip_prefix(root).unwrap().display().to_string());
+                if path.is_dir() {
+                    stack.push(path);
+                }
+            }
+        }
+        out
     }
 
     fn scratch() -> (tempfile::TempDir, FileMetastore) {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
-        let metastore =
-            FileMetastore::new(Arc::new(store), Path::default()).with_local_dir(dir.path().into());
+        let metastore = FileMetastore::new(Arc::new(store), Path::default())
+            .with_names(crate::hive::reference_names())
+            .with_local_dir(dir.path().into());
         (dir, metastore)
     }
 
@@ -1288,9 +1369,13 @@ mod tests {
     async fn metadata_has_every_field_trino_431_requires() {
         let (dir, metastore) = scratch();
         metastore.create_schema("raw", "raw", "dbt").await.unwrap();
-        let table = TableMetadata::managed_parquet("dbt", Vec::new());
+        let table = TableMetadata::managed_parquet("dbt", Vec::new(), &crate::hive::reference_names());
         metastore.write_table("raw", "t", &table).await.unwrap();
-        let view = TableMetadata::trino_view("dbt", "/* Presto View: e30= */".into());
+        let view = TableMetadata::view(
+            "dbt",
+            "/* Presto View: e30= */".into(),
+            &crate::hive::reference_names(),
+        );
         metastore.write_table("raw", "v", &view).await.unwrap();
         for file in ["raw/t/.trinoSchema", "raw/v/.trinoSchema"] {
             let json = written_json(&dir, file);
@@ -1350,7 +1435,7 @@ mod tests {
     async fn new_metadata_carries_the_trino_version() {
         let (dir, metastore) = scratch();
         metastore.create_schema("raw", "raw", "dbt").await.unwrap();
-        let table = TableMetadata::managed_parquet("dbt", Vec::new());
+        let table = TableMetadata::managed_parquet("dbt", Vec::new(), &crate::hive::reference_names());
         metastore.write_table("raw", "t", &table).await.unwrap();
         for file in [".raw.trinoSchema", "raw/t/.trinoSchema"] {
             let json: serde_json::Value =
@@ -1372,7 +1457,7 @@ mod tests {
     async fn dropping_an_external_table_keeps_its_data() {
         let (dir, metastore) = scratch();
         metastore.create_schema("raw", "raw", "dbt").await.unwrap();
-        let mut table = TableMetadata::managed_parquet("dbt", Vec::new());
+        let mut table = TableMetadata::managed_parquet("dbt", Vec::new(), &crate::hive::reference_names());
         table.table_type = EXTERNAL_TABLE.into();
         metastore.write_table("raw", "ext", &table).await.unwrap();
         metastore
@@ -1403,7 +1488,8 @@ mod tests {
         let bare = FileMetastore::new(
             Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()),
             Path::default(),
-        );
+        )
+        .with_names(crate::hive::reference_names());
         assert!(!bare.table_location_exists("raw", "t").await.unwrap());
         std::fs::create_dir_all(dir.path().join("raw/u")).unwrap();
         std::fs::write(dir.path().join("raw/u/f"), b"x").unwrap();
@@ -1416,7 +1502,8 @@ mod tests {
     /// metadata, then removes the old objects.
     #[tokio::test]
     async fn rename_on_an_object_store() {
-        let metastore = FileMetastore::new(Arc::new(object_store::memory::InMemory::new()), Path::from("wh"));
+        let metastore = FileMetastore::new(Arc::new(object_store::memory::InMemory::new()), Path::from("wh"))
+            .with_names(crate::hive::reference_names());
         let table = fixture().table("pilot", "t1").await.unwrap().unwrap();
         metastore.create_schema("raw", "raw", "dbt").await.unwrap();
         metastore.write_table("raw", "t", &table).await.unwrap();
@@ -1467,6 +1554,7 @@ mod tests {
                 properties: BTreeMap::new(),
                 extra: BTreeMap::new(),
             }],
+            &crate::hive::reference_names(),
         );
         table.parameters.insert("numRows".into(), "10".into());
         table

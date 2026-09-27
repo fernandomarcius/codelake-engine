@@ -47,7 +47,8 @@ async fn engine_over(warehouse: &FsPath, spill: &FsPath, limit: ByteSize) -> Eng
                 path_style: false,
             },
         )
-        .with_parquet_time_zone(codelake_core::parquet_time_zone::ParquetTimeZone::UTC),
+        .with_parquet_time_zone(codelake_core::parquet_time_zone::ParquetTimeZone::UTC)
+        .with_metastore_names(crate::hive::reference_names()),
     );
     engine
         .attach(connector, true, std::time::Duration::from_secs(30))
@@ -82,7 +83,11 @@ impl Lake {
 
     fn catalog(&self) -> HiveCatalog {
         let store = LocalFileSystem::new_with_prefix(self.warehouse.path()).unwrap();
-        HiveCatalog::new("hive", FileMetastore::new(Arc::new(store), Path::default())).unwrap()
+        HiveCatalog::new(
+            "hive",
+            FileMetastore::new(Arc::new(store), Path::default()).with_names(crate::hive::reference_names()),
+        )
+        .unwrap()
     }
 
     /// A table handle with its own locks, like another `CodeLake` process.

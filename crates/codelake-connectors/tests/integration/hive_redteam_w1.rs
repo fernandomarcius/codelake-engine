@@ -77,6 +77,7 @@ async fn engine_in(
     };
     let mut engine = Engine::new(&memory, &ExecutionConfig::default()).unwrap();
     let connector = HiveConnector::new("hive".into(), params(warehouse))
+        .with_metastore_names(crate::common::reference_names())
         .with_timestamp_precision(precision)
         .with_parquet_time_zone(zone);
     engine

@@ -402,7 +402,8 @@ mod tests {
         let metastore = FileMetastore::new(
             Arc::new(LocalFileSystem::new_with_prefix(root).unwrap()),
             Path::default(),
-        );
+        )
+        .with_names(crate::hive::reference_names());
         let mut metadata = fixture_metadata();
         let schema = Arc::new(table_schema(&metadata));
         let ctx = SessionContext::new();
