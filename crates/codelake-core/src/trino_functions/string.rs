@@ -131,6 +131,7 @@ pub(crate) fn lower() -> ScalarUDF {
     Func::new("lower", coerce_str1, UTF8, |call| {
         map_str1(call, |s| s.chars().map(simple_lower).collect())
     })
+    .keeps_varchar_length()
     .udf()
 }
 
@@ -138,6 +139,7 @@ pub(crate) fn upper() -> ScalarUDF {
     Func::new("upper", coerce_str1, UTF8, |call| {
         map_str1(call, |s| s.chars().map(simple_upper).collect())
     })
+    .keeps_varchar_length()
     .udf()
 }
 
@@ -252,6 +254,7 @@ pub(crate) fn substr() -> ScalarUDF {
         invoke_substr,
     )
     .alias("substring")
+    .keeps_varchar_length()
     .udf()
 }
 
@@ -269,6 +272,7 @@ fn trim_function(name: &'static str, left: bool, right: bool) -> ScalarUDF {
         UTF8,
         invoke,
     )
+    .keeps_varchar_length()
     .udf()
 }
 

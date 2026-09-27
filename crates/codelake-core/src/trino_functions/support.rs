@@ -477,6 +477,7 @@ pub(crate) struct Func {
     zone: Arc<str>,
     zone_sensitive: bool,
     returns_json: bool,
+    keeps_varchar_length: bool,
 }
 
 impl PartialEq for Func {
@@ -510,7 +511,16 @@ impl Func {
             zone: Arc::from("UTC"),
             zone_sensitive: false,
             returns_json: false,
+            keeps_varchar_length: false,
         }
+    }
+
+    /// The result keeps the `varchar(n)` of the first argument, as Trino
+    /// types `lower`, `upper`, `trim` and `substr` (`varchar(x)` →
+    /// `varchar(x)`); a `CREATE TABLE AS` stores the column with it.
+    pub(crate) fn keeps_varchar_length(mut self) -> Self {
+        self.keeps_varchar_length = true;
+        self
     }
 
     /// The result is Trino `json` (see [`json_field`]).
@@ -585,7 +595,16 @@ impl ScalarUDFImpl for Func {
         if self.returns_json && data_type == DataType::Utf8 {
             return Ok(Arc::new(json_field(self.name)));
         }
-        Ok(Arc::new(Field::new(self.name, data_type, true)))
+        let field = Field::new(self.name, data_type, true);
+        if self.keeps_varchar_length
+            && let Some(first) = args.arg_fields.first()
+            && let Some(declared @ crate::trino_types::Declared::Varchar(_)) =
+                crate::trino_types::declared(first)
+            && declared.fits(field.data_type())
+        {
+            return Ok(Arc::new(field.with_metadata(declared.metadata())));
+        }
+        Ok(Arc::new(field))
     }
 
     fn with_updated_config(&self, config: &ConfigOptions) -> Option<ScalarUDF> {

@@ -66,6 +66,16 @@ fn sql_type(data_type: &str, max_length: Option<i32>, datetime_precision: Option
     }
 }
 
+/// The bounded text type a column shows in results and keeps through
+/// `CREATE TABLE AS`, as the reference maps SQL Server: `varchar(n)` and
+/// `nvarchar(n)` are `varchar(n)`; `(max)`, `text` and `ntext` are unbounded.
+fn declared_text(data_type: &str, max_length: Option<i32>) -> Option<String> {
+    match (data_type.to_ascii_lowercase().as_str(), max_length) {
+        ("varchar" | "nvarchar", Some(n)) if n > 0 => Some(format!("varchar({n})")),
+        _ => None,
+    }
+}
+
 /// Object names are rendered in `[...]`; `]` would end the quote. Such names
 /// are not exposed instead of being escaped at every use site.
 fn safe_name(name: &str) -> bool {
@@ -272,10 +282,14 @@ impl SqlServerResolver {
                 );
                 continue;
             };
-            let field = Field::new(column.to_lowercase(), arrow, nullable).with_metadata(HashMap::from([(
+            let mut metadata = HashMap::from([(
                 SQL_TYPE.to_owned(),
                 sql_type(data_type, max_length, datetime_precision),
-            )]));
+            )]);
+            if let Some(declared) = declared_text(data_type, max_length) {
+                metadata.insert(codelake_core::trino_types::TRINO_TYPE.to_owned(), declared);
+            }
+            let field = Field::new(column.to_lowercase(), arrow, nullable).with_metadata(metadata);
             real_names.insert(column.to_lowercase(), column.to_owned());
             fields.push(field);
         }
@@ -379,6 +393,24 @@ impl Connector for SqlServerConnector {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bounded_text_declares_its_length() {
+        assert_eq!(declared_text("varchar", Some(20)).as_deref(), Some("varchar(20)"));
+        assert_eq!(
+            declared_text("NVARCHAR", Some(50)).as_deref(),
+            Some("varchar(50)")
+        );
+        assert_eq!(declared_text("varchar", Some(-1)), None, "varchar(max)");
+        assert_eq!(declared_text("ntext", Some(1_073_741_823)), None);
+        assert_eq!(
+            declared_text("char", Some(3)),
+            None,
+            "char(n) keeps its own semantics"
+        );
+        assert_eq!(declared_text("int", None), None);
+    }
+
     use super::*;
 
     fn params() -> SqlServerParams {

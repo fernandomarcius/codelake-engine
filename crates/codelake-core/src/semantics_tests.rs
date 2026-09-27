@@ -959,3 +959,30 @@ async fn repeated_names_in_later_union_branches_plan() {
     )
     .await;
 }
+
+/// `lower`, `upper`, `trim` and `substr` keep the `varchar(n)` of their
+/// argument, as Trino 431 types them (and `CREATE TABLE AS` stores them).
+#[tokio::test]
+async fn text_functions_keep_the_varchar_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    assert_same(
+        &engine,
+        &[(
+            "SELECT trim(v), ltrim(v), rtrim(v), lower(v), upper(v), substr(v, 2) \
+             FROM (SELECT CAST(' Ab ' AS VARCHAR(5)) AS v) t",
+            answer(
+                &[
+                    "varchar(5)",
+                    "varchar(5)",
+                    "varchar(5)",
+                    "varchar(5)",
+                    "varchar(5)",
+                    "varchar(5)",
+                ],
+                &[&["Ab", "Ab ", " Ab", " ab ", " AB ", "Ab "]],
+            ),
+        )],
+    )
+    .await;
+}
