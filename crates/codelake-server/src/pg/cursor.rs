@@ -42,7 +42,8 @@ use datafusion::sql::sqlparser::ast::{
     ValueWithSpan,
 };
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use datafusion::sql::sqlparser::tokenizer::{Span, Token, Tokenizer, Word};
+use datafusion::sql::sqlparser::parser::Parser;
+use datafusion::sql::sqlparser::tokenizer::{Span, Token, TokenWithSpan, Tokenizer, Word};
 use datafusion_postgres::arrow_pg::datatypes::df::encode_dataframe;
 use datafusion_postgres::hooks::{HookClient, QueryHook};
 use datafusion_postgres::pgwire::api::portal::{Format, Portal, PortalExecutionState};
@@ -90,13 +91,17 @@ struct Cursor {
     failed: AtomicBool,
     /// The governed statement that declared it.
     record: Mutex<Option<Arc<QueryRecord>>>,
+    /// The subtransaction it was declared in ([`Book::subtransactions`]):
+    /// a `ROLLBACK TO SAVEPOINT` of a savepoint set before closes it.
+    subtransaction: u64,
 }
 
 impl Cursor {
-    fn new(hold: bool, scroll: bool) -> Self {
+    fn new(hold: bool, scroll: bool, subtransaction: u64) -> Self {
         Self {
             hold,
             scroll,
+            subtransaction,
             pending: AtomicBool::new(true),
             current: Mutex::new(None),
             columns: Mutex::new(None),
@@ -116,6 +121,10 @@ impl Cursor {
 pub(super) struct Cursors(Mutex<Book>);
 
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "PostgreSQL's transaction flags, each set on its own"
+)]
 struct Book {
     cursors: HashMap<String, Arc<Cursor>>,
     /// In a transaction block (`BEGIN`), as `pgwire` tracks it when a
@@ -128,6 +137,28 @@ struct Book {
     /// `PostgreSQL` runs them in one implicit transaction block, where a
     /// cursor may be declared.
     implicit_block: bool,
+    /// The transaction block's savepoints, oldest first, each with the
+    /// subtransaction it began.
+    savepoints: Vec<(String, u64)>,
+    /// The last subtransaction begun (by `SAVEPOINT`, or `ROLLBACK TO
+    /// SAVEPOINT`, which begins its savepoint's again), counted from the
+    /// connection's first: what was declared since a savepoint has a number
+    /// at least its own.
+    subtransactions: u64,
+    /// The subtransaction in which the transaction last ran a statement
+    /// that may write ([`reads_only`]): the engine's writes are not
+    /// transactional, so a `ROLLBACK TO SAVEPOINT` could not undo it.
+    last_write: Option<u64>,
+    /// A statement set the transaction status to one `pgwire` cannot tell
+    /// from its answer (`ROLLBACK TO SAVEPOINT` in a failed block, `AND
+    /// CHAIN`): the message ends in the status this book says
+    /// ([`restated`]).
+    restated: bool,
+    /// An extended-protocol `Execute` of the transaction completed before
+    /// the one being run, in the same pipeline (`PostgreSQL`'s
+    /// `XACT_FLAGS_PIPELINING`): what cannot run in a transaction block
+    /// cannot run here either.
+    pipelined: bool,
 }
 
 impl Cursors {
@@ -139,6 +170,11 @@ impl Cursors {
     /// transaction status as `pgwire` tracks it.
     fn begin_message(&self, status: TransactionStatus, statements: usize) {
         let mut book = lock(&self.0);
+        book.restated = false;
+        if status == TransactionStatus::Idle {
+            book.savepoints.clear();
+            book.last_write = None;
+        }
         book.explicit = status != TransactionStatus::Idle;
         book.aborted = status == TransactionStatus::Error;
         book.implicit_block = statements > 1;
@@ -214,6 +250,12 @@ impl Cursors {
                     "DISCARD ALL cannot run inside a transaction block",
                 ));
             }
+            if book.pipelined {
+                return Err(user_error(
+                    "25001",
+                    "DISCARD ALL cannot be executed within a pipeline",
+                ));
+            }
             client.portal_store().clear_portals();
             book.cursors.clear();
             drop(book);
@@ -225,11 +267,117 @@ impl Cursors {
     /// The cursor `name` (a portal of the extended protocol has one too).
     fn cursor(&self, name: &str) -> Arc<Cursor> {
         let mut book = lock(&self.0);
+        let subtransaction = book.subtransactions;
         let cursor = book
             .cursors
             .entry(name.to_owned())
-            .or_insert_with(|| Arc::new(Cursor::new(false, true)));
+            .or_insert_with(|| Arc::new(Cursor::new(false, true, subtransaction)));
         Arc::clone(cursor)
+    }
+
+    /// `SAVEPOINT`: a subtransaction begins, in a transaction block only
+    /// (`25P01`), as in `PostgreSQL`.
+    fn savepoint(&self, name: &Ident) -> PgWireResult<Response> {
+        let mut book = lock(&self.0);
+        if !book.explicit {
+            return Err(outside_block("SAVEPOINT"));
+        }
+        book.subtransactions += 1;
+        let subtransaction = book.subtransactions;
+        book.savepoints.push((cursor_name(name), subtransaction));
+        Ok(Response::Execution(Tag::new("SAVEPOINT")))
+    }
+
+    /// Where the savepoint `name` stands: the last set of that name
+    /// (`3B001` when there is none, `25P01` outside a transaction block).
+    fn find_savepoint(book: &Book, name: &Ident, statement: &str) -> PgWireResult<usize> {
+        if !book.explicit {
+            return Err(outside_block(statement));
+        }
+        let name = cursor_name(name);
+        book.savepoints
+            .iter()
+            .rposition(|(set, _)| *set == name)
+            .ok_or_else(|| user_error("3B001", format!("savepoint \"{name}\" does not exist")))
+    }
+
+    /// `RELEASE SAVEPOINT`: the savepoint and those set after it are gone;
+    /// what was declared since stays open, as in `PostgreSQL`.
+    fn release(&self, name: &Ident) -> PgWireResult<Response> {
+        let mut book = lock(&self.0);
+        let at = Self::find_savepoint(&book, name, "RELEASE SAVEPOINT")?;
+        book.savepoints.truncate(at);
+        Ok(Response::Execution(Tag::new("RELEASE")))
+    }
+
+    /// `ROLLBACK TO SAVEPOINT`, as `PostgreSQL` does it for cursors: the
+    /// cursors declared since the savepoint are closed (their statements end,
+    /// slot and memory given back), those declared before stay open where
+    /// they stand (a move is not undone), the savepoints set after it are
+    /// gone, and a failed transaction block is no longer failed. The
+    /// engine's writes are not transactional: after a statement that may
+    /// write ([`reads_only`]) since the savepoint it fails with `0A000`
+    /// rather than leave the write in place as if undone.
+    fn rollback_to(&self, client: &mut dyn HookClient, name: &Ident) -> PgWireResult<Response> {
+        let store = client.portal_store();
+        let mut book = lock(&self.0);
+        let at = Self::find_savepoint(&book, name, "ROLLBACK TO SAVEPOINT")?;
+        let (set, since) = book.savepoints[at].clone();
+        if book.last_write.is_some_and(|written| written >= since) {
+            return Err(user_error(
+                "0A000",
+                format!(
+                    "ROLLBACK TO SAVEPOINT \"{set}\" cannot undo the statements since it that may \
+                     write: the engine's writes are not transactional"
+                ),
+            ));
+        }
+        let closed: Vec<String> = book
+            .cursors
+            .iter()
+            .filter(|(_, cursor)| cursor.subtransaction >= since)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in closed {
+            store.rm_portal(&name);
+            book.cursors.remove(&name);
+        }
+        book.savepoints.truncate(at + 1);
+        book.subtransactions += 1;
+        let subtransaction = book.subtransactions;
+        book.savepoints[at].1 = subtransaction;
+        book.aborted = false;
+        book.restated = true;
+        drop(book);
+        client.set_transaction_status(TransactionStatus::Transaction);
+        Ok(Response::Execution(Tag::new("ROLLBACK")))
+    }
+
+    /// `COMMIT AND CHAIN` (`commit`) or `ROLLBACK AND CHAIN`: the
+    /// transaction block ends, as `COMMIT` or `ROLLBACK` would end it (a
+    /// failed one is rolled back), and a new one begins at once, in a
+    /// transaction block only (`25P01`), as in `PostgreSQL`.
+    fn chain(&self, client: &mut dyn HookClient, commit: bool) -> PgWireResult<Response> {
+        let (explicit, aborted) = {
+            let book = lock(&self.0);
+            (book.explicit, book.aborted)
+        };
+        if !explicit {
+            let statement = if commit {
+                "COMMIT AND CHAIN"
+            } else {
+                "ROLLBACK AND CHAIN"
+            };
+            return Err(outside_block(statement));
+        }
+        self.end_transaction(Some(client.portal_store()), commit);
+        let mut book = lock(&self.0);
+        book.explicit = true;
+        book.restated = true;
+        drop(book);
+        client.set_transaction_status(TransactionStatus::Transaction);
+        let tag = if commit && !aborted { "COMMIT" } else { "ROLLBACK" };
+        Ok(Response::Execution(Tag::new(tag)))
     }
 
     /// The transaction in progress ends, committed or rolled back (a failed
@@ -240,6 +388,9 @@ impl Cursors {
         let commit = commit && !book.aborted;
         book.explicit = false;
         book.aborted = false;
+        book.savepoints.clear();
+        book.last_write = None;
+        book.pipelined = false;
         book.cursors
             .retain(|_, cursor| cursor.hold && (commit || !cursor.pending.load(Ordering::SeqCst)));
         let Some(store) = store else {
@@ -299,7 +450,10 @@ impl Book {
             if store.is_some_and(|store| store.get_portal(&name).is_some()) {
                 return Err(user_error("42P03", format!("cursor \"{name}\" already exists")));
             }
-            made.push((name, Cursor::new(hold, declare.scroll != Some(false))));
+            made.push((
+                name,
+                Cursor::new(hold, declare.scroll != Some(false), self.subtransactions),
+            ));
         }
         Ok(made)
     }
@@ -359,9 +513,125 @@ where
     }
 }
 
+/// `statement` can only be used in transaction blocks (`25P01`).
+fn outside_block(statement: &str) -> PgWireError {
+    user_error(
+        "25P01",
+        format!("{statement} can only be used in transaction blocks"),
+    )
+}
+
+/// The transaction status a message or an `Execute` ends in, when one of
+/// its statements set it where `pgwire` cannot follow ([`Cursors::rollback_to`],
+/// [`Cursors::chain`]): the one this connection's book says.
+pub(super) fn restated(client: &(impl ClientInfo + ?Sized)) -> Option<TransactionStatus> {
+    let cursors = Cursors::of(client);
+    let mut book = lock(&cursors.0);
+    if !std::mem::take(&mut book.restated) {
+        return None;
+    }
+    Some(match (book.explicit, book.aborted) {
+        (false, _) => TransactionStatus::Idle,
+        (true, false) => TransactionStatus::Transaction,
+        (true, true) => TransactionStatus::Error,
+    })
+}
+
+/// `statements` are about to run (`None`: a message the SQL parser does not
+/// read): when one may write ([`reads_only`]), a `ROLLBACK TO SAVEPOINT` of
+/// a savepoint set before cannot undo it.
+pub(super) fn will_run(client: &(impl ClientInfo + ?Sized), statements: Option<&[Statement]>) {
+    if !statements.is_some_and(|statements| statements.iter().all(reads_only)) {
+        let cursors = Cursors::of(client);
+        let mut book = lock(&cursors.0);
+        book.last_write = Some(book.subtransactions);
+    }
+}
+
+/// Whether `statement` leaves every table as it was: a query (no `SELECT
+/// INTO`, no data-modifying `WITH`), a cursor statement, `EXPLAIN` without
+/// `ANALYZE`, `SHOW`, `SET`, transaction control, `PREPARE`, a procedure
+/// `CALL` (`kill_query`). Anything else may write.
+fn reads_only(statement: &Statement) -> bool {
+    match statement {
+        Statement::Query(query) => query_reads_only(query),
+        Statement::Declare { stmts } => stmts
+            .iter()
+            .all(|declare| declare.for_query.as_deref().is_none_or(query_reads_only)),
+        Statement::Explain {
+            analyze, statement, ..
+        } => !*analyze || reads_only(statement),
+        Statement::Fetch { .. }
+        | Statement::Close { .. }
+        | Statement::ExplainTable { .. }
+        | Statement::ShowVariable { .. }
+        | Statement::ShowVariables { .. }
+        | Statement::ShowTables { .. }
+        | Statement::ShowColumns { .. }
+        | Statement::ShowFunctions { .. }
+        | Statement::ShowCreate { .. }
+        | Statement::ShowSchemas { .. }
+        | Statement::ShowViews { .. }
+        | Statement::Set(_)
+        | Statement::StartTransaction { .. }
+        | Statement::Commit { .. }
+        | Statement::Rollback { .. }
+        | Statement::Savepoint { .. }
+        | Statement::ReleaseSavepoint { .. }
+        | Statement::Discard { .. }
+        | Statement::Deallocate { .. }
+        | Statement::Prepare { .. }
+        | Statement::Call(_) => true,
+        _ => false,
+    }
+}
+
+fn query_reads_only(query: &datafusion::sql::sqlparser::ast::Query) -> bool {
+    query
+        .with
+        .as_ref()
+        .is_none_or(|with| with.cte_tables.iter().all(|cte| query_reads_only(&cte.query)))
+        && set_reads_only(&query.body)
+}
+
+fn set_reads_only(body: &datafusion::sql::sqlparser::ast::SetExpr) -> bool {
+    use datafusion::sql::sqlparser::ast::SetExpr;
+    match body {
+        SetExpr::Select(select) => select.into.is_none(),
+        SetExpr::Values(_) | SetExpr::Table(_) => true,
+        SetExpr::Query(query) => query_reads_only(query),
+        SetExpr::SetOperation { left, right, .. } => set_reads_only(left) && set_reads_only(right),
+        _ => false,
+    }
+}
+
 /// An extended-protocol `Execute` starts.
 pub(super) fn begin_execute(client: &(impl ClientInfo + ?Sized)) {
     Cursors::of(client).begin_message(client.transaction_status(), 1);
+}
+
+/// An extended-protocol `Execute` of `statement` completed (its portal not
+/// suspended): as in `PostgreSQL`, the statements after it before the next
+/// `Sync` run in a pipeline, where `DISCARD ALL` fails with `25001`. A
+/// transaction statement or a `DISCARD ALL` ends the transaction it ran in
+/// instead (`PostgreSQL` commits it at once).
+pub(super) fn executed(client: &(impl ClientInfo + ?Sized), statement: Option<&Statement>) {
+    let ends = matches!(
+        statement,
+        Some(
+            Statement::StartTransaction { .. }
+                | Statement::Commit { .. }
+                | Statement::Rollback { .. }
+                | Statement::Savepoint { .. }
+                | Statement::ReleaseSavepoint { .. }
+                | Statement::Discard {
+                    object_type: DiscardObject::ALL
+                }
+        )
+    );
+    if !ends {
+        lock(&Cursors::of(client).0).pipelined = true;
+    }
 }
 
 /// An extended-protocol `Sync`: outside a transaction block it ends the
@@ -388,8 +658,11 @@ where
 pub(crate) struct CursorHook;
 
 impl CursorHook {
+    /// `bound` is the statement's plan and its parameters' values, on the
+    /// extended protocol.
     async fn observe(
         statement: &Statement,
+        bound: Option<(&LogicalPlan, &ParamValues)>,
         session_context: &SessionContext,
         client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
@@ -418,11 +691,29 @@ impl CursorHook {
                     Err(error) => Err(error),
                 });
             }
-            Statement::StartTransaction { .. } => cursors.begin(),
+            Statement::Savepoint { name } => return Some(cursors.savepoint(name)),
+            Statement::ReleaseSavepoint { name } => return Some(cursors.release(name)),
+            Statement::Rollback {
+                savepoint: Some(name),
+                ..
+            } => return Some(cursors.rollback_to(client, name)),
+            Statement::Commit { chain: true, .. } => return Some(cursors.chain(client, true)),
+            Statement::Rollback { chain: true, .. } => return Some(cursors.chain(client, false)),
+            // Answered here for its tag: `START TRANSACTION` or `BEGIN`, as
+            // written (`datafusion-postgres` answers `BEGIN` to both).
+            Statement::StartTransaction { begin, .. } => {
+                cursors.begin();
+                let tag = Tag::new(if *begin { "BEGIN" } else { "START TRANSACTION" });
+                return Some(Ok(if client.transaction_status() == TransactionStatus::Idle {
+                    Response::TransactionStart(tag)
+                } else {
+                    Response::Execution(tag)
+                }));
+            }
             Statement::Commit { .. } => cursors.end_transaction(Some(client.portal_store()), true),
             Statement::Rollback { .. } => cursors.end_transaction(Some(client.portal_store()), false),
             Statement::Declare { stmts } => {
-                return Some(declare(&cursors, stmts, session_context, client).await);
+                return Some(declare(&cursors, stmts, bound, session_context, client).await);
             }
             _ => {}
         }
@@ -438,39 +729,94 @@ impl QueryHook for CursorHook {
         session_context: &SessionContext,
         client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
-        Self::observe(statement, session_context, client).await
+        Self::observe(statement, None, session_context, client).await
     }
 
     /// `DISCARD`, which `DataFusion` does not plan, is answered here when
-    /// it runs.
+    /// it runs. A `DECLARE` of one cursor is planned as its query, whose
+    /// parameters (`$1`) the client then binds, as `PostgreSQL` plans it
+    /// (psycopg3's server-side cursors send them); it is described with no
+    /// columns ([`declares_one`]).
     async fn handle_extended_parse_query(
         &self,
         statement: &Statement,
-        _session_context: &SessionContext,
+        session_context: &SessionContext,
         _client: &(dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<LogicalPlan>> {
-        matches!(statement, Statement::Discard { .. }).then(|| Ok(empty_plan()))
+        if let Some(query) = declares_one(statement) {
+            let mut query = datafusion::sql::parser::Statement::Statement(Box::new(Statement::Query(
+                Box::new(query.clone()),
+            )));
+            // `IS [NOT] DISTINCT FROM` grouped as PostgreSQL groups it, as
+            // every other statement of the session (`hooks::plan_checked`).
+            codelake_core::regroup_distinct_from(&mut query);
+            return Some(
+                session_context
+                    .state()
+                    .statement_to_plan(query)
+                    .await
+                    .map_err(|error| PgWireError::ApiError(Box::new(error))),
+            );
+        }
+        matches!(
+            statement,
+            Statement::Discard { .. } | Statement::Savepoint { .. } | Statement::ReleaseSavepoint { .. }
+        )
+        .then(|| Ok(empty_plan()))
     }
 
     async fn handle_extended_query(
         &self,
         statement: &Statement,
-        _logical_plan: &LogicalPlan,
-        _params: &ParamValues,
+        logical_plan: &LogicalPlan,
+        params: &ParamValues,
         session_context: &SessionContext,
         client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
-        Self::observe(statement, session_context, client).await
+        Self::observe(statement, Some((logical_plan, params)), session_context, client).await
     }
 }
 
+/// `PostgreSQL`'s longest identifier, in bytes (`NAMEDATALEN - 1`).
+const MAX_IDENTIFIER_BYTES: usize = 63;
+
 /// A cursor's name as `PostgreSQL` reads it: folded to lower case unless
-/// quoted (`DECLARE Big` declares `big`).
+/// quoted (`DECLARE Big` declares `big`), and cut to 63 bytes, on a
+/// character boundary, as it cuts every identifier (a `FETCH` naming the
+/// cursor in full finds it too).
 fn cursor_name(name: &Ident) -> String {
-    if name.quote_style.is_some() {
+    let mut name = if name.quote_style.is_some() {
         name.value.clone()
     } else {
         name.value.to_ascii_lowercase()
+    };
+    if name.len() > MAX_IDENTIFIER_BYTES {
+        let mut end = MAX_IDENTIFIER_BYTES;
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name.truncate(end);
+    }
+    name
+}
+
+/// The query of a `DECLARE` of one cursor, planned on the extended protocol
+/// with its parameters ([`CursorHook`]).
+pub(super) fn declares_one(statement: &Statement) -> Option<&datafusion::sql::sqlparser::ast::Query> {
+    match statement {
+        Statement::Declare { stmts } => match stmts.as_slice() {
+            [declare] => declare.for_query.as_deref(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether `params` holds any value.
+fn has_values(params: &ParamValues) -> bool {
+    match params {
+        ParamValues::List(values) => !values.is_empty(),
+        ParamValues::Map(values) => !values.is_empty(),
     }
 }
 
@@ -478,14 +824,18 @@ fn cursor_name(name: &Ident) -> String {
 /// query planned as a query of the session is (operands checked,
 /// [`crate::hooks::plan_checked`]) and its stream kept in a portal of the
 /// connection, rows encoded in text as a query's are, for `FETCH` to read.
+/// On the extended protocol (`bound`), a query with parameters runs the
+/// plan made when it was parsed, with the values bound to them.
 async fn declare(
     cursors: &Cursors,
     declares: &[Declare],
+    bound: Option<(&LogicalPlan, &ParamValues)>,
     session_context: &SessionContext,
     client: &mut dyn HookClient,
 ) -> PgWireResult<Response> {
     let made = cursors.declare(declares, Some(client.portal_store()))?;
     let options = Arc::new(FormatOptions::from_client_metadata(client.metadata()));
+    let bound = bound.filter(|(_, params)| declares.len() == 1 && has_values(params));
     for ((name, _), declare) in made.iter().zip(declares) {
         let outcome = async {
             let query = declare
@@ -493,7 +843,16 @@ async fn declare(
                 .as_ref()
                 .ok_or_else(|| user_error("42601", "DECLARE CURSOR requires a FOR query"))?
                 .to_string();
-            let df = crate::hooks::plan_checked(session_context, &query).await?;
+            let df = match bound {
+                Some((plan, params)) => {
+                    let plan = plan
+                        .clone()
+                        .replace_params_with_values(params)
+                        .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
+                    crate::hooks::run_checked(session_context, plan).await?
+                }
+                None => crate::hooks::plan_checked(session_context, &query).await?,
+            };
             let rows = encode_dataframe(df, &Format::UnifiedText, Some(Arc::clone(&options))).await?;
             let statement = StoredStatement::new(name.clone(), (query, None), Vec::new());
             let portal = Portal::new_cursor(name.clone(), Arc::new(statement));
@@ -621,11 +980,21 @@ impl Declared {
 /// in the result `format` its client asked for, or `MOVE` when `sql`, the
 /// statement's text, is one ([`moves`]); `None` when `statement` is not a
 /// `FETCH`.
+///
+/// `held_in` is the memory pool when the `FETCH` is a protocol portal
+/// executed with a row limit (JDBC's fetch size), which the client may leave
+/// suspended while it runs other statements, other `FETCH`es of the same
+/// cursor among them: as `PostgreSQL` does, the `FETCH` then reads all its
+/// rows from the cursor at its first `Execute`, held in the pool until they
+/// are sent ([`Fetch::collected`]), so no later statement takes rows that
+/// are its. Read as they were sent, the rows of a `FETCH 4` suspended after
+/// one went to a `FETCH 1` run in between, and the portal resumed past them.
 pub(super) async fn fetch<C>(
     client: &C,
     sql: &str,
     statement: &Statement,
     format: &Format,
+    held_in: Option<&Arc<dyn MemoryPool>>,
 ) -> Option<PgWireResult<Response>>
 where
     C: ClientInfo + ClientPortalStore + ?Sized,
@@ -654,11 +1023,55 @@ where
         moving,
     )
     .await;
-    Some(match fetch {
-        Ok(fetch) if moving => fetch.moved().await,
-        Ok(fetch) => Ok(fetch.streamed()),
-        Err(error) => Err(error),
+    Some(match (fetch, held_in) {
+        (Ok(fetch), _) if moving => fetch.moved().await,
+        (Ok(fetch), Some(pool)) => fetch.collected(pool).await,
+        (Ok(fetch), None) => Ok(fetch.streamed()),
+        (Err(error), _) => Err(error),
     })
+}
+
+/// `FETCH` or `MOVE` among other statements of a simple-protocol message
+/// ([`statements`]): its rows read before the next statement runs, held in
+/// `pool` ([`Fetch::collected`]), as a `FETCH` the SQL parser reads there is
+/// ([`CursorHook`]).
+pub(super) async fn fetch_among<C>(
+    client: &C,
+    sql: &str,
+    statement: &Statement,
+    pool: &Arc<dyn MemoryPool>,
+) -> PgWireResult<Response>
+where
+    C: ClientInfo + ClientPortalStore + ?Sized,
+    C::PortalStore: PortalStore,
+{
+    let Statement::Fetch {
+        name,
+        direction,
+        into,
+        ..
+    } = statement
+    else {
+        return Err(user_error("42601", format!("not a FETCH: {statement}")));
+    };
+    if into.is_some() {
+        return Err(into_error());
+    }
+    let moving = moves(sql);
+    let fetch = open(
+        &Cursors::of(client),
+        portals(client),
+        &cursor_name(name),
+        direction,
+        &Format::UnifiedText,
+        moving,
+    )
+    .await?;
+    if moving {
+        fetch.moved().await
+    } else {
+        fetch.collected(pool).await
+    }
 }
 
 /// Whether `sql` is a `MOVE`: [`unparsed`] reads it as the `FETCH` of the
@@ -750,7 +1163,9 @@ impl Fetch {
     }
 
     /// The rows, read before the response is made (a `FETCH` among other
-    /// statements of a message: the next one runs before they are sent).
+    /// statements of a message: the next one runs before they are sent; a
+    /// `FETCH` portal with a row limit: another `FETCH` may run before the
+    /// portal is resumed, [`fetch`]).
     /// Until they are sent they are held in `pool`, the engine's memory
     /// pool; rows that do not fit fail the `FETCH` with `53200`
     /// (`out_of_memory`) rather than be held outside the pool, and its
@@ -1009,35 +1424,82 @@ fn number(count: &ValueWithSpan) -> PgWireResult<i64> {
     }
 }
 
-/// A message the SQL parser does not read (`error`) that holds a `FETCH` or
-/// a `MOVE`, answered at once, on either protocol. A single `FETCH` is read
-/// here as `PostgreSQL` reads it (a negative count, no count, no `FROM`:
-/// `FETCH -1 FROM c`, `FETCH FROM c`, `FETCH c`), and a single `MOVE` as the
-/// `FETCH` of the same direction ([`moves`] tells them apart); among other
-/// statements they are a syntax error (`42601`). `None` when the message
-/// holds neither.
+/// A statement the SQL parser does not read (`error`) that is a `FETCH` or
+/// a `MOVE`, answered at once, on either protocol ([`statements`]); `None`
+/// when it is neither. A message of several statements is refused
+/// (`42601`), as `PostgreSQL` refuses one in a prepared statement.
 pub(super) fn unparsed(sql: &str, error: &impl std::fmt::Display) -> Option<PgWireResult<Statement>> {
-    let tokens: Vec<Token> = Tokenizer::new(&PostgreSqlDialect {}, sql)
-        .tokenize()
-        .ok()?
+    Some(match statements(sql, error)? {
+        Ok(mut statements) if statements.len() == 1 => Ok(statements.remove(0).1),
+        Ok(_) => Err(user_error(
+            "42601",
+            "cannot insert multiple commands into a prepared statement",
+        )),
+        Err(error) => Err(error),
+    })
+}
+
+/// The statements of a message the SQL parser does not read (`error`)
+/// because it holds a `FETCH` or a `MOVE` the parser does not read, each
+/// with its text, to be run one after the other as `PostgreSQL` runs them.
+/// A `FETCH` is read here as `PostgreSQL` reads it when the parser cannot
+/// (a negative count, no count, no `FROM`: `FETCH -1 FROM c`, `FETCH FROM
+/// c`, `FETCH c`), and a `MOVE` as the `FETCH` of the same direction
+/// ([`moves`] tells them apart, from the statement's text). A statement
+/// neither reads fails the whole message (`42601`) before any of it runs,
+/// as `PostgreSQL` parses a message whole. `None` when the message holds no
+/// `FETCH` or `MOVE`.
+pub(super) fn statements(
+    sql: &str,
+    error: &impl std::fmt::Display,
+) -> Option<PgWireResult<Vec<(String, Statement)>>> {
+    let tokens = Tokenizer::new(&PostgreSqlDialect {}, sql)
+        .tokenize_with_location()
+        .ok()?;
+    // Each statement's text and its tokens, empty statements (`;;`) left
+    // out.
+    let mut pieces: Vec<(String, Vec<Token>)> = Vec::new();
+    let mut start = 0;
+    let mut piece = Vec::new();
+    for token in tokens
         .into_iter()
-        .filter(|token| !matches!(token, Token::Whitespace(_)))
-        .collect();
-    let mut tokens = tokens.as_slice();
-    while let [rest @ .., Token::SemiColon] = tokens {
-        tokens = rest;
-    }
-    let statements: Vec<&[Token]> = tokens.split(|token| *token == Token::SemiColon).collect();
-    let starts =
-        |statement: &[Token], keyword: &str| statement.first().is_some_and(|token| is(token, keyword));
-    let cursor = |statement: &[Token]| starts(statement, "FETCH") || starts(statement, "MOVE");
-    match statements.as_slice() {
-        [statement] if cursor(statement) => Some(read_fetch(&statement[1..])),
-        _ if statements.iter().any(|statement| cursor(statement)) => {
-            Some(Err(user_error("42601", format!("syntax error: {error}"))))
+        .chain(std::iter::once(TokenWithSpan::wrap(Token::SemiColon)))
+    {
+        match token.token {
+            Token::Whitespace(_) => {}
+            Token::SemiColon => {
+                let end = if token.span == Span::empty() {
+                    sql.len()
+                } else {
+                    offset(sql, token.span.start.line, token.span.start.column)?
+                };
+                if !piece.is_empty() {
+                    pieces.push((sql[start..end].to_owned(), std::mem::take(&mut piece)));
+                }
+                start = (end + 1).min(sql.len());
+            }
+            other => piece.push(other),
         }
-        _ => None,
     }
+    let starts = |tokens: &[Token], keyword: &str| tokens.first().is_some_and(|token| is(token, keyword));
+    let cursor = |tokens: &[Token]| starts(tokens, "FETCH") || starts(tokens, "MOVE");
+    if !pieces.iter().any(|(_, tokens)| cursor(tokens)) {
+        return None;
+    }
+    let syntax = || user_error("42601", format!("syntax error: {error}"));
+    let read = |(text, tokens): (String, Vec<Token>)| {
+        let parsed = Parser::parse_sql(&PostgreSqlDialect {}, &text)
+            .ok()
+            .filter(|parsed| parsed.len() == 1)
+            .and_then(|mut parsed| parsed.pop());
+        let statement = match parsed {
+            Some(statement) if !starts(&tokens, "MOVE") => statement,
+            _ if cursor(&tokens) => read_fetch(&tokens[1..])?,
+            _ => return Err(syntax()),
+        };
+        Ok((text, statement))
+    };
+    Some(pieces.into_iter().map(read).collect())
 }
 
 /// `sql` with its `ABORT` statements (`PostgreSQL`'s `ROLLBACK`, which the
@@ -1241,6 +1703,28 @@ mod tests {
         // Folded to lower case unless quoted, as PostgreSQL reads them.
         assert_eq!(declared_names(&statements), ["c1", "Big", "small"]);
         assert!(declared_names(&parse("SELECT 1; FETCH 1 FROM c1")).is_empty());
+    }
+
+    #[test]
+    fn cursor_names_are_cut_as_postgresql_cuts_identifiers() {
+        let name = |sql: &str| declared_names(&parse(sql)).remove(0);
+        let long = "C".repeat(70);
+        assert_eq!(
+            name(&format!("DECLARE {long} CURSOR FOR SELECT 1")),
+            "c".repeat(63)
+        );
+        assert_eq!(
+            name(&format!("DECLARE \"{long}\" CURSOR FOR SELECT 1")),
+            "C".repeat(63)
+        );
+        // Never inside a character: "é" would end at byte 64.
+        let accented = format!("{}é", "a".repeat(62));
+        assert_eq!(
+            name(&format!("DECLARE \"{accented}\" CURSOR FOR SELECT 1")),
+            "a".repeat(62)
+        );
+        let exact = "b".repeat(63);
+        assert_eq!(name(&format!("DECLARE {exact} CURSOR FOR SELECT 1")), exact);
     }
 
     fn declares(sql: &str) -> Vec<Declare> {
@@ -1560,6 +2044,42 @@ mod tests {
         assert_eq!(refused("SELECT 'FETCH' FROM ("), None);
     }
 
+    #[test]
+    fn messages_with_unparsed_fetches_are_read_statement_by_statement() {
+        let read = |sql: &str| {
+            statements(sql, &"parse error").map(|outcome| {
+                outcome
+                    .map(|statements| {
+                        statements
+                            .into_iter()
+                            .map(|(text, statement)| {
+                                (
+                                    text.trim().to_owned(),
+                                    matches!(statement, Statement::Fetch { .. }),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .map_err(code)
+            })
+        };
+        let text = |text: &str, fetch: bool| (text.to_owned(), fetch);
+        assert_eq!(
+            read("SELECT 'é;x'; FETCH FROM c ;; MOVE 2 IN c; /* ; */ FETCH 1 FROM c;"),
+            Some(Ok(vec![
+                text("SELECT 'é;x'", false),
+                text("FETCH FROM c", true),
+                text("MOVE 2 IN c", true),
+                text("/* ; */ FETCH 1 FROM c", true),
+            ]))
+        );
+        assert_eq!(read("FETCH c"), Some(Ok(vec![text("FETCH c", true)])));
+        // A statement neither reads fails the message before any of it runs.
+        assert_eq!(read("FETCH c; SELEC 1"), Some(Err("42601".to_owned())));
+        assert_eq!(read("FETCH c; FETCH -x FROM c"), Some(Err("42601".to_owned())));
+        assert_eq!(read("SELECT 1; SELEC 2"), None);
+    }
+
     /// A cursor `c` over rows `1..=rows`, declared in a transaction block.
     async fn cursor_over(rows: u8, declare: &str) -> (Cursors, Store) {
         cursor_streaming((1..=rows).map(|value| Ok(row(value))).collect(), declare).await
@@ -1592,6 +2112,36 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    /// A `FETCH` read at once (a portal with a row limit): the cursor is
+    /// past its rows before any is sent, and they are held until they are.
+    #[tokio::test]
+    async fn a_fetch_read_at_once_takes_its_rows_first() {
+        let (cursors, store) = cursor_over(5, "DECLARE c CURSOR FOR SELECT 1").await;
+        let Statement::Fetch { name, direction, .. } = &parse("FETCH 3 FROM c")[0] else {
+            unreachable!();
+        };
+        let fetch = open(
+            &cursors,
+            Some(&store),
+            &name.value,
+            direction,
+            &Format::UnifiedText,
+            false,
+        )
+        .await
+        .unwrap();
+        let Ok(Response::Query(mut held)) = fetch.collected(&pool(1 << 20)).await else {
+            panic!("not a query response");
+        };
+        assert_eq!(fetched(&cursors, &store, "FETCH 1 FROM c").await, Ok(vec![4]));
+        let rows: Vec<_> = held
+            .data_rows()
+            .map(|row| row.unwrap().data.to_vec())
+            .collect()
+            .await;
+        assert_eq!(rows.len(), 3);
     }
 
     #[tokio::test]
@@ -1845,7 +2395,7 @@ mod tests {
         max_rows: usize,
     ) -> Vec<Result<Vec<u8>, String>> {
         let max = (max_rows > 0).then_some(max_rows);
-        cursor_rows(Arc::clone(state), max, Arc::new(Cursor::new(false, true)))
+        cursor_rows(Arc::clone(state), max, Arc::new(Cursor::new(false, true, 0)))
             .map(|row| row.map(|row| row.data.to_vec()).map_err(|e| e.to_string()))
             .collect()
             .await

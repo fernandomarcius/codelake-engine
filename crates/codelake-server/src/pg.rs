@@ -40,12 +40,17 @@
 //! - a cancel request (`psql`'s Ctrl-C, JDBC `Statement.cancel`,
 //!   `tokio-postgres`' `cancel_query`), which names the connection by its
 //!   process id and secret key: while the connection executes a message (a
-//!   query, an `Execute`), every governed statement of that connection
-//!   fails with `57014`, whether it waits in the queue, is planned, or sends
-//!   rows — open cursors and suspended portals too, which `PostgreSQL`'s
-//!   aborted transaction would close. Between messages, as in `PostgreSQL`,
-//!   a cancel request does nothing: an open cursor or a portal suspended by
-//!   a row limit reads on;
+//!   query, an `Execute`), the governed statements that message runs fail
+//!   with `57014`, whether they wait in the queue, are planned, or send
+//!   rows — the statements it admits, and those whose rows it reads: the
+//!   cursor a `FETCH` reads (which cannot be read again, as `PostgreSQL`'s
+//!   failed portal), the portal an `Execute` resumes ([`Running`]). The
+//!   connection's other open cursors and suspended portals read on, as in
+//!   `PostgreSQL`, where a canceled statement fails only itself (and the
+//!   transaction block it runs in, whose end then closes its cursors): a
+//!   `WITH HOLD` cursor outside a transaction block outlives the cancel of
+//!   a query beside it. Between messages, as in `PostgreSQL`, a cancel
+//!   request does nothing;
 //! - `CALL system.runtime.kill_query(query_id => '…', message => '…')` from
 //!   a connection of the query's owner, for a query of any protocol (its id
 //!   is listed in `system.runtime.queries`); it answers without taking a
@@ -54,7 +59,7 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -76,7 +81,9 @@ use datafusion_postgres::hooks::HookClient;
 use datafusion_postgres::pgwire::api::auth::noop::NoopStartupHandler;
 use datafusion_postgres::pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
 use datafusion_postgres::pgwire::api::portal::{Format, Portal, PortalExecutionState};
-use datafusion_postgres::pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use datafusion_postgres::pgwire::api::query::{
+    ExtendedQueryHandler, SimpleQueryHandler, send_execution_response, send_ready_for_query,
+};
 use datafusion_postgres::pgwire::api::results::FieldInfo;
 use datafusion_postgres::pgwire::api::results::{
     DescribePortalResponse, DescribeStatementResponse, QueryResponse, Response, SendableRowStream, Tag,
@@ -84,17 +91,22 @@ use datafusion_postgres::pgwire::api::results::{
 use datafusion_postgres::pgwire::api::stmt::{QueryParser, StoredStatement};
 use datafusion_postgres::pgwire::api::store::PortalStore;
 use datafusion_postgres::pgwire::api::{
-    ClientInfo, ClientPortalStore, ConnectionManager, ErrorHandler, METADATA_APPLICATION_NAME, METADATA_USER,
-    PgWireServerHandlers, Type,
+    ClientInfo, ClientPortalStore, ConnectionManager, DEFAULT_NAME, ErrorHandler, METADATA_APPLICATION_NAME,
+    METADATA_USER, PgWireServerHandlers, Type,
 };
+use datafusion_postgres::pgwire::api::{ConnectionHandle, PgWireConnectionState, copy};
 use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
 use datafusion_postgres::pgwire::messages::cancel::CancelRequest;
 use datafusion_postgres::pgwire::messages::data::DataRow;
+use datafusion_postgres::pgwire::messages::data::RowDescription;
 use datafusion_postgres::pgwire::messages::extendedquery::{Execute, Sync as PgSync};
+use datafusion_postgres::pgwire::messages::response::EmptyQueryResponse;
 use datafusion_postgres::pgwire::messages::response::TransactionStatus;
 use datafusion_postgres::pgwire::messages::simplequery::Query;
 use datafusion_postgres::{DfSessionService, QueryHook};
+use futures::SinkExt;
+use futures::future::{Either, select};
 use futures::{Sink, Stream};
 use tokio::sync::{Notify, OwnedMutexGuard};
 
@@ -219,15 +231,45 @@ fn connection_key(client: &(impl ClientInfo + ?Sized)) -> ConnectionKey {
     (pid, secret.to_bytes().to_vec())
 }
 
-/// The governed statements alive on each connection, so a cancel request
-/// (which names a connection, not a statement) reaches them, the
-/// connections executing a message, the only ones a cancel request stops,
-/// and the admission slot each connection holds, with its resource group.
+/// The connections executing a message, the only ones a cancel request
+/// stops, each with the governed statements its message runs, so a cancel
+/// request (which names a connection, not a statement) reaches them; and
+/// the admission slot each connection holds, with its resource group.
 #[derive(Default)]
 struct Connections {
-    live: Mutex<HashMap<ConnectionKey, Vec<Weak<QueryRecord>>>>,
-    executing: Mutex<HashMap<ConnectionKey, usize>>,
+    executing: Mutex<HashMap<ConnectionKey, (usize, Arc<Running>)>>,
     slots: Mutex<HashMap<ConnectionKey, HeldSlot>>,
+}
+
+/// The governed statements the message a connection executes runs: those
+/// it admits, and those whose rows it reads ([`GovernedRows`] adds its
+/// statement when a message first reads it) — the only ones a cancel
+/// request stops. Kept in the connection's session extensions.
+#[derive(Default)]
+struct Running {
+    /// The message being executed, counted from the connection's first.
+    message: AtomicU64,
+    records: Mutex<Vec<Weak<QueryRecord>>>,
+}
+
+impl Running {
+    fn of(client: &(impl ClientInfo + ?Sized)) -> Arc<Self> {
+        client.session_extensions().get_or_insert_with(Self::default)
+    }
+
+    /// A message starts: it runs no statement yet.
+    fn start(&self) {
+        self.message.fetch_add(1, Ordering::SeqCst);
+        lock(&self.records).clear();
+    }
+
+    fn add(&self, record: &Arc<QueryRecord>) {
+        lock(&self.records).push(Arc::downgrade(record));
+    }
+
+    fn records(&self) -> Vec<Arc<QueryRecord>> {
+        lock(&self.records).iter().filter_map(Weak::upgrade).collect()
+    }
 }
 
 /// A connection's admission slot, while a statement holds it, and the
@@ -243,7 +285,7 @@ struct Executing {
 impl Drop for Executing {
     fn drop(&mut self) {
         let mut executing = lock(&self.connections.executing);
-        if let Some(count) = executing.get_mut(&self.key) {
+        if let Some((count, _)) = executing.get_mut(&self.key) {
             *count -= 1;
             if *count == 0 {
                 executing.remove(&self.key);
@@ -253,8 +295,15 @@ impl Drop for Executing {
 }
 
 impl Connections {
-    fn execute(self: &Arc<Self>, key: ConnectionKey) -> Executing {
-        *lock(&self.executing).entry(key.clone()).or_default() += 1;
+    /// The connection starts executing a message, whose statements
+    /// `running` gathers.
+    fn execute(self: &Arc<Self>, key: ConnectionKey, running: &Arc<Running>) -> Executing {
+        let mut executing = lock(&self.executing);
+        let (count, _) = executing.entry(key.clone()).or_insert_with(|| {
+            running.start();
+            (0, Arc::clone(running))
+        });
+        *count += 1;
         Executing {
             key,
             connections: Arc::clone(self),
@@ -263,23 +312,6 @@ impl Connections {
 
     fn executing(&self, key: &ConnectionKey) -> bool {
         lock(&self.executing).contains_key(key)
-    }
-
-    fn add(&self, key: &ConnectionKey, record: &Arc<QueryRecord>) {
-        lock(&self.live)
-            .entry(key.clone())
-            .or_default()
-            .push(Arc::downgrade(record));
-    }
-
-    fn remove(&self, key: &ConnectionKey, record: &QueryRecord) {
-        let mut live = lock(&self.live);
-        if let Some(records) = live.get_mut(key) {
-            records.retain(|r| r.strong_count() > 0 && !std::ptr::eq(r.as_ptr(), record));
-            if records.is_empty() {
-                live.remove(key);
-            }
-        }
     }
 
     /// The admission slot a statement of the connection holds, if any, and
@@ -311,22 +343,23 @@ impl Connections {
         lock(&self.slots).insert(key.clone(), (Arc::downgrade(permit), group));
     }
 
+    /// The statements the message the connection executes runs.
     fn records(&self, key: &ConnectionKey) -> Vec<Arc<QueryRecord>> {
-        lock(&self.live)
+        lock(&self.executing)
             .get(key)
-            .map(|records| records.iter().filter_map(Weak::upgrade).collect())
+            .map(|(_, running)| running.records())
             .unwrap_or_default()
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        lock(&self.live).len() + lock(&self.slots).len()
+        lock(&self.executing).len() + lock(&self.slots).len()
     }
 }
 
-/// Cancel requests: when the connection executes a message, fail its
-/// governed statements (their watchers then drop their streams), then let
-/// `datafusion-postgres` stop what it is planning.
+/// Cancel requests: when the connection executes a message, fail the
+/// governed statements it runs (their watchers then drop their streams),
+/// then let `datafusion-postgres` stop what it is planning.
 struct CancelRequests {
     connections: Arc<Connections>,
     inner: DefaultCancelHandler,
@@ -489,6 +522,61 @@ fn governed_text(sql: &str) -> bool {
         .map_or(true, |statements| !statements.iter().all(answered_by_the_session))
 }
 
+/// The command tag of a statement that returned `rows` rows: `SHOW` alone,
+/// as `PostgreSQL` tags it; else the statement's tag and its row count
+/// (`SELECT 3`, as `pgwire` tags them).
+fn completion_tag(command_tag: &str, rows: usize) -> Tag {
+    if command_tag == SHOW_TAG {
+        Tag::new(SHOW_TAG)
+    } else {
+        Tag::new(command_tag).with_rows(rows)
+    }
+}
+
+/// `SHOW`'s command tag (`datafusion-postgres` tags it `SELECT 1`).
+const SHOW_TAG: &str = "SHOW";
+
+/// Tags the answers of `SHOW` statements among `statements`, one answer
+/// each, `SHOW` ([`completion_tag`]).
+fn tag_shows(statements: &[Statement], responses: &mut [Response]) {
+    for (statement, response) in statements.iter().zip(responses.iter_mut()) {
+        if let (Statement::ShowVariable { .. }, Response::Query(query)) = (statement, response) {
+            query.set_command_tag(SHOW_TAG);
+        }
+    }
+}
+
+/// `pgwire`'s `send_query_response` for a simple-protocol message, with
+/// the statement's tag as `PostgreSQL`'s ([`completion_tag`]).
+async fn send_query<C>(client: &mut C, results: QueryResponse) -> PgWireResult<()>
+where
+    C: Sink<PgWireBackendMessage> + Unpin + Send,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    use futures::StreamExt;
+    let QueryResponse {
+        command_tag,
+        row_schema,
+        mut data_rows,
+        ..
+    } = results;
+    let description = RowDescription::new(row_schema.iter().map(Into::into).collect());
+    client
+        .feed(PgWireBackendMessage::RowDescription(description))
+        .await?;
+    let mut rows = 0;
+    while let Some(row) = data_rows.next().await {
+        client.feed(PgWireBackendMessage::DataRow(row?)).await?;
+        rows += 1;
+    }
+    let tag = completion_tag(&command_tag, rows);
+    client
+        .feed(PgWireBackendMessage::CommandComplete(tag.into()))
+        .await?;
+    Ok(())
+}
+
 /// In a failed transaction block only its end runs (`COMMIT`, which rolls
 /// it back, or `ROLLBACK`): anything else fails with `25P02`, as in
 /// `PostgreSQL`, before it reads a cursor or takes a slot.
@@ -591,7 +679,6 @@ impl Drop for Execution {
             self.record
                 .fail(Failure::new(USER_CANCELED, "USER_ERROR", CANCELED));
         }
-        self.connections.remove(&self.connection, &self.record);
         lock(&self.permit).take();
         self.connections.release(&self.connection);
         self.done.notify_one();
@@ -632,6 +719,11 @@ struct GovernedRows {
     slot: Slot,
     execution: Option<Arc<Execution>>,
     rows: u64,
+    /// The connection's messages: a message that reads the rows runs the
+    /// statement, for cancel requests.
+    running: Arc<Running>,
+    /// The last message that read them.
+    message: u64,
 }
 
 impl GovernedRows {
@@ -659,6 +751,11 @@ impl Stream for GovernedRows {
         let Some(execution) = this.execution.clone() else {
             return Poll::Ready(None);
         };
+        let message = this.running.message.load(Ordering::SeqCst);
+        if message != this.message {
+            this.message = message;
+            this.running.add(&execution.record);
+        }
         // A failed query (time limit, cancel) stops here, even when its
         // stream still has rows ready.
         let failed = execution.record.state() == QueryState::Failed;
@@ -704,8 +801,9 @@ impl Stream for GovernedRows {
 }
 
 /// Moves `query`'s rows into a slot the deadline watcher can empty, and
-/// hands `query` governed rows that read them.
-fn govern(execution: &Arc<Execution>, query: &mut QueryResponse) -> Slot {
+/// hands `query` governed rows that read them; the connection's `running`
+/// statements take it in when a message reads them.
+fn govern(execution: &Arc<Execution>, query: &mut QueryResponse, running: &Arc<Running>) -> Slot {
     let rows = std::mem::replace(&mut query.data_rows, Box::pin(futures::stream::empty()));
     let slot: Slot = Arc::new(Mutex::new(SlotState {
         rows: Some(rows),
@@ -715,6 +813,8 @@ fn govern(execution: &Arc<Execution>, query: &mut QueryResponse) -> Slot {
         slot: Arc::clone(&slot),
         execution: Some(Arc::clone(execution)),
         rows: 0,
+        running: Arc::clone(running),
+        message: running.message.load(Ordering::SeqCst),
     });
     slot
 }
@@ -735,7 +835,7 @@ impl Governed {
         let source = metadata(client, METADATA_APPLICATION_NAME).filter(|s| !s.is_empty());
         let record = governance.register(Protocol::Postgres, user, source, sql);
         let connection = connection_key(client);
-        self.connections.add(&connection, &record);
+        Running::of(client).add(&record);
         let execution = Arc::new(Execution {
             record: Arc::clone(&record),
             permit: Mutex::new(None),
@@ -830,6 +930,7 @@ impl Governed {
         admitted: Admitted,
         responses: Vec<Response>,
         cursors: &mut [OwnedMutexGuard<PortalExecutionState>],
+        running: &Arc<Running>,
     ) -> Vec<Response> {
         let Admitted {
             execution,
@@ -841,14 +942,14 @@ impl Governed {
         let mut slots = Vec::new();
         for cursor in cursors.iter_mut() {
             if let PortalExecutionState::Suspended(query) = &mut **cursor {
-                slots.push(govern(&execution, query));
+                slots.push(govern(&execution, query, running));
             }
         }
         let responses = responses
             .into_iter()
             .map(|response| match response {
                 Response::Query(mut query) => {
-                    slots.push(govern(&execution, &mut query));
+                    slots.push(govern(&execution, &mut query, running));
                     Response::Query(query)
                 }
                 Response::Error(info) => {
@@ -901,7 +1002,11 @@ impl Governed {
 
 #[async_trait]
 impl SimpleQueryHandler for Governed {
-    /// `pgwire`'s, with the connection marked as executing while it runs.
+    /// `pgwire`'s (`_on_query`), with the connection marked as executing
+    /// while it runs, and the transaction status it ends in taken from the
+    /// connection's book when a statement set one `pgwire` cannot tell from
+    /// its answer ([`cursor::restated`]: `ROLLBACK TO SAVEPOINT` in a failed
+    /// block, `AND CHAIN`).
     async fn on_query<C>(&self, client: &mut C, query: Query) -> PgWireResult<()>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -909,8 +1014,79 @@ impl SimpleQueryHandler for Governed {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let _executing = self.connections.execute(connection_key(client));
-        self._on_query(client, query).await
+        let _executing = self
+            .connections
+            .execute(connection_key(client), &Running::of(client));
+        if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+            return Err(PgWireError::NotReadyForQuery);
+        }
+        let mut transaction_status = client.transaction_status();
+        client.set_state(PgWireConnectionState::QueryInProgress);
+        let query = query.query;
+        if query.chars().all(|c| c == ';' || c.is_whitespace()) {
+            client
+                .feed(PgWireBackendMessage::EmptyQueryResponse(EmptyQueryResponse::new()))
+                .await?;
+        } else {
+            let cancel = match client.session_extensions().get::<Arc<ConnectionHandle>>() {
+                Some(handle) => Some(handle.start_query().await),
+                None => None,
+            };
+            let responses = match cancel {
+                Some(cancel) => {
+                    match select(SimpleQueryHandler::do_query(self, client, &query), cancel).await {
+                        Either::Left((responses, _)) => responses,
+                        Either::Right(_) => Err(PgWireError::QueryCanceled),
+                    }
+                }
+                None => SimpleQueryHandler::do_query(self, client, &query).await,
+            }?;
+            let mut failed = false;
+            for response in responses {
+                match response {
+                    Response::EmptyQuery => {
+                        client
+                            .feed(PgWireBackendMessage::EmptyQueryResponse(EmptyQueryResponse::new()))
+                            .await?;
+                    }
+                    Response::Query(results) => send_query(client, results).await?,
+                    Response::Execution(tag) => send_execution_response(client, tag).await?,
+                    Response::TransactionStart(tag) => {
+                        send_execution_response(client, tag).await?;
+                        transaction_status = transaction_status.to_in_transaction_state();
+                    }
+                    Response::TransactionEnd(tag) => {
+                        send_execution_response(client, tag).await?;
+                        transaction_status = transaction_status.to_idle_state();
+                    }
+                    Response::Error(error) => {
+                        client
+                            .feed(PgWireBackendMessage::ErrorResponse((*error).into()))
+                            .await?;
+                        transaction_status = transaction_status.to_error_state();
+                        failed = true;
+                    }
+                    Response::CopyIn(result) => {
+                        copy::send_copy_in_response(client, result).await?;
+                        client.set_state(PgWireConnectionState::CopyInProgress(false));
+                    }
+                    Response::CopyOut(result) => copy::send_copy_out_response(client, result).await?,
+                    Response::CopyBoth(result) => {
+                        copy::send_copy_both_response(client, result).await?;
+                        client.set_state(PgWireConnectionState::CopyInProgress(false));
+                    }
+                }
+            }
+            if let Some(status) = cursor::restated(&*client).filter(|_| !failed) {
+                transaction_status = status;
+            }
+        }
+        if !matches!(client.state(), PgWireConnectionState::CopyInProgress(_)) {
+            client.set_state(PgWireConnectionState::ReadyForQuery);
+            client.set_transaction_status(transaction_status);
+            send_ready_for_query(client, transaction_status).await?;
+        }
+        Ok(())
     }
 
     /// Runs the message's statements in the connection's transaction: when
@@ -926,17 +1102,61 @@ impl SimpleQueryHandler for Governed {
         let rewritten = cursor::abort_as_rollback(query);
         let query = rewritten.as_deref().unwrap_or(query);
         let statements = Parser::parse_sql(&PostgreSqlDialect {}, query);
-        cursor::begin_simple(&*client, statements.as_ref().map_or(1, Vec::len));
-        let outcome = match statements {
-            Ok(statements) => self.simple(client, query, statements).await,
-            Err(error) => match cursor::unparsed(query, &error) {
-                Some(Ok(fetch)) => self.simple(client, query, vec![fetch]).await,
-                Some(Err(error)) => Err(error),
-                None => self.simple(client, query, Vec::new()).await,
-            },
+        let read = match &statements {
+            Ok(_) => None,
+            Err(error) => cursor::statements(query, error),
+        };
+        let count = match (&statements, &read) {
+            (Ok(statements), _) => statements.len(),
+            (_, Some(Ok(read))) => read.len(),
+            _ => 1,
+        };
+        cursor::begin_simple(&*client, count);
+        let outcome = match (statements, read) {
+            (Ok(statements), _) => self.simple(client, query, statements).await,
+            (Err(_), Some(Ok(mut read))) if read.len() == 1 => {
+                let (_, fetch) = read.remove(0);
+                self.simple(client, query, vec![fetch]).await
+            }
+            (Err(_), Some(Ok(read))) => self.one_by_one(client, read).await,
+            (Err(_), Some(Err(error))) => Err(error),
+            (Err(_), None) => self.simple(client, query, Vec::new()).await,
         };
         cursor::end_simple(&*client, outcome.is_ok());
         outcome
+    }
+}
+
+impl Governed {
+    /// A simple-protocol message whose statements the SQL parser does not
+    /// all read — a `FETCH` or `MOVE` of the forms it does not read, among
+    /// others — run one after the other, each read on its own
+    /// ([`cursor::statements`]), in the message's transaction, as
+    /// `PostgreSQL` runs them: a `FETCH` among them holds its rows in the
+    /// pool until they are sent ([`cursor::fetch_among`]), as one the parser
+    /// reads does. The first that fails fails the message.
+    async fn one_by_one<C>(
+        &self,
+        client: &mut C,
+        statements: Vec<(String, Statement)>,
+    ) -> PgWireResult<Vec<Response>>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let pool = Arc::clone(&self.engine.context().runtime_env().memory_pool);
+        let mut responses = Vec::new();
+        for (sql, statement) in statements {
+            if matches!(statement, Statement::Fetch { .. }) {
+                aborted(&*client, &statement)?;
+                responses.push(cursor::fetch_among(&*client, &sql, &statement, &pool).await?);
+            } else {
+                responses.extend(self.simple(client, &sql, vec![statement]).await?);
+            }
+        }
+        Ok(responses)
     }
 }
 
@@ -960,17 +1180,24 @@ impl Governed {
         if let [statement] = statements.as_slice() {
             cursor::check_declare(&*client, statement)?;
         }
+        cursor::will_run(
+            &*client,
+            (!statements.is_empty()).then_some(statements.as_slice()),
+        );
         if let Some(request) = kill_request_sql(query) {
             return Ok(vec![self.kill(client, request)?]);
         }
         client.metadata_mut().remove(QUERY_ID);
         if let [statement] = statements.as_slice()
-            && let Some(response) = cursor::fetch(&*client, query, statement, &Format::UnifiedText).await
+            && let Some(response) =
+                cursor::fetch(&*client, query, statement, &Format::UnifiedText, None).await
         {
             return Ok(vec![response?]);
         }
         if !governed_text(query) {
-            return SimpleQueryHandler::do_query(&*self.inner, client, query).await;
+            let mut responses = SimpleQueryHandler::do_query(&*self.inner, client, query).await?;
+            tag_shows(&statements, &mut responses);
+            return Ok(responses);
         }
         let declared = cursor::Declared::before(&*client, cursor::declared_names(&statements));
         let admitted = self.admit(client, query).await?;
@@ -981,10 +1208,11 @@ impl Governed {
                 SimpleQueryHandler::do_query(&*self.inner, client, query),
             )
             .await;
-        let responses = declared.settle(client, responses)?;
+        let mut responses = declared.settle(client, responses)?;
+        tag_shows(&statements, &mut responses);
         declared.attach(&*client, &admitted.execution.record);
         let mut cursors = declared.states(client).await;
-        Ok(self.run(admitted, responses, &mut cursors))
+        Ok(self.run(admitted, responses, &mut cursors, &Running::of(&*client)))
     }
 }
 
@@ -1018,8 +1246,25 @@ impl ExtendedQueryHandler for Governed {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let _executing = self.connections.execute(connection_key(client));
-        execute::execute(self, client, message).await
+        let _executing = self
+            .connections
+            .execute(connection_key(client), &Running::of(client));
+        let portal = client
+            .portal_store()
+            .get_portal(message.name.as_deref().unwrap_or(DEFAULT_NAME));
+        execute::execute(self, client, message).await?;
+        if let Some(portal) = portal
+            && !matches!(*portal.state().lock().await, PortalExecutionState::Suspended(_))
+        {
+            let statement = portal
+                .statement
+                .statement
+                .1
+                .as_ref()
+                .map(|(statement, _)| statement);
+            cursor::executed(&*client, statement);
+        }
+        Ok(())
     }
 
     async fn do_describe_statement<C>(
@@ -1038,7 +1283,15 @@ impl ExtendedQueryHandler for Governed {
         {
             return Ok(DescribeStatementResponse::new(Vec::new(), fields?));
         }
-        ExtendedQueryHandler::do_describe_statement(&*self.inner, client, target).await
+        let described = ExtendedQueryHandler::do_describe_statement(&*self.inner, client, target).await?;
+        // A DECLARE is planned as its query, for its parameters: it returns
+        // no rows, as PostgreSQL describes it.
+        if let (_, Some((statement, _))) = &target.statement
+            && cursor::declares_one(statement).is_some()
+        {
+            return Ok(DescribeStatementResponse::new(described.parameters, Vec::new()));
+        }
+        Ok(described)
     }
 
     async fn do_describe_portal<C>(
@@ -1057,6 +1310,11 @@ impl ExtendedQueryHandler for Governed {
                 cursor::fetch_fields(&*client, sql, statement, &target.result_column_format).await
         {
             return Ok(DescribePortalResponse::new(fields?));
+        }
+        if let (_, Some((statement, _))) = &target.statement.statement
+            && cursor::declares_one(statement).is_some()
+        {
+            return Ok(DescribePortalResponse::new(Vec::new()));
         }
         ExtendedQueryHandler::do_describe_portal(&*self.inner, client, target).await
     }
@@ -1079,12 +1337,24 @@ impl ExtendedQueryHandler for Governed {
             aborted(&*client, statement)?;
             cursor::check_declare(&*client, statement)?;
         }
+        cursor::will_run(
+            &*client,
+            Some(
+                parsed
+                    .as_ref()
+                    .map_or(&[], |(statement, _)| std::slice::from_ref(statement)),
+            ),
+        );
         if let Some(request) = parsed.as_ref().and_then(|(statement, _)| kill_request(statement)) {
             return self.kill(client, request);
         }
+        // With a row limit the portal may be left suspended: its FETCH reads
+        // its rows at once, held in the pool (cursor::fetch).
+        let pool = Arc::clone(&self.engine.context().runtime_env().memory_pool);
+        let held_in = (max_rows > 0).then_some(&pool);
         if let Some((statement, _)) = parsed
             && let Some(response) =
-                cursor::fetch(&*client, sql, statement, &portal.result_column_format).await
+                cursor::fetch(&*client, sql, statement, &portal.result_column_format, held_in).await
         {
             return response;
         }
@@ -1093,7 +1363,14 @@ impl ExtendedQueryHandler for Governed {
             .as_ref()
             .is_some_and(|(statement, _)| !answered_by_the_session(statement));
         if !governed {
-            return ExtendedQueryHandler::do_query(&*self.inner, client, portal, max_rows).await;
+            let mut response = ExtendedQueryHandler::do_query(&*self.inner, client, portal, max_rows).await?;
+            if let Some((statement, _)) = parsed {
+                tag_shows(
+                    std::slice::from_ref(statement),
+                    std::slice::from_mut(&mut response),
+                );
+            }
+            return Ok(response);
         }
         let declared = cursor::Declared::before(
             &*client,
@@ -1111,7 +1388,7 @@ impl ExtendedQueryHandler for Governed {
         declared.attach(&*client, &admitted.execution.record);
         let mut cursors = declared.states(client).await;
         Ok(self
-            .run(admitted, vec![response], &mut cursors)
+            .run(admitted, vec![response], &mut cursors, &Running::of(&*client))
             .pop()
             .unwrap_or(Response::EmptyQuery))
     }
@@ -1196,27 +1473,33 @@ mod tests {
         };
         let mine = QueryRecord::detached("q1", Protocol::Postgres, "u", "SELECT 1");
         let other = QueryRecord::detached("q2", Protocol::Postgres, "u", "SELECT 2");
+        let held = QueryRecord::detached("q3", Protocol::Postgres, "u", "DECLARE h CURSOR WITH HOLD");
         let key = (7, vec![1, 2, 3, 4]);
         let other_key = (7, vec![9, 9, 9, 9]);
-        connections.add(&key, &mine);
-        connections.add(&other_key, &other);
+        let (running, other_running) = (Arc::new(Running::default()), Arc::new(Running::default()));
+        // A statement of an earlier message (the held cursor's).
+        let earlier = connections.execute(key.clone(), &running);
+        running.add(&held);
+        drop(earlier);
         // Between messages a cancel request does nothing.
         assert_eq!(requests.cancel(&key), 0);
-        assert!(mine.failure().is_none());
-        let executing = connections.execute(key.clone());
-        let _other_executing = connections.execute(other_key.clone());
+        let executing = connections.execute(key.clone(), &running);
+        let other_executing = connections.execute(other_key.clone(), &other_running);
+        running.add(&mine);
+        other_running.add(&other);
         // Same process id, another secret key: nothing is canceled.
         assert_eq!(requests.cancel(&(7, vec![0, 0, 0, 0])), 0);
+        // Only what the message runs: not the cursor an earlier one opened.
         assert_eq!(requests.cancel(&key), 1);
         drop(executing);
         assert!(!connections.executing(&key), "the message is done");
         assert!(connections.executing(&other_key));
         assert_eq!(mine.failure().map(|f| f.message), Some(CANCELED.to_owned()));
         assert!(mine.cancellation().is_cancelled());
+        assert!(held.failure().is_none(), "the held cursor was canceled");
         assert!(other.failure().is_none());
-        connections.remove(&key, &mine);
-        connections.remove(&other_key, &other);
-        assert_eq!(connections.len(), 0, "entries go away with their statements");
+        drop(other_executing);
+        assert_eq!(connections.len(), 0, "entries go away with their messages");
     }
 
     #[test]

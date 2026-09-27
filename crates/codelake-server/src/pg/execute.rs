@@ -13,20 +13,18 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use datafusion_postgres::pgwire::api::portal::{Portal, PortalExecutionState};
-use datafusion_postgres::pgwire::api::query::{
-    ExtendedQueryHandler, send_execution_response, send_partial_query_response,
-};
-use datafusion_postgres::pgwire::api::results::{Response, Tag};
+use datafusion_postgres::pgwire::api::query::{ExtendedQueryHandler, send_execution_response};
+use datafusion_postgres::pgwire::api::results::{QueryResponse, Response, Tag};
 use datafusion_postgres::pgwire::api::store::PortalStore;
 use datafusion_postgres::pgwire::api::{
     ClientInfo, ClientPortalStore, ConnectionHandle, DEFAULT_NAME, PgWireConnectionState, copy,
 };
 use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
-use datafusion_postgres::pgwire::messages::extendedquery::Execute;
+use datafusion_postgres::pgwire::messages::extendedquery::{Execute, PortalSuspended};
 use datafusion_postgres::pgwire::messages::response::{EmptyQueryResponse, TransactionStatus};
 use futures::future::{Either, select};
-use futures::{Sink, SinkExt};
+use futures::{Sink, SinkExt, StreamExt};
 
 /// Runs the portal `message` names (when not started yet) and sends up to
 /// `max_rows` of its rows (all when `0`), as `pgwire`'s default does, one
@@ -70,7 +68,13 @@ where
             },
             None => handler.do_query(client, portal.as_ref(), max_rows).await,
         }?;
-        send_response(client, portal.as_ref(), response, &mut transaction_status).await?
+        let has_rows = send_response(client, portal.as_ref(), response, &mut transaction_status).await?;
+        // ROLLBACK TO SAVEPOINT in a failed block, AND CHAIN: statuses
+        // pgwire cannot tell from the answer.
+        if let Some(status) = super::cursor::restated(&*client) {
+            transaction_status = status;
+        }
+        has_rows
     } else {
         // Suspended or finished: send what is left.
         true
@@ -170,7 +174,7 @@ where
                 .await?;
         }
         PortalExecutionState::Suspended(response) => {
-            match send_partial_query_response(client, response, max_rows).await {
+            match send_partial(client, response, max_rows).await {
                 Ok(true) => {}
                 Ok(false) => *state = PortalExecutionState::Finished,
                 Err(error) => {
@@ -183,4 +187,34 @@ where
         }
     }
     Ok(())
+}
+
+/// Sends up to `max_rows` of `results` (all when `0`), then
+/// `PortalSuspended` (`true`) or `CommandComplete` (`false`), as `pgwire`'s
+/// `send_partial_query_response` does, with the statement's tag as
+/// `PostgreSQL`'s ([`super::completion_tag`]: `SHOW` without a row count).
+async fn send_partial<C>(client: &mut C, results: &mut QueryResponse, max_rows: usize) -> PgWireResult<bool>
+where
+    C: Sink<PgWireBackendMessage> + Unpin,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    let command_tag = results.command_tag().to_owned();
+    let data_rows = results.data_rows();
+    let mut rows = 0;
+    while max_rows == 0 || rows < max_rows {
+        let Some(row) = data_rows.next().await else {
+            let tag = super::completion_tag(&command_tag, rows);
+            client
+                .send(PgWireBackendMessage::CommandComplete(tag.into()))
+                .await?;
+            return Ok(false);
+        };
+        client.feed(PgWireBackendMessage::DataRow(row?)).await?;
+        rows += 1;
+    }
+    client
+        .send(PgWireBackendMessage::PortalSuspended(PortalSuspended::new()))
+        .await?;
+    Ok(true)
 }

@@ -864,6 +864,21 @@ impl Wire {
         self.bind_portal("", statement, format);
     }
 
+    /// Binds `statement` to the unnamed portal with `params` as text,
+    /// results in text.
+    fn bind_params(&mut self, statement: &str, params: &[&str]) {
+        let mut body = [cstr(""), cstr(statement)].concat();
+        body.extend(0_i16.to_be_bytes());
+        body.extend(i16::try_from(params.len()).unwrap().to_be_bytes());
+        for param in params {
+            body.extend(i32::try_from(param.len()).unwrap().to_be_bytes());
+            body.extend(param.as_bytes());
+        }
+        body.extend(1_i16.to_be_bytes());
+        body.extend(0_i16.to_be_bytes());
+        self.send(b'B', &body);
+    }
+
     /// Binds `statement` to `portal`, results in `format`.
     fn bind_portal(&mut self, portal: &str, statement: &str, format: i16) {
         let tail = [
@@ -1204,6 +1219,46 @@ async fn transaction_end_closes_cursors_and_portals() {
     cursors_need_a_transaction_block(&server, &client).await;
     held_cursors_outlive_their_commit(&server, &client).await;
     portals_end_with_their_transaction(&server).await;
+    abort_takes_no_slot(&server, &client).await;
+}
+
+/// `ABORT` is transaction control, as `ROLLBACK` is: it takes no admission
+/// slot, on either protocol, in a failed transaction block too, so it
+/// answers at once while another connection of its user holds the user's
+/// only slot. (The SQL parser does not read `ABORT`: read as a query, it
+/// queued behind the other connection's statement; the third F6
+/// verification found no test of it.)
+async fn abort_takes_no_slot(server: &Server, client: &Client) {
+    let other = server.connect("tx").await;
+    other
+        .batch_execute(&format!("BEGIN; DECLARE busy CURSOR FOR {STREAMS_WITH_MEMORY}"))
+        .await
+        .unwrap();
+    assert_eq!(text_rows(&other, "FETCH 1 FROM busy").await.len(), 1);
+    assert_eq!(load(server).await, (1, 0), "the other connection holds the slot");
+    let at_once = Duration::from_secs(10);
+    for abort in ["ABORT", "abort work"] {
+        client.batch_execute("BEGIN").await.unwrap();
+        tokio::time::timeout(at_once, client.batch_execute(abort))
+            .await
+            .unwrap_or_else(|_| panic!("{abort} queued"))
+            .unwrap();
+        client.batch_execute("BEGIN").await.unwrap();
+        tokio::time::timeout(at_once, client.execute(abort, &[]))
+            .await
+            .unwrap_or_else(|_| panic!("{abort} queued on the extended protocol"))
+            .unwrap();
+    }
+    // In a failed transaction block (a FETCH of no cursor takes no slot).
+    client.batch_execute("BEGIN").await.unwrap();
+    client.simple_query("FETCH 1 FROM nothing").await.unwrap_err();
+    tokio::time::timeout(at_once, client.batch_execute("ABORT"))
+        .await
+        .expect("ABORT queued in a failed transaction block")
+        .unwrap();
+    assert_eq!(load(server).await, (1, 0), "ABORT took no slot");
+    other.batch_execute("ROLLBACK").await.unwrap();
+    server.slots_free().await;
 }
 
 async fn commit_and_rollback_close_cursors(server: &Server, client: &Client) {
@@ -1499,6 +1554,8 @@ fn cursor_script() -> Vec<(String, Want)> {
         beside_cursors_script(),
         discard_script(),
         names_script(),
+        unparsed_script(),
+        savepoints_script(),
     ]
     .into_iter()
     .flatten()
@@ -1619,11 +1676,138 @@ fn transactions_script() -> Vec<(String, Want)> {
     ]
 }
 
-/// Cursor names are folded to lower case unless quoted.
+/// `FETCH` and `MOVE` the SQL parser does not read, among other statements
+/// of a message: run one by one, as PostgreSQL runs them, a statement
+/// neither reads failing the message before any of it runs. (Found by the
+/// third F6 verification: they failed with 42601.)
+fn unparsed_script() -> Vec<(String, Want)> {
+    use Want::{Code, Rows};
+    let none = Want::none;
+    let declare = |name: &str| format!("DECLARE {name} NO SCROLL CURSOR FOR {TEN}");
+    vec![
+        (format!("BEGIN; {}", declare("u")), none()),
+        ("FETCH FROM u; FETCH 1 FROM u".into(), Rows(vec![1, 2])),
+        ("MOVE 1 IN u; FETCH u".into(), Rows(vec![4])),
+        (
+            "SELECT 5; FETCH NEXT u; MOVE u; FETCH 2 u; ".into(),
+            Rows(vec![5, 5, 7, 8]),
+        ),
+        ("FETCH u; SELEC 1".into(), Code("42601")),
+        ("ROLLBACK".into(), none()),
+        (
+            format!("{}; FETCH w; MOVE 7 IN w; FETCH ALL w", declare("w")),
+            Rows(vec![1, 9, 10]),
+        ),
+        ("FETCH 1 FROM w".into(), Code("34000")),
+    ]
+}
+
+/// Savepoints and `AND CHAIN`, as PostgreSQL treats the cursors in them:
+/// `ROLLBACK TO SAVEPOINT` closes the cursors declared since, keeps the
+/// others where they stand and ends the failed state; `RELEASE` keeps
+/// them; `AND CHAIN` begins a new transaction at once. (Found by the third
+/// F6 verification: `SAVEPOINT` and `RELEASE` failed with XX000, `ROLLBACK
+/// TO SAVEPOINT` ended the whole transaction, and `AND CHAIN` began none.)
+fn savepoints_script() -> Vec<(String, Want)> {
+    savepoints_and_cursors_script()
+        .into_iter()
+        .chain(chain_script())
+        .collect()
+}
+
+fn savepoints_and_cursors_script() -> Vec<(String, Want)> {
+    use Want::{Code, Rows};
+    let none = Want::none;
+    let declare = |name: &str, how: &str| format!("DECLARE {name} {how} FOR {TEN}");
+    vec![
+        ("BEGIN".into(), none()),
+        (declare("sa", "NO SCROLL CURSOR"), none()),
+        ("FETCH 1 FROM sa".into(), Rows(vec![1])),
+        ("SAVEPOINT s1".into(), none()),
+        (declare("sb", "CURSOR"), none()),
+        ("FETCH 1 FROM sa".into(), Rows(vec![2])),
+        ("SAVEPOINT s2".into(), none()),
+        ("FETCH 1 FROM nothing".into(), Code("34000")),
+        ("FETCH 1 FROM sa".into(), Code("25P02")),
+        ("RELEASE s2".into(), Code("25P02")),
+        ("ROLLBACK TO SAVEPOINT s2".into(), none()),
+        ("FETCH 1 FROM sa".into(), Rows(vec![3])),
+        ("FETCH 1 FROM sb".into(), Rows(vec![1])),
+        ("ROLLBACK TO s1".into(), none()),
+        ("FETCH 1 FROM sa".into(), Rows(vec![4])),
+        ("FETCH 1 FROM sb".into(), Code("34000")),
+        ("ROLLBACK TO S1".into(), none()),
+        ("RELEASE SAVEPOINT s1".into(), none()),
+        ("RELEASE s1".into(), Code("3B001")),
+        ("ROLLBACK TO s1".into(), Code("3B001")),
+        ("ROLLBACK".into(), none()),
+        ("FETCH 1 FROM sa".into(), Code("34000")),
+        // Outside a transaction block.
+        ("SAVEPOINT x".into(), Code("25P01")),
+        ("RELEASE x".into(), Code("25P01")),
+        ("ROLLBACK TO x".into(), Code("25P01")),
+        // A name set twice: the last savepoint of that name.
+        ("BEGIN; SAVEPOINT d".into(), none()),
+        (declare("d1", "CURSOR"), none()),
+        ("SAVEPOINT d".into(), none()),
+        (declare("d2", "CURSOR"), none()),
+        ("ROLLBACK TO d".into(), none()),
+        ("FETCH 1 FROM d1".into(), Rows(vec![1])),
+        ("FETCH 1 FROM d2".into(), Code("34000")),
+        ("ROLLBACK".into(), none()),
+    ]
+}
+
+/// `AND CHAIN`: the transaction ends as `COMMIT` or `ROLLBACK` ends it (a
+/// failed one is rolled back), and the next one is open at once; outside a
+/// transaction block it fails.
+fn chain_script() -> Vec<(String, Want)> {
+    use Want::{Code, Rows};
+    let none = Want::none;
+    let declare = |name: &str, how: &str| format!("DECLARE {name} {how} FOR {TEN}");
+    vec![
+        ("COMMIT AND CHAIN".into(), Code("25P01")),
+        ("ROLLBACK AND CHAIN".into(), Code("25P01")),
+        ("BEGIN".into(), none()),
+        (declare("ch", "CURSOR WITH HOLD"), none()),
+        (declare("cn", "CURSOR"), none()),
+        ("COMMIT AND CHAIN".into(), none()),
+        ("FETCH 1 FROM ch".into(), Rows(vec![1])),
+        (declare("cm", "CURSOR"), none()),
+        ("ROLLBACK AND CHAIN".into(), none()),
+        ("FETCH 1 FROM cm".into(), Code("34000")),
+        ("COMMIT AND CHAIN".into(), none()),
+        (declare("cn", "CURSOR"), none()),
+        ("FETCH 1 FROM ch".into(), Rows(vec![2])),
+        ("COMMIT".into(), none()),
+        ("CLOSE ch".into(), none()),
+    ]
+}
+
+/// Cursor names are folded to lower case unless quoted, and cut to 63
+/// bytes, never inside a character, as PostgreSQL cuts identifiers.
 fn names_script() -> Vec<(String, Want)> {
     use Want::{Code, Rows};
     let none = Want::none;
+    let long = "Long".repeat(18);
+    let cut = "long".repeat(18)[..63].to_owned();
+    let accented = format!("{}é", "a".repeat(62));
+    let accented_cut = "a".repeat(62);
     vec![
+        (
+            format!("BEGIN; DECLARE {long} NO SCROLL CURSOR FOR {TEN}"),
+            none(),
+        ),
+        (format!("FETCH 1 FROM {cut}"), Rows(vec![1])),
+        (format!("FETCH 1 FROM {long}"), Rows(vec![2])),
+        (format!("MOVE 1 IN {long}"), none()),
+        (format!("CLOSE {long}"), none()),
+        (format!("FETCH 1 FROM {cut}"), Code("34000")),
+        ("ROLLBACK".into(), none()),
+        (format!("BEGIN; DECLARE \"{accented}\" CURSOR FOR {TEN}"), none()),
+        (format!("FETCH 1 FROM \"{accented_cut}\""), Rows(vec![1])),
+        (format!("FETCH 1 FROM \"{accented}\""), Rows(vec![2])),
+        ("ROLLBACK".into(), none()),
         (format!("BEGIN; DECLARE Big NO SCROLL CURSOR FOR {TEN}"), none()),
         ("FETCH 1 FROM big".into(), Rows(vec![1])),
         ("FETCH 1 FROM BIG".into(), Rows(vec![2])),
@@ -1697,6 +1881,11 @@ fn beside_cursors_script() -> Vec<(String, Want)> {
 enum Step {
     Simple(String),
     Extended(String),
+    /// On the extended protocol with parameters bound as text, the portal
+    /// described before it runs (psycopg3's server-side cursors).
+    Bound(String, Vec<&'static str>),
+    /// Statements on the extended protocol, one `Sync` after them all.
+    Pipeline(Vec<String>),
 }
 
 /// What a client sees of one step: its command tags, the text of its rows
@@ -1725,8 +1914,33 @@ async fn exchanged(
                         wire.execute();
                         wire.sync()
                     }
+                    Step::Pipeline(statements) => {
+                        for sql in statements {
+                            wire.parse("", sql);
+                            wire.bind("", 0);
+                            wire.execute();
+                        }
+                        wire.sync()
+                    }
+                    Step::Bound(sql, params) => {
+                        wire.parse("", sql);
+                        wire.bind_params("", params);
+                        wire.describe(b'P', "");
+                        wire.execute();
+                        wire.sync()
+                    }
                 };
-                (tags(&messages), data_rows(&messages), error_code(&messages))
+                // How a bound portal was described: no rows (NoData) or rows.
+                let described = messages
+                    .iter()
+                    .find_map(|(kind, _)| match kind {
+                        b'n' => Some("NoData".to_owned()),
+                        b'T' => Some("RowDescription".to_owned()),
+                        _ => None,
+                    })
+                    .filter(|_| matches!(step, Step::Bound(..)));
+                let tags = described.into_iter().chain(tags(&messages)).collect();
+                (tags, data_rows(&messages), error_code(&messages))
             })
             .collect()
     })
@@ -1813,6 +2027,9 @@ fn extended_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
     .into_iter()
     .chain(session_scripts())
     .chain(move_scripts())
+    .chain(parameter_scripts())
+    .chain(pipeline_scripts())
+    .chain(tag_scripts())
     .collect()
 }
 
@@ -1890,6 +2107,150 @@ fn move_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
         script(vec![Extended("MOVE -1 IN m".into())], vec![failed("55000")]),
         script(vec![Simple("MOVE 2147483648 IN m".into())], vec![failed("42601")]),
     ]
+}
+
+/// A `DECLARE` with parameters on the extended protocol (psycopg3's
+/// server-side cursors): described with no rows, its query run with the
+/// values bound. (Found by the third F6 verification: XX000, the query
+/// planned without its values.)
+fn parameter_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
+    use Step::{Bound, Extended, Simple};
+    let ok = |tag: &str| (vec![tag.to_owned()], Vec::new(), None);
+    let rows = |tag: &str, values: &[i64]| {
+        (
+            vec![tag.to_owned()],
+            values.iter().map(|v| vec![v.to_string()]).collect(),
+            None,
+        )
+    };
+    let declare = |name: &str, how: &str| format!("DECLARE {name} {how} FOR {TEN}");
+    vec![(
+        vec![
+            Simple("BEGIN".into()),
+            Bound(
+                format!("{} WHERE x > $1 AND x < $2", declare("pc", "CURSOR")),
+                vec!["2", "5"],
+            ),
+            Extended("FETCH ALL FROM pc".into()),
+            Bound(
+                format!("{} WHERE x = $1", declare("pd", "NO SCROLL CURSOR")),
+                vec!["9"],
+            ),
+            Simple("FETCH 2 FROM pd".into()),
+            // `IS DISTINCT FROM` binds tighter than `AND`, as in PostgreSQL
+            // (the DECLARE is planned apart from the other statements).
+            Bound(
+                format!(
+                    "{} WHERE x IS DISTINCT FROM $1 AND x < 3",
+                    declare("pe", "CURSOR")
+                ),
+                vec!["1"],
+            ),
+            Extended("FETCH ALL FROM pe".into()),
+            Simple("ROLLBACK".into()),
+        ],
+        vec![
+            ok("BEGIN"),
+            (
+                vec!["NoData".to_owned(), "DECLARE CURSOR".to_owned()],
+                Vec::new(),
+                None,
+            ),
+            rows("FETCH 2", &[3, 4]),
+            (
+                vec!["NoData".to_owned(), "DECLARE CURSOR".to_owned()],
+                Vec::new(),
+                None,
+            ),
+            rows("FETCH 1", &[9]),
+            (
+                vec!["NoData".to_owned(), "DECLARE CURSOR".to_owned()],
+                Vec::new(),
+                None,
+            ),
+            rows("FETCH 1", &[2]),
+            ok("ROLLBACK"),
+        ],
+    )]
+}
+
+/// In a pipeline, after a statement completed, `DISCARD ALL` fails as in a
+/// transaction block; first in the pipeline it runs, closing the cursor the
+/// next statement reads. (Found by the third F6 verification: the `DISCARD
+/// ALL` ran after the `SELECT`.)
+fn pipeline_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
+    use Step::{Pipeline, Simple};
+    let ok = |tag: &str| (vec![tag.to_owned()], Vec::new(), None);
+    let rows = |tag: &str, values: &[i64]| {
+        (
+            vec![tag.to_owned()],
+            values.iter().map(|v| vec![v.to_string()]).collect(),
+            None,
+        )
+    };
+    let declare = |name: &str, how: &str| format!("DECLARE {name} {how} FOR {TEN}");
+    vec![(
+        vec![
+            Simple(declare("z", "CURSOR WITH HOLD")),
+            Pipeline(vec!["SELECT 1".into(), "DISCARD ALL".into()]),
+            Simple("FETCH 1 FROM z".into()),
+            Pipeline(vec!["DISCARD ALL".into(), "FETCH 1 FROM z".into()]),
+            Pipeline(vec!["SELECT 2".into(), "COMMIT".into(), "DISCARD ALL".into()]),
+        ],
+        vec![
+            ok("DECLARE CURSOR"),
+            (
+                vec!["SELECT 1".to_owned()],
+                vec![vec!["1".to_owned()]],
+                Some("25001".to_owned()),
+            ),
+            rows("FETCH 1", &[1]),
+            (
+                vec!["DISCARD ALL".to_owned()],
+                Vec::new(),
+                Some("34000".to_owned()),
+            ),
+            (
+                vec![
+                    "SELECT 1".to_owned(),
+                    "COMMIT".to_owned(),
+                    "DISCARD ALL".to_owned(),
+                ],
+                vec![vec!["2".to_owned()]],
+                None,
+            ),
+        ],
+    )]
+}
+
+/// Tags as PostgreSQL's: `SHOW` without a row count, `START TRANSACTION`
+/// as written. (Found by the third F6 verification: `SELECT 1` and
+/// `BEGIN`.)
+fn tag_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
+    use Step::{Extended, Simple};
+    let ok = |tag: &str| (vec![tag.to_owned()], Vec::new(), None);
+    vec![(
+        vec![
+            Simple("SHOW statement_timeout".into()),
+            Extended("SHOW statement_timeout".into()),
+            Simple("START TRANSACTION".into()),
+            Extended("START TRANSACTION".into()),
+            Extended("COMMIT".into()),
+            Extended("START TRANSACTION".into()),
+            Simple("BEGIN".into()),
+            Simple("ROLLBACK".into()),
+        ],
+        vec![
+            (vec!["SHOW".to_owned()], vec![vec!["0".to_owned()]], None),
+            (vec!["SHOW".to_owned()], vec![vec!["0".to_owned()]], None),
+            ok("START TRANSACTION"),
+            ok("START TRANSACTION"),
+            ok("COMMIT"),
+            ok("START TRANSACTION"),
+            ok("BEGIN"),
+            ok("ROLLBACK"),
+        ],
+    )]
 }
 
 /// Wire scripts of the statements that end or reset a session's
@@ -2070,6 +2431,9 @@ async fn cursors_answer_like_postgresql() {
     for client in [&postgres, &engine] {
         moves_through_a_driver(client).await;
     }
+    suspended_fetches_answer_like_postgresql(&host, port, server.pg).await;
+    savepoints_answer_like_postgresql(&host, port, server.pg).await;
+    rollback_to_refused_after_a_write(&engine).await;
     // On the extended protocol too, a DECLARE needs a transaction block.
     let declare = format!("DECLARE x CURSOR FOR {TEN}");
     for client in [&postgres, &engine] {
@@ -2082,6 +2446,205 @@ async fn cursors_answer_like_postgresql() {
     }
     server.slots_free().await;
     assert_eq!(server.pool_drains().await, 0);
+}
+
+/// The engine's writes are not transactional: a `ROLLBACK TO SAVEPOINT`
+/// after a statement that may write fails rather than leave the write as
+/// if it were undone; after reads only it runs.
+async fn rollback_to_refused_after_a_write(engine: &Client) {
+    for (sql, want) in [
+        ("BEGIN; SAVEPOINT r", Some(Ok(Vec::new()))),
+        ("SELECT 1", Some(Ok(vec![vec!["1".to_owned()]]))),
+        ("ROLLBACK TO r", Some(Ok(Vec::new()))),
+        ("INSERT INTO nowhere VALUES (1)", None),
+        ("ROLLBACK TO r", Some(Err("0A000".to_owned()))),
+        ("ROLLBACK", Some(Ok(Vec::new()))),
+    ] {
+        let answered = seen(engine, sql).await;
+        match want {
+            Some(want) => assert_eq!(answered, want, "engine: {sql}"),
+            None => assert!(answered.is_err(), "engine: {sql}"),
+        }
+    }
+}
+
+/// The transaction statuses of [`savepoint_statuses`] on PostgreSQL
+/// (`host`, `port`) and on the engine (`engine`).
+async fn savepoints_answer_like_postgresql(host: &str, port: u16, engine: u16) {
+    let want = [
+        ('T', "BEGIN"),
+        ('T', "SAVEPOINT"),
+        ('E', "34000"),
+        ('T', "ROLLBACK"),
+        ('T', "COMMIT"),
+        ('E', "34000"),
+        ('T', "ROLLBACK"),
+        ('T', "ROLLBACK"),
+        ('I', "COMMIT"),
+    ]
+    .map(|(status, answer)| (status, answer.to_owned()));
+    for steps in savepoint_statuses() {
+        let reference = transaction_statuses(host.to_owned(), port, "postgres", "postgres", &steps).await;
+        let answered =
+            transaction_statuses("127.0.0.1".to_owned(), engine, "pgcursors", "codelake", &steps).await;
+        assert_eq!(reference, want, "PostgreSQL: {steps:?}");
+        assert_eq!(answered, want, "engine: {steps:?}");
+    }
+}
+
+/// Savepoints and `AND CHAIN` that end or leave a failed state, on each
+/// protocol ([`transaction_statuses`]).
+fn savepoint_statuses() -> Vec<Vec<Step>> {
+    let statements = [
+        "BEGIN",
+        "SAVEPOINT a",
+        "FETCH 1 FROM nothing",
+        "ROLLBACK TO a",
+        "COMMIT AND CHAIN",
+        "FETCH 1 FROM nothing",
+        "COMMIT AND CHAIN",
+        "ROLLBACK AND CHAIN",
+        "COMMIT",
+    ];
+    vec![
+        statements
+            .iter()
+            .map(|sql| Step::Simple((*sql).to_owned()))
+            .collect(),
+        statements
+            .iter()
+            .map(|sql| Step::Extended((*sql).to_owned()))
+            .collect(),
+    ]
+}
+
+/// The transaction status each step of `steps` leaves the connection in
+/// (`ReadyForQuery`: `I`, `T` or `E`), with its tag or SQLSTATE.
+async fn transaction_statuses(
+    host: String,
+    port: u16,
+    user: &'static str,
+    database: &'static str,
+    steps: &[Step],
+) -> Vec<(char, String)> {
+    let steps = steps.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let mut wire = Wire::connect_to(&host, port, user, database);
+        steps
+            .iter()
+            .map(|step| {
+                let messages = match step {
+                    Step::Simple(sql) => wire.query(sql),
+                    Step::Extended(sql) => {
+                        wire.parse("", sql);
+                        wire.bind("", 0);
+                        wire.execute();
+                        wire.sync()
+                    }
+                    other => panic!("{other:?}"),
+                };
+                let status = messages
+                    .iter()
+                    .rev()
+                    .find(|(kind, _)| *kind == b'Z')
+                    .map(|(_, body)| char::from(body[0]))
+                    .unwrap();
+                let answer = error_code(&messages)
+                    .or_else(|| tags(&messages).pop())
+                    .unwrap_or_default();
+                (status, answer)
+            })
+            .collect()
+    })
+    .await
+    .unwrap()
+}
+
+/// What a client sees of `messages`, in order: the first value of each row,
+/// command tags, `suspended` for a portal suspended by its row limit, and
+/// `E<SQLSTATE>` for an error.
+fn events(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter_map(|message| match message.0 {
+            b'D' => data_rows(std::slice::from_ref(message))
+                .remove(0)
+                .into_iter()
+                .next(),
+            b'C' => tags(std::slice::from_ref(message)).pop(),
+            b's' => Some("suspended".to_owned()),
+            b'E' => error_code(std::slice::from_ref(message)).map(|code| format!("E{code}")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// [`suspended_fetch`] on PostgreSQL (`host`, `port`) and on the engine
+/// (`engine`), in a pipeline and across `Sync`s.
+async fn suspended_fetches_answer_like_postgresql(host: &str, port: u16, engine: u16) {
+    for pipelined in [true, false] {
+        let reference = suspended_fetch(host.to_owned(), port, "postgres", "postgres", pipelined).await;
+        let answered =
+            suspended_fetch("127.0.0.1".to_owned(), engine, "pgcursors", "codelake", pipelined).await;
+        let want = [
+            "3",
+            "suspended",
+            "7",
+            "FETCH 1",
+            "4",
+            "5",
+            "6",
+            "FETCH 3",
+            "8",
+            "FETCH 1",
+            "COMMIT",
+        ];
+        assert_eq!(reference, want, "PostgreSQL, pipelined {pipelined}");
+        assert_eq!(answered, want, "engine, pipelined {pipelined}");
+    }
+}
+
+/// A `FETCH 4` executed as a portal with a row limit of one (JDBC's fetch
+/// size), suspended after its first row while a `FETCH 1` of the same cursor
+/// runs, then resumed: in the same pipeline, or across `Sync`s when not
+/// `pipelined`. As in PostgreSQL, the `FETCH 4` took its four rows (3 to 6)
+/// at its first `Execute`: the `FETCH 1` between gets row 7, and the resumed
+/// portal the rows it had taken. (Found by the third F6 verification: the
+/// portal read the cursor as it sent, so the `FETCH 1` got row 4 and the
+/// portal 5 to 7.)
+async fn suspended_fetch(
+    host: String,
+    port: u16,
+    user: &'static str,
+    database: &'static str,
+    pipelined: bool,
+) -> Vec<String> {
+    tokio::task::spawn_blocking(move || {
+        let mut wire = Wire::connect_to(&host, port, user, database);
+        let declared = wire.query(&format!("BEGIN; DECLARE sf NO SCROLL CURSOR FOR {TEN}"));
+        assert_eq!(error_code(&declared), None, "{declared:?}");
+        assert_eq!(numbers(&data_rows(&wire.query("FETCH 2 FROM sf"))), [1, 2]);
+        let mut seen = Vec::new();
+        wire.parse("four", "FETCH 4 FROM sf");
+        wire.bind_portal("p", "four", 0);
+        wire.execute_portal("p", 1);
+        if !pipelined {
+            seen.extend(events(&wire.sync()));
+        }
+        wire.parse("", "FETCH 1 FROM sf");
+        wire.bind("", 0);
+        wire.execute();
+        if !pipelined {
+            seen.extend(events(&wire.sync()));
+        }
+        wire.execute_portal("p", 0);
+        seen.extend(events(&wire.sync()));
+        seen.extend(events(&wire.query("FETCH 1 FROM sf")));
+        seen.extend(events(&wire.query("COMMIT")));
+        seen
+    })
+    .await
+    .unwrap()
 }
 
 /// `MOVE` through a driver's execute (Parse, Describe, Bind, Execute): its
@@ -2183,6 +2746,73 @@ async fn cancel_requests_reach_the_extended_protocol() {
     assert_eq!(error_code(&ended), None, "{ended:?}");
     server.slots_free().await;
     canceled_fetches_leave_their_cursor_unreadable(&server).await;
+    cancel_spares_the_cursors_the_message_does_not_read(&server).await;
+}
+
+/// A cancel request stops the statement the connection executes, not its
+/// cursors: a `WITH HOLD` cursor outside a transaction block reads on after
+/// a query beside it was canceled, on either protocol, as in PostgreSQL; in
+/// a transaction block the cancel aborts the transaction (`25P02`). (Found
+/// by the third F6 verification: the cancel failed every statement of the
+/// connection, and the cursor's next FETCH got 57014.)
+async fn cancel_spares_the_cursors_the_message_does_not_read(server: &Server) {
+    let client = server.connect("ext-cancel").await;
+    client
+        .batch_execute(&format!("DECLARE hc CURSOR WITH HOLD FOR {TEN}"))
+        .await
+        .unwrap();
+    let mut read = numbers(&text_rows(&client, "FETCH 1 FROM hc").await);
+    // What the open cursor holds: the canceled query's memory returns to it.
+    let cursor_holds = server.reserved().await;
+    for extended in [false, true] {
+        let token = client.cancel_token();
+        let beside = async {
+            if extended {
+                client.query(HOLDS_MEMORY, &[]).await.map(|_| ())
+            } else {
+                client.simple_query(HOLDS_MEMORY).await.map(|_| ())
+            }
+        };
+        let cancel = async {
+            let reserved = pool_fills(server).await;
+            token.cancel_query(NoTls).await.unwrap();
+            reserved
+        };
+        let (outcome, reserved) = tokio::join!(beside, cancel);
+        let error = outcome.unwrap_err();
+        assert_eq!(error.code(), Some(&SqlState::QUERY_CANCELED), "{error:?}");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while server.reserved().await > cursor_holds {
+            assert!(
+                Instant::now() < deadline,
+                "reservations left (held {reserved}, the cursor {cursor_holds})"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        read.extend(numbers(&text_rows(&client, "FETCH 1 FROM hc").await));
+    }
+    assert_eq!(read, [1, 2, 3], "the held cursor did not read on");
+    client.batch_execute("CLOSE hc").await.unwrap();
+
+    client
+        .batch_execute(&format!("BEGIN; DECLARE tc CURSOR FOR {TEN}"))
+        .await
+        .unwrap();
+    let token = client.cancel_token();
+    let (outcome, ()) = tokio::join!(client.simple_query(HOLDS_MEMORY), async {
+        pool_fills(server).await;
+        token.cancel_query(NoTls).await.unwrap();
+    });
+    assert_eq!(outcome.unwrap_err().code(), Some(&SqlState::QUERY_CANCELED));
+    let error = client.simple_query("FETCH 1 FROM tc").await.unwrap_err();
+    assert_eq!(
+        error.code(),
+        Some(&SqlState::IN_FAILED_SQL_TRANSACTION),
+        "{error:?}"
+    );
+    client.batch_execute("ROLLBACK").await.unwrap();
+    server.slots_free().await;
+    assert_eq!(server.pool_drains().await, 0);
 }
 
 /// A `FETCH` canceled while it executes (simple protocol): in a transaction
@@ -2314,7 +2944,9 @@ async fn extended_protocol_streams_rows_under_governance() {
 /// server from 114 MB to 815 MB of RSS, with a 256 MiB pool.)
 #[tokio::test]
 async fn fetch_among_other_statements_holds_its_rows_in_the_pool() {
-    const ROWS: i64 = 400_000;
+    // More than the connection's socket buffers hold: most rows wait in
+    // the server for the client.
+    const ROWS: i64 = 1_000_000;
     let dir = tempfile::tempdir().unwrap();
     let server = start_server(dir.path());
     server.wait_ready().await;
@@ -2337,10 +2969,11 @@ async fn fetch_among_other_statements_holds_its_rows_in_the_pool() {
     });
     fetch_sent.await.unwrap();
     // Held in the pool while they wait: at least a row's bookkeeping each.
+    let least = u64::try_from(ROWS).unwrap() * 32;
     let deadline = Instant::now() + Duration::from_secs(20);
     let held = loop {
         let reserved = server.reserved().await;
-        if reserved >= u64::try_from(ROWS).unwrap() * 32 {
+        if reserved >= least {
             break reserved;
         }
         assert!(
@@ -2349,6 +2982,14 @@ async fn fetch_among_other_statements_holds_its_rows_in_the_pool() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
+    // Still held once read, while the client has not read them: not only
+    // while the FETCH reads them from the cursor.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let waiting = server.reserved().await;
+    assert!(
+        waiting >= least,
+        "the rows waiting for the client left the pool ({waiting} bytes, {held} while read)"
+    );
     read.send(()).unwrap();
     let (fetched, ended) = fetching.await.unwrap();
     assert_eq!(error_code(&fetched), None);

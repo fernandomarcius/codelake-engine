@@ -82,7 +82,7 @@ Per protocol:
 | session limit | `query_max_run_time`, `query_max_execution_time` | `SET statement_timeout` (as run time) |
 | slot held | from admission to the end of execution (the last batch produced; ≤ 2 buffered batches, reserved, may still wait for the client) | until every row is sent or the stream is dropped; one per connection: while a cursor or suspended portal holds it, the connection's other statements run in it |
 | not governed | `USE`, `SET/RESET SESSION`, `PREPARE`, `DEALLOCATE`, `kill_query` | `SET`, `SHOW <variable>`, transaction control, `DISCARD`, `DEALLOCATE`, `kill_query`; `FETCH` and `CLOSE` (governed as their cursor's `DECLARE`, which ends with its transaction unless `WITH HOLD`) |
-| client cancel | `DELETE` of the query's `nextUri` | cancel request (process id + secret key), while the connection executes a message: every governed statement of the connection, queued, planning or sending rows (open cursors and suspended portals too, as PostgreSQL's aborted transaction); between messages it does nothing, as in PostgreSQL; SQLSTATE `57014` |
+| client cancel | `DELETE` of the query's `nextUri` | cancel request (process id + secret key), while the connection executes a message: the governed statements that message runs, queued, planning or sending rows — those it admits and those whose rows it reads (the cursor a `FETCH` reads, the portal an `Execute` resumes); the connection's other cursors and suspended portals read on, as in PostgreSQL; between messages it does nothing, as in PostgreSQL; SQLSTATE `57014` |
 | `kill_query` errors | as the reference engine 431 (checked against it): `NOT_FOUND`, `NOT_SUPPORTED` (not running), `INVALID_ARGUMENTS`, `INVALID_PROCEDURE_ARGUMENT` (`NULL` id), `TYPE_MISMATCH`; plus `PERMISSION_DENIED` (not the owner) | `42704`, `55000`, `22023`, `22023`, `42804`; `42501` |
 
 On the PostgreSQL wire the server wraps `datafusion-postgres`'s query
@@ -94,8 +94,14 @@ that stopped reading) is stopped at its deadline too, and the reader, when
 waiting, is woken with the error. The same watcher wakes on the record's
 cancellation token, which a cancel request or `kill_query` fires: the
 server's cancel handler maps the request's process id and secret key to the
-connection's live statements (a wrong secret key cancels nothing, and so
-does a request that arrives while the connection executes no message), then lets
+statements the message the connection executes runs — the ones it admits and
+the ones whose rows it reads (a governed stream joins the message that reads
+it) — so a cancel stops the statement being executed, never a `WITH HOLD`
+cursor or a suspended portal the message does not read (amended after the
+third F6 verification, ISS-032: the handler failed every live statement of
+the connection, which PostgreSQL's aborted transaction does not do to a held
+cursor). A wrong secret key cancels nothing, and so does a request that
+arrives while the connection executes no message; the handler then lets
 `datafusion-postgres` interrupt what it is planning. A hook plans
 `kill_query` as an empty statement on the extended protocol, where
 `DataFusion` could not plan `CALL`. The server also replaces `pgwire`'s
@@ -139,7 +145,15 @@ sent, and rows beyond what the pool gives fail the `FETCH` with `53200`
 (`EXCEEDED_LOCAL_MEMORY_LIMIT`, slot and memory given back) and leave the
 cursor unreadable (`55000`), never held outside the pool (before, `FETCH
 ALL FROM c; CLOSE c` over 6 M rows took the server from 114 MB to 815 MB of
-RSS with a 256 MiB pool). On the
+RSS with a 256 MiB pool). So does a `FETCH` executed as a protocol portal
+with a row limit (JDBC's fetch size), which reads all its rows at its first
+`Execute`, as PostgreSQL does, and sends them as the client asks, tagged
+with every row it read (`FETCH 4`); read as they were sent, a `FETCH` run
+while the portal was suspended took rows that were the portal's (a wrong
+result found by the third F6 verification, ISS-032). A message whose `FETCH`
+or `MOVE` the SQL parser does not read runs statement by statement, each
+read on its own (a statement neither reads fails the message before any of
+it runs). On the
 extended protocol (psycopg3's server-side cursors) a `FETCH` is described
 with its cursor's columns, as PostgreSQL does (`datafusion-postgres`
 describes it with none: the client failed on the first row, after the
@@ -148,6 +162,10 @@ text when it is declared, so a `FETCH` bound for binary results
 (`tokio-postgres`' `query`) is refused with SQLSTATE `0A000` before it reads
 a row, where PostgreSQL would send them in binary (ISS-029), and so is a
 `BINARY` cursor. A statement that fails after declaring a cursor drops it.
+On the extended protocol a `DECLARE` of one cursor is planned as its query,
+so its parameters (`$1`, psycopg3's server-side cursors) are typed and
+bound, and described with no columns, as PostgreSQL does. Cursor names are
+cut to 63 bytes, as PostgreSQL cuts identifiers.
 
 A cursor lives in its transaction, as in PostgreSQL (amended after the F6
 re-verification, ISS-030). The end of a transaction — `COMMIT`, `ROLLBACK`,
@@ -166,7 +184,17 @@ not read, is read as `ROLLBACK` on both protocols. `DISCARD ALL` closes
 every cursor and portal, held ones too, and resets `statement_timeout`, as a
 connection pool expects when it resets a connection; inside a transaction
 block (explicit, or a message of several statements) it fails with
-`25001`, as in PostgreSQL. `DISCARD PLANS`, `SEQUENCES` and `TEMP` have
+`25001`, as in PostgreSQL, and so it does in an extended-protocol pipeline
+after an `Execute` that completed (PostgreSQL 17's pipelining rule).
+Savepoints hold what the engine's transactions hold (ISS-032): `ROLLBACK TO
+SAVEPOINT` closes the cursors declared since the savepoint, keeps the others
+where they stand and ends the failed state, `RELEASE` keeps them, `AND
+CHAIN` begins the next transaction at once, with PostgreSQL's errors
+(`25P01` outside a block, `3B001` for a missing savepoint). The engine's
+writes are not transactional: a `ROLLBACK TO SAVEPOINT` after a statement
+that may write since the savepoint fails with `0A000` rather than leave the
+write as if undone. `SHOW` answers the tag `SHOW` and `START TRANSACTION`
+its own, as PostgreSQL. `DISCARD PLANS`, `SEQUENCES` and `TEMP` have
 nothing to discard. A hook ahead of
 `datafusion-postgres`'s cursor and transaction hooks
 (`crates/codelake-server/src/pg/cursor.rs`) tracks the transaction block and
@@ -261,6 +289,7 @@ set, they still apply.
   transactions, slot and pool freed at their end; statements beside an
   open cursor or suspended portal under a per-user limit of one; a `FETCH`
   among other statements held in the pool; the cancel request on the
-  extended protocol; cursors differentially against PostgreSQL 17, message
-  by message on both protocols); the
+  extended protocol, sparing the cursors the message does not read; cursors,
+  savepoints and suspended `FETCH` portals differentially against
+  PostgreSQL 17, message by message on both protocols); the
   query id on the PostgreSQL span (`tests/e2e/otlp.rs`).
