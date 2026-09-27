@@ -796,9 +796,73 @@ fn nullif(args: Vec<Expr>, func: &Arc<ScalarUDF>, schema: &DFSchema) -> Result<T
     ))))
 }
 
+/// Adds the declared text type of one value where text values meet: a
+/// literal is `varchar(<its length>)`, a typed expression its
+/// `varchar(n)`/`char(n)`, other text unbounded (`None`); a `NULL` does not
+/// count.
+fn push_text_type(expr: &Expr, schema: &DFSchema, declared: &mut Vec<Option<Declared>>) -> Result<()> {
+    if let Expr::Literal(value, _) = expr
+        && value.is_null()
+    {
+        return Ok(());
+    }
+    if let Some(text) = text_literal(expr) {
+        declared.push(Some(Declared::Varchar(
+            u32::try_from(text.chars().count()).unwrap_or(u32::MAX),
+        )));
+        return Ok(());
+    }
+    let (_, field) = expr.to_field(schema)?;
+    declared.push(crate::trino_types::declared(&field));
+    Ok(())
+}
+
+/// A `CASE` or `coalesce`-like text result declares Trino's common type of
+/// its values (`CASE … THEN 'Fisica' … THEN 'Juridica' END` is `varchar(8)`,
+/// `coalesce(varchar(100) column, '')` is `varchar(100)`), which
+/// `CREATE TABLE AS` stores; `DataFusion` gave unbounded text.
+fn typed_text_result(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
+    let values: Vec<&Expr> = match &expr {
+        Expr::Case(case) => case
+            .when_then_expr
+            .iter()
+            .map(|(_, then)| then.as_ref())
+            .chain(case.else_expr.as_deref())
+            .collect(),
+        Expr::ScalarFunction(ScalarFunction { func, args }) if unifies_arguments(func.name()) => {
+            args.iter().collect()
+        }
+        _ => return Ok(Transformed::no(expr)),
+    };
+    if !is_text_type(&expr.get_type(schema)?) {
+        return Ok(Transformed::no(expr));
+    }
+    let mut declared = Vec::with_capacity(values.len());
+    for value in values {
+        push_text_type(value, schema, &mut declared)?;
+    }
+    let Some(common) = common_text(&declared) else {
+        return Ok(Transformed::no(expr));
+    };
+    Ok(Transformed::yes(crate::declared::trino_typed().call(vec![
+        expr,
+        Expr::Literal(ScalarValue::Utf8(Some(typed_name(Some(common)))), None),
+    ])))
+}
+
 /// Every construct of one expression node where values meet (see the module
 /// documentation).
 fn common_types(expr: Expr, schema: &DFSchema, session_zone: &str) -> Result<Transformed<Expr>> {
+    let unified = common_values(expr, schema, session_zone)?;
+    let transformed = unified.transformed;
+    let typed = typed_text_result(unified.data, schema)?;
+    Ok(Transformed::new_transformed(
+        typed.data,
+        transformed || typed.transformed,
+    ))
+}
+
+fn common_values(expr: Expr, schema: &DFSchema, session_zone: &str) -> Result<Transformed<Expr>> {
     Ok(match expr {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_comparison(op) => {
             unify(vec![*left, *right], schema, session_zone)?.update_data(|mut pair| {

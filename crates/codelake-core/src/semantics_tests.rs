@@ -986,3 +986,23 @@ async fn text_functions_keep_the_varchar_length() {
     )
     .await;
 }
+
+/// `CASE` and `coalesce` of text declare Trino's common type of their values.
+#[tokio::test]
+async fn case_and_coalesce_of_text_declare_the_common_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    assert_same(
+        &engine,
+        &[(
+            "SELECT CASE k WHEN 0 THEN 'Fisica' WHEN 1 THEN 'Juridica' END, \
+             coalesce(v, ''), coalesce(v, 'abcdefgh'), CASE WHEN k = 0 THEN v END \
+             FROM (SELECT 0 AS k, CAST('Rua A' AS VARCHAR(5)) AS v) t",
+            answer(
+                &["varchar(8)", "varchar(5)", "varchar(8)", "varchar(5)"],
+                &[&["Fisica", "Rua A", "Rua A", "Rua A"]],
+            ),
+        )],
+    )
+    .await;
+}
