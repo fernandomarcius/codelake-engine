@@ -146,6 +146,25 @@ versioning: [SemVer](https://semver.org/).
 - `varchar(n)` is kept from SQL Server, through `lower`/`upper`/`trim`/`substr`, and as the common type of
   `CASE`/`coalesce` of text; CTAS stores it (ISS-044).
 - Shadow harness: `replaced_characters` expected-difference rule (ISS-047).
+- PostgreSQL wire, `FETCH` (wrong rows): a `FETCH n` executed as a portal with a row limit
+  (JDBC's fetch size) read its cursor as it sent, so a `FETCH` of the same cursor run while the
+  portal was suspended took the portal's rows (PostgreSQL: the portal 3–6 and the `FETCH` 7;
+  CodeLake: the `FETCH` 4 and the portal 5–7). It now reads its rows at its first `Execute`, held
+  in the pool until sent, as PostgreSQL does (ADR 0016, ISS-032).
+- PostgreSQL wire, cancel requests: canceling a statement failed every cursor of the
+  connection, so a `WITH HOLD` cursor read afterwards answered `57014`. A cancel now stops the
+  statements the message runs (the one executed, the cursor a `FETCH` reads, the portal an
+  `Execute` resumes) and the other cursors read on, as in PostgreSQL.
+- PostgreSQL wire, savepoints: `SAVEPOINT` and `RELEASE` failed with `XX000`, `ROLLBACK TO
+  SAVEPOINT` ended the whole transaction and closed every cursor, and `COMMIT AND CHAIN`
+  began no transaction. They now behave as PostgreSQL for cursors and the transaction status;
+  a `ROLLBACK TO SAVEPOINT` after a statement that may write fails with `0A000` (the engine's
+  writes are not transactional; ISS-032).
+- PostgreSQL wire, cursors: a `DECLARE` with parameters on the extended protocol (psycopg3's
+  server-side cursors) failed with `XX000`; `DISCARD ALL` ran inside an extended-protocol
+  pipeline (PostgreSQL: `25001`); `FETCH FROM c`, `FETCH c` and `MOVE` among other statements
+  of a message failed with `42601`; cursor names were not cut to 63 bytes; `SHOW` answered the
+  tag `SELECT 1` and `START TRANSACTION` the tag `BEGIN`. All now answer as PostgreSQL.
 - PostgreSQL wire, memory outside the pool: a `FETCH` among other statements of a message
   (`FETCH ALL FROM c; CLOSE c`) collected its rows in memory outside the pool before sending
   them (6 M rows took the server from 114 MB to 815 MB of RSS with a 256 MiB pool). The rows
