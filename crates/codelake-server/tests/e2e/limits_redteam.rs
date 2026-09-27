@@ -378,6 +378,33 @@ async fn mixed_case_names_over_both_protocols() {
     if let Some(error) = error {
         failures.push(format!("http: {quoted}: {error}"));
     }
+    // A cursor's query resolves every spelling too, declared as text or
+    // with parameters on the extended protocol (planned apart from the
+    // session's other statements). PostgreSQL itself folds only unquoted
+    // names, so this is checked here, not in the PostgreSQL comparison.
+    let cursor = async {
+        simple(client, "BEGIN").await?;
+        simple(client, "DECLARE cc CURSOR FOR SELECT CAST(\"CustomerCode\" AS VARCHAR) FROM hive.\"Vendas\".\"Pedido\" ORDER BY 1").await?;
+        let text = simple(client, "FETCH ALL FROM cc").await?;
+        client
+            .execute(
+                "DECLARE cp CURSOR FOR SELECT CAST(\"Valor\" AS VARCHAR) FROM hive.\"Vendas\".\"Pedido\" WHERE \"CustomerCode\" > $1 ORDER BY 1",
+                &[&2_i64],
+            )
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        let bound = simple(client, "FETCH ALL FROM cp").await?;
+        simple(client, "ROLLBACK").await?;
+        Ok::<_, String>((text, bound))
+    }
+    .await;
+    let column = |values: &[&str]| -> Vec<Vec<Option<String>>> {
+        values.iter().map(|v| vec![Some((*v).to_owned())]).collect()
+    };
+    let expected = (column(&["1", "2", "3", "5"]), column(&["30", "50"]));
+    if cursor != Ok(expected) {
+        failures.push(format!("pg cursors: {cursor:?}"));
+    }
     assert!(failures.is_empty(), "{failures:#?}");
     let (names, _, error) = http(
         running.http,

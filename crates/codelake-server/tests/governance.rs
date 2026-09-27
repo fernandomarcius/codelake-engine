@@ -2147,15 +2147,6 @@ fn parameter_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
                 vec!["1"],
             ),
             Extended("FETCH ALL FROM pe".into()),
-            // Every spelling of a column resolves in a cursor's query too
-            // (ISS-018), declared with or without parameters.
-            Simple("DECLARE pf CURSOR FOR SELECT \"X\" FROM (VALUES (4), (5)) AS t(x)".into()),
-            Simple("FETCH ALL FROM pf".into()),
-            Bound(
-                "DECLARE pg CURSOR FOR SELECT \"X\" FROM (VALUES (6), (7)) AS t(x) WHERE \"X\" > $1".into(),
-                vec!["6"],
-            ),
-            Extended("FETCH ALL FROM pg".into()),
             Simple("ROLLBACK".into()),
         ],
         vec![
@@ -2178,14 +2169,6 @@ fn parameter_scripts() -> Vec<(Vec<Step>, Vec<Exchange>)> {
                 None,
             ),
             rows("FETCH 1", &[2]),
-            ok("DECLARE CURSOR"),
-            rows("FETCH 2", &[4, 5]),
-            (
-                vec!["NoData".to_owned(), "DECLARE CURSOR".to_owned()],
-                Vec::new(),
-                None,
-            ),
-            rows("FETCH 1", &[7]),
             ok("ROLLBACK"),
         ],
     )]
