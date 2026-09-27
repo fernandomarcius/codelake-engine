@@ -182,6 +182,39 @@ class CompareTests(unittest.TestCase):
         self.assertEqual([c["column"] for c in result["columns_differing"]], ["label"])
         self.assertEqual([e["rule"] for e in result["expected_differences"]], ["ISS-019"])
 
+    def test_replaced_characters_rule_compares_after_the_reference_replacement(self) -> None:
+        decl = [("id", "int"), ("cargo", "varchar(9)")]
+        self.w.write("ref", "s.t", "SELECT 1 AS id, 'A' || chr(65533) || 'B' AS cargo UNION ALL SELECT 2, 'C'",
+                     declared=decl)
+        self.w.write("cand", "s.t", "SELECT 1 AS id, 'A' || chr(129) || 'B' AS cargo UNION ALL SELECT 2, 'C'",
+                     declared=decl)
+        self.assertEqual(self.w.compare()["reasons"], ["checksum"])
+        rule = {"id": "ISS-047", "kind": "replaced_characters", "reason": "0x81 kept",
+                "table": "s.t", "column": "cargo", "characters": "c1"}
+        result = self.w.compare(expected={"differences": [rule]})
+        self.assertEqual(result["status"], "equal", result)
+        self.assertEqual(
+            result["expected_differences"],
+            [{"column": "cargo", "kind": "replaced_characters", "rule": "ISS-047", "reason": "0x81 kept",
+              "reference": "U+FFFD", "candidate": "c1 (1 rows)"}],
+        )
+        # Another column, or any other value difference, is still compared.
+        other = {"differences": [dict(rule, column="id")]}
+        self.assertEqual(self.w.compare(expected=other)["status"], "divergent")
+        self.w.write("cand", "s.t", "SELECT 1 AS id, 'A' || chr(129) || 'X' AS cargo UNION ALL SELECT 2, 'C'",
+                     declared=decl)
+        self.assertEqual(self.w.compare(expected={"differences": [rule]})["reasons"], ["checksum"])
+
+    def test_replaced_characters_rules_are_narrow(self) -> None:
+        base = {"id": "ISS-047", "kind": "replaced_characters", "reason": "r", "table": "s.t", "column": "c"}
+        expected.parse({"differences": [dict(base, characters="c1")]})
+        for broken in (dict(base), dict(base, characters="all"), dict(base, characters="c1", table="s.*"),
+                       dict(base, characters="c1", reference="varchar")):
+            with self.assertRaises(expected.ExpectedError, msg=str(broken)):
+                expected.parse({"differences": [broken]})
+        with self.assertRaises(expected.ExpectedError):
+            expected.parse({"differences": [{"id": "x", "kind": "name_case", "reason": "r", "characters": "c1"}]})
+
     def test_name_case_differences(self) -> None:
         self.w.write("ref", "s.t", "SELECT 1 AS order_id, 'a' AS status")
         self.w.write("cand", "S.T", 'SELECT 1 AS "Order_Id", \'a\' AS status')

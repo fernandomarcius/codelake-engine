@@ -229,8 +229,10 @@ in the output is declared, not hidden. A rule file (JSON) lists them:
 ]}
 ```
 
-- `kind`: `declared_type` (a column's declared type) or `name_case` (a table or
-  column name that differs only by case). `id` (the accepted issue) and
+- `kind`: `declared_type` (a column's declared type), `name_case` (a table or
+  column name that differs only by case) or `replaced_characters` (the
+  reference replaced characters of a text column with U+FFFD; `characters`:
+  `c1`, the C1 controls U+0080–U+009F, ISS-047). `id` (the accepted issue) and
   `reason` are required. `table` (`schema.table`) and `column`: globs for
   `name_case` (default `*`); for `declared_type`, one exact table and column,
   required: a type change is expected only on a column someone checked (the
@@ -241,7 +243,13 @@ in the output is declared, not hidden. A rule file (JSON) lists them:
 - A matching difference is reported under *Expected and documented
   differences* with its rule, per table and column, and counted per rule in
   the cumulative report; it does not make the table divergent.
-- A rule never covers values: row count, checksum, per-column checksums and
+- `replaced_characters` is the one rule about values, for one exact table and
+  column (required, no glob): the candidate's values of that column are
+  compared after the same replacement, every other value and column exactly;
+  the report shows the rule and how many candidate rows it changed. Example:
+  `{"id": "ISS-047", "kind": "replaced_characters", "reason": "…",
+  "table": "erp_raw_b1.pesfis_b1", "column": "cargo_pf", "characters": "c1"}`.
+- No other rule covers values: row count, checksum, per-column checksums and
   columns present on one side only are always compared, and so are column
   order and storage. A table whose only difference is a documented type is
   equal; the same table with one changed value is divergent.

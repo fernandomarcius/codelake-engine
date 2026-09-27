@@ -21,6 +21,19 @@ pub trait TableResolver: Send + Sync + Debug {
     async fn resolve(&self, schema: &str, table: &str) -> Result<Option<Arc<dyn TableProvider>>>;
 }
 
+/// The listed name `name` refers to: itself when listed, else its lower-case
+/// form. Listings hold the names the source folds to lower case (Trino's
+/// rule), and a quoted identifier keeps its case (`"dbo_Vendas_CT"`, as dbt
+/// writes every name), so it is resolved without regard to case; a name
+/// listed with capitals (a `MongoDB` collection) still matches exactly.
+fn listed_name(name: &str, listed: impl Fn(&str) -> bool) -> Option<String> {
+    if listed(name) {
+        return Some(name.to_owned());
+    }
+    let lower = name.to_lowercase();
+    (lower != name && listed(&lower)).then_some(lower)
+}
+
 /// Catalog whose names come from `listing` and whose tables come from `resolver`.
 #[derive(Debug)]
 pub struct FederatedCatalog {
@@ -40,9 +53,10 @@ impl CatalogProvider for FederatedCatalog {
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        self.listing.schema(name).map(|listing| {
+        let name = listed_name(name, |n| self.listing.schema(n).is_some())?;
+        self.listing.schema(&name).map(|listing| {
             Arc::new(FederatedSchema {
-                name: name.to_owned(),
+                name,
                 listing,
                 resolver: Arc::clone(&self.resolver),
             }) as Arc<dyn SchemaProvider>
@@ -115,14 +129,14 @@ impl SchemaProvider for FederatedSchema {
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        if !self.listing.table_exist(name) {
+        let Some(name) = listed_name(name, |n| self.listing.table_exist(n)) else {
             return Ok(None);
-        }
-        self.resolver.resolve(&self.name, name).await
+        };
+        self.resolver.resolve(&self.name, &name).await
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.listing.table_exist(name)
+        listed_name(name, |n| self.listing.table_exist(n)).is_some()
     }
 }
 
@@ -209,6 +223,26 @@ mod tests {
         assert!(schema.table("users").await.unwrap().is_some());
         assert!(schema.table("ghost").await.unwrap().is_none());
         assert_eq!(resolver.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn quoted_names_resolve_without_regard_to_case() {
+        let resolver = Arc::new(RecordingResolver::default());
+        let catalog = FederatedCatalog::new(listing(), resolver.clone());
+        let schema = catalog.schema("Public").unwrap();
+        assert!(schema.table_exist("Orders"));
+        assert!(schema.table("ORDERS").await.unwrap().is_some());
+        assert_eq!(
+            *resolver.calls.lock().unwrap(),
+            vec![("public".to_owned(), "orders".to_owned())]
+        );
+        // A name listed with capitals matches exactly; its lower case does not
+        // exist and is not invented.
+        let listing = NameListing::new(BTreeMap::from([("db".to_owned(), vec!["Orders".to_owned()])]));
+        let catalog = FederatedCatalog::new(Arc::new(listing), resolver.clone());
+        let schema = catalog.schema("db").unwrap();
+        assert!(schema.table_exist("Orders"));
+        assert!(!schema.table_exist("orders"));
     }
 
     #[tokio::test]

@@ -872,3 +872,137 @@ async fn in_subquery_is_refused_where_unknown_would_read_as_false() {
     )
     .await;
 }
+
+/// Timestamps of different precisions meet at the higher one, as in Trino
+/// 431; `DataFusion` truncated the finer side (the equality was true).
+#[tokio::test]
+async fn timestamps_of_different_precisions_compare_at_the_finer_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    assert_same(
+        &engine,
+        &[
+            (
+                "SELECT TIMESTAMP '2020-01-01 00:00:00.123' = TIMESTAMP '2020-01-01 00:00:00.123400', \
+                 TIMESTAMP '2020-01-01 00:00:00.123' >= TIMESTAMP '2020-01-01 00:00:00.123500', \
+                 TIMESTAMP '2020-01-01 00:00:00.123' < TIMESTAMP '2020-01-01 00:00:00.123001', \
+                 TIMESTAMP '2020-01-01 00:00:00' = TIMESTAMP '2020-01-01 00:00:00.000'",
+                answer(
+                    &["boolean", "boolean", "boolean", "boolean"],
+                    &[&["false", "false", "true", "true"]],
+                ),
+            ),
+            (
+                "SELECT k FROM (VALUES (1, TIMESTAMP '2020-01-01 00:00:00.123'), (2, TIMESTAMP '2020-01-01 00:00:00.124')) t(k, ts) \
+                 WHERE ts BETWEEN TIMESTAMP '2020-01-01 00:00:00.123100' AND TIMESTAMP '2020-01-01 00:00:00.124000'",
+                answer(&["integer"], &[&["2"]]),
+            ),
+            (
+                "SELECT k FROM (VALUES (1, TIMESTAMP '2020-01-01 00:00:00.123'), (2, TIMESTAMP '2020-01-01 00:00:00.124')) t(k, ts) \
+                 WHERE ts IN (TIMESTAMP '2020-01-01 00:00:00.123400', TIMESTAMP '2020-01-01 00:00:00.124000')",
+                answer(&["integer"], &[&["2"]]),
+            ),
+            (
+                "SELECT coalesce(CAST(NULL AS TIMESTAMP(3)), TIMESTAMP '2020-01-01 00:00:00.123456')",
+                answer(&["timestamp(6)"], &[&["2020-01-01T00:00:00.123456"]]),
+            ),
+        ],
+    )
+    .await;
+}
+
+/// A window ordered by a `varbinary` key without a frame (the default
+/// `RANGE … CURRENT ROW`, peers included) plans as in Trino 431.
+#[tokio::test]
+async fn windows_ordered_by_varbinary_keep_range_peers() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    assert_same(
+        &engine,
+        &[(
+            "SELECT k, rank() OVER (ORDER BY b), count(*) OVER (ORDER BY b), \
+             count(*) OVER (ORDER BY b RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) \
+             FROM (VALUES (1, X'02'), (2, X'01'), (3, X'01'), (4, X'0100')) t(k, b) ORDER BY k",
+            answer(
+                &["integer", "bigint", "bigint", "bigint"],
+                &[
+                    &["1", "4", "4", "1"],
+                    &["2", "1", "2", "4"],
+                    &["3", "1", "2", "4"],
+                    &["4", "3", "3", "2"],
+                ],
+            ),
+        )],
+    )
+    .await;
+}
+
+/// A name written twice in a later branch of a `UNION` plans: the names of
+/// a set operation come from its first branch.
+#[tokio::test]
+async fn repeated_names_in_later_union_branches_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    assert_same(
+        &engine,
+        &[(
+            "SELECT * FROM (\
+               SELECT 1 AS g, t.a AS first_a, t.* FROM (VALUES (10, 'x')) t(a, b) \
+               UNION ALL \
+               SELECT 2, t.a, t.* FROM (VALUES (20, 'y')) t(a, b)\
+             ) ORDER BY g",
+            answer(
+                &["integer", "integer", "integer", "varchar(1)"],
+                &[&["1", "10", "10", "x"], &["2", "20", "20", "y"]],
+            ),
+        )],
+    )
+    .await;
+}
+
+/// `lower`, `upper`, `trim` and `substr` keep the `varchar(n)` of their
+/// argument, as Trino 431 types them (and `CREATE TABLE AS` stores them).
+#[tokio::test]
+async fn text_functions_keep_the_varchar_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    assert_same(
+        &engine,
+        &[(
+            "SELECT trim(v), ltrim(v), rtrim(v), lower(v), upper(v), substr(v, 2) \
+             FROM (SELECT CAST(' Ab ' AS VARCHAR(5)) AS v) t",
+            answer(
+                &[
+                    "varchar(5)",
+                    "varchar(5)",
+                    "varchar(5)",
+                    "varchar(5)",
+                    "varchar(5)",
+                    "varchar(5)",
+                ],
+                &[&["Ab", "Ab ", " Ab", " ab ", " AB ", "Ab "]],
+            ),
+        )],
+    )
+    .await;
+}
+
+/// `CASE` and `coalesce` of text declare Trino's common type of their values.
+#[tokio::test]
+async fn case_and_coalesce_of_text_declare_the_common_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    assert_same(
+        &engine,
+        &[(
+            "SELECT CASE k WHEN 0 THEN 'Fisica' WHEN 1 THEN 'Juridica' END, \
+             coalesce(v, ''), coalesce(v, 'abcdefgh'), CASE WHEN k = 0 THEN v END \
+             FROM (SELECT 0 AS k, CAST('Rua A' AS VARCHAR(5)) AS v) t",
+            answer(
+                &["varchar(8)", "varchar(5)", "varchar(8)", "varchar(5)"],
+                &[&["Fisica", "Rua A", "Rua A", "Rua A"]],
+            ),
+        )],
+    )
+    .await;
+}

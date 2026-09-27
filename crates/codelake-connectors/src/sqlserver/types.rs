@@ -2,9 +2,13 @@
 //!
 //! Choices that affect results (all covered by integration tests):
 //! - `tinyint` (0..255) maps to `Int16`, as in Trino.
-//! - `datetime`, `datetime2`, `smalldatetime` map to microsecond timestamps.
-//!   Nanoseconds cannot represent the `9999-12-31` sentinel common in ERPs;
-//!   the 7th fractional digit of `datetime2(7)` is truncated.
+//! - Temporal types keep the precision they declare, as in Trino:
+//!   `datetime` is `timestamp(3)` (its 1/300 s ticks rounded to the nearest
+//!   millisecond, as SQL Server converts to `datetime2(3)`), `smalldatetime`
+//!   `timestamp(0)`, `datetime2(p)` and `datetimeoffset(p)` seconds (`p = 0`),
+//!   milliseconds (`p ≤ 3`) or microseconds. Nanoseconds cannot represent the
+//!   `9999-12-31` sentinel common in ERPs; the 7th fractional digit of
+//!   `datetime2(7)` is truncated.
 //! - `datetimeoffset` is converted to UTC.
 //! - `uniqueidentifier` is rendered upper-case, like `CAST(x AS varchar)`.
 //! - `money`/`smallmoney` map to `Decimal128(19,4)`/`(10,4)`. TDS decodes them
@@ -21,9 +25,11 @@ use std::sync::Arc;
 use datafusion::arrow::array::{
     ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
     Float64Builder, Int16Builder, Int32Builder, Int64Builder, RecordBatch, StringBuilder,
-    Time64NanosecondBuilder, TimestampMicrosecondBuilder,
+    Time64NanosecondBuilder,
 };
-use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use datafusion::arrow::datatypes::{
+    DataType, SchemaRef, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType, TimestampSecondType,
+};
 use datafusion::error::{DataFusionError, Result};
 use tiberius::ColumnData;
 use tiberius::numeric::Numeric;
@@ -34,11 +40,26 @@ const DAYS_0001_TO_EPOCH: i64 = 719_162;
 /// Days from 1900-01-01 to 1970-01-01.
 const DAYS_1900_TO_EPOCH: i64 = 25_567;
 const MICROS_PER_DAY: i64 = 86_400_000_000;
+const MILLIS_PER_DAY: i64 = 86_400_000;
 const UTC: &str = "+00:00";
+
+/// Unit of a `datetime2(p)` or `datetimeoffset(p)` (`p` defaults to 7).
+fn fraction_unit(datetime_precision: Option<i16>) -> TimeUnit {
+    match datetime_precision {
+        Some(0) => TimeUnit::Second,
+        Some(1..=3) => TimeUnit::Millisecond,
+        _ => TimeUnit::Microsecond,
+    }
+}
 
 /// Arrow type for a column described by `INFORMATION_SCHEMA.COLUMNS`, or `None`
 /// when the type is not supported.
-pub(crate) fn arrow_type(data_type: &str, precision: Option<u8>, scale: Option<i8>) -> Option<DataType> {
+pub(crate) fn arrow_type(
+    data_type: &str,
+    precision: Option<u8>,
+    scale: Option<i8>,
+    datetime_precision: Option<i16>,
+) -> Option<DataType> {
     let mapped = match data_type.to_ascii_lowercase().as_str() {
         "bit" => DataType::Boolean,
         "tinyint" | "smallint" => DataType::Int16,
@@ -54,8 +75,10 @@ pub(crate) fn arrow_type(data_type: &str, precision: Option<u8>, scale: Option<i
         }
         "binary" | "varbinary" | "image" | "timestamp" | "rowversion" => DataType::Binary,
         "date" => DataType::Date32,
-        "datetime" | "datetime2" | "smalldatetime" => DataType::Timestamp(TimeUnit::Microsecond, None),
-        "datetimeoffset" => DataType::Timestamp(TimeUnit::Microsecond, Some(UTC.into())),
+        "datetime" => DataType::Timestamp(TimeUnit::Millisecond, None),
+        "smalldatetime" => DataType::Timestamp(TimeUnit::Second, None),
+        "datetime2" => DataType::Timestamp(fraction_unit(datetime_precision), None),
+        "datetimeoffset" => DataType::Timestamp(fraction_unit(datetime_precision), Some(UTC.into())),
         "time" => DataType::Time64(TimeUnit::Nanosecond),
         _ => return None,
     };
@@ -166,6 +189,15 @@ pub(crate) fn datetime_micros(value: DateTime) -> i64 {
     days * MICROS_PER_DAY + (ticks * 20_000 + 3) / 6
 }
 
+/// `datetime` to milliseconds, each 1/300 s tick rounded to the nearest
+/// millisecond (`.xx3`, `.xx7`, `.xx0`), as SQL Server and the reference
+/// engine read it. A third of a millisecond never ties.
+pub(crate) fn datetime_millis(value: DateTime) -> i64 {
+    let days = i64::from(value.days()) - DAYS_1900_TO_EPOCH;
+    let ticks = i64::from(value.seconds_fragments());
+    days * MILLIS_PER_DAY + (ticks * 10 + 1) / 3
+}
+
 /// `smalldatetime` stores minutes since midnight.
 pub(crate) fn smalldatetime_micros(value: SmallDateTime) -> i64 {
     let days = i64::from(value.days()) - DAYS_1900_TO_EPOCH;
@@ -200,8 +232,20 @@ enum Column {
     Utf8(StringBuilder),
     Binary(BinaryBuilder),
     Date32(Date32Builder),
-    Timestamp(TimestampMicrosecondBuilder),
+    /// Values in the column's unit; typed when the array is finished.
+    Timestamp(Int64Builder, TimeUnit),
     Time64(Time64NanosecondBuilder),
+}
+
+/// Microseconds to `unit`. The column types never make a value finer than
+/// its unit (`datetime` has its own rounding), so this division is exact.
+fn from_micros(micros: i64, unit: TimeUnit) -> i64 {
+    match unit {
+        TimeUnit::Second => micros.div_euclid(1_000_000),
+        TimeUnit::Millisecond => micros.div_euclid(1_000),
+        TimeUnit::Microsecond => micros,
+        TimeUnit::Nanosecond => micros.saturating_mul(1_000),
+    }
 }
 
 impl Column {
@@ -217,9 +261,10 @@ impl Column {
             DataType::Utf8 => Self::Utf8(StringBuilder::with_capacity(capacity, capacity * 16)),
             DataType::Binary => Self::Binary(BinaryBuilder::with_capacity(capacity, capacity * 16)),
             DataType::Date32 => Self::Date32(Date32Builder::with_capacity(capacity)),
-            DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                Self::Timestamp(TimestampMicrosecondBuilder::with_capacity(capacity))
-            }
+            DataType::Timestamp(
+                unit @ (TimeUnit::Second | TimeUnit::Millisecond | TimeUnit::Microsecond),
+                _,
+            ) => Self::Timestamp(Int64Builder::with_capacity(capacity), *unit),
             DataType::Time64(TimeUnit::Nanosecond) => {
                 Self::Time64(Time64NanosecondBuilder::with_capacity(capacity))
             }
@@ -236,14 +281,13 @@ impl Column {
             Self::Boolean(b) => b.len(),
             Self::Int16(b) => b.len(),
             Self::Int32(b) => b.len(),
-            Self::Int64(b) => b.len(),
+            Self::Int64(b) | Self::Timestamp(b, _) => b.len(),
             Self::Float32(b) => b.len(),
             Self::Float64(b) => b.len(),
             Self::Decimal(b, ..) => b.len(),
             Self::Utf8(b) => b.len(),
             Self::Binary(b) => b.len(),
             Self::Date32(b) => b.len(),
-            Self::Timestamp(b) => b.len(),
             Self::Time64(b) => b.len(),
         }
     }
@@ -253,14 +297,13 @@ impl Column {
             Self::Boolean(b) => b.append_null(),
             Self::Int16(b) => b.append_null(),
             Self::Int32(b) => b.append_null(),
-            Self::Int64(b) => b.append_null(),
+            Self::Int64(b) | Self::Timestamp(b, _) => b.append_null(),
             Self::Float32(b) => b.append_null(),
             Self::Float64(b) => b.append_null(),
             Self::Decimal(b, ..) => b.append_null(),
             Self::Utf8(b) => b.append_null(),
             Self::Binary(b) => b.append_null(),
             Self::Date32(b) => b.append_null(),
-            Self::Timestamp(b) => b.append_null(),
             Self::Time64(b) => b.append_null(),
         }
     }
@@ -301,16 +344,23 @@ impl Column {
             (Self::Utf8(b), ColumnData::Xml(Some(x))) => b.append_value(x.to_string()),
             (Self::Binary(b), ColumnData::Binary(Some(bytes))) => b.append_value(bytes),
             (Self::Date32(b), ColumnData::Date(Some(d))) => b.append_value(date_days(*d)),
-            (Self::Timestamp(b), ColumnData::DateTime2(Some(v))) => b.append_value(datetime2_micros(*v)),
-            (Self::Timestamp(b), ColumnData::DateTime(Some(v))) => b.append_value(datetime_micros(*v)),
-            (Self::Timestamp(b), ColumnData::SmallDateTime(Some(v))) => {
-                b.append_value(smalldatetime_micros(*v));
+            (Self::Timestamp(b, TimeUnit::Millisecond), ColumnData::DateTime(Some(v))) => {
+                b.append_value(datetime_millis(*v));
             }
-            (Self::Timestamp(b), ColumnData::DateTimeOffset(Some(v))) => {
-                b.append_value(datetimeoffset_micros(*v));
+            (Self::Timestamp(b, unit), ColumnData::DateTime(Some(v))) => {
+                b.append_value(from_micros(datetime_micros(*v), *unit));
             }
-            (Self::Timestamp(b), ColumnData::Date(Some(d))) => {
-                b.append_value(i64::from(date_days(*d)) * MICROS_PER_DAY);
+            (Self::Timestamp(b, unit), ColumnData::DateTime2(Some(v))) => {
+                b.append_value(from_micros(datetime2_micros(*v), *unit));
+            }
+            (Self::Timestamp(b, unit), ColumnData::SmallDateTime(Some(v))) => {
+                b.append_value(from_micros(smalldatetime_micros(*v), *unit));
+            }
+            (Self::Timestamp(b, unit), ColumnData::DateTimeOffset(Some(v))) => {
+                b.append_value(from_micros(datetimeoffset_micros(*v), *unit));
+            }
+            (Self::Timestamp(b, unit), ColumnData::Date(Some(d))) => {
+                b.append_value(from_micros(i64::from(date_days(*d)) * MICROS_PER_DAY, *unit));
             }
             (Self::Time64(b), ColumnData::Time(Some(t))) => b.append_value(time_nanos(*t)),
             _ => return None,
@@ -330,11 +380,28 @@ impl Column {
             Self::Utf8(b) => Arc::new(b.finish()),
             Self::Binary(b) => Arc::new(b.finish()),
             Self::Date32(b) => Arc::new(b.finish()),
-            Self::Timestamp(b) => {
-                let array = b.finish();
-                match data_type {
-                    DataType::Timestamp(_, Some(tz)) => Arc::new(array.with_timezone(Arc::clone(tz))),
-                    _ => Arc::new(array),
+            Self::Timestamp(b, unit) => {
+                let values = b.finish();
+                let zone = match data_type {
+                    DataType::Timestamp(_, Some(tz)) => Some(Arc::clone(tz)),
+                    _ => None,
+                };
+                match unit {
+                    TimeUnit::Second => Arc::new(
+                        values
+                            .reinterpret_cast::<TimestampSecondType>()
+                            .with_timezone_opt(zone),
+                    ),
+                    TimeUnit::Millisecond => Arc::new(
+                        values
+                            .reinterpret_cast::<TimestampMillisecondType>()
+                            .with_timezone_opt(zone),
+                    ),
+                    TimeUnit::Microsecond | TimeUnit::Nanosecond => Arc::new(
+                        values
+                            .reinterpret_cast::<TimestampMicrosecondType>()
+                            .with_timezone_opt(zone),
+                    ),
                 }
             }
             Self::Time64(b) => Arc::new(b.finish()),
@@ -419,7 +486,6 @@ mod tests {
     use datafusion::arrow::array::{Array, AsArray};
     use datafusion::arrow::datatypes::{
         Date32Type, Decimal128Type, Field, Int16Type, Int64Type, Schema, Time64NanosecondType,
-        TimestampMicrosecondType,
     };
     use std::borrow::Cow;
 
@@ -440,6 +506,8 @@ mod tests {
             ("varbinary", DataType::Binary),
             ("timestamp", DataType::Binary),
             ("date", DataType::Date32),
+            ("datetime", DataType::Timestamp(TimeUnit::Millisecond, None)),
+            ("smalldatetime", DataType::Timestamp(TimeUnit::Second, None)),
             ("datetime2", DataType::Timestamp(TimeUnit::Microsecond, None)),
             (
                 "datetimeoffset",
@@ -448,18 +516,37 @@ mod tests {
             ("time", DataType::Time64(TimeUnit::Nanosecond)),
         ];
         for (sql, arrow) in cases {
-            assert_eq!(arrow_type(sql, None, None), Some(arrow), "{sql}");
+            assert_eq!(arrow_type(sql, None, None, None), Some(arrow), "{sql}");
         }
         assert_eq!(
-            arrow_type("decimal", Some(18), Some(6)),
+            arrow_type("decimal", Some(18), Some(6), None),
             Some(DataType::Decimal128(18, 6))
         );
         assert_eq!(
-            arrow_type("numeric", None, None),
+            arrow_type("numeric", None, None, None),
             Some(DataType::Decimal128(18, 0))
         );
         for unsupported in ["sql_variant", "geography", "hierarchyid", "cursor"] {
-            assert_eq!(arrow_type(unsupported, None, None), None, "{unsupported}");
+            assert_eq!(arrow_type(unsupported, None, None, None), None, "{unsupported}");
+        }
+        // Declared precision of datetime2(p) / datetimeoffset(p).
+        for (p, unit) in [
+            (0, TimeUnit::Second),
+            (1, TimeUnit::Millisecond),
+            (3, TimeUnit::Millisecond),
+            (4, TimeUnit::Microsecond),
+            (7, TimeUnit::Microsecond),
+        ] {
+            assert_eq!(
+                arrow_type("datetime2", None, None, Some(p)),
+                Some(DataType::Timestamp(unit, None)),
+                "datetime2({p})"
+            );
+            assert_eq!(
+                arrow_type("datetimeoffset", None, None, Some(p)),
+                Some(DataType::Timestamp(unit, Some(UTC.into()))),
+                "datetimeoffset({p})"
+            );
         }
     }
 
@@ -476,6 +563,16 @@ mod tests {
         // datetime: 1970-01-02 + 300 ticks (1 s) + 1 tick (3.333 ms → 3333 µs).
         let dt = DateTime::new(25_568, 301);
         assert_eq!(datetime_micros(dt), MICROS_PER_DAY + 1_003_333);
+        // …and to milliseconds, rounded: 1 tick → .003, 2 → .007, 3 → .010.
+        assert_eq!(datetime_millis(dt), MILLIS_PER_DAY + 1_003);
+        assert_eq!(datetime_millis(DateTime::new(25_567, 2)), 7);
+        assert_eq!(datetime_millis(DateTime::new(25_567, 3)), 10);
+        // 19:53:49.846667 (254 ticks after :49) reads as .847.
+        let ticks = (19 * 3600 + 53 * 60 + 49) * 300 + 254;
+        assert_eq!(datetime_millis(DateTime::new(25_567, ticks)), 71_629_847);
+        // Last tick of a day (.997) stays in the day; before 1970 too.
+        assert_eq!(datetime_millis(DateTime::new(25_567, 25_919_999)), 86_399_997);
+        assert_eq!(datetime_millis(DateTime::new(25_566, 1)), -MILLIS_PER_DAY + 3);
         // smalldatetime: 1970-01-01 + 90 minutes.
         assert_eq!(
             smalldatetime_micros(SmallDateTime::new(25_567, 90)),

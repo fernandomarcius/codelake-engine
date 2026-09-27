@@ -119,6 +119,15 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- SQL Server `datetime`, `smalldatetime`, `datetime2(p)` and `datetimeoffset(p)` keep the precision they declare
+  (`datetime` rounded to the millisecond); a CTAS into a millisecond hive catalog no longer fails (ISS-042).
+- Timestamps of different precisions compare at the finer one; the simplifier no longer truncates the literal (ISS-042).
+- Quoted mixed-case names of federated sources resolve without regard to case (ISS-043).
+- Windows ordered by a binary key with the default frame plan (`RANGE` without offsets as `GROUPS`) (ISS-045).
+- A name repeated in a later branch of a set operation is accepted (ISS-046).
+- `varchar(n)` is kept from SQL Server, through `lower`/`upper`/`trim`/`substr`, and as the common type of
+  `CASE`/`coalesce` of text; CTAS stores it (ISS-044).
+- Shadow harness: `replaced_characters` expected-difference rule (ISS-047).
 - PostgreSQL wire, memory outside the pool: a `FETCH` among other statements of a message
   (`FETCH ALL FROM c; CLOSE c`) collected its rows in memory outside the pool before sending
   them (6 M rows took the server from 114 MB to 815 MB of RSS with a 256 MiB pool). The rows

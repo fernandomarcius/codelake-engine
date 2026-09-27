@@ -17,8 +17,11 @@ but it must stay visible. A rule file declares them:
        "reason": "Case-preserving names"}
     ]}
 
-- ``kind`` is ``declared_type`` (a column's declared type differs) or
-  ``name_case`` (a table or column name differs only by letter case).
+- ``kind`` is ``declared_type`` (a column's declared type differs),
+  ``name_case`` (a table or column name differs only by letter case) or
+  ``replaced_characters`` (the reference replaced characters of a text
+  column with U+FFFD; ``characters`` names which: ``c1``, the C1 controls
+  U+0080-U+009F, ISS-047).
 - ``table`` (``schema.table``) and ``column``: globs for ``name_case``
   (default ``*``); exact names for ``declared_type``, required. A type
   difference is expected only where someone checked that column: the same
@@ -29,9 +32,14 @@ but it must stay visible. A rule file declares them:
   ``declared_type`` rule must constrain at least one side: a rule that would
   accept any type change is refused.
 
-A rule only classifies a difference of **type** or **name case** as expected
-and documented. Values are always compared: a rule never turns a checksum,
-row count or column difference into an equal table.
+A ``declared_type`` or ``name_case`` rule only classifies a difference of
+**type** or **name case** as expected and documented. Values are always
+compared: such a rule never turns a checksum, row count or column difference
+into an equal table. The one exception is ``replaced_characters``, for one
+exact table and column: the candidate's values of that column are compared
+after the same replacement the reference made (each character of the class
+becomes U+FFFD), every other value and column exactly; the rows it changed
+are counted in the report.
 """
 
 from __future__ import annotations
@@ -40,7 +48,11 @@ import dataclasses
 import fnmatch
 import json
 
-KINDS = ("declared_type", "name_case")
+KINDS = ("declared_type", "name_case", "replaced_characters")
+
+#: Character classes a ``replaced_characters`` rule may name, as regular
+#: expressions (RE2, DuckDB's ``regexp_replace``).
+CHARACTER_CLASSES = {"c1": "[\u0080-\u009f]"}
 
 
 class ExpectedError(ValueError):
@@ -71,6 +83,7 @@ class Rule:
     column: str = "*"
     reference: tuple[str, ...] = ("*",)
     candidate: tuple[str, ...] = ("*",)
+    characters: str = ""
 
     def _scope(self, table: str, column: str) -> bool:
         return fnmatch.fnmatchcase(table.lower(), self.table.lower()) and fnmatch.fnmatchcase(
@@ -100,7 +113,9 @@ def parse(document: object, source: str = "expected differences") -> list[Rule]:
         if not isinstance(entry, dict):
             errors.append(f"{where}: must be an object")
             continue
-        unknown = sorted(set(entry) - {"id", "reason", "kind", "table", "column", "reference", "candidate"})
+        unknown = sorted(
+            set(entry) - {"id", "reason", "kind", "table", "column", "reference", "candidate", "characters"}
+        )
         if unknown:
             errors.append(f"{where}: unknown keys {', '.join(unknown)}")
         rule_id, reason, kind = entry.get("id"), entry.get("reason"), entry.get("kind")
@@ -116,17 +131,24 @@ def parse(document: object, source: str = "expected differences") -> list[Rule]:
                 errors.append(f"{where}: `{key}` must be a non-empty glob")
         reference = _globs(entry.get("reference"), f"{where}.reference", errors)
         candidate = _globs(entry.get("candidate"), f"{where}.candidate", errors)
-        if kind == "declared_type":
+        if kind in ("declared_type", "replaced_characters"):
             for key, value in (("table", table), ("column", column)):
                 if key not in entry or (isinstance(value, str) and any(ch in value for ch in "*?[")):
                     errors.append(
-                        f"{where}: a declared_type rule names one `{key}` exactly (no glob): "
-                        "a type change is expected only on the columns it was checked on"
+                        f"{where}: a {kind} rule names one `{key}` exactly (no glob): "
+                        "a difference is expected only on the columns it was checked on"
                     )
         if kind == "declared_type" and reference == ("*",) and candidate == ("*",):
             errors.append(f"{where}: a declared_type rule must name the reference or the candidate type")
-        if kind == "name_case" and ("reference" in entry or "candidate" in entry):
-            errors.append(f"{where}: a name_case rule takes no types")
+        if kind in ("name_case", "replaced_characters") and ("reference" in entry or "candidate" in entry):
+            errors.append(f"{where}: a {kind} rule takes no types")
+        characters = entry.get("characters", "")
+        if kind == "replaced_characters" and characters not in CHARACTER_CLASSES:
+            errors.append(
+                f"{where}: a replaced_characters rule names `characters`: one of {', '.join(CHARACTER_CLASSES)}"
+            )
+        if kind != "replaced_characters" and "characters" in entry:
+            errors.append(f"{where}: only a replaced_characters rule takes `characters`")
         rules.append(
             Rule(
                 id=str(rule_id or "").strip(),
@@ -136,6 +158,7 @@ def parse(document: object, source: str = "expected differences") -> list[Rule]:
                 column=str(column),
                 reference=reference,
                 candidate=candidate,
+                characters=str(characters or ""),
             )
         )
     if errors:
@@ -161,5 +184,15 @@ def match(rules: list[Rule], kind: str, table: str, column: str, reference: str 
     """The first rule that declares this difference, if any."""
     for rule in rules:
         if rule.matches(kind, table, column, reference, candidate):
+            return rule
+    return None
+
+
+def replacements(rules: list[Rule], table: str, column: str) -> Rule | None:
+    """The ``replaced_characters`` rule of this exact table and column."""
+    for rule in rules:
+        if rule.kind == "replaced_characters" and rule.table.lower() == table.lower() and (
+            rule.column.lower() == column.lower()
+        ):
             return rule
     return None

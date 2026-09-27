@@ -50,3 +50,11 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-039](ISS-039-benchmarks-and-global-dod.md) | Benchmarks and global Definition of Done pending | pending work | 2026-09-26 | open |
 | [ISS-040](ISS-040-environment-leftovers.md) | Local environment leftovers after the iCloud move | environment | 2026-09-26 | open |
 | [ISS-041](ISS-041-human-gates-pending.md) | Human gates pending | human decision | 2026-09-26 | open |
+| [ISS-042](ISS-042-sqlserver-datetime-microseconds.md) | SQL Server `datetime` read as a microsecond timestamp; hive write refuses it | defect | 2026-09-26 | closed |
+| [ISS-043](ISS-043-quoted-mixed-case-sqlserver-names.md) | Quoted mixed-case names are not resolved against SQL Server | defect | 2026-09-26 | closed |
+| [ISS-044](ISS-044-varchar-length-dropped-in-metastore.md) | `varchar(n)` from a source is declared `string` in the hive metastore | defect | 2026-09-26 | closed |
+| [ISS-045](ISS-045-binary-range-pruning-internal-error.md) | Internal error "Cannot run range queries on datatype: Binary" | defect | 2026-09-26 | closed |
+| [ISS-046](ISS-046-duplicate-projection-names-refused.md) | Duplicate output names in an inner projection are refused | removed limitation | 2026-09-26 | closed |
+| [ISS-047](ISS-047-sqlserver-undefined-cp1252-bytes.md) | Bytes undefined in code page 1252 keep their value (U+0081), the reference replaces them with U+FFFD | expected difference | 2026-09-26 | closed |
+| [ISS-048](ISS-048-shadow-run-minor-findings.md) | Shadow run: minor findings | defect | 2026-09-26 | open |
+| [ISS-049](ISS-049-dbt-row-number-ties-nondeterministic.md) | dbt_pilot numbers CDC rows with ties: output differs between runs | use-case defect | 2026-09-26 | open |

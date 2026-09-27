@@ -91,7 +91,7 @@ def cycle_markdown(cycle: dict[str, Any]) -> str:
     if documented:
         lines += [
             "",
-            "## Expected and documented differences (type or name case only; values compared)",
+            "## Expected and documented differences (type, name case, or characters the reference replaced)",
             "",
             "| Table | Rule | Kind | What | Reference | Candidate |",
             "|---|---|---|---|---|---|",
