@@ -11,7 +11,8 @@
 //!   null-aware joins only the zero is normalized), grouping keys and
 //!   `DISTINCT` aggregate arguments `codelake_trino_float_group_key(k)`, both
 //!   under the original output name (in `GROUPING SETS`, `ROLLUP` and
-//!   `CUBE` too). Window `PARTITION BY` keys get the grouping form too.
+//!   `CUBE` too). Window `PARTITION BY` and `ORDER BY` keys get the grouping
+//!   form too (`-0.0` and `0.0` are peers).
 //! - **Window function arguments.** `lag(x + 1)` evaluates `x + 1` inside
 //!   the window operator, where the physical rule cannot make it fail on
 //!   overflow: integer `+ - *` there becomes Trino's checked functions.
@@ -242,6 +243,18 @@ impl TrinoKeys {
                     let original =
                         std::mem::replace(key, Expr::Literal(datafusion::common::ScalarValue::Null, None));
                     *key = Self::wrap(&self.group_key, original);
+                    touched = true;
+                }
+            }
+            // `ORDER BY` a float: `-0.0` and `0.0` are peers (ranks, frames),
+            // as they are one value everywhere (ADR 0017).
+            for sort in &mut function.params.order_by {
+                if !is_key_call(&sort.expr) && sort.expr.get_type(&input).is_ok_and(|t| is_float(&t)) {
+                    let original = std::mem::replace(
+                        &mut sort.expr,
+                        Expr::Literal(datafusion::common::ScalarValue::Null, None),
+                    );
+                    sort.expr = Self::wrap(&self.group_key, original);
                     touched = true;
                 }
             }
