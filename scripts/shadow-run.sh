@@ -74,6 +74,11 @@ if [ "$COMMAND" != test ]; then
   mount_dir "$(cfg SHADOW_DBT_PROJECT_DIR)" ro
   mount_dir "$(cfg SHADOW_DBT_PROFILES_DIR)" ro
   mount_dir "$(cfg SHADOW_OUT_DIR)" rw
+  # A rule file given as a local path (not `default`, which ships in the image).
+  expected_file="$(cfg SHADOW_EXPECTED_DIFFERENCES)"
+  case "$expected_file" in
+    /*) [ -f "$expected_file" ] && args+=(-v "$expected_file:$expected_file:ro") ;;
+  esac
 fi
 # Warehouses: host directories (mounted read-only), or paths inside the
 # volumes of SHADOW_DOCKER_VOLUMES.
