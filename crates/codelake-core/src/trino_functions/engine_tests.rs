@@ -345,6 +345,16 @@ async fn the_two_zeros_are_one_value_everywhere() {
         ("SELECT count(*) FROM t WHERE 0 = x", 2),
         ("SELECT count(*) FROM t WHERE x <> 0", 3),
         ("SELECT count(*) FROM t WHERE NOT (x = 0)", 3),
+        // Negations of float comparisons keep NaN (every comparison with it
+        // is false, so its negation is true), as in Trino.
+        ("SELECT count(*) FROM t WHERE NOT (x > 1)", 5),
+        ("SELECT count(*) FROM t WHERE NOT (r < 0)", 4),
+        ("SELECT count(*) FROM t WHERE x NOT BETWEEN -0.5E0 AND 0.5E0", 3),
+        // The two zeros are peers in a window ordered by them.
+        (
+            "SELECT count(*) FROM (SELECT rank() OVER (ORDER BY x) AS rk FROM t WHERE id <= 2) WHERE rk = 1",
+            2,
+        ),
         ("SELECT count(*) FROM t WHERE x < 0", 1),
         ("SELECT count(*) FROM t WHERE x <= -0.0E0", 3),
         ("SELECT count(*) FROM t WHERE x > -0.0E0", 1),

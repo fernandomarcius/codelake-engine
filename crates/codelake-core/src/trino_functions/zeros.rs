@@ -43,6 +43,11 @@ use datafusion::logical_expr::{BinaryExpr, Expr, ExprSchemable, LogicalPlan, Ope
 use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
+/// `isnan(e)`, for a float operand of a negated comparison.
+fn nan_of(e: &Expr) -> Expr {
+    datafusion::functions::math::expr_fn::isnan(e.clone())
+}
+
 /// Name of [`FloatZeros`].
 pub(crate) const FLOAT_ZEROS: &str = "codelake_float_zeros";
 
@@ -273,6 +278,14 @@ impl Zeros<'_> {
                     _ => Transformed::new_transformed(same, changed),
                 })
             }
+            Expr::Not(inner) => {
+                let inner = self.rewrite(*inner)?;
+                let changed = inner.transformed;
+                Ok(match self.negated_ordering(&inner.data) {
+                    Some(negated) => Transformed::yes(negated),
+                    None => Transformed::new_transformed(Expr::Not(Box::new(inner.data)), changed),
+                })
+            }
             other => {
                 let children = other.map_children(|child| self.rewrite(child))?;
                 let changed = children.transformed;
@@ -387,12 +400,49 @@ impl Zeros<'_> {
         Transformed::new_transformed(Expr::InList(InList::new(list.expr, items, list.negated)), changed)
     }
 
+    /// `NOT (a < b)` of floats (any ordering comparison) as the negated
+    /// comparison or a NaN operand: every comparison with NaN is false, so
+    /// its negation is true (Trino). The simplifier would write `a >= b`,
+    /// false for NaN.
+    fn negated_ordering(&self, expr: &Expr) -> Option<Expr> {
+        let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
+            return None;
+        };
+        let negated = match op {
+            Operator::Lt => Operator::GtEq,
+            Operator::LtEq => Operator::Gt,
+            Operator::Gt => Operator::LtEq,
+            Operator::GtEq => Operator::Lt,
+            _ => return None,
+        };
+        self.float_type(left).or_else(|| self.float_type(right))?;
+        Some(
+            compare(left.as_ref().clone(), negated, right.as_ref().clone())
+                .or(nan_of(left))
+                .or(nan_of(right)),
+        )
+    }
+
     /// `x BETWEEN a AND b` of floats with a zero bound as its two
-    /// comparisons. `NOT BETWEEN` is `x < a OR x > b`, which the bit order
-    /// answers right for zeros where it runs.
+    /// comparisons; `NOT BETWEEN` of floats as `x < a OR x > b` or a NaN
+    /// operand.
     fn between(&self, between: Between) -> Transformed<Expr> {
-        if between.negated || self.float_type(&between.expr).is_none() {
+        if self.float_type(&between.expr).is_none() {
             return Transformed::no(Expr::Between(between));
+        }
+        if between.negated {
+            // `NOT (x >= a AND x <= b)`: true where a comparison is false,
+            // NaN included (`x < a OR x > b` alone drops NaN rows).
+            let Between { expr, low, high, .. } = between;
+            let below = self.comparison_or_same(expr.as_ref().clone(), Operator::Lt, low.as_ref().clone());
+            let above = self.comparison_or_same(expr.as_ref().clone(), Operator::Gt, high.as_ref().clone());
+            return Transformed::yes(
+                below
+                    .or(above)
+                    .or(nan_of(&expr))
+                    .or(nan_of(&low))
+                    .or(nan_of(&high)),
+            );
         }
         let Between { expr, low, high, .. } = between;
         let (at_low, at_high) = (
