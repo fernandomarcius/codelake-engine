@@ -264,16 +264,19 @@ pub(crate) async fn open(
     let mut engine = Engine::new(&memory, execution).expect("engine");
     common::attach(
         &mut engine,
-        Arc::new(HiveConnector::new(
-            "hive".into(),
-            HiveParams {
-                warehouse: warehouse.display().to_string(),
-                s3_endpoint: None,
-                s3_region: "us-east-1".into(),
-                credentials: None,
-                path_style: false,
-            },
-        )),
+        Arc::new(
+            HiveConnector::new(
+                "hive".into(),
+                HiveParams {
+                    warehouse: warehouse.display().to_string(),
+                    s3_endpoint: None,
+                    s3_region: "us-east-1".into(),
+                    credentials: None,
+                    path_style: false,
+                },
+            )
+            .with_metastore_names(crate::common::reference_names()),
+        ),
     )
     .await;
     for (key, value) in settings {

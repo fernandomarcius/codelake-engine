@@ -45,13 +45,14 @@ use tracing::warn;
 
 /// `version()` as Trino answers it: the server version, here the Trino
 /// release whose protocol is implemented.
-pub(crate) fn version_function(version: &'static str) -> Arc<ScalarUDF> {
+pub(crate) fn version_function(version: &str) -> Arc<ScalarUDF> {
+    let version = version.to_owned();
     Arc::new(create_udf(
         "version",
         Vec::new(),
         DataType::Utf8,
         Volatility::Immutable,
-        Arc::new(move |_| Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(version.to_owned()))))),
+        Arc::new(move |_| Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(version.clone()))))),
     ))
 }
 

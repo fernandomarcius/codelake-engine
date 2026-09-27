@@ -4,6 +4,7 @@
 //! codelake check-config --config codelake.toml   # validate and exit (CI / deploy gate)
 //! codelake serve --config codelake.toml          # run the server
 //! codelake config import --from catalog/ --out codelake.toml --env-out codelake.env
+//! codelake hive migrate-names --config codelake.toml --source hive --from-metadata-file … [--apply]
 //! ```
 
 use std::io::Write as _;
@@ -54,6 +55,127 @@ enum Command {
     /// Configuration tools.
     #[command(subcommand)]
     Config(ConfigCommand),
+    /// Hive warehouse tools.
+    #[command(subcommand)]
+    Hive(HiveCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum HiveCommand {
+    /// Rename a local warehouse's metastore files and markers from the names
+    /// another engine wrote to the source's `metastore_names` (ISS-011).
+    /// Prints the plan; changes files only with `--apply`.
+    MigrateNames(MigrateNamesArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct MigrateNamesArgs {
+    #[arg(long, env = "CODELAKE_CONFIG")]
+    config: PathBuf,
+    /// The hive source whose warehouse is migrated (its `metastore_names`
+    /// are the new names).
+    #[arg(long)]
+    source: String,
+    /// Names the warehouse has now (the engine that wrote it).
+    #[arg(long)]
+    from_metadata_file: String,
+    #[arg(long)]
+    from_permissions_dir: String,
+    #[arg(long)]
+    from_view_marker: String,
+    #[arg(long)]
+    from_view_parameter: String,
+    #[arg(long)]
+    from_version_parameter: String,
+    /// Change the files (without it, only the plan is printed).
+    #[arg(long)]
+    apply: bool,
+}
+
+fn migrate_names(args: &MigrateNamesArgs) -> ExitCode {
+    let mut err = std::io::stderr();
+    let loaded = match codelake_core::Config::load(&args.config) {
+        Ok(validated) => validated,
+        Err(e) => {
+            let _ = writeln!(err, "codelake hive migrate-names: {e}");
+            return ExitCode::from(EXIT_CONFIG);
+        }
+    };
+    let Some((warehouse, names)) = loaded
+        .config
+        .sources
+        .iter()
+        .find(|s| s.name == args.source)
+        .and_then(|s| match &s.kind {
+            codelake_core::config::SourceKind::Hive {
+                warehouse,
+                metastore_names,
+                ..
+            } => Some((warehouse.clone(), metastore_names.clone())),
+            _ => None,
+        })
+    else {
+        let _ = writeln!(
+            err,
+            "codelake hive migrate-names: no hive source `{}`",
+            args.source
+        );
+        return ExitCode::from(EXIT_CONFIG);
+    };
+    let Some(root) = warehouse
+        .strip_prefix("file://")
+        .or(Some(warehouse.as_str()))
+        .filter(|w| w.starts_with('/'))
+    else {
+        let _ = writeln!(
+            err,
+            "codelake hive migrate-names: only local warehouses are migrated, not `{warehouse}`"
+        );
+        return ExitCode::from(EXIT_CONFIG);
+    };
+    let old = codelake_core::config::MetastoreNames {
+        metadata_file: args.from_metadata_file.clone(),
+        permissions_dir: args.from_permissions_dir.clone(),
+        view_marker: args.from_view_marker.clone(),
+        view_parameter: args.from_view_parameter.clone(),
+        version_parameter: args.from_version_parameter.clone(),
+        writer_version: names.writer_version.clone(),
+    };
+    if let Some(problem) = old.problems().first() {
+        let _ = writeln!(err, "codelake hive migrate-names: old names: {problem}");
+        return ExitCode::from(EXIT_CONFIG);
+    }
+    match codelake_connectors::hive::migrate::migrate_names(
+        std::path::Path::new(root),
+        &old,
+        &names,
+        args.apply,
+    ) {
+        Ok(steps) => {
+            let mut out = std::io::stdout().lock();
+            for step in &steps {
+                let _ = match step {
+                    codelake_connectors::hive::migrate::Step::Rewrite { from, to } => {
+                        writeln!(out, "rewrite {} -> {}", from.display(), to.display())
+                    }
+                    codelake_connectors::hive::migrate::Step::Rename { from, to } => {
+                        writeln!(out, "rename  {} -> {}", from.display(), to.display())
+                    }
+                };
+            }
+            let verb = if args.apply {
+                "applied"
+            } else {
+                "planned (dry run: add --apply)"
+            };
+            let _ = writeln!(out, "{} change(s) {verb}", steps.len());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            let _ = writeln!(err, "codelake hive migrate-names: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -85,6 +207,7 @@ fn main() -> ExitCode {
     let config = match &cli.command {
         Command::CheckConfig { config } | Command::Serve { config } => config,
         Command::Config(ConfigCommand::Import(args)) => return config_import(args),
+        Command::Hive(HiveCommand::MigrateNames(args)) => return migrate_names(args),
     };
     // Load first: the exporter is configured by the file. Errors are logged
     // once the subscriber exists.
@@ -110,7 +233,7 @@ fn main() -> ExitCode {
     };
     let code = match cli.command {
         // Handled before the configuration is loaded.
-        Command::Config(_) => ExitCode::SUCCESS,
+        Command::Config(_) | Command::Hive(_) => ExitCode::SUCCESS,
         Command::CheckConfig { .. } => {
             tracing::info!(sources = validated.config.sources.len(), "configuration is valid");
             ExitCode::SUCCESS

@@ -137,6 +137,7 @@ same path inside it.
 | `SHADOW_THREADS` | dbt `--threads` | profile |
 | `SHADOW_DBT_VARS` | extra dbt variables, a JSON object | — |
 | `SHADOW_REFERENCE_WAREHOUSE`, `SHADOW_CANDIDATE_WAREHOUSE` | where each side's output is read: absolute path or `s3://bucket/prefix` | required, different |
+| `SHADOW_REFERENCE_METASTORE_FILE`, `SHADOW_CANDIDATE_METASTORE_FILE` | each side's table metadata file (the candidate's `metastore_names.metadata_file`) | `.trinoSchema`, `.codelakeSchema` |
 | `SHADOW_OUTPUT_CATALOGS` | catalogs whose models are compared | `hive` |
 | `SHADOW_TABLES` | compare these `schema.table` instead of the models that ran (any other entry is refused) | — |
 | `SHADOW_PARQUET_TIME_ZONE` | IANA zone the hive catalogs of **both** engines convert `INT96` timestamps with (`hive.parquet.time-zone` / `parquet_time_zone`); an `INT96` column is not compared without it | none |
@@ -183,7 +184,7 @@ Per table:
 - **sample**: hashes of rows whose count differs, with the count on each side.
   Values only with `SHADOW_SHOW_ROWS=true` (they are production data).
 - **schema**, every difference a divergence:
-  - the metastore file (`.trinoSchema`, `dataColumns`) on one side only;
+  - the metastore file (each side's `SHADOW_<SIDE>_METASTORE_FILE`, `dataColumns`) on one side only;
   - declared columns: names, **order** (`SELECT *` and a positional `UNION`
     depend on it) and **types** (unless a rule documents a type, below),
     from the metastore file of both sides, or from the Parquet schema of both

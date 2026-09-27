@@ -67,7 +67,11 @@ from . import expected as expected_rules
 
 # Table metadata file of the file metastore: a compatibility name, the layout
 # both engines write (docs/adr/0007).
+# Metadata file of a table: the reference engine's name (Trino 431's file
+# metastore) and CodeLake's default (its `metastore_names`, ISS-011). Each
+# side's name is configured (SHADOW_<SIDE>_METASTORE_FILE).
 METASTORE_FILE = ".trinoSchema"
+CANDIDATE_METASTORE_FILE = ".codelakeSchema"
 
 # DuckDB type families, by the prefix of the type name DESCRIBE reports.
 _INTEGER_TYPES = {
@@ -169,6 +173,7 @@ class Location:
     """Where one side's tables are: a local directory or an s3:// prefix."""
 
     warehouse: str
+    metastore_file: str = METASTORE_FILE
 
     def table_dir(self, schema: str, table: str) -> str:
         return self.warehouse.rstrip("/") + "/" + schema.lower() + "/" + table.lower()
@@ -185,6 +190,7 @@ class TableDir:
     path: str
     schema: str
     table: str
+    metastore_file: str = METASTORE_FILE
 
 
 def _visible(name: str) -> bool:
@@ -209,7 +215,7 @@ def find_table(con: duckdb.DuckDBPyConnection, location: Location, schema: str, 
         for s, t in dict.fromkeys(((schema, table), (schema.lower(), table.lower()))):
             path = f"{root}/{s}/{t}"
             if con.execute("SELECT count(*) FROM glob(?)", [path + "/**"]).fetchone()[0]:
-                return TableDir(path, s, t)
+                return TableDir(path, s, t, location.metastore_file)
         return None
     schema_name = _entry(root, schema)
     if schema_name is None:
@@ -217,7 +223,7 @@ def find_table(con: duckdb.DuckDBPyConnection, location: Location, schema: str, 
     table_name = _entry(os.path.join(root, schema_name), table)
     if table_name is None:
         return None
-    return TableDir(os.path.join(root, schema_name, table_name), schema_name, table_name)
+    return TableDir(os.path.join(root, schema_name, table_name), schema_name, table_name, location.metastore_file)
 
 
 def data_files(con: duckdb.DuckDBPyConnection, directory: TableDir) -> list[str]:
@@ -247,7 +253,7 @@ def data_files(con: duckdb.DuckDBPyConnection, directory: TableDir) -> list[str]
 def declared_columns(con: duckdb.DuckDBPyConnection, directory: TableDir) -> dict[str, tuple[str, str]] | None:
     """Declared columns of the table's metastore file: lower-case name ->
     (name as written, type). None when the file is absent or unreadable."""
-    path = directory.path.rstrip("/") + "/" + METASTORE_FILE
+    path = directory.path.rstrip("/") + "/" + directory.metastore_file
     try:
         if directory.path.startswith("s3://"):
             row = con.execute("SELECT content FROM read_text(?)", [path]).fetchone()

@@ -129,6 +129,7 @@ async fn codelake_in(warehouse: &Path, spill: &Path, zone: ParquetTimeZone) -> E
                     path_style: false,
                 },
             )
+            .with_metastore_names(crate::common::reference_names())
             .with_parquet_time_zone(zone),
         ),
     )

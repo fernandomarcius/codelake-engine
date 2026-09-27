@@ -367,6 +367,7 @@ async fn staged_table(lake: &Lake, values: Vec<i64>) -> super::metastore::Stagin
             properties: std::collections::BTreeMap::new(),
             extra: std::collections::BTreeMap::new(),
         }],
+        &crate::hive::reference_names(),
     );
     metadata.parameters.insert(TABLE_ID.into(), "staged".into());
     metastore

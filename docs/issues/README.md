@@ -62,3 +62,4 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-050](ISS-050-float-zeros-are-one-value.md) | `0.0` and `-0.0` are one value everywhere (joins diverge from Trino 431) | deliberate divergence | 2026-09-26 | open |
 | [ISS-051](ISS-051-char-container-type-names.md) | Containers of char(n) are typed with varchar elements | known defect | 2026-09-27 | open |
 | [ISS-052](ISS-052-char-round5-by-recommendation.md) | char(n) round 5: choices applied by recommendation | behavior | 2026-09-26 | awaiting-confirmation |
+| [ISS-053](ISS-053-authentication-from-an-identity-service.md) | Client authentication comes from an external identity service | scope decision | 2026-09-27 | open |

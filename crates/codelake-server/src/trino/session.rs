@@ -7,27 +7,76 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderName};
 use codelake_core::{PropertyRegistry, SessionProperties};
 
 use super::errors::{Code, Namespace, QueryError};
 use super::prepared;
 use super::types::Encoding;
 
-pub(crate) const USER: &str = "x-trino-user";
-pub(crate) const CATALOG: &str = "x-trino-catalog";
-pub(crate) const SCHEMA: &str = "x-trino-schema";
-pub(crate) const SOURCE: &str = "x-trino-source";
-pub(crate) const SESSION: &str = "x-trino-session";
-pub(crate) const SET_CATALOG: &str = "x-trino-set-catalog";
-pub(crate) const SET_SCHEMA: &str = "x-trino-set-schema";
-pub(crate) const SET_SESSION: &str = "x-trino-set-session";
-pub(crate) const CLEAR_SESSION: &str = "x-trino-clear-session";
-pub(crate) const CLIENT_CAPABILITIES: &str = "x-trino-client-capabilities";
-pub(crate) const TIME_ZONE: &str = "x-trino-time-zone";
-pub(crate) const PREPARED_STATEMENT: &str = "x-trino-prepared-statement";
-pub(crate) const ADDED_PREPARE: &str = "x-trino-added-prepare";
-pub(crate) const DEALLOCATED_PREPARE: &str = "x-trino-deallocated-prepare";
+/// The protocol's header names: the configured prefix (`[server.trino]
+/// header_prefix`, default `X-CodeLake-`, ISS-011) and each header's
+/// suffix, in lower case as `http` compares them.
+#[derive(Debug, Clone)]
+pub(crate) struct HeaderNames {
+    /// The prefix as configured, for messages.
+    prefix: String,
+    pub(crate) user: HeaderName,
+    pub(crate) catalog: HeaderName,
+    pub(crate) schema: HeaderName,
+    pub(crate) source: HeaderName,
+    pub(crate) session: HeaderName,
+    pub(crate) set_catalog: HeaderName,
+    pub(crate) set_schema: HeaderName,
+    pub(crate) set_session: HeaderName,
+    pub(crate) clear_session: HeaderName,
+    pub(crate) client_capabilities: HeaderName,
+    pub(crate) time_zone: HeaderName,
+    pub(crate) prepared_statement: HeaderName,
+    pub(crate) added_prepare: HeaderName,
+    pub(crate) deallocated_prepare: HeaderName,
+}
+
+impl HeaderNames {
+    /// Names under `prefix` (checked by the configuration: `X-<token>-`).
+    ///
+    /// # Panics
+    ///
+    /// When `prefix` plus a suffix is not a valid header name; the
+    /// configuration refuses such a prefix before the server starts.
+    #[allow(
+        clippy::expect_used,
+        reason = "the configuration check validates the prefix first"
+    )]
+    pub(crate) fn new(prefix: &str) -> Self {
+        let name = |suffix: &str| {
+            HeaderName::from_bytes(format!("{prefix}{suffix}").to_ascii_lowercase().as_bytes())
+                .expect("checked header prefix")
+        };
+        Self {
+            prefix: prefix.to_owned(),
+            user: name("User"),
+            catalog: name("Catalog"),
+            schema: name("Schema"),
+            source: name("Source"),
+            session: name("Session"),
+            set_catalog: name("Set-Catalog"),
+            set_schema: name("Set-Schema"),
+            set_session: name("Set-Session"),
+            clear_session: name("Clear-Session"),
+            client_capabilities: name("Client-Capabilities"),
+            time_zone: name("Time-Zone"),
+            prepared_statement: name("Prepared-Statement"),
+            added_prepare: name("Added-Prepare"),
+            deallocated_prepare: name("Deallocated-Prepare"),
+        }
+    }
+
+    /// `<prefix><suffix>` as written in the configuration, for messages.
+    pub(crate) fn shown(&self, suffix: &str) -> String {
+        format!("{}{suffix}", self.prefix)
+    }
+}
 
 fn invalid_property(error: codelake_core::session_properties::PropertyError) -> QueryError {
     QueryError::new(Code::InvalidSessionProperty, error.0)
@@ -102,35 +151,40 @@ impl ClientSession {
     pub(crate) fn from_headers(
         headers: &HeaderMap,
         registry: &PropertyRegistry,
+        names: &HeaderNames,
     ) -> Result<Self, SessionError> {
-        let user = header(headers, USER)?
-            .ok_or_else(|| SessionError::BadRequest("User must be set (X-Trino-User)".into()))?;
-        let catalog = header(headers, CATALOG)?;
-        let schema = header(headers, SCHEMA)?;
+        let user = header(headers, names.user.as_str())?
+            .ok_or_else(|| SessionError::BadRequest(format!("User must be set ({})", names.shown("User"))))?;
+        let catalog = header(headers, names.catalog.as_str())?;
+        let schema = header(headers, names.schema.as_str())?;
         if schema.is_some() && catalog.is_none() {
-            return Err(SessionError::BadRequest(
-                "Schema is set but catalog is not (X-Trino-Catalog)".into(),
-            ));
+            return Err(SessionError::BadRequest(format!(
+                "Schema is set but catalog is not ({})",
+                names.shown("Catalog")
+            )));
         }
         let mut raw = BTreeMap::new();
-        for text in texts(headers, SESSION)? {
+        for text in texts(headers, names.session.as_str())? {
             for pair in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
                 let (name, value) = pair.split_once('=').ok_or_else(|| {
-                    SessionError::BadRequest(format!("Invalid X-Trino-Session header: {pair}"))
+                    SessionError::BadRequest(format!("Invalid {} header: {pair}", names.shown("Session")))
                 })?;
                 let value = percent_decode(value.trim()).map_err(|_| {
-                    SessionError::BadRequest(format!("Invalid X-Trino-Session header: {pair}"))
+                    SessionError::BadRequest(format!("Invalid {} header: {pair}", names.shown("Session")))
                 })?;
                 raw.insert(name.trim().to_owned(), value);
             }
         }
-        let parametric_datetime = texts(headers, CLIENT_CAPABILITIES)?
+        let parametric_datetime = texts(headers, names.client_capabilities.as_str())?
             .iter()
             .flat_map(|text| text.split(','))
             .any(|capability| capability.trim().eq_ignore_ascii_case("PARAMETRIC_DATETIME"));
-        let prepared = prepared::parse_header(texts(headers, PREPARED_STATEMENT)?.into_iter())
-            .map_err(SessionError::BadRequest)?;
-        let time_zone = header(headers, TIME_ZONE)?
+        let prepared = prepared::parse_header(
+            texts(headers, names.prepared_statement.as_str())?.into_iter(),
+            &names.shown("Prepared-Statement"),
+        )
+        .map_err(SessionError::BadRequest)?;
+        let time_zone = header(headers, names.time_zone.as_str())?
             .map(|zone| {
                 codelake_core::trino_time_zone(&zone).ok_or_else(|| {
                     SessionError::Query(QueryError::new(
@@ -142,7 +196,7 @@ impl ClientSession {
             .transpose()?;
         Ok(Self {
             user,
-            source: header(headers, SOURCE)?,
+            source: header(headers, names.source.as_str())?,
             catalog,
             schema,
             properties: registry
@@ -389,6 +443,7 @@ mod tests {
                 ("X-Trino-Session", "query_max_execution_time=30m"),
             ]),
             &registry(),
+            &HeaderNames::new("X-Trino-"),
         )
         .unwrap();
         assert_eq!(session.user, "dbt");
@@ -410,12 +465,13 @@ mod tests {
     fn session_errors() {
         let registry = registry();
         assert!(matches!(
-            ClientSession::from_headers(&headers(&[]), &registry),
+            ClientSession::from_headers(&headers(&[]), &registry, &HeaderNames::new("X-Trino-")),
             Err(SessionError::BadRequest(_))
         ));
         let unknown = ClientSession::from_headers(
             &headers(&[("X-Trino-User", "u"), ("X-Trino-Session", "nope=1")]),
             &registry,
+            &HeaderNames::new("X-Trino-"),
         );
         assert_eq!(query_error(unknown), "INVALID_SESSION_PROPERTY");
         let bad = ClientSession::from_headers(
@@ -424,6 +480,7 @@ mod tests {
                 ("X-Trino-Session", "query_max_run_time=soon"),
             ]),
             &registry,
+            &HeaderNames::new("X-Trino-"),
         );
         assert_eq!(query_error(bad), "INVALID_SESSION_PROPERTY");
         for malformed in [
@@ -432,7 +489,7 @@ mod tests {
             &[("X-Trino-User", "u"), ("X-Trino-Prepared-Statement", "no_equals")][..],
         ] {
             assert!(matches!(
-                ClientSession::from_headers(&headers(malformed), &registry),
+                ClientSession::from_headers(&headers(malformed), &registry, &HeaderNames::new("X-Trino-")),
                 Err(SessionError::BadRequest(_))
             ));
         }
@@ -447,9 +504,15 @@ mod tests {
             ClientSession::from_headers(
                 &headers(&[("X-Trino-User", "u"), ("X-Trino-Time-Zone", value)]),
                 &registry,
+                &HeaderNames::new("X-Trino-"),
             )
         };
-        let plain = ClientSession::from_headers(&headers(&[("X-Trino-User", "u")]), &registry).unwrap();
+        let plain = ClientSession::from_headers(
+            &headers(&[("X-Trino-User", "u")]),
+            &registry,
+            &HeaderNames::new("X-Trino-"),
+        )
+        .unwrap();
         assert_eq!(plain.time_zone, None);
         for (value, expected) in [
             ("America/Sao_Paulo", "America/Sao_Paulo"),
@@ -471,7 +534,12 @@ mod tests {
     #[test]
     fn capabilities_and_prepared_statements_come_from_headers() {
         let registry = registry();
-        let plain = ClientSession::from_headers(&headers(&[("X-Trino-User", "u")]), &registry).unwrap();
+        let plain = ClientSession::from_headers(
+            &headers(&[("X-Trino-User", "u")]),
+            &registry,
+            &HeaderNames::new("X-Trino-"),
+        )
+        .unwrap();
         assert!(!plain.encoding.parametric_datetime);
         let modern = ClientSession::from_headers(
             &headers(&[
@@ -483,6 +551,7 @@ mod tests {
                 ("X-Trino-Prepared-Statement", "s1=SELECT+%3F,s2=SELECT%201"),
             ]),
             &registry,
+            &HeaderNames::new("X-Trino-"),
         )
         .unwrap();
         assert!(modern.encoding.parametric_datetime);

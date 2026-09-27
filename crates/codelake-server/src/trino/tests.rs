@@ -62,7 +62,13 @@ fn harness_full(
         metadata_cache_limit: ByteSize::mib(1),
     };
     let engine = Arc::new(Engine::with_governance(&memory, execution, governance, None).unwrap());
-    let state = TrinoState::new(Arc::clone(&engine), limits, "127.0.0.1:8081".parse().unwrap());
+    let state = TrinoState::new(
+        Arc::clone(&engine),
+        limits,
+        "127.0.0.1:8081".parse().unwrap(),
+        "X-Trino-",
+        "431",
+    );
     engine
         .context()
         .register_catalog("system", state.system_catalog().unwrap());

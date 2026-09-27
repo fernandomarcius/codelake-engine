@@ -55,7 +55,10 @@ async fn codelake_with(warehouse: &Path, spill: &Path, limit: ByteSize) -> Engin
     let mut engine = Engine::new(&memory, &ExecutionConfig::default()).unwrap();
     common::attach(
         &mut engine,
-        Arc::new(HiveConnector::new("hive".into(), params(warehouse))),
+        Arc::new(
+            HiveConnector::new("hive".into(), params(warehouse))
+                .with_metastore_names(crate::common::reference_names()),
+        ),
     )
     .await;
     engine

@@ -84,6 +84,27 @@ pub struct TrinoProtocolConfig {
     /// `QUERY_TEXT_TOO_LARGE`, as with Trino's `query.max-length`.
     #[serde(default = "default_trino_max_query_length")]
     pub max_query_length: usize,
+    /// Prefix of the protocol's headers (`<prefix>User`, `<prefix>Catalog`,
+    /// …; ISS-011). Default `X-CodeLake-`; clients built for another engine
+    /// send that engine's prefix, set here.
+    #[serde(default = "default_header_prefix")]
+    pub header_prefix: String,
+    /// Version the server reports (`/v1/info`, `version()`); default
+    /// `CodeLake`'s. Some clients check it.
+    pub reported_version: Option<String>,
+}
+
+fn default_header_prefix() -> String {
+    "X-CodeLake-".into()
+}
+
+/// Whether `prefix` makes valid header names: `X-`, then letters, digits and
+/// `-`, ending in `-`.
+fn valid_header_prefix(prefix: &str) -> bool {
+    prefix.len() > 3
+        && prefix.get(..2).is_some_and(|x| x.eq_ignore_ascii_case("x-"))
+        && prefix.ends_with('-')
+        && prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 const fn default_trino_max_active_queries() -> usize {
@@ -486,6 +507,11 @@ pub enum SourceKind {
         /// wrote in UTC reads shifted by the zone's offset.
         #[serde(default = "default_parquet_time_zone")]
         parquet_time_zone: String,
+        /// Names of the metastore's files and markers (ISS-011): `CodeLake`'s
+        /// by default; a warehouse another engine shares or wrote names them
+        /// as that engine does (`[source.metastore_names]`).
+        #[serde(default)]
+        metastore_names: MetastoreNames,
     },
     Iceberg {
         /// Iceberg REST catalog URI.
@@ -612,6 +638,74 @@ impl HiveTimestampPrecision {
             Self::Microseconds => "MICROSECONDS",
             Self::Nanoseconds => "NANOSECONDS",
         }
+    }
+}
+
+/// Names the hive file metastore writes and reads (ISS-011). The defaults
+/// are `CodeLake`'s; another engine sharing the warehouse needs its own names
+/// here, and `codelake hive migrate-names` renames the files of an existing
+/// warehouse.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MetastoreNames {
+    /// Metadata file of a table or view, and suffix of a schema's
+    /// (`.<schema><metadata_file>`).
+    pub metadata_file: String,
+    /// Directory of a table's ownership files.
+    pub permissions_dir: String,
+    /// Marker of a view's SQL (`/* <marker>: … */`) and its comment.
+    pub view_marker: String,
+    /// Table parameter set to `true` on a view.
+    pub view_parameter: String,
+    /// Table parameter holding the writer's version.
+    pub version_parameter: String,
+    /// `writerVersion` of new metadata (an engine sharing the warehouse may
+    /// refuse metadata of another version).
+    pub writer_version: String,
+}
+
+impl Default for MetastoreNames {
+    fn default() -> Self {
+        Self {
+            metadata_file: ".codelakeSchema".into(),
+            permissions_dir: ".codelakePermissions".into(),
+            view_marker: "CodeLake View".into(),
+            view_parameter: "codelake_view".into(),
+            version_parameter: "codelake_version".into(),
+            writer_version: env!("CARGO_PKG_VERSION").into(),
+        }
+    }
+}
+
+impl MetastoreNames {
+    /// Every problem of these names, for the configuration check.
+    #[must_use]
+    pub fn problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        for (key, value) in [
+            ("metadata_file", &self.metadata_file),
+            ("permissions_dir", &self.permissions_dir),
+        ] {
+            if !value.starts_with('.') || value.len() < 2 || value.contains(['/', '\\']) {
+                problems.push(format!(
+                    "metastore_names.{key} must be a hidden file name (`.name`, no `/`)"
+                ));
+            }
+        }
+        if self.metadata_file == self.permissions_dir {
+            problems.push("metastore_names.metadata_file and permissions_dir must differ".into());
+        }
+        for (key, value) in [
+            ("view_marker", &self.view_marker),
+            ("view_parameter", &self.view_parameter),
+            ("version_parameter", &self.version_parameter),
+            ("writer_version", &self.writer_version),
+        ] {
+            if value.trim().is_empty() || value.contains("*/") {
+                problems.push(format!("metastore_names.{key} must not be empty nor hold `*/`"));
+            }
+        }
+        problems
     }
 }
 
@@ -827,6 +921,19 @@ impl Config {
         if trino.client_timeout_secs == 0 {
             errors.push("server.trino.client_timeout_secs must be > 0".into());
         }
+        if !valid_header_prefix(&trino.header_prefix) {
+            errors.push(format!(
+                "server.trino.header_prefix `{}` must be `X-`, letters, digits or `-`, ending in `-`",
+                trino.header_prefix
+            ));
+        }
+        if trino
+            .reported_version
+            .as_deref()
+            .is_some_and(|v| v.trim().is_empty())
+        {
+            errors.push("server.trino.reported_version must not be empty".into());
+        }
         if trino.max_query_length == 0 {
             errors.push("server.trino.max_query_length must be > 0".into());
         }
@@ -1038,10 +1145,14 @@ impl Config {
                     access_key_id_env,
                     secret_access_key_env,
                     parquet_time_zone,
+                    metastore_names,
                     ..
                 } => {
                     if let Err(err) = parquet_time_zone.parse::<crate::parquet_time_zone::ParquetTimeZone>() {
                         errors.push(format!("source `{name}`: parquet_time_zone {err}"));
+                    }
+                    for problem in metastore_names.problems() {
+                        errors.push(format!("source `{name}`: {problem}"));
                     }
                     let local = warehouse.starts_with('/') || warehouse.starts_with("file:");
                     if !local && !warehouse.starts_with("s3://") {
@@ -1790,5 +1901,36 @@ mod tests {
             labels,
             vec!["postgres", "iceberg", "mysql", "sqlserver", "mongodb"]
         );
+    }
+    #[test]
+    fn metastore_names_default_to_codelakes_and_are_checked() {
+        let names = MetastoreNames::default();
+        assert_eq!(names.metadata_file, ".codelakeSchema");
+        assert!(names.problems().is_empty());
+        let doc = format!(
+            "{VALID}\n[[source]]\nname = \"hive\"\nkind = \"hive\"\nwarehouse = \"/wh\"\n\
+             [source.metastore_names]\nmetadata_file = \"schema\"\npermissions_dir = \"schema\"\nview_marker = \"x */\"\n"
+        );
+        let errors = parse(&doc)
+            .validate(&full_env, &|_| true)
+            .unwrap_err()
+            .0
+            .join("\n");
+        assert!(
+            errors.contains("metastore_names.metadata_file must be a hidden file name"),
+            "{errors}"
+        );
+        assert!(
+            errors.contains("metadata_file and permissions_dir must differ"),
+            "{errors}"
+        );
+        assert!(
+            errors.contains("metastore_names.view_marker must not be empty"),
+            "{errors}"
+        );
+        let unknown = format!(
+            "{VALID}\n[[source]]\nname = \"hive\"\nkind = \"hive\"\nwarehouse = \"/wh\"\n[source.metastore_names]\nmetadata = \".x\"\n"
+        );
+        assert!(Config::parse(std::path::Path::new("t.toml"), &unknown, &full_env).is_err());
     }
 }

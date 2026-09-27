@@ -87,6 +87,8 @@ shutdown_grace_secs = 1
 
 [server.trino]
 listen = "127.0.0.1:{port}"
+header_prefix = "X-Trino-"
+reported_version = "431"
 
 [memory]
 limit = "1GiB"
@@ -98,6 +100,14 @@ metadata_cache_limit = "8MiB"
 name = "hive"
 kind = "hive"
 warehouse = "{warehouse}"
+
+[source.metastore_names]
+metadata_file = ".trinoSchema"
+permissions_dir = ".trinoPermissions"
+view_marker = "Presto View"
+view_parameter = "presto_view"
+version_parameter = "presto_version"
+writer_version = "431"
 "#,
             spill = dir.path().join("spill").display(),
             warehouse = warehouse.display(),

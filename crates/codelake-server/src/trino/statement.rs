@@ -68,8 +68,6 @@ const PAGE_TARGET_BYTES: usize = 1 << 20;
 const MAX_WAIT: Duration = Duration::from_secs(1);
 /// Batches produced ahead of the client.
 const BUFFERED_BATCHES: usize = 2;
-/// Version reported to clients: the Trino release whose protocol is implemented.
-const PROTOCOL_VERSION: &str = "431";
 
 type TrinoQuery = Query<Exec>;
 
@@ -660,6 +658,10 @@ pub(crate) struct TrinoState {
     fallback_host: String,
     started: Instant,
     draining: AtomicBool,
+    /// Header names under the configured prefix (ISS-011).
+    headers: session::HeaderNames,
+    /// Version the server reports (`/v1/info`, `version()`).
+    version: String,
 }
 
 impl std::fmt::Debug for TrinoState {
@@ -671,8 +673,16 @@ impl std::fmt::Debug for TrinoState {
 }
 
 impl TrinoState {
-    pub(crate) fn new(engine: Arc<Engine>, limits: Limits, listen: SocketAddr) -> Arc<Self> {
+    pub(crate) fn new(
+        engine: Arc<Engine>,
+        limits: Limits,
+        listen: SocketAddr,
+        header_prefix: &str,
+        version: &str,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            headers: session::HeaderNames::new(header_prefix),
+            version: version.to_owned(),
             queries: Arc::new(Registry::new(Arc::clone(engine.governance().registry()), limits)),
             engine,
             fallback_host: listen.to_string(),
@@ -753,13 +763,11 @@ pub(crate) fn router(state: Arc<TrinoState>) -> Router {
         .with_state(state)
 }
 
-fn json_response(body: Bytes, headers: &[(&'static str, String)]) -> Response {
+fn json_response(body: Bytes, headers: &[(HeaderName, String)]) -> Response {
     let mut response = (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], body).into_response();
     for (name, value) in headers {
         if let Ok(value) = HeaderValue::from_str(value) {
-            response
-                .headers_mut()
-                .append(HeaderName::from_static(name), value);
+            response.headers_mut().append(name.clone(), value);
         }
     }
     response
@@ -828,7 +836,7 @@ async fn submit(State(state): State<Arc<TrinoState>>, request: Request) -> Respo
     let (parts, body) = request.into_parts();
     let headers = parts.headers;
     let Some(user) = headers
-        .get(session::USER)
+        .get(&state.headers.user)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|u| !u.is_empty())
@@ -837,7 +845,7 @@ async fn submit(State(state): State<Arc<TrinoState>>, request: Request) -> Respo
         return (StatusCode::UNAUTHORIZED, "User must be set").into_response();
     };
     let source = headers
-        .get(session::SOURCE)
+        .get(&state.headers.source)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     let base = state.base_uri(&headers);
@@ -876,7 +884,7 @@ async fn submit(State(state): State<Arc<TrinoState>>, request: Request) -> Respo
         );
     }
     let registry = state.engine.session_properties();
-    let session = match ClientSession::from_headers(&headers, registry) {
+    let session = match ClientSession::from_headers(&headers, registry, &state.headers) {
         Ok(session) => Ok(session),
         Err(SessionError::BadRequest(message)) => {
             return (StatusCode::BAD_REQUEST, message).into_response();
@@ -918,10 +926,10 @@ async fn submit(State(state): State<Arc<TrinoState>>, request: Request) -> Respo
     }
 }
 
-type Started = (Page, Vec<(&'static str, String)>, Option<u64>);
+type Started = (Page, Vec<(HeaderName, String)>, Option<u64>);
 
 /// A statement answered at once, without execution.
-fn answered(query: &TrinoQuery, update_type: &'static str, headers: Vec<(&'static str, String)>) -> Started {
+fn answered(query: &TrinoQuery, update_type: &'static str, headers: Vec<(HeaderName, String)>) -> Started {
     query.set_state(QueryState::Running);
     query.finish();
     let page = Page {
@@ -960,7 +968,11 @@ fn start(
                 session::percent_encode(&name),
                 session::percent_encode(&statement)
             );
-            return Ok(answered(query, "PREPARE", vec![(session::ADDED_PREPARE, added)]));
+            return Ok(answered(
+                query,
+                "PREPARE",
+                vec![(state.headers.added_prepare.clone(), added)],
+            ));
         }
         Some(Command::Deallocate { name }) => {
             if !session.prepared.contains_key(&name) {
@@ -970,7 +982,7 @@ fn start(
             return Ok(answered(
                 query,
                 "DEALLOCATE",
-                vec![(session::DEALLOCATED_PREPARE, removed)],
+                vec![(state.headers.deallocated_prepare.clone(), removed)],
             ));
         }
         Some(Command::Execute { name, parameters }) => {
@@ -1001,7 +1013,7 @@ fn start(
         return Ok(answered(
             query,
             control.update_type(),
-            control_headers(&control, &session),
+            control_headers(&control, &session, &state.headers),
         ));
     }
     exec.shape = shape(sql);
@@ -1032,7 +1044,7 @@ fn start(
         schema: session.schema,
         time_zone: session.time_zone,
         properties: session.properties,
-        functions: vec![super::system_tables::version_function(PROTOCOL_VERSION)],
+        functions: vec![super::system_tables::version_function(&state.version)],
         // The query span carries the id clients see.
         trace: QueryTrace::default().with_query_id(query.id.clone()),
         ..QueryOptions::for_user(&session.user)
@@ -1048,23 +1060,27 @@ fn start(
     Ok((Page::default(), Vec::new(), Some(1)))
 }
 
-fn control_headers(control: &Control, session: &ClientSession) -> Vec<(&'static str, String)> {
+fn control_headers(
+    control: &Control,
+    session: &ClientSession,
+    names: &session::HeaderNames,
+) -> Vec<(HeaderName, String)> {
     match control {
         Control::Use { catalog, schema } => {
             let mut headers = Vec::new();
             if let Some(catalog) = catalog.as_ref().or(session.catalog.as_ref()) {
-                headers.push((session::SET_CATALOG, catalog.clone()));
+                headers.push((names.set_catalog.clone(), catalog.clone()));
             }
-            headers.push((session::SET_SCHEMA, schema.clone()));
+            headers.push((names.set_schema.clone(), schema.clone()));
             headers
         }
         Control::SetSession { name, value } => {
             vec![(
-                session::SET_SESSION,
+                names.set_session.clone(),
                 format!("{name}={}", session::percent_encode(value)),
             )]
         }
-        Control::ResetSession { name } => vec![(session::CLEAR_SESSION, name.clone())],
+        Control::ResetSession { name } => vec![(names.clear_session.clone(), name.clone())],
     }
 }
 
@@ -1431,7 +1447,7 @@ async fn kill_query(
     headers: HeaderMap,
 ) -> StatusCode {
     let user = headers
-        .get(session::USER)
+        .get(&state.headers.user)
         .and_then(|v| v.to_str().ok())
         .map(str::trim);
     let Some(query) = state.queries.get(&id) else {
@@ -1451,7 +1467,7 @@ async fn kill_query(
 
 async fn info(State(state): State<Arc<TrinoState>>) -> Response {
     let body = json!({
-        "nodeVersion": {"version": PROTOCOL_VERSION},
+        "nodeVersion": {"version": state.version},
         "environment": "codelake",
         "coordinator": true,
         "starting": false,

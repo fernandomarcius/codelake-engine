@@ -21,6 +21,10 @@ shutdown_grace_secs = 30
 listen = "0.0.0.0:8081"
 max_active_queries = 100
 client_timeout_secs = 300
+# Header prefix and reported version: CodeLake's by default. While clients
+# of the reference engine are not ported, set theirs (docs/operations/migration.md):
+# header_prefix = "X-Trino-"
+# reported_version = "431"
 
 [memory]
 # ~75% of the 8 GiB container (docs/operations/sizing.md).
@@ -52,6 +56,16 @@ name = "lake"
 kind = "hive"
 warehouse = "/data/warehouse"
 timestamp_precision = "MILLISECONDS"
+# Metastore names: CodeLake's by default. A warehouse the reference engine
+# shares or wrote needs its names (docs/operations/configuration.md), or
+# `codelake hive migrate-names` once CodeLake alone uses it.
+# [source.metastore_names]
+# metadata_file = ".trinoSchema"
+# permissions_dir = ".trinoPermissions"
+# view_marker = "Presto View"
+# view_parameter = "presto_view"
+# version_parameter = "presto_version"
+# writer_version = "431"
 
 # Federated SQL Server, read-only account.
 [[source]]

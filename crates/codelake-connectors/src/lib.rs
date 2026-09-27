@@ -121,6 +121,7 @@ pub fn build(source: &SourceConfig, secrets: &Secrets) -> Result<Arc<dyn Connect
             s3_path_style,
             timestamp_precision,
             parquet_time_zone,
+            metastore_names,
         } => {
             let zone = parquet_time_zone
                 .parse()
@@ -144,7 +145,8 @@ pub fn build(source: &SourceConfig, secrets: &Secrets) -> Result<Arc<dyn Connect
                     },
                 )
                 .with_timestamp_precision(*timestamp_precision)
-                .with_parquet_time_zone(zone),
+                .with_parquet_time_zone(zone)
+                .with_metastore_names(metastore_names.clone()),
             ))
         }
         // No Iceberg integration is published for the DataFusion train (ADR 0013).

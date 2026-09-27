@@ -69,6 +69,7 @@ Blocking items, in order:
    `trino_functions` golden and unit test passed.
 5. **Client authentication** on both listeners (SCRAM-SHA-256 for PostgreSQL wire,
    password/JWT for the Trino protocol) and table ownership semantics (R11).
+   **Stopped (2026-09-27, owner):** authentication will come from the external identity service; this item is not implemented in CodeLake (ISS-053).
 6. ✅ **Query governance** (R12, F6) — implemented in the core for both client
    protocols (ADR 0016): one query registry (`system.runtime.queries` lists
    PostgreSQL wire and HTTP queries), `query_max_run_time` /

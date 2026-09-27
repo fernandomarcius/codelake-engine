@@ -41,6 +41,7 @@ async fn open_engine(warehouse: &Path, spill: &Path) -> Engine {
                     path_style: false,
                 },
             )
+            .with_metastore_names(crate::common::reference_names())
             .with_parquet_time_zone(ParquetTimeZone::UTC),
         ),
     )

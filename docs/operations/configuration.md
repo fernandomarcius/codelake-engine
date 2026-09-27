@@ -67,7 +67,23 @@ stops startup.
 | `postgres` | `host`, `port` (5432), `database`, `user`, `password_env`, `sslmode` (`verify-full`) | |
 | `mysql` | `host`, `port` (3306), `database`, `user`, `password_env`, `sslmode` (`required`) | |
 | `mongodb` | `connection_string_env` | the whole URI is the secret |
-| `hive` | `warehouse` (absolute path or `file:` URL), `timestamp_precision` (`MILLISECONDS`, `MICROSECONDS`, `NANOSECONDS`) | Parquet in the file-metastore layout (ADR 0007). S3/MinIO warehouses are not in this build |
+| `hive` | `warehouse` (absolute path or `file:` URL), `timestamp_precision` (`MILLISECONDS`, `MICROSECONDS`, `NANOSECONDS`), `parquet_time_zone` (`America/Sao_Paulo`), `[source.metastore_names]` (below) | Parquet in the file-metastore layout (ADR 0007). S3/MinIO warehouses are not in this build |
+
+### Metastore names: `[source.metastore_names]`
+
+Names of the hive metastore's files and markers (ISS-011). The defaults are
+CodeLake's; a warehouse another engine writes or shares needs that engine's
+names, and [`codelake hive migrate-names`](migration.md#hive-warehouse-names)
+renames an existing warehouse instead.
+
+| Key | Default | What |
+|---|---|---|
+| `metadata_file` | `.codelakeSchema` | a table's or view's metadata file, and a schema's suffix (`.<schema><metadata_file>`) |
+| `permissions_dir` | `.codelakePermissions` | a table's ownership files |
+| `view_marker` | `CodeLake View` | a view's SQL marker (`/* <marker>: … */`) and comment |
+| `view_parameter` | `codelake_view` | table parameter set on a view |
+| `version_parameter` | `codelake_version` | table parameter holding the writer's version |
+| `writer_version` | the CodeLake version | `writerVersion` of new metadata (an engine sharing the warehouse may refuse another version) |
 
 Use a read-only database account for federated sources. A hive warehouse must
 be writable by uid 65532.
@@ -100,6 +116,8 @@ per-user limit restrains well-behaved clients, not a hostile one.
 | `[server.trino] client_timeout_secs` | a query whose client stops polling this long is canceled (`ABANDONED_QUERY`, default 300) |
 | `[server.trino] history_size`, `history_retention_secs` | deprecated: use `[governance]`; still honored when set |
 | `[server.trino] max_query_length` | longest SQL text (1 000 000 characters) |
+| `[server.trino] header_prefix` | prefix of the protocol's headers (`X-CodeLake-`: `X-CodeLake-User`, `X-CodeLake-Catalog`, …); clients built for another engine send that engine's prefix, set here (ISS-011) |
+| `[server.trino] reported_version` | version in `/v1/info` and `version()` (the CodeLake version); some clients check it |
 | `server.tls` | `cert_path`, `key_path` for the PostgreSQL listener; a missing file stops startup |
 
 **There is no client authentication yet** on either query listener (ROADMAP

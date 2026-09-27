@@ -56,7 +56,8 @@ pub(super) async fn engine_over(
                 path_style: false,
             },
         )
-        .with_timestamp_precision(precision),
+        .with_timestamp_precision(precision)
+        .with_metastore_names(crate::hive::reference_names()),
     );
     engine
         .attach(connector, true, std::time::Duration::from_secs(30))
@@ -135,7 +136,9 @@ impl Lake {
 
     pub(super) fn metastore(&self) -> FileMetastore {
         let store = LocalFileSystem::new_with_prefix(self.warehouse.path()).unwrap();
-        FileMetastore::new(Arc::new(store), Path::default()).with_local_dir(self.warehouse.path().into())
+        FileMetastore::new(Arc::new(store), Path::default())
+            .with_names(crate::hive::reference_names())
+            .with_local_dir(self.warehouse.path().into())
     }
 
     /// Rewrites a table's metadata (and its checksum) the way another writer
