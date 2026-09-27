@@ -6,12 +6,6 @@
 //! - A timestamp precision above 12 is an unknown type in Trino
 //!   (`TYPE_MISMATCH`, `Unknown type: timestamp(13)`), not a feature the
 //!   engine lacks. [`check_statement`] rejects both before planning.
-//! - Identifiers are case-insensitive in Trino: every catalog has lower-case
-//!   columns only, and `"CamelCol"` names the column `camelcol`.
-//!   `DataFusion` matches a quoted name exactly. [`fold_quoted_columns`]
-//!   folds a quoted column reference to lower case, unless the statement
-//!   itself defines that exact name (a column alias, a table or CTE alias, a
-//!   derived column list), which then stays reachable as written.
 //! - `IS [NOT] DISTINCT FROM` binds tighter than `AND` and `OR` in Trino (and
 //!   PostgreSQL): `a IS NOT DISTINCT FROM b AND c` is `(a IS NOT DISTINCT
 //!   FROM b) AND c`. The parser reads the whole rest of the expression as the
@@ -19,6 +13,9 @@
 //!   `ON a.flag IS NOT DISTINCT FROM b.flag AND a.id = b.id` answered other
 //!   rows, and with a non-boolean `b` the statement failed.
 //!   [`regroup_distinct_from`] gives the operator its operand back.
+//!
+//! The case of identifiers is folded for every client protocol by
+//! [`crate::identifier_case`].
 
 use std::collections::HashSet;
 use std::ops::ControlFlow;
@@ -26,9 +23,8 @@ use std::ops::ControlFlow;
 use datafusion::error::DataFusionError;
 use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
-    BinaryOperator, DataType, Expr, Ident, Query, SelectItem, SetExpr, Statement as SqlStatement,
-    TableFactor, TimezoneInfo, UnaryOperator, Value, ValueWithSpan, Visit, VisitMut, Visitor, VisitorMut,
-    visit_expressions, visit_expressions_mut,
+    BinaryOperator, DataType, Expr, Statement as SqlStatement, TimezoneInfo, UnaryOperator, Value,
+    ValueWithSpan, visit_expressions, visit_expressions_mut,
 };
 use datafusion::sql::sqlparser::parser::ParserError;
 
@@ -134,155 +130,6 @@ pub(crate) fn check_statement(statement: &DFStatement) -> Result<(), DataFusionE
     match flow {
         ControlFlow::Break(error) => Err(error),
         ControlFlow::Continue(()) => Ok(()),
-    }
-}
-
-/// Names a statement defines: column aliases, table and CTE aliases,
-/// derived column lists.
-#[derive(Default)]
-struct DefinedNames(HashSet<String>);
-
-impl DefinedNames {
-    fn add(&mut self, ident: &Ident) {
-        self.0.insert(ident.value.clone());
-    }
-}
-
-impl Visitor for DefinedNames {
-    type Break = ();
-
-    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
-        if let Some(with) = &query.with {
-            for cte in &with.cte_tables {
-                self.add(&cte.alias.name);
-                for column in &cte.alias.columns {
-                    self.add(&column.name);
-                }
-            }
-        }
-        let mut bodies = vec![query.body.as_ref()];
-        while let Some(body) = bodies.pop() {
-            match body {
-                SetExpr::Select(select) => {
-                    for item in &select.projection {
-                        if let SelectItem::ExprWithAlias { alias, .. } = item {
-                            self.add(alias);
-                        }
-                    }
-                }
-                SetExpr::SetOperation { left, right, .. } => {
-                    bodies.push(left);
-                    bodies.push(right);
-                }
-                _ => {}
-            }
-        }
-        ControlFlow::Continue(())
-    }
-
-    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
-        let alias = match factor {
-            TableFactor::Table { alias, .. }
-            | TableFactor::Derived { alias, .. }
-            | TableFactor::UNNEST { alias, .. }
-            | TableFactor::Function { alias, .. }
-            | TableFactor::NestedJoin { alias, .. } => alias.as_ref(),
-            _ => None,
-        };
-        if let Some(alias) = alias {
-            self.add(&alias.name);
-            for column in &alias.columns {
-                self.add(&column.name);
-            }
-        }
-        ControlFlow::Continue(())
-    }
-}
-
-/// Folds the quoted column references not in `defined`.
-struct FoldColumns<'a> {
-    defined: &'a HashSet<String>,
-}
-
-impl FoldColumns<'_> {
-    fn fold(&self, ident: &mut Ident) {
-        if ident.quote_style.is_some()
-            && ident.value.chars().any(char::is_uppercase)
-            && !self.defined.contains(&ident.value)
-        {
-            ident.value = ident.value.to_lowercase();
-        }
-    }
-}
-
-impl VisitorMut for FoldColumns<'_> {
-    type Break = ();
-
-    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
-        match expr {
-            Expr::Identifier(ident) => self.fold(ident),
-            // `t."Col"`: the column; the qualifier names a relation.
-            Expr::CompoundIdentifier(parts) => {
-                if let Some(last) = parts.last_mut() {
-                    self.fold(last);
-                }
-            }
-            _ => {}
-        }
-        ControlFlow::Continue(())
-    }
-}
-
-/// Folds quoted column references to lower case (see the module
-/// documentation).
-pub(crate) fn fold_quoted_columns(statement: &mut DFStatement) {
-    let DFStatement::Statement(inner) = statement else {
-        return;
-    };
-    let mut defined = DefinedNames::default();
-    let _ = inner.as_ref().visit(&mut defined);
-    let _ = inner.as_mut().visit(&mut NameFoldedItems { defined: &defined.0 });
-    let _ = inner.as_mut().visit(&mut FoldColumns { defined: &defined.0 });
-}
-
-/// A select item that is a quoted column reference about to be folded keeps
-/// its name as written (Trino names it `CamelCol`, and `SELECT "CamelCol",
-/// "CAMELCOL"` is two columns).
-struct NameFoldedItems<'a> {
-    defined: &'a HashSet<String>,
-}
-
-impl VisitorMut for NameFoldedItems<'_> {
-    type Break = ();
-
-    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<()> {
-        let SetExpr::Select(select) = query.body.as_mut() else {
-            return ControlFlow::Continue(());
-        };
-        for item in &mut select.projection {
-            let SelectItem::UnnamedExpr(expr) = item else {
-                continue;
-            };
-            let name = match expr {
-                Expr::Identifier(ident) => ident,
-                Expr::CompoundIdentifier(parts) => match parts.last() {
-                    Some(last) => last,
-                    None => continue,
-                },
-                _ => continue,
-            };
-            let folds = name.quote_style.is_some()
-                && name.value.chars().any(char::is_uppercase)
-                && !self.defined.contains(&name.value);
-            if folds {
-                let alias = name.clone();
-                *item = SelectItem::ExprWithAlias {
-                    expr: expr.clone(),
-                    alias,
-                };
-            }
-        }
-        ControlFlow::Continue(())
     }
 }
 
@@ -478,6 +325,7 @@ fn regroup(pieces: &mut Vec<Piece>, floor: u8) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::sql::sqlparser::ast::SetExpr;
 
     /// The tree of `e` with every operator in parentheses.
     fn shape(e: &Expr) -> String {
@@ -588,41 +436,6 @@ mod tests {
                 "{error}"
             );
         }
-    }
-
-    fn folded(sql: &str) -> String {
-        let mut statement = datafusion::sql::parser::DFParser::parse_sql(sql)
-            .unwrap()
-            .pop_front()
-            .unwrap();
-        fold_quoted_columns(&mut statement);
-        statement.to_string()
-    }
-
-    #[test]
-    fn quoted_columns_fold_unless_the_statement_defines_them() {
-        assert_eq!(
-            folded("SELECT \"CamelCol\" AS \"OtherCol\" FROM s.\"MiXeD\" WHERE t.\"Id\" > 1"),
-            "SELECT \"camelcol\" AS \"OtherCol\" FROM s.\"MiXeD\" WHERE t.\"id\" > 1"
-        );
-        assert_eq!(
-            folded("SELECT \"CamelCol\", t.\"CAMELCOL\" FROM t"),
-            "SELECT \"camelcol\" AS \"CamelCol\", t.\"camelcol\" AS \"CAMELCOL\" FROM t"
-        );
-        assert_eq!(
-            folded(
-                "SELECT \"ID\", \"Mixed Case\" FROM (SELECT id AS \"ID\", 1 AS \"Mixed Case\") ORDER BY \"ID\""
-            ),
-            "SELECT \"ID\", \"Mixed Case\" FROM (SELECT id AS \"ID\", 1 AS \"Mixed Case\") ORDER BY \"ID\""
-        );
-        assert_eq!(
-            folded("SELECT \"T\".\"K\" FROM (VALUES (1)) \"T\"(\"K\")"),
-            "SELECT \"T\".\"K\" FROM (VALUES (1)) \"T\" (\"K\")"
-        );
-        assert_eq!(
-            folded("SELECT Foo, \"lower\" FROM t"),
-            "SELECT Foo, \"lower\" FROM t"
-        );
     }
 
     #[test]

@@ -9,7 +9,7 @@
 6. `char(n)` kept as implemented (padding semantics of the reference engine).
 7. OPTIMIZE preserves the original timestamp precision.
 8. Table and schema names containing `/` are refused.
-9. `CREATE OR REPLACE` on hive tables is refused, as on the reference engine.
+9. `CREATE OR REPLACE` on hive tables is refused, as on the reference engine. Overturned 2026-09-25 (ISS-017): replaced atomically since 2026-09-26.
 10. Differential red-team tests that need users wait for F5 (auth).
 - Implemented: 6 in 2ccc9a7 (char comparisons refused wherever they are, W1-4); 7 in 91b7ee4 (W1-3/W1-7); 8 in 0f364c7; 9 in 87072b8 (W1-1). Decisions the W1 corrections added by recommendation: ISS-014.
 - Revisit when: confirmed or overturned by a human.

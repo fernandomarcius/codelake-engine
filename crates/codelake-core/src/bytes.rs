@@ -19,7 +19,9 @@ pub enum ByteSizeError {
     Empty,
     #[error("invalid number in byte size `{0}`")]
     InvalidNumber(String),
-    #[error("unknown unit `{unit}` in byte size `{input}` (use B, KB, MB, GB, TB, KiB, MiB, GiB, TiB)")]
+    #[error(
+        "unknown unit `{unit}` in byte size `{input}` (use B, KiB, MiB, GiB, TiB (powers of 1024) or KB, MB, GB, TB (powers of 1000), any case)"
+    )]
     UnknownUnit { input: String, unit: String },
     #[error("byte size `{0}` overflows u64")]
     Overflow(String),
@@ -164,6 +166,18 @@ mod tests {
             "-1GiB".parse::<ByteSize>(),
             Err(ByteSizeError::InvalidNumber(_))
         ));
+    }
+
+    /// The message names both families of units and what they mean: in the
+    /// configuration `MB` is decimal, in session properties it is binary.
+    #[test]
+    fn unknown_unit_lists_the_accepted_units() {
+        let message = "4 gigs".parse::<ByteSize>().unwrap_err().to_string();
+        assert!(
+            message.contains("KiB, MiB, GiB, TiB (powers of 1024)"),
+            "{message}"
+        );
+        assert!(message.contains("KB, MB, GB, TB (powers of 1000)"), "{message}");
     }
 
     #[test]

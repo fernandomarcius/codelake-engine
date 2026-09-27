@@ -42,7 +42,9 @@ use serde::{Deserialize, Serialize};
 
 use codelake_core::config::HiveTimestampPrecision;
 
-use super::metastore::{ColumnMetadata, FileMetastore, MetastoreError, Staging, TableMetadata};
+use super::metastore::{
+    ColumnMetadata, FileMetastore, MetastoreError, Staging, TABLE_ID, TableMetadata, WRITTEN_NAME,
+};
 use super::optimize::{self, OPTIMIZE, Settings};
 use super::table::{HiveSink, HiveTable, refuse_char_comparisons};
 use super::types::{UNSUPPORTED, arrow_type, char_column, hive_type, stored_type, unsupported};
@@ -587,12 +589,56 @@ impl SchemaProvider for HiveSchema {
     }
 }
 
-/// Name as the Hive connector stores it. Trino folds identifiers to lower
-/// case, so its Hive catalog only knows lower-case schemas, tables and
-/// columns: a quoted `"MixedCase"` is the table `mixedcase`. Every entry of
-/// this catalog folds, so directory, metadata and lookup always agree.
+/// A name folded to lower case: how the engine sees every schema, table and
+/// column of this catalog (identifiers are case-insensitive), how the
+/// metastore names them and the directory of a schema or table. Trino folds
+/// identifiers too: it finds a table only in its lower-case directory and
+/// writes only into lower-case columns. The name as written is kept in the
+/// metadata (`codelake.name`) and, for columns, in the files (ISS-018).
 pub(crate) fn hive_name(name: &str) -> String {
     name.to_lowercase()
+}
+
+/// Records `written` in `parameters` when it is not already its folded
+/// form (ISS-018: the metastore keeps names as they were written).
+pub(crate) fn record_written_name(parameters: &mut BTreeMap<String, String>, written: &str) {
+    if written == hive_name(written) {
+        parameters.remove(WRITTEN_NAME);
+    } else {
+        parameters.insert(WRITTEN_NAME.into(), written.to_owned());
+    }
+}
+
+/// The error for a name taken by one that differs from it only by case.
+fn taken(kind: &str, catalog: &str, written: &str, folded: &str) -> String {
+    if written == folded {
+        format!("{kind} {catalog}.{folded} already exists")
+    } else {
+        format!(
+            "{kind} {catalog}.{written} cannot be created: {catalog}.{folded} already exists, and names \
+             that differ only by case are the same {kind}"
+        )
+    }
+}
+
+/// Refuses two column names that differ only by case (ISS-018): readers
+/// that ignore case (the engine, the reference engine, SQL Server
+/// `OPENROWSET`) would read one for the other.
+fn refuse_case_duplicates<'a>(names: impl IntoIterator<Item = &'a str>, relation: &str) -> Result<()> {
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for name in names {
+        if let Some(other) = seen.insert(hive_name(name), name) {
+            return Err(DataFusionError::Plan(if other == name {
+                format!("Column name '{name}' specified more than once in {relation}")
+            } else {
+                format!(
+                    "columns `{other}` and `{name}` of {relation} differ only by case: column names are \
+                     case-insensitive, so they would be one column"
+                )
+            }));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -612,8 +658,9 @@ async fn rename_relation(
     catalog: &HiveCatalog,
     view: bool,
     (schema, name): (&str, &str),
-    (new_schema, new_name): (&str, &str),
+    (new_schema, written): (&str, &str),
 ) -> Result<()> {
+    let (new_schema, new_name) = (&hive_name(new_schema), &hive_name(written));
     let (noun, other) = if view {
         ("View", "table")
     } else {
@@ -637,11 +684,31 @@ async fn rename_relation(
         )));
     }
     catalog.require_schema(new_schema).await?;
-    catalog
+    match catalog
         .metastore
         .rename_table(schema, name, new_schema, new_name)
         .await
-        .map_err(metastore_error)?;
+    {
+        Ok(()) => {}
+        Err(MetastoreError::AlreadyExists(_)) => {
+            return Err(DataFusionError::Plan(taken(
+                if view { "view" } else { "table" },
+                &format!("{}.{new_schema}", catalog.name),
+                written,
+                new_name,
+            )));
+        }
+        Err(err) => return Err(metastore_error(err)),
+    }
+    // The name as the statement wrote it (ISS-018); cosmetic, so a failure
+    // here leaves the rename done.
+    if let Err(err) = catalog
+        .metastore
+        .record_written_name(new_schema, new_name, written)
+        .await
+    {
+        tracing::warn!(catalog = %catalog.name, table = %new_name, error = %err, "could not record the written name");
+    }
     catalog.refresh().await
 }
 
@@ -652,11 +719,15 @@ fn new_column(
     check_precision: bool,
 ) -> Result<ColumnMetadata> {
     check_object_name(ObjectKind::Column, field.name())?;
+    // Folded in the metastore, as written in its property and in the files
+    // (ISS-018).
+    let mut properties = BTreeMap::new();
+    record_written_name(&mut properties, field.name());
     Ok(ColumnMetadata {
         name: hive_name(field.name()),
         hive_type: stored_type(field, precision, check_precision)?,
         comment: field.metadata().get(COLUMN_COMMENT).cloned(),
-        properties: BTreeMap::new(),
+        properties,
         extra: BTreeMap::new(),
     })
 }
@@ -672,6 +743,8 @@ fn check_names(schema: &str, table: &str, kind: ObjectKind) -> Result<()> {
 enum Existing {
     Fail,
     Keep,
+    /// `CREATE OR REPLACE` (ISS-017).
+    Replace,
 }
 
 impl HiveCatalog {
@@ -685,6 +758,9 @@ impl HiveCatalog {
         table: &str,
         existing: Existing,
     ) -> Result<bool> {
+        if existing == Existing::Replace {
+            return self.swap_in(staging, schema, table).await.map(|()| true);
+        }
         let _metadata = self
             .metastore
             .lock_metadata(schema, table)
@@ -695,19 +771,46 @@ impl HiveCatalog {
             // Another statement created it meanwhile: `IF NOT EXISTS` is
             // satisfied, anything else fails as if that one came first.
             Err(MetastoreError::AlreadyExists(_)) if existing == Existing::Keep => Ok(false),
-            Err(MetastoreError::AlreadyExists(_)) => Err(DataFusionError::Plan(format!(
-                "table {}.{schema}.{table} already exists",
-                self.name
+            Err(MetastoreError::AlreadyExists(_)) => Err(DataFusionError::Plan(taken(
+                "table",
+                &format!("{}.{schema}", self.name),
+                table,
+                table,
             ))),
             Err(err) => Err(metastore_error(err)),
         }
     }
 
-    /// `CREATE TABLE [AS]`: rows and metadata are written into a private
-    /// staging directory, then published
-    /// under the table's metadata lock (see `metastore.rs`). A failure at any
-    /// point removes only the staging directory: an existing table, or one
-    /// another statement created meanwhile, is never touched.
+    /// `CREATE OR REPLACE`: the staged table takes the name in one step
+    /// ([`FileMetastore::replace_table`]), under the same locks as
+    /// `DROP TABLE` (no `OPTIMIZE` swap, commit of `INSERT` files, or scan
+    /// listing of this table, in any process, sees it half done).
+    async fn swap_in(&self, staging: &Staging, schema: &str, table: &str) -> Result<()> {
+        let locks = self.metastore.table_locks(schema, table);
+        let _swap = locks.commit.write().await;
+        let _other_processes = self
+            .metastore
+            .table_file_lock(schema, table, true)
+            .await
+            .map_err(metastore_error)?;
+        let _metadata = self
+            .metastore
+            .lock_metadata(schema, table)
+            .await
+            .map_err(metastore_error)?;
+        match self.metastore.replace_table(staging, schema, table).await {
+            Ok(()) => Ok(()),
+            Err(MetastoreError::Conflict(message)) => Err(DataFusionError::Plan(message)),
+            Err(err) => Err(metastore_error(err)),
+        }
+    }
+
+    /// `CREATE [OR REPLACE] TABLE [AS]`: rows and metadata are written into a
+    /// private staging directory, then published (or swapped in, for `OR
+    /// REPLACE`) under the table's locks (see `metastore.rs`). A failure
+    /// before that removes only the staging directory: an existing table, or
+    /// one another statement created meanwhile, is never touched. After a
+    /// replacement the staging directory holds the old table, removed last.
     async fn write_table_as(
         &self,
         (schema, table): (&str, &str),
@@ -717,6 +820,7 @@ impl HiveCatalog {
         context: Arc<TaskContext>,
     ) -> Result<u64> {
         let if_not_exists = existing == Existing::Keep;
+        let written = table;
         let (schema, table) = (&hive_name(schema), &hive_name(table));
         check_names(schema, table, ObjectKind::Table)?;
         self.require_schema(schema).await?;
@@ -725,12 +829,20 @@ impl HiveCatalog {
             .table(schema, table)
             .await
             .map_err(metastore_error)?;
-        match found {
+        match &found {
             Some(_) if if_not_exists => return Ok(0),
-            Some(_) => {
+            Some(metadata) if existing == Existing::Replace && metadata.is_view() => {
                 return Err(DataFusionError::Plan(format!(
-                    "table {}.{schema}.{table} already exists",
-                    self.name
+                    "{schema}.{table} is a view: use CREATE OR REPLACE VIEW, or DROP VIEW first"
+                )));
+            }
+            Some(_) if existing == Existing::Replace => {}
+            Some(_) => {
+                return Err(DataFusionError::Plan(taken(
+                    "table",
+                    &format!("{}.{schema}", self.name),
+                    written,
+                    table,
                 )));
             }
             None => {}
@@ -742,27 +854,32 @@ impl HiveCatalog {
             .iter()
             .map(|f| new_column(f, precision, true))
             .collect::<Result<Vec<_>>>()?;
-        let mut names = BTreeSet::new();
-        if let Some(twice) = columns.iter().find(|c| !names.insert(c.name.as_str())) {
-            return Err(DataFusionError::Plan(format!(
-                "duplicate column name `{}` in {schema}.{table} (hive column names are case-insensitive)",
-                twice.name
-            )));
-        }
+        refuse_case_duplicates(
+            columns.iter().map(ColumnMetadata::written_name),
+            &format!("{schema}.{table}"),
+        )?;
         // Trino refuses a target directory that exists without a table (left
-        // by another writer); taking it over could mix foreign files in.
-        if self
-            .metastore
-            .table_location_exists(schema, table)
-            .await
-            .map_err(metastore_error)?
+        // by another writer); taking it over could mix foreign files in, and
+        // replacing it would delete them (red-team W1-1).
+        if found.is_none()
+            && self
+                .metastore
+                .table_location_exists(schema, table)
+                .await
+                .map_err(metastore_error)?
         {
             return Err(DataFusionError::Plan(format!(
                 "target directory for table {}.{schema}.{table} already exists",
                 self.name
             )));
         }
-        let metadata = TableMetadata::managed_parquet(owner, columns);
+        let mut metadata = TableMetadata::managed_parquet(owner, columns);
+        record_written_name(&mut metadata.parameters, written);
+        if existing == Existing::Replace {
+            metadata
+                .parameters
+                .insert(TABLE_ID.into(), uuid::Uuid::new_v4().simple().to_string());
+        }
         let hive = self.table_provider(schema, table, &metadata)?;
         let staging = self.metastore.staging();
         let committed = async {
@@ -777,7 +894,8 @@ impl HiveCatalog {
             Ok::<_, DataFusionError>(if published { written } else { 0 })
         }
         .await;
-        // Published or not, nothing of this statement stays in staging.
+        // Published or not, nothing of this statement stays in staging
+        // (after a replacement: the old table, no longer visible).
         self.metastore.discard(&staging).await;
         let written = committed?;
         self.refresh().await?;
@@ -788,11 +906,17 @@ impl HiveCatalog {
 #[async_trait]
 impl WritableCatalog for HiveCatalog {
     async fn create_schema(&self, schema: &str, if_not_exists: bool, owner: &str) -> Result<()> {
+        let written = schema;
         let schema = &hive_name(schema);
         check_object_name(ObjectKind::Schema, schema)?;
-        match self.metastore.create_schema(schema, owner).await {
+        match self.metastore.create_schema(schema, written, owner).await {
             Ok(()) => {}
             Err(MetastoreError::AlreadyExists(_)) if if_not_exists => return Ok(()),
+            Err(MetastoreError::AlreadyExists(_)) => {
+                return Err(DataFusionError::Plan(taken(
+                    "schema", &self.name, written, schema,
+                )));
+            }
             Err(err) => return Err(metastore_error(err)),
         }
         self.refresh().await
@@ -813,6 +937,22 @@ impl WritableCatalog for HiveCatalog {
             Existing::Fail
         };
         self.write_table_as((schema, table), existing, owner, rows, context)
+            .await
+    }
+
+    /// `CREATE OR REPLACE TABLE`, which Trino 431's hive connector refuses
+    /// (ISS-017, deliberate divergence): the new table is staged, then its
+    /// directory and the old table's are exchanged in one step (see
+    /// `HiveCatalog::write_table_as` and `FileMetastore::replace_table`).
+    async fn replace_table_as(
+        &self,
+        schema: &str,
+        table: &str,
+        owner: &str,
+        rows: SendableRecordBatchStream,
+        context: Arc<TaskContext>,
+    ) -> Result<u64> {
+        self.write_table_as((schema, table), Existing::Replace, owner, rows, context)
             .await
     }
 
@@ -869,6 +1009,7 @@ impl WritableCatalog for HiveCatalog {
         owner: &str,
         definition: ViewDefinition,
     ) -> Result<()> {
+        let written = view;
         let (schema, view) = (&hive_name(schema), &hive_name(view));
         check_names(schema, view, ObjectKind::View)?;
         // Trino stores no owner for SECURITY INVOKER views (`runAsInvoker`).
@@ -913,7 +1054,8 @@ impl WritableCatalog for HiveCatalog {
             path: Vec::new(),
             extra: BTreeMap::new(),
         };
-        let metadata = TableMetadata::trino_view(owner, trino_view.encode()?);
+        let mut metadata = TableMetadata::trino_view(owner, trino_view.encode()?);
+        record_written_name(&mut metadata.parameters, written);
         let _metadata = self
             .metastore
             .lock_metadata(schema, view)
@@ -929,9 +1071,11 @@ impl WritableCatalog for HiveCatalog {
                 return Err(DataFusionError::Plan(format!("{schema}.{view} is a table")));
             }
             if !or_replace {
-                return Err(DataFusionError::Plan(format!(
-                    "view {}.{schema}.{view} already exists",
-                    self.name
+                return Err(DataFusionError::Plan(taken(
+                    "view",
+                    &format!("{}.{schema}", self.name),
+                    written,
+                    view,
                 )));
             }
         }
@@ -983,13 +1127,11 @@ impl WritableCatalog for HiveCatalog {
 
     async fn rename_table(&self, schema: &str, table: &str, new_schema: &str, new_table: &str) -> Result<()> {
         let (schema, table) = (&hive_name(schema), &hive_name(table));
-        let (new_schema, new_table) = (&hive_name(new_schema), &hive_name(new_table));
         rename_relation(self, false, (schema, table), (new_schema, new_table)).await
     }
 
     async fn rename_view(&self, schema: &str, view: &str, new_schema: &str, new_view: &str) -> Result<()> {
         let (schema, view) = (&hive_name(schema), &hive_name(view));
-        let (new_schema, new_view) = (&hive_name(new_schema), &hive_name(new_view));
         rename_relation(self, true, (schema, view), (new_schema, new_view)).await
     }
 

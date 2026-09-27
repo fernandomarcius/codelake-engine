@@ -60,8 +60,20 @@ Server 2022, and each is the behavior of Trino 431 itself.
   write `INT96`, so the writer encodes those columns itself and leaves them
   without min/max statistics (undefined sort order must never prune).
 - **Managed tables own their directory.** `DROP TABLE` removes the table
-  directory with its data (a view's directory holds only metadata); `EXTERNAL_TABLE`
-  keeps its data and loses only what the metastore wrote. A `CREATE TABLE AS`
+  directory with its data; `EXTERNAL_TABLE` keeps its data and loses only
+  what the metastore wrote. **A view owns nothing but its metadata**
+  (amended 2026-09-26, ISS-023, deliberate divergence): `DROP VIEW` removes
+  `.trinoSchema`, its checksum and `.trinoPermissions`, and the directory
+  only when nothing else is left in it; `ALTER VIEW … RENAME` moves only
+  those files (new name written whole, `.trinoSchema` last, then the old
+  one removed). Trino 431 lets `CREATE VIEW` take a directory that already
+  holds another writer's files and deletes them all on `DROP VIEW`;
+  `CodeLake` keeps them, byte for byte (`hive::limits_tests::drop_view_*`,
+  `view_rename_and_replace_never_move_foreign_files`). The view's rows are
+  the same in both engines, and after `DROP VIEW` neither finds it
+  (`hive_acceptance::drop_view_keeps_foreign_files_and_trino_reads_the_view`,
+  Trino 431). Any table type other than `MANAGED_TABLE`
+  loses only its metadata on `DROP TABLE`. A `CREATE TABLE AS`
   that fails removes everything it wrote, directory included. A CTAS whose
   target directory already exists fails, as in Trino ("Target directory for
   table … already exists"). `CREATE SCHEMA` creates the schema directory.
@@ -71,12 +83,59 @@ Server 2022, and each is the behavior of Trino 431 itself.
   `CodeLake` plans stored views the same way and records its own session
   catalog/schema when it creates a view. Unknown fields of the view
   definition (`comment`, …) survive a rewrite.
-- **Names are lower case.** Trino folds identifiers to lower case, so the Hive
-  connector only has lower-case schemas, tables and columns. `CodeLake` folds
-  them at every entry of the catalog (DDL, lookup, listing), so a quoted
-  `"MixedCase"` is the table `mixedcase` in the directory, the metadata and
-  every query, from both engines. Two columns that differ only in case are an
-  error.
+- **Names resolve folded; the case written is kept** (amended 2026-09-26,
+  ISS-018, removed limitation, no compatibility mode). Trino folds
+  identifiers to lower case, so its Hive connector only has lower-case
+  schemas, tables and columns, and loses the case a client wrote.
+  `CodeLake` now keeps it where that loses nothing:
+  - **Files:** every Parquet file `CodeLake` writes (`CREATE TABLE AS`,
+    `INSERT`, `OPTIMIZE`) names each column as it was written: a quoted
+    `"CustomerCode"` is the Parquet column `CustomerCode` (an unquoted
+    name is folded, as SQL reads it). Readers of the files see it: SQL
+    Server 2022 `OPENROWSET` (case-insensitive collation) reads the right
+    columns under either spelling, and Trino 431 reads them (its Parquet
+    reader matches names ignoring case).
+  - **Metastore:** names stay folded (`dataColumns[].name`, the directories
+    of schemas and tables); the name as written is recorded in the
+    `codelake.name` property of the column (`properties`) and in the
+    `codelake.name` parameter of the table, view and schema (only when it
+    differs from the folded name; updated by a rename). Checked on Trino
+    431: with a mixed-case name in `dataColumns` it reads the table but its
+    `INSERT` fails (`NullPointerException: "type" is null`), and it finds a
+    table only in its lower-case directory; it keeps the column properties
+    through its own `INSERT`. A `codelake.name` that no longer folds to the
+    column's name (another engine renamed it) is ignored.
+  - **Resolution:** the engine sees every schema, table and column by its
+    folded name, so any spelling resolves (`customercode`, `CUSTOMERCODE`,
+    `"CustomerCode"`), on both client protocols (HTTP and the PostgreSQL
+    wire, simple and extended), wherever a statement names a column: in
+    expressions, `INSERT` column lists and `JOIN … USING` lists
+    (`codelake_core::identifier_case`; a name the statement itself defines,
+    an alias, stays as written). An unquoted name with a non-ASCII capital
+    folds as `A`–`Z` do (`DESCRIÇÃO` is `descrição`; the planner alone
+    folds ASCII only, which recorded `descriÇÃo`, a spelling nobody
+    wrote). Result headers, `information_schema` and `DESCRIBE`
+    show the folded name, as Trino does. Showing the written case there
+    needs case-insensitive column resolution in the planner, which
+    `DataFusion` 54 does not have (ISS-018, awaiting confirmation).
+  - **Ambiguity is refused:** two names of one level that differ only by
+    case (columns of a table, a column added next to another, tables,
+    views, schemas) fail with an error that names both ("differ only by
+    case"). A table whose metadata (another writer's) holds such columns
+    fails when read; a data file with several spellings of one column is
+    read by the exact written spelling, then the folded one, and otherwise
+    fails when the column is read, never NULL nor a guess. Footer
+    statistics match file columns the same way (a column spelled otherwise
+    in the file is no longer taken for absent, "all NULL").
+  - Tables written before (lower-case files and metadata) read and write
+    as before; files of other writers (`ID` for `id`) too.
+  - Evidence: `hive::limits_tests` (`column_names_keep_their_case_…`,
+    `names_that_differ_only_by_case_are_refused`, `schema_and_table_names_…`,
+    stale and ambiguous names), `hive::columns` and `file_statistics` unit
+    tests, `hive_acceptance::case_preserved_columns_are_read_by_trino_and_openrowset`
+    (Trino 431 reads the rows `CodeLake` reads and appends rows `CodeLake`
+    then reads; SQL Server 2022 reads each file's columns by both spellings
+    and reports the written names).
 - **`INT96` time zone per catalog: `parquet_time_zone`** (amended
   2026-09-25). Trino 431 converts `INT96` values with
   `hive.parquet.time-zone` (default: the JVM zone, UTC in the
@@ -137,11 +196,67 @@ requires where Trino has no equivalent.
   never mix rows (the loser fails), an `ADD COLUMN` is never lost to a
   concurrent `INSERT` or `ADD COLUMN`, an `INSERT` whose metadata update fails
   leaves no file visible, and a failed CTAS removes only its own staging.
-- **`CREATE OR REPLACE TABLE`** is refused as Trino 431's Hive connector
-  refuses it (`NOT_SUPPORTED`, "This connector does not support replacing
-  tables"), whether the name exists or not (owner decision, 2026-09-24: the
-  catalog answers what Trino answers on the same metastore). The existing
-  table and the staging area are untouched.
+- **`CREATE OR REPLACE TABLE`** (and `… AS`) replaces the table atomically
+  (amended 2026-09-26, ISS-017, deliberate divergence, no compatibility
+  mode; it was refused as Trino 431's Hive connector refuses it, "This
+  connector does not support replacing tables"):
+  - the new table (data files, `.trinoSchema`, permissions) is written in
+    the statement's staging directory, like a CTAS; a query that fails, or
+    a process that dies, leaves the old table untouched (the orphan staging
+    is hidden, disk only);
+  - under the table's commit lock, cross-process file lock and metadata
+    lock (those `DROP TABLE` takes), the staging directory and the table
+    directory are **exchanged in one step** (`renameat2(RENAME_EXCHANGE)`,
+    `renamex_np(RENAME_SWAP)` on macOS): every reader that takes those
+    locks (this process, another `CodeLake` node on the warehouse, the
+    sink) finds the whole old table or the whole new one under the name,
+    never a mix and never nothing. Trino reads the table's `.trinoSchema`
+    and lists its directory in separate steps, without those locks: the
+    exchange guarantees it never finds the table missing, but a Trino query
+    that overlaps the swap may read the new table's files with the old
+    table's metadata (not reproduced; do not replace a table Trino is
+    reading). The old table is then in the staging directory and is removed
+    last; a crash before that leaves the new table and a hidden orphan in
+    `.codelake/staging`, which nothing removes yet (disk only);
+  - a free name is a CTAS (a directory without a table is refused, never
+    deleted: W1-1); a view, or a table of another type than
+    `MANAGED_TABLE` (an `EXTERNAL_TABLE` does not own its data), is
+    refused with nothing changed; a file system or platform that cannot
+    exchange two directories, and object-store warehouses, refuse the
+    statement with the table unchanged;
+  - the new table's metadata carries a `codelake.table_id` parameter. A
+    scan lists files only after checking, under the locks the swap takes,
+    that the table still has the identity it was planned with; an `INSERT`
+    commits its file under the same check; `OPTIMIZE` checks it before its
+    swap. A plan made against the replaced table fails ("was replaced
+    (CREATE OR REPLACE) after this statement was planned; plan the statement
+    again"): it never reads the new table's files with the old table's
+    columns, nor puts rows planned for one into the other. A query that
+    listed the old files just before the swap fails reading them (file not
+    found: loud, never partial), as a query planned before an `OPTIMIZE`
+    swap does (ADR 0009);
+  - a client protocol that keeps plans plans the statement again before
+    running it. The PostgreSQL wire keeps the plan of a prepared statement
+    from `Parse` (JDBC after five runs, psycopg3, Npgsql): each `Execute`
+    plans the statement again against the catalogs as they are, as
+    PostgreSQL plans a prepared statement again when a table it reads
+    changed, so a pool keeps working across a dbt run that replaces its
+    tables. When the new plan would answer other columns (names or types)
+    than `Describe` announced, or take other parameter types, the statement
+    is refused as PostgreSQL refuses it (SQLSTATE `0A000`, "cached plan must
+    not change result type") until it is prepared again. The HTTP protocol
+    plans every statement it runs;
+  - evidence: `hive::limits_tests` (replacement and self-reading
+    replacement, free name, view, foreign directory and external table
+    refused, failed query, a crash while writing, a crash before and after
+    the swap with a reopened catalog, statements planned before the swap,
+    readers of two processes racing twelve replacements, two processes
+    replacing at once), `hive::limits_redteam_tests` (a lock-free reader
+    always finds the table, a kept plan), e2e `limits_redteam` (`SIGKILL` of
+    the binary at 14 points of a replacement; prepared statements across a
+    replacement with the same and with other columns), `hive_redteam_w1` (`OR REPLACE` racing `OPTIMIZE`
+    on another node; Trino 431 reads the replaced table with the same rows
+    as `CodeLake`).
 - **Stored views are queries.** The SQL of a view is parsed and must be one
   `SELECT`/`WITH`/`VALUES`, when it is created and every time it is read.
 - **Timestamps.** The catalog has Trino's `hive.timestamp-precision`
@@ -173,7 +288,7 @@ requires where Trino has no equivalent.
   only when a query reads it.
 - **Column options** the catalog cannot keep (`NOT NULL`, `DEFAULT`, …) are
   refused with Trino's messages; `COMMENT` is stored.
-- **Views** pad their `char(n)` columns and fold their column names (a quoted `"MixedCol"` is `mixedcol`), and
+- **Views** pad their `char(n)` columns and fold their column names (a quoted `"MixedCol"` is `mixedcol`; a view writes no file, so ISS-018 keeps nothing else), and
   `timestamp(p) with time zone` columns keep their instant (read in UTC: Arrow
   has one zone per column, so each value's own zone is not kept).
 - **Pending, F5.** Owner-based security (R11): Trino with
@@ -187,8 +302,10 @@ A second red-team (`tests/integration/hive_redteam_w1.rs`, after the F9
 its correction and passes after it (2026-09-25).
 
 - **W1-1 `CREATE OR REPLACE` over a foreign directory** deleted it. The
-  statement is refused as Trino 431 refuses it (see above), so nothing is
-  deleted (`w1_or_replace_never_deletes_a_foreign_directory`).
+  statement was then refused as Trino 431 refuses it; since ISS-017 it
+  replaces tables, and a name without a table whose directory exists is
+  still refused, nothing deleted (see above;
+  `w1_or_replace_never_deletes_a_foreign_directory`).
 - **W1-2 NANOSECONDS scans of `INT96` outside 1677–2262** answered another
   instant (the reader's nanoseconds wrap: 1500-06-01 read as 2084-12-18).
   A NANOSECONDS catalog now reads its timestamps exactly

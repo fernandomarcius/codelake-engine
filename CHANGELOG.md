@@ -93,6 +93,31 @@ versioning: [SemVer](https://semver.org/).
   fronts' Definition of Done (docs/gates.md).
 
 ### Changed
+- **Breaking:** hive tables keep the case a column name was written with: Parquet files written
+  by `CREATE TABLE AS`, `INSERT` and `OPTIMIZE` name a quoted `"CustomerCode"` column
+  `CustomerCode` (it was `customercode`), so readers of the files (SQL Server `OPENROWSET`,
+  pandas) see the name as written; a consumer that expects lower-case Parquet column names under
+  a case-sensitive comparison must follow. The metastore keeps folded names and records the
+  written one as `codelake.name` (column property; table, view and schema parameter), which the
+  reference engine reads and keeps. Queries resolve any spelling. Two names of one level that
+  differ only by case are refused with an error naming both; statistics and reads match file
+  columns without regard to case, and a file with two spellings of one column fails when that
+  column is read (ADR 0007, ISS-018).
+- **Breaking:** `CREATE OR REPLACE TABLE [… AS]` on a hive catalog replaces the table instead
+  of failing with "This connector does not support replacing tables" (the reference engine's
+  answer). The new table is written aside and exchanged with the old one's directory in one
+  step: readers see the old or the new table, never a mix or nothing; a failure or a crash
+  before the swap leaves the old table. Views, external tables, directories without a table
+  and warehouses that cannot exchange two directories are refused with nothing changed. A
+  plan made against the replaced table fails and the statement must be planned again; a
+  PostgreSQL prepared statement is planned again at each `Execute`, as PostgreSQL does, so it
+  reads the new table, and is refused with SQLSTATE `0A000` ("cached plan must not change
+  result type") when the new table changes its columns (ADR 0007, ISS-017).
+- Session properties and table-procedure arguments of type data size
+  (`file_size_threshold`, `target_max_file_size`) accept `KiB MiB GiB TiB PiB`
+  besides `kB MB GB TB PB`, all powers of 1024 (`MB` keeps its meaning); the
+  reference engine refuses the IEC names. Size errors keep the reference
+  engine's message and add the accepted units (ADR 0009, ISS-020).
 - The query registry moved to the core: `system.runtime.queries` lists the queries of both
   protocols and exists on the PostgreSQL wire too; `resource_group_id` is `["global"]` (or
   `["global", "<group>"]`) instead of NULL. `[server.trino] history_size` and
@@ -211,6 +236,15 @@ versioning: [SemVer](https://semver.org/).
   one value everywhere, for `double` and `real`. **Deliberate divergence:** joins,
   `IN (subquery)` and `IN` lists of `real` match `0.0` with `-0.0`, as PostgreSQL does and
   Trino 431 does not (ADR 0017, ISS-050).
+- Column names resolve in any spelling wherever a statement names a column: a quoted
+  `"CustomerCode"` in an `INSERT` column list or a `JOIN … USING` list, and in any statement on
+  the PostgreSQL wire (simple and extended protocols), failed with `No field named`; an unquoted
+  name with a non-ASCII capital (`DESCRIÇÃO`) was folded to ASCII lower case only
+  (`descriÇÃo`, also the name written to the files) and did not resolve (ADR 0007, ISS-018).
+- Hive catalog: `DROP VIEW` deleted every file in the view's directory, including files of
+  another writer when the view had been created over an existing directory (as the reference
+  engine does); `ALTER VIEW … RENAME` moved them. Both now touch only the view's metadata
+  (ADR 0007, ISS-023, deliberate divergence).
 - PostgreSQL wire, transactions: `COMMIT` and `ROLLBACK` did not close cursors and portals,
   which kept their admission slot and pool memory (for good on a pooled connection) and
   answered `FETCH` after the `COMMIT`. The end of a transaction (`COMMIT`, `ROLLBACK`, a

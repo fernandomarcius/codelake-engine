@@ -31,7 +31,7 @@ observed on a real `trinodb/trino:431` with a file metastore (2026-09-23):
 | `WHERE` on a non-partitioned table | `Unexpected FilterNode found in plan; probably connector was not able to handle provided WHERE expression` (after the session property check) |
 | quoted names | `hive."S"."T"` is the table `hive.s.t` (the hive catalog folds names) |
 | view / missing table | `ALTER TABLE EXECUTE is not supported for views` / `Table 'hive.s.nope' does not exist` |
-| sizes | airlift `DataSize`: units `B kB MB GB TB PB`, case-sensitive, powers of 1024; a fraction rounds to the nearest byte, half up (`374.5B` is 375 bytes); more than 2^63 − 1 bytes → `size is too large to be represented in bytes` |
+| sizes | airlift `DataSize`: units `B kB MB GB TB PB`, case-sensitive, powers of 1024; a fraction rounds to the nearest byte, half up (`374.5B` is 375 bytes); more than 2^63 − 1 bytes → `size is too large to be represented in bytes`; `512MiB` → `Unknown unit: MiB` (`CodeLake` accepts it since ISS-020, see below) |
 | threshold | files with size **≤** threshold are rewritten (a file exactly at the threshold is) |
 | checks order | table, procedure, arguments, the session property, then `WHERE` |
 | zero-byte file | skipped by reads and by `OPTIMIZE` (left in place) |
@@ -61,7 +61,15 @@ observed on a real `trinodb/trino:431` with a file metastore (2026-09-23):
   subqueries), checks table, view and procedure, binds, rejects `WHERE`, then
   calls the catalog, and answers with an empty result with one `rows` column.
 - `parse_data_size` implements airlift `DataSize`; session properties of type
-  `DataSize` now validate with it too (Trino rejects `512MiB`, so do we).
+  `DataSize` now validate with it too. Amended 2026-09-26 (ISS-020, removed
+  limitation, no compatibility mode): it also accepts the IEC names of the
+  same multiples, `KiB MiB GiB TiB PiB` (case-sensitive), which Trino
+  refuses; airlift's units keep their meaning (`MB` is 1024², so no existing
+  setting changes). Every size error starts with airlift's message (clients
+  that match Trino's text keep matching) and then lists the accepted units.
+  The server configuration (`ByteSize`, ADR 0003) keeps its own reading,
+  where `KB MB GB TB` are powers of 1000 and any case is accepted; its error
+  says so, and `KiB`/`MiB` mean the same in both places.
 
 ### Hive implementation (`hive/optimize.rs`)
 
@@ -159,6 +167,11 @@ second marker, and concurrent `OPTIMIZE` + reads in one process
 (`hive/optimize_tests.rs`).
 
 ### Deliberate differences from Trino
+
+- Sizes (`file_size_threshold`, `target_max_file_size`, every `DataSize`
+  session property) also accept `KiB MiB GiB TiB PiB` (ISS-020); Trino
+  answers `Unknown unit`. Size errors carry Trino's message followed by the
+  list of accepted units.
 
 - Fewer than two files under the threshold: nothing is rewritten. Trino
   rewrites a single small file into a new name; that gains nothing and makes

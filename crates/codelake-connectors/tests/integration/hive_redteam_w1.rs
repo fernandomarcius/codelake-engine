@@ -327,16 +327,17 @@ async fn w1_optimize_racing_inserts_keeps_every_row_once() {
 }
 
 /// `CREATE OR REPLACE TABLE … AS SELECT … FROM` the same table, racing an
-/// `OPTIMIZE` of it on another node. The hive catalog refuses `OR REPLACE`
-/// as Trino 431 does (W1-1): each round the replace must be refused, the
-/// compaction must succeed, the table must hold its old rows, and nothing of
-/// either statement stays behind.
+/// `OPTIMIZE` of it on another node. The hive catalog replaces tables since
+/// ISS-017 (Trino 431 refuses): each round the table must be the old one or
+/// the replacement, whole (never a mix, never empty), whatever each
+/// statement answered, and nothing of either statement stays behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w1_or_replace_racing_optimize_is_old_or_new_never_mixed() {
     let l = Local::new().await;
     cl(&l.engine, "CREATE SCHEMA hive.s").await;
     let other = l.other().await;
     let mut bad = Vec::new();
+    let mut replaced_rounds = 0;
     for round in 0..5 {
         let table = format!("hive.s.r{round}");
         seeded(&l.engine, &table, 10, 4_000).await;
@@ -350,11 +351,21 @@ async fn w1_or_replace_racing_optimize_is_old_or_new_never_mixed() {
             (&compacted, &replaced, &got),
         );
         let old = vec![vec!["40000".to_owned(), triangle(40_000)]];
-        let refused = replaced
-            .as_ref()
-            .is_err_and(|e| e.contains("does not support replacing tables"));
-        if !refused || compacted.is_err() || got.as_ref() != Ok(&old) {
-            bad.push((round, compacted, replaced, got));
+        let new = vec![vec![
+            "40000".to_owned(),
+            (10 * i128::from(40_000_i64) * 40_001 / 2).to_string(),
+        ]];
+        replaced_rounds += usize::from(replaced.is_ok());
+        let whole = match &replaced {
+            Ok(_) => got.as_ref() == Ok(&new),
+            Err(_) => got.as_ref() == Ok(&old),
+        };
+        let hidden: Vec<String> = tree(&l.warehouse.join(format!("s/r{round}")))
+            .into_iter()
+            .filter(|p| p.starts_with('.') && !p.starts_with(".trino") && !p.starts_with("..trino"))
+            .collect();
+        if !whole || !hidden.is_empty() {
+            bad.push((round, compacted, replaced, got, hidden));
         }
     }
     let internal = tree(&l.warehouse.join(".codelake"))
@@ -362,6 +373,7 @@ async fn w1_or_replace_racing_optimize_is_old_or_new_never_mixed() {
         .filter(|p| p.starts_with("staging/") || p.starts_with("replace/"))
         .collect::<Vec<_>>();
     assert!(bad.is_empty(), "{bad:#?}");
+    assert!(replaced_rounds > 0, "no replacement succeeded");
     assert!(internal.is_empty(), "left in .codelake: {internal:?}");
 }
 
@@ -429,7 +441,8 @@ async fn w1_rename_table_is_done_or_refused() {
 
 /// `CREATE TABLE` refuses a target directory that exists without a table
 /// (files of another writer, as Trino does). `CREATE OR REPLACE` of a name
-/// with no table is a `CREATE`: it must refuse too, not delete those files.
+/// with no table is a `CREATE`: it must refuse too, not delete those files
+/// (still true now that `OR REPLACE` replaces tables, ISS-017).
 #[tokio::test]
 async fn w1_or_replace_never_deletes_a_foreign_directory() {
     let l = Local::new().await;
@@ -462,6 +475,10 @@ async fn w1_or_replace_never_deletes_a_foreign_directory() {
         foreign.exists(),
         "OR REPLACE ({replaced:?}) deleted {}",
         foreign.display()
+    );
+    assert!(
+        replaced.as_ref().is_err_and(|e| e.contains("already exists")),
+        "OR REPLACE over a foreign directory: {replaced:?}"
     );
 }
 

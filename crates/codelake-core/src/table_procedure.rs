@@ -272,13 +272,19 @@ mod tests {
             err(vec![named("foo", text("1MB"))]),
             "Catalog 'hive' table procedure 'OPTIMIZE' property 'foo' does not exist"
         );
+        // Trino's message, then the units `CodeLake` accepts (ISS-020).
+        let units = crate::session_properties::DATA_SIZE_UNITS;
         assert_eq!(
             err(vec![named("file_size_threshold", text("abc"))]),
-            "Unable to set catalog 'hive' table procedure 'OPTIMIZE' property 'file_size_threshold' to ['abc']: size is not a valid data size string: abc"
+            format!(
+                "Unable to set catalog 'hive' table procedure 'OPTIMIZE' property 'file_size_threshold' to ['abc']: size is not a valid data size string: abc (expected a number and a unit, as in 512MB or 1.5GiB: {units})"
+            )
         );
         assert_eq!(
             err(vec![named("file_size_threshold", text("10mb"))]),
-            "Unable to set catalog 'hive' table procedure 'OPTIMIZE' property 'file_size_threshold' to ['10mb']: Unknown unit: mb"
+            format!(
+                "Unable to set catalog 'hive' table procedure 'OPTIMIZE' property 'file_size_threshold' to ['10mb']: Unknown unit: mb (accepted: {units})"
+            )
         );
         assert_eq!(
             err(vec![named("file_size_threshold", ArgumentValue::Integer(10))]),

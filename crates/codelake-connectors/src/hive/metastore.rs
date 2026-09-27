@@ -46,7 +46,20 @@ pub(crate) const MANAGED_TABLE: &str = "MANAGED_TABLE";
 pub(crate) const VIRTUAL_VIEW: &str = "VIRTUAL_VIEW";
 /// Data lives at `externalLocation`, owned by someone else: dropping the table
 /// removes only its metadata.
+#[cfg(test)]
 const EXTERNAL_TABLE: &str = "EXTERNAL_TABLE";
+/// Table parameter: the identity of a table `CREATE OR REPLACE` wrote. Two
+/// handles of one name with different identities are different tables, so
+/// a scan or an `INSERT` planned against the table that was replaced never
+/// reads or writes the new one (ISS-017).
+pub(crate) const TABLE_ID: &str = "codelake.table_id";
+/// Table, schema and column property: the name as the statement that
+/// created (or renamed) it wrote it, when that is not its folded form
+/// (ISS-018). The metastore's names stay folded, as Trino writes and needs
+/// them (its `INSERT` fails on a column name that is not lower case); the
+/// directory, and every lookup, use the folded name; the files a table's
+/// writes produce spell each column as written.
+pub(crate) const WRITTEN_NAME: &str = "codelake.name";
 pub(crate) const METADATA_FILE: &str = ".trinoSchema";
 const PERMISSIONS_DIR: &str = ".trinoPermissions";
 /// Directory of `CodeLake`'s own files at the warehouse root: locks, staging
@@ -75,6 +88,17 @@ pub(crate) struct ColumnMetadata {
     /// Fields this version does not model, kept on rewrite.
     #[serde(flatten)]
     pub(crate) extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl ColumnMetadata {
+    /// The column's name as it was written (ISS-018): its [`WRITTEN_NAME`]
+    /// property, or else its metastore name. Files are written with it.
+    pub(crate) fn written_name(&self) -> &str {
+        self.properties
+            .get(WRITTEN_NAME)
+            .filter(|written| written.to_lowercase() == self.name.to_lowercase())
+            .map_or(self.name.as_str(), String::as_str)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -170,6 +194,11 @@ impl TableMetadata {
             column_statistics: BTreeMap::new(),
             extra: BTreeMap::from([("originalStorageFormat".into(), serde_json::json!({}))]),
         }
+    }
+
+    /// The identity [`TABLE_ID`] records, if any.
+    pub(crate) fn table_id(&self) -> Option<&str> {
+        self.parameters.get(TABLE_ID).map(String::as_str)
     }
 
     /// After new data files, the table's statistics no longer describe it.
@@ -306,6 +335,20 @@ async fn remove_local_dir(path: PathBuf) -> std::io::Result<()> {
     })
     .await
     .map_err(std::io::Error::other)?
+}
+
+/// Exchanges the directories `a` and `b` in one step (`renameat2` with
+/// `RENAME_EXCHANGE` on Linux, `renamex_np` with `RENAME_SWAP` on macOS):
+/// any reader sees one or the other under each name, never neither.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn exchange_dirs(a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    renameat_with(CWD, a, CWD, b, RenameFlags::EXCHANGE).map_err(std::io::Error::from)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn exchange_dirs(_: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 /// Directory of `path` (every part but the last).
@@ -587,15 +630,27 @@ impl FileMetastore {
         self.read_json(&self.table_file(schema, table)).await
     }
 
-    pub(crate) async fn create_schema(&self, schema: &str, owner: &str) -> MetastoreResult<()> {
+    /// Creates the schema `schema` (folded), recording `written` when the
+    /// statement wrote it with other letter case (ISS-018).
+    pub(crate) async fn create_schema(
+        &self,
+        schema: &str,
+        written: &str,
+        owner: &str,
+    ) -> MetastoreResult<()> {
         if self.schema_exists(schema).await? {
             return Err(MetastoreError::AlreadyExists(format!("schema {schema}")));
         }
+        let parameters = if written == schema {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([(WRITTEN_NAME.to_owned(), written.to_owned())])
+        };
         let metadata = SchemaMetadata {
             writer_version: Some(TRINO_VERSION.into()),
             owner_name: Some(owner.into()),
             owner_type: Some("USER".into()),
-            parameters: BTreeMap::new(),
+            parameters,
             extra: BTreeMap::new(),
         };
         self.write_json(&self.schema_file(schema), &metadata).await?;
@@ -640,6 +695,32 @@ impl FileMetastore {
             .collect();
         let path = dir.clone().join(PERMISSIONS_DIR).join(format!("user_{owner}"));
         self.write_json(&path, &grants).await
+    }
+
+    /// Records `written` as the name of the table or view `schema.table`
+    /// (after a rename), under its metadata lock.
+    pub(crate) async fn record_written_name(
+        &self,
+        schema: &str,
+        table: &str,
+        written: &str,
+    ) -> MetastoreResult<()> {
+        let _metadata = self.lock_metadata(schema, table).await?;
+        let Some(mut metadata) = self.table(schema, table).await? else {
+            return Err(MetastoreError::NotFound(format!("table {schema}.{table}")));
+        };
+        let before = metadata.parameters.clone();
+        if written == table {
+            metadata.parameters.remove(WRITTEN_NAME);
+        } else {
+            metadata
+                .parameters
+                .insert(WRITTEN_NAME.into(), written.to_owned());
+        }
+        if metadata.parameters != before {
+            self.write_table(schema, table, &metadata).await?;
+        }
+        Ok(())
     }
 
     /// Drops statistics after new data files were written, when any exist.
@@ -809,16 +890,90 @@ impl FileMetastore {
         Ok(())
     }
 
+    /// `CREATE OR REPLACE TABLE`: makes the table staged in `staging` the
+    /// table `schema.table` (ISS-017). The caller holds the table's commit,
+    /// file and metadata locks.
+    ///
+    /// - No table of that name: [`FileMetastore::publish_table`] (a
+    ///   directory without a table is refused, never deleted).
+    /// - A managed table: its directory and the staging directory are
+    ///   exchanged in one step, metadata and data together, so a reader
+    ///   (this engine, another node, the reference engine, the sink) finds
+    ///   the old table or the new one, never a mix and never nothing. The
+    ///   old table is then in `staging`, for the caller to remove. A crash
+    ///   before the exchange leaves the old table; after it, the new one
+    ///   (and the old one in hidden staging).
+    /// - A view, or a table whose data is not its own (`EXTERNAL_TABLE`):
+    ///   refused, nothing changed.
+    ///
+    /// Only a local warehouse on a file system that can exchange two
+    /// directories replaces a table; elsewhere the statement is refused
+    /// with the table unchanged.
+    pub(crate) async fn replace_table(
+        &self,
+        staging: &Staging,
+        schema: &str,
+        table: &str,
+    ) -> MetastoreResult<()> {
+        let Some(existing) = self.table(schema, table).await? else {
+            return self.publish_table(staging, schema, table).await;
+        };
+        if existing.is_view() {
+            return Err(MetastoreError::Conflict(format!(
+                "{schema}.{table} is a view: use CREATE OR REPLACE VIEW, or DROP VIEW first"
+            )));
+        }
+        if existing.table_type != MANAGED_TABLE {
+            return Err(MetastoreError::Conflict(format!(
+                "{schema}.{table} is a table of type {} whose data does not belong to it; \
+                 CREATE OR REPLACE replaces only managed tables (DROP TABLE it first)",
+                existing.table_type
+            )));
+        }
+        let target = self.table_dir(schema, table);
+        let (Some(from), Some(to)) = (self.local_path(&staging.dir), self.local_path(&target)) else {
+            return Err(MetastoreError::Conflict(format!(
+                "CREATE OR REPLACE TABLE {schema}.{table} needs a local warehouse (the table's \
+                 directory is exchanged with the new one in one step); the table is unchanged"
+            )));
+        };
+        tokio::task::spawn_blocking(move || exchange_dirs(&from, &to))
+            .await
+            .map_err(std::io::Error::other)?
+            .map_err(|err| match rustix::io::Errno::from_io_error(&err) {
+                // What a file system answers when it cannot exchange.
+                Some(errno)
+                    if [
+                        rustix::io::Errno::INVAL,
+                        rustix::io::Errno::NOSYS,
+                        rustix::io::Errno::OPNOTSUPP,
+                    ]
+                    .contains(&errno) =>
+                {
+                    MetastoreError::Conflict(format!(
+                        "the warehouse's file system cannot exchange two directories in one step \
+                         ({err}), which CREATE OR REPLACE TABLE {schema}.{table} needs; the table is unchanged"
+                    ))
+                }
+                _ if err.kind() == std::io::ErrorKind::Unsupported => MetastoreError::Conflict(format!(
+                    "this platform cannot exchange two directories in one step, which CREATE OR \
+                     REPLACE TABLE {schema}.{table} needs; the table is unchanged"
+                )),
+                _ => MetastoreError::Io(err),
+            })
+    }
+
     /// Commits the data file `staged` of an `INSERT` into `schema.table` as
     /// `name`: under the table's metadata lock, checks that the table still
     /// exists with the columns the file was written with (an `ADD COLUMN`
-    /// meanwhile only appends), marks its statistics unknown, then renames
-    /// the file into the table directory. The rename is the commit: any
-    /// failure before it leaves no row visible.
+    /// meanwhile only appends) and is the table the statement was planned
+    /// against (`table_id`: not replaced meanwhile), marks its statistics
+    /// unknown, then renames the file into the table directory. The rename is
+    /// the commit: any failure before it leaves no row visible.
     pub(crate) async fn commit_insert(
         &self,
-        schema: &str,
-        table: &str,
+        (schema, table): (&str, &str),
+        table_id: Option<&str>,
         written: &[ColumnMetadata],
         staged: &Path,
         name: &str,
@@ -827,8 +982,13 @@ impl FileMetastore {
         let Some(metadata) = self.table(schema, table).await?.filter(|m| !m.is_view()) else {
             return Err(MetastoreError::NotFound(format!("table {schema}.{table}")));
         };
+        if metadata.table_id() != table_id {
+            return Err(MetastoreError::Conflict(format!(
+                "table {schema}.{table} was replaced (CREATE OR REPLACE) after the INSERT was planned; nothing was written"
+            )));
+        }
         let same = |a: &ColumnMetadata, b: &ColumnMetadata| {
-            a.name.eq_ignore_ascii_case(&b.name) && a.hive_type.eq_ignore_ascii_case(&b.hive_type)
+            a.name.to_lowercase() == b.name.to_lowercase() && a.hive_type.eq_ignore_ascii_case(&b.hive_type)
         };
         let unchanged = metadata.data_columns.len() >= written.len()
             && written
@@ -837,7 +997,7 @@ impl FileMetastore {
                 .all(|(a, b)| same(a, b));
         if !unchanged {
             return Err(MetastoreError::Conflict(format!(
-                "table {schema}.{table} was replaced while the INSERT ran; nothing was written"
+                "table {schema}.{table} was replaced after the INSERT was planned; nothing was written"
             )));
         }
         self.invalidate_statistics_locked(schema, table).await?;
@@ -862,34 +1022,50 @@ impl FileMetastore {
         if metadata.is_view() {
             return Err(MetastoreError::Conflict(format!("{schema}.{table} is a view")));
         }
-        if metadata
+        let folded = column.name.to_lowercase();
+        if let Some(existing) = metadata
             .data_columns
             .iter()
             .chain(&metadata.partition_columns)
-            .any(|c| c.name.eq_ignore_ascii_case(&column.name))
+            .find(|c| c.name.to_lowercase() == folded)
         {
-            return Err(MetastoreError::Conflict(format!(
-                "column {} already exists in {schema}.{table}",
-                column.name
-            )));
+            let (new, old) = (column.written_name(), existing.written_name());
+            return Err(MetastoreError::Conflict(if new == old {
+                format!("column {new} already exists in {schema}.{table}")
+            } else {
+                format!(
+                    "column {new} cannot be added to {schema}.{table}: column {old} exists, and column names \
+                     that differ only by case are the same column"
+                )
+            }));
         }
         metadata.data_columns.push(column);
         self.write_table(schema, table, &metadata).await
     }
 
     /// Drops a table or view: metadata first (it disappears atomically), then
-    /// its directory. A managed table's data goes with it, as in Trino; an
-    /// external table keeps its data and loses only what the metastore wrote.
+    /// its directory. A managed table's data goes with it, as in Trino. An
+    /// external table keeps its data and loses only what the metastore wrote;
+    /// so does a view (ISS-023): a view owns no data, and one created over a
+    /// directory that already held files (another writer's) must not take
+    /// them with it. Trino 431 deletes that directory on `DROP VIEW`.
     pub(crate) async fn drop_table(&self, schema: &str, table: &str) -> MetastoreResult<()> {
         let Some(metadata) = self.table(schema, table).await? else {
             return Err(MetastoreError::NotFound(format!("table {schema}.{table}")));
         };
         let file = self.table_file(schema, table);
         self.store.delete(&file).await?;
-        if metadata.table_type != EXTERNAL_TABLE {
+        if metadata.table_type == MANAGED_TABLE {
             return self.remove_table_location(schema, table).await;
         }
-        let dir = self.table_dir(schema, table);
+        self.remove_metadata_leftovers(&self.table_dir(schema, table))
+            .await
+    }
+
+    /// Removes what the metastore writes next to `.trinoSchema` (its
+    /// checksum and the permissions) from `dir`, and the directory itself
+    /// only if nothing else is left in it. Any other file stays.
+    async fn remove_metadata_leftovers(&self, dir: &Path) -> MetastoreResult<()> {
         self.delete_all(&dir.clone().join(PERMISSIONS_DIR)).await?;
         match self
             .store
@@ -899,12 +1075,58 @@ impl FileMetastore {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
             Err(err) => return Err(err.into()),
         }
-        if let Some(path) = self.local_path(&dir) {
-            // Only empty directories go; data under the table directory stays.
+        if let Some(path) = self.local_path(dir) {
+            // Only empty directories go; any other file under it stays.
             let _ = std::fs::remove_dir(path.join(PERMISSIONS_DIR));
             let _ = std::fs::remove_dir(path);
         }
         Ok(())
+    }
+
+    /// Metadata files of the table or view in `dir`: the `.trinoSchema`
+    /// commit point last, so a copy in that order makes the name visible
+    /// only once everything else is there.
+    async fn metadata_files(&self, dir: &Path) -> MetastoreResult<Vec<Path>> {
+        let file = dir.clone().join(METADATA_FILE);
+        let crc = dir.clone().join(crc_name(METADATA_FILE));
+        let permissions = dir.clone().join(PERMISSIONS_DIR);
+        let mut files: Vec<Path> = self
+            .store
+            .list(Some(&permissions))
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await?;
+        files.sort();
+        for path in [crc, file] {
+            match self.store.head(&path).await {
+                Ok(_) => files.push(path),
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(files)
+    }
+
+    /// `ALTER VIEW … RENAME TO`: moves only the view's metadata (ISS-023),
+    /// never other files in its directory. The new name appears whole
+    /// (its `.trinoSchema` is copied last), then the old one disappears
+    /// (its `.trinoSchema` is deleted first): a failure part way leaves the
+    /// old name, or both names with the same definition.
+    async fn rename_view(
+        &self,
+        (schema, view): (&str, &str),
+        (new_schema, new_view): (&str, &str),
+    ) -> MetastoreResult<()> {
+        let (old_dir, new_dir) = (self.table_dir(schema, view), self.table_dir(new_schema, new_view));
+        let files = self.metadata_files(&old_dir).await?;
+        for location in &files {
+            if let Some(relative) = location.prefix_match(&old_dir) {
+                let to = Path::from_iter(new_dir.parts().chain(relative));
+                self.store.copy(location, &to).await?;
+            }
+        }
+        self.store.delete(&self.table_file(schema, view)).await?;
+        self.remove_metadata_leftovers(&old_dir).await
     }
 
     /// Moves a table or view to a new name, like Trino's file metastore,
@@ -920,7 +1142,8 @@ impl FileMetastore {
     /// both names over identical files; never a name without its data.
     ///
     /// A target directory holding any object is refused: its files would
-    /// otherwise become rows of the renamed table.
+    /// otherwise become rows of the renamed table. A view moves only its
+    /// metadata ([`FileMetastore::rename_view`]).
     pub(crate) async fn rename_table(
         &self,
         schema: &str,
@@ -944,6 +1167,9 @@ impl FileMetastore {
             return Err(MetastoreError::AlreadyExists(format!(
                 "table {new_schema}.{new_table}"
             )));
+        }
+        if self.table(schema, table).await?.is_some_and(|m| m.is_view()) {
+            return self.rename_view((schema, table), (new_schema, new_table)).await;
         }
         match self.store.rename(&old_dir, &new_dir).await {
             // A local directory: renamed as a whole.
@@ -1039,7 +1265,7 @@ mod tests {
     async fn round_trip_keeps_unknown_fields_and_writes_checksums() {
         let (dir, metastore) = scratch();
         let original = fixture().table("pilot", "t1").await.unwrap().unwrap();
-        metastore.create_schema("pilot", "dbt").await.unwrap();
+        metastore.create_schema("pilot", "pilot", "dbt").await.unwrap();
         metastore.write_table("pilot", "t1", &original).await.unwrap();
         let back = metastore.table("pilot", "t1").await.unwrap().unwrap();
         assert_eq!(back, original);
@@ -1061,7 +1287,7 @@ mod tests {
     #[tokio::test]
     async fn metadata_has_every_field_trino_431_requires() {
         let (dir, metastore) = scratch();
-        metastore.create_schema("raw", "dbt").await.unwrap();
+        metastore.create_schema("raw", "raw", "dbt").await.unwrap();
         let table = TableMetadata::managed_parquet("dbt", Vec::new());
         metastore.write_table("raw", "t", &table).await.unwrap();
         let view = TableMetadata::trino_view("dbt", "/* Presto View: e30= */".into());
@@ -1093,7 +1319,7 @@ mod tests {
         original
             .extra
             .insert("bucketProperty".into(), serde_json::json!({"bucketCount": 4}));
-        metastore.create_schema("pilot", "trino").await.unwrap();
+        metastore.create_schema("pilot", "pilot", "trino").await.unwrap();
         metastore.write_table("pilot", "t1", &original).await.unwrap();
 
         metastore.invalidate_statistics("pilot", "t1").await.unwrap();
@@ -1123,7 +1349,7 @@ mod tests {
     #[tokio::test]
     async fn new_metadata_carries_the_trino_version() {
         let (dir, metastore) = scratch();
-        metastore.create_schema("raw", "dbt").await.unwrap();
+        metastore.create_schema("raw", "raw", "dbt").await.unwrap();
         let table = TableMetadata::managed_parquet("dbt", Vec::new());
         metastore.write_table("raw", "t", &table).await.unwrap();
         for file in [".raw.trinoSchema", "raw/t/.trinoSchema"] {
@@ -1145,7 +1371,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_an_external_table_keeps_its_data() {
         let (dir, metastore) = scratch();
-        metastore.create_schema("raw", "dbt").await.unwrap();
+        metastore.create_schema("raw", "raw", "dbt").await.unwrap();
         let mut table = TableMetadata::managed_parquet("dbt", Vec::new());
         table.table_type = EXTERNAL_TABLE.into();
         metastore.write_table("raw", "ext", &table).await.unwrap();
@@ -1166,7 +1392,7 @@ mod tests {
     #[tokio::test]
     async fn removing_a_table_location_removes_the_directory() {
         let (dir, metastore) = scratch();
-        metastore.create_schema("raw", "dbt").await.unwrap();
+        metastore.create_schema("raw", "raw", "dbt").await.unwrap();
         std::fs::create_dir_all(dir.path().join("raw/t/.hidden")).unwrap();
         std::fs::write(dir.path().join("raw/t/.hidden/x"), b"x").unwrap();
         std::fs::write(dir.path().join("raw/t/f"), b"x").unwrap();
@@ -1192,7 +1418,7 @@ mod tests {
     async fn rename_on_an_object_store() {
         let metastore = FileMetastore::new(Arc::new(object_store::memory::InMemory::new()), Path::from("wh"));
         let table = fixture().table("pilot", "t1").await.unwrap().unwrap();
-        metastore.create_schema("raw", "dbt").await.unwrap();
+        metastore.create_schema("raw", "raw", "dbt").await.unwrap();
         metastore.write_table("raw", "t", &table).await.unwrap();
         metastore
             .write_owner_permissions("raw", "t", "dbt")
@@ -1227,9 +1453,9 @@ mod tests {
     #[tokio::test]
     async fn schema_and_table_lifecycle() {
         let (dir, metastore) = scratch();
-        metastore.create_schema("raw", "dbt").await.unwrap();
+        metastore.create_schema("raw", "raw", "dbt").await.unwrap();
         assert!(matches!(
-            metastore.create_schema("raw", "dbt").await,
+            metastore.create_schema("raw", "raw", "dbt").await,
             Err(MetastoreError::AlreadyExists(_))
         ));
         let mut table = TableMetadata::managed_parquet(
@@ -1269,7 +1495,7 @@ mod tests {
 
         assert!(dir.path().join("raw").is_dir(), "schema directory, as Trino");
         assert!(metastore.table_location_exists("raw", "t").await.unwrap());
-        metastore.create_schema("mart", "dbt").await.unwrap();
+        metastore.create_schema("mart", "mart", "dbt").await.unwrap();
         metastore.rename_table("raw", "t", "mart", "t2").await.unwrap();
         assert!(metastore.table("raw", "t").await.unwrap().is_none());
         assert_eq!(metastore.table("mart", "t2").await.unwrap().unwrap(), table);

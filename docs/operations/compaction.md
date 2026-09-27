@@ -12,8 +12,9 @@ ALTER TABLE <lake>.<schema>.<table> EXECUTE optimize(file_size_threshold => '100
 
 Files of at most `file_size_threshold` are rewritten into files of up to
 `<lake>.target_max_file_size` (default `1GB`). Fewer than two small files:
-nothing is rewritten. Sizes use the units `B kB MB GB TB` (case-sensitive,
-powers of 1024).
+nothing is rewritten. Sizes use the units `B kB MB GB TB PB` or
+`KiB MiB GiB TiB PiB` (case-sensitive, all powers of 1024: `100MB` and
+`100MiB` are the same size; the reference engine accepts only the first set).
 
 ## One engine compacts
 

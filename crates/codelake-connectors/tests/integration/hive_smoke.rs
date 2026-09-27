@@ -234,8 +234,10 @@ async fn views_resolve_unqualified_names_in_their_own_session() {
     assert_eq!(definition["tableType"], "VIRTUAL_VIEW");
 }
 
-/// Hive names are lower case (Trino folds identifiers): a quoted mixed-case
-/// name is the same table everywhere, and columns are case-insensitive.
+/// Hive directories and metastore names are lower case (Trino folds
+/// identifiers): a quoted mixed-case name is the same table everywhere, and
+/// columns are case-insensitive. The name as written is kept in the
+/// metadata and in the files (ISS-018).
 #[tokio::test]
 async fn names_are_folded_to_lower_case() {
     let dir = tempfile::tempdir().unwrap();
@@ -275,6 +277,16 @@ async fn names_are_folded_to_lower_case() {
         columns.contains("| id ") && columns.contains("| origem "),
         "{columns}"
     );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(warehouse.join("vendas/mixedcase/.trinoSchema")).unwrap())
+            .unwrap();
+    assert_eq!(metadata["parameters"]["codelake.name"], "MixedCase");
+    assert_eq!(metadata["dataColumns"][0]["name"], "id");
+    assert_eq!(metadata["dataColumns"][0]["properties"]["codelake.name"], "Id");
+    assert_eq!(
+        metadata["dataColumns"][1]["properties"]["codelake.name"],
+        "Origem"
+    );
     let duplicate = engine
         .sql("CREATE TABLE hive.vendas.dup AS SELECT 1 AS \"A\", 2 AS a")
         .await;
@@ -285,7 +297,7 @@ async fn names_are_folded_to_lower_case() {
     assert!(
         duplicate
             .as_ref()
-            .is_err_and(|e| e.to_string().contains("duplicate column")),
+            .is_err_and(|e| e.to_string().contains("differ only by case")),
         "{duplicate:?}"
     );
     assert!(!warehouse.join("vendas/dup").exists());

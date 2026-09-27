@@ -1216,6 +1216,57 @@ impl Governed {
     }
 }
 
+impl Governed {
+    /// `portal` with its statement planned again against the catalogs as
+    /// they are now, as `PostgreSQL` plans a prepared statement again when a
+    /// table it reads changed: the plan kept since `Parse` names the tables
+    /// it was planned against, and a table replaced since
+    /// (`CREATE OR REPLACE`, ISS-017) refuses such a plan. Refused with
+    /// `PostgreSQL`'s error (SQLSTATE `0A000`) when the new plan would answer
+    /// other columns than the ones `Describe` announced, or take other
+    /// parameter types than the ones `Bind` decoded.
+    async fn replanned<C>(
+        &self,
+        client: &C,
+        portal: &Portal<DfStatement>,
+    ) -> PgWireResult<Portal<DfStatement>>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let stored = &portal.statement;
+        let parser = ExtendedQueryHandler::query_parser(self);
+        let fresh = parser
+            .parse_sql(client, &stored.statement.0, &stored.parameter_types)
+            .await?;
+        if let (Some((_, kept)), Some((_, plan))) = (&stored.statement.1, &fresh.1) {
+            let columns = |plan: &LogicalPlan| -> Vec<(String, datafusion::arrow::datatypes::DataType)> {
+                plan.schema()
+                    .fields()
+                    .iter()
+                    .map(|field| (field.name().clone(), field.data_type().clone()))
+                    .collect()
+            };
+            let changed = columns(kept) != columns(plan)
+                || parser.get_parameter_types(&stored.statement)? != parser.get_parameter_types(&fresh)?;
+            if changed {
+                return Err(user_error("0A000", "cached plan must not change result type"));
+            }
+        }
+        let mut replanned = Portal::default();
+        replanned.name.clone_from(&portal.name);
+        replanned.statement = Arc::new(StoredStatement::new(
+            stored.id.clone(),
+            fresh,
+            stored.parameter_types.clone(),
+        ));
+        replanned.parameter_format = portal.parameter_format.clone();
+        replanned.parameters.clone_from(&portal.parameters);
+        replanned.result_column_format = portal.result_column_format.clone();
+        replanned.state = portal.state();
+        Ok(replanned)
+    }
+}
+
 #[async_trait]
 impl ExtendedQueryHandler for Governed {
     type Statement = DfStatement;
@@ -1372,6 +1423,8 @@ impl ExtendedQueryHandler for Governed {
             }
             return Ok(response);
         }
+        let replanned = self.replanned(&*client, portal).await?;
+        let portal = &replanned;
         let declared = cursor::Declared::before(
             &*client,
             cursor::declared_names(parsed.as_ref().map(|(statement, _)| statement)),
