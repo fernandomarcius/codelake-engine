@@ -74,6 +74,24 @@ versioning: [SemVer](https://semver.org/).
   self-test with SQL Server CDC and mutation scenarios (`tools/shadow/selftest.sh`,
   docs/shadow-run.md).
 
+- Shared compilation cache for local builds: the toolbelt image ships sccache 0.18.0 (pinned,
+  checked by SHA-256) and `scripts/dev.sh` mounts one `codelake-sccache` volume for every
+  checkout (`CODELAKE_SCCACHE_SIZE`, 20G by default; `CODELAKE_SCCACHE=0` turns it off; off in
+  CI unless asked). Targets stay one per checkout. `scripts/sccache-check.sh` proves entries
+  are keyed by content, not mtime; `gates.sh fast` prints the run's hits (docs/gates.md).
+- Differential gate `gates.sh differential` (`tools/differential`): declarative TOML cases run
+  against CodeLake and an oracle (Trino 431 over HTTP, PostgreSQL 17 over the wire, or fixed
+  rows), CodeLake reached over its Trino protocol and its PostgreSQL wire; outcomes `WRONG`,
+  `RECUSA`, `EXTRA`, `ERRO`, `ORDEM`, `TIPO`, `TRAVA`; JSON report; exit 1 on any outcome a case
+  does not expect. Divergences are expected only with an issue, ADR or front named (`known`
+  open defect or `accepted` divergence) and are listed, never counted green; a known defect
+  that is fixed fails until its marker goes. The engines run as sibling containers on a private
+  network, no port published, removed at the end. First cases: char(n) (CH1–CH16, ISS-025
+  shapes, W1 verdict probes), NULL-only Parquet row groups under null-safe joins, `-0.0`,
+  PostgreSQL cursors and transaction blocks, PostgreSQL wire against Trino
+  (docs/differential.md); divergences no front fixes are recorded in ISS-032. Part of the
+  fronts' Definition of Done (docs/gates.md).
+
 ### Changed
 - The query registry moved to the core: `system.runtime.queries` lists the queries of both
   protocols and exists on the PostgreSQL wire too; `resource_group_id` is `["global"]` (or

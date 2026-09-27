@@ -17,6 +17,17 @@
    scripts/dev.sh scripts/gates.sh integration
    ```
 
+   A change to planning, pushdown, a connector, a client protocol or SQL semantics
+   also runs the differential gate, and adds a case for each wrong result it finds
+   or fixes ([docs/differential.md](docs/differential.md)):
+
+   ```bash
+   scripts/dev.sh scripts/gates.sh differential
+   ```
+
+   Builds share a compilation cache across checkouts (`CODELAKE_SCCACHE=0` turns
+   it off; [docs/gates.md](docs/gates.md#build-caches)).
+
 5. Open a PR with the template checklist. All gates must be green before review.
    Reviews cite objective criteria (requirement, ADR, measurable risk); personal
    preference alone does not block.

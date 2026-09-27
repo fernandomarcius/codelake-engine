@@ -1,0 +1,360 @@
+# Declared cursors and transaction blocks on the PostgreSQL wire, statement by statement
+# against PostgreSQL 17 (the F6 verification scripts): rows or SQLSTATE per step.
+
+oracle = "postgres"
+
+[[case]]
+id = "case-folding"
+steps = [
+  "BEGIN",
+  "DECLARE Big CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 1 FROM big",
+  "FETCH 1 FROM BIG",
+  "FETCH 1 FROM \"Big\"",
+  "ROLLBACK",
+  "BEGIN",
+  "DECLARE Big CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 1 FROM \"big\"",
+  "CLOSE BIG",
+  "ROLLBACK",
+]
+
+[[case]]
+id = "quoted-mixed"
+steps = [
+  "BEGIN",
+  "DECLARE \"Mixed\" CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 1 FROM \"Mixed\"",
+  "FETCH \"Mixed\"",
+  "FETCH 1 FROM mixed",
+  "ROLLBACK",
+]
+
+[[case]]
+id = "end-and-abort"
+steps = [
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 2 FROM c",
+  "END",
+  "FETCH 1 FROM c",
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "ABORT",
+  "FETCH 1 FROM c",
+  "START TRANSACTION",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 1 FROM c",
+  "COMMIT",
+  "FETCH 1 FROM c",
+]
+
+[[case]]
+id = "savepoints"
+expect = "RECUSA"
+known = "ISS-032"
+diverges_at = [4, 5, 7, 8, 9]
+steps = [
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 1 FROM c",
+  "SAVEPOINT s",
+  "FETCH 1 FROM c",
+  "ROLLBACK TO SAVEPOINT s",
+  "FETCH 1 FROM c",
+  "RELEASE SAVEPOINT s",
+  "FETCH 1 FROM c",
+  "COMMIT",
+  "FETCH 1 FROM c",
+]
+
+[[case]]
+id = "commit-and-chain"
+expect = "ERRO"
+known = "ISS-032"
+diverges_at = [6, 7]
+steps = [
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 1 FROM c",
+  "COMMIT AND CHAIN",
+  "FETCH 1 FROM c",
+  "DECLARE e CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 1 FROM e",
+  "COMMIT",
+  "FETCH 1 FROM e",
+]
+
+[[case]]
+id = "discard-all"
+steps = [
+  "DECLARE h CURSOR WITH HOLD FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 1 FROM h",
+  "DISCARD ALL",
+  "FETCH 1 FROM h",
+  "CLOSE ALL",
+]
+
+[[case]]
+id = "counts"
+steps = [
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH +3 FROM c",
+  "FETCH FORWARD +2 FROM c",
+  "FETCH 9223372036854775807 FROM c",
+  "ROLLBACK",
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 99999999999999999999 FROM c",
+  "ROLLBACK",
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH ALL IN c",
+  "ROLLBACK",
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH IN c",
+  "FETCH NEXT IN c",
+  "FETCH FORWARD c",
+  "FETCH FORWARD ALL FROM c",
+  "ROLLBACK",
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "fetch 2 from c;",
+  "  FETCH   1   FROM   c  ;  ",
+  "/* x */ FETCH 1 FROM c",
+  "-- c\nFETCH 1 FROM c",
+  "ROLLBACK",
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 0.0 FROM c",
+  "ROLLBACK",
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH '2' FROM c",
+  "ROLLBACK",
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 2e0 FROM c",
+  "ROLLBACK",
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH $1 FROM c",
+  "ROLLBACK",
+]
+
+[[case]]
+id = "aborted"
+steps = [
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  { sql = "SELECT * FROM nope", any_error = true },
+  "FETCH 1 FROM c",
+  "DECLARE d CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 0 FROM c",
+  "FETCH -1 FROM c",
+  "MOVE 1 IN c",
+  "BEGIN",
+  "SHOW search_path",
+  "SET search_path = x",
+  "COMMIT",
+  "FETCH 1 FROM c",
+]
+
+[[case]]
+id = "declare-that-fails"
+steps = [
+  "BEGIN",
+  { sql = "DECLARE c CURSOR FOR SELECT * FROM nope", any_error = true },
+  "FETCH 1 FROM c",
+  "ROLLBACK",
+]
+
+[[case]]
+id = "implicit-block-fails"
+steps = [
+  { sql = "DECLARE m CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x); SELECT * FROM nope", any_error = true },
+  "FETCH 1 FROM m",
+  { sql = "DECLARE h CURSOR WITH HOLD FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x); SELECT * FROM nope", any_error = true },
+  "FETCH 1 FROM h",
+]
+
+[[case]]
+id = "held-in-aborted-block"
+steps = [
+  "BEGIN",
+  "DECLARE h CURSOR WITH HOLD FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  { sql = "SELECT * FROM nope", any_error = true },
+  "COMMIT",
+  "FETCH 1 FROM h",
+]
+
+[[case]]
+id = "multi-after-commit"
+steps = [
+  "BEGIN; DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x); COMMIT; DECLARE d CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x); FETCH 2 FROM d",
+  "FETCH 1 FROM d",
+  "FETCH 1 FROM c",
+]
+
+[[case]]
+id = "multi-with-unparsed-fetch"
+expect = "RECUSA"
+accepted = "ISS-030 item 5"
+diverges_at = [3]
+steps = [
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 2 FROM c; FETCH -1 FROM c",
+  "ROLLBACK",
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 2 FROM c; FETCH ALL FROM c; CLOSE c",
+  "COMMIT",
+]
+
+[[case]]
+id = "close-then-fetch-0"
+steps = [
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 2 FROM c",
+  "CLOSE c",
+  "FETCH 0 FROM c",
+  "ROLLBACK",
+]
+
+[[case]]
+id = "held-survives-rollback"
+steps = [
+  "DECLARE h CURSOR WITH HOLD FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 3 FROM h",
+  "BEGIN",
+  "CLOSE h",
+  "ROLLBACK",
+  "FETCH 1 FROM h",
+  "CLOSE h",
+]
+
+[[case]]
+id = "held-redeclared"
+steps = [
+  "DECLARE h CURSOR WITH HOLD FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "DECLARE h CURSOR WITH HOLD FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "BEGIN",
+  "DECLARE h CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "ROLLBACK",
+  "FETCH 1 FROM h",
+  "CLOSE h",
+]
+
+[[case]]
+id = "scroll-keyword"
+expect = "RECUSA"
+accepted = "ISS-030 item 5"
+diverges_at = [5]
+steps = [
+  "BEGIN",
+  "DECLARE s SCROLL CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 2 FROM s",
+  "FETCH 0 FROM s",
+  "FETCH PRIOR FROM s",
+  "ROLLBACK",
+  "BEGIN",
+  "DECLARE i INSENSITIVE CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 2 FROM i",
+  "ROLLBACK",
+]
+
+[[case]]
+id = "fetch-zero-current-row"
+steps = [
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 0 FROM c",
+  "FETCH 3 FROM c",
+  "FETCH 0 FROM c",
+  "FETCH 0 FROM c",
+  "FETCH 1 FROM c",
+  "ROLLBACK",
+]
+
+[[case]]
+id = "commit-closes-cursor"
+steps = [
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 1 FROM c",
+  "COMMIT",
+  "FETCH 1 FROM c",
+  "BEGIN",
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "ROLLBACK",
+  "FETCH 1 FROM c",
+]
+
+[[case]]
+id = "declare-outside-block"
+steps = [
+  "DECLARE c CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "DECLARE h CURSOR WITH HOLD FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "FETCH 2 FROM h",
+  "CLOSE h",
+]
+
+[[case]]
+id = "binary-cursor"
+expect = "RECUSA"
+accepted = "ISS-030 item 7"
+diverges_at = [2]
+steps = [
+  "BEGIN",
+  "DECLARE b BINARY CURSOR FOR SELECT x FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) AS t(x)",
+  "ROLLBACK",
+]
+
+[[case]]
+id = "sqlstate-undefined-table"
+expect = "ERRO"
+known = "ISS-032"
+diverges_at = [1]
+steps = [
+  "SELECT * FROM nope",
+]
+
+[[case]]
+id = "sqlstate-division-by-zero"
+expect = "ERRO"
+known = "ISS-032"
+diverges_at = [1]
+steps = [
+  "SELECT x / (x - 1) FROM (VALUES (1)) AS t(x)",
+]
+
+[[case]]
+id = "sqlstate-invalid-text"
+expect = "ERRO"
+known = "ISS-032"
+diverges_at = [1]
+steps = [
+  "SELECT CAST('x' AS integer)",
+]
+
+[[case]]
+id = "sqlstate-syntax"
+expect = "ERRO"
+known = "ISS-032"
+diverges_at = [1]
+steps = [
+  "SELECT 1 +",
+]
+
+[[case]]
+id = "sqlstate-undefined-function"
+expect = "ERRO"
+known = "ISS-032"
+diverges_at = [1]
+steps = [
+  "SELECT nope_fn(1)",
+]

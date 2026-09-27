@@ -4,6 +4,7 @@
 #
 #   scripts/dev.sh scripts/gates.sh fast        # fmt, lint, unit tests, arch, supply chain
 #   scripts/dev.sh scripts/gates.sh <gate>      # one gate
+#   scripts/dev.sh scripts/gates.sh differential [--only char]   # extra args go to the gate
 #
 # Thresholds are documented in docs/gates.md. Changing one is a gate exception.
 set -euo pipefail
@@ -59,16 +60,34 @@ gate_mutants() {
   [ "$score" -ge "$MUTATION_MIN_CORE" ]
 }
 
+# CodeLake against Trino 431 / PostgreSQL 17 on the recorded cases
+# (tools/differential/cases, docs/differential.md). Starts and removes its own
+# containers through the Docker socket; run it under heavy.sh when fronts share
+# a machine. Extra arguments go to run.py (e.g. --only char,cursors).
+gate_differential() {
+  python3 -m unittest discover -s tools/differential/tests
+  cargo build --locked -p codelake-server --bin codelake
+  python3 tools/differential/run.py --binary target/debug/codelake "$@"
+}
+
 gate_sbom() { cargo cyclonedx --format json --override-filename sbom; }
 
 gate_fast() {
   for g in fmt clippy typos arch train test doc deny machete; do
     echo "::group::gate ${g}"; "gate_${g}"; echo "::endgroup::"
   done
+  sccache_stats
+}
+
+# Hits and misses of the shared compilation cache in this run (scripts/dev.sh).
+sccache_stats() {
+  if [ "${RUSTC_WRAPPER:-}" = sccache ]; then
+    echo "::group::sccache"; sccache --show-stats; echo "::endgroup::"
+  fi
 }
 
 gate="${1:-fast}"
 if ! declare -F "gate_${gate}" >/dev/null; then
   echo "unknown gate: ${gate}"; declare -F | sed -n 's/declare -f gate_/  /p'; exit 2
 fi
-"gate_${gate}"
+"gate_${gate}" "${@:2}"

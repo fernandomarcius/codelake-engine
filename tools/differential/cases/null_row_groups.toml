@@ -1,0 +1,347 @@
+# NULL keys in Parquet row groups that hold only NULLs (Trino wrote each INSERT to its own
+# file) under null-safe joins, set operations and IS [NOT] DISTINCT FROM; c1 is the same
+# data written by CodeLake. Precedence of IS [NOT] DISTINCT FROM against AND/OR.
+
+oracle = "trino"
+setup_trino = [
+  "CREATE SCHEMA hive.nrg",
+  "CREATE TABLE hive.nrg.n1 (id bigint, v varchar) WITH (format = 'PARQUET')",
+  "INSERT INTO hive.nrg.n1 VALUES (1, 'a'), (2, 'b')",
+  "INSERT INTO hive.nrg.n1 VALUES (3, NULL)",
+  "CREATE TABLE hive.nrg.n2 (id bigint, k bigint, d double, b boolean) WITH (format = 'PARQUET')",
+  "INSERT INTO hive.nrg.n2 VALUES (1, 10, 1.5E0, true), (2, 20, 2.5E0, false)",
+  "INSERT INTO hive.nrg.n2 VALUES (3, NULL, NULL, NULL)",
+]
+setup_codelake = [
+  "CREATE TABLE hive.nrg.c1 (id bigint, v varchar)",
+  "INSERT INTO hive.nrg.c1 VALUES (1, 'a'), (2, 'b')",
+  "INSERT INTO hive.nrg.c1 VALUES (3, NULL)",
+]
+
+[[case]]
+id = "N1"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT * FROM hive.nrg.n1 EXCEPT SELECT * FROM hive.nrg.n1"
+
+[[case]]
+id = "N2"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM (SELECT * FROM hive.nrg.n1 INTERSECT SELECT * FROM hive.nrg.n1)"
+
+[[case]]
+id = "N3"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT * FROM hive.nrg.n1 INTERSECT SELECT * FROM hive.nrg.n1 ORDER BY id"
+
+[[case]]
+id = "N4"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM hive.nrg.n1 a JOIN hive.nrg.n1 b ON a.v IS NOT DISTINCT FROM b.v"
+
+[[case]]
+id = "N5"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT a.id, b.id FROM hive.nrg.n1 a JOIN hive.nrg.n1 b ON a.v IS NOT DISTINCT FROM b.v ORDER BY 1, 2"
+
+[[case]]
+id = "N6"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT id FROM hive.nrg.n1 a WHERE NOT EXISTS (SELECT 1 FROM hive.nrg.n1 b WHERE b.v IS NOT DISTINCT FROM a.v) ORDER BY id"
+
+[[case]]
+id = "N7"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT id FROM hive.nrg.n1 a WHERE EXISTS (SELECT 1 FROM hive.nrg.n1 b WHERE b.v IS NOT DISTINCT FROM a.v) ORDER BY id"
+
+[[case]]
+id = "N8"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM hive.nrg.n1 a LEFT JOIN hive.nrg.n1 b ON a.v IS NOT DISTINCT FROM b.v WHERE b.id IS NULL"
+
+[[case]]
+id = "N9"
+sql = "SELECT count(*) FROM hive.nrg.n1 a RIGHT JOIN hive.nrg.n1 b ON a.v IS NOT DISTINCT FROM b.v WHERE a.id IS NULL"
+
+[[case]]
+id = "N10"
+sql = "SELECT count(*) FROM hive.nrg.n1 a FULL JOIN hive.nrg.n1 b ON a.v IS NOT DISTINCT FROM b.v WHERE a.id IS NULL OR b.id IS NULL"
+
+[[case]]
+id = "N11"
+expect = "RECUSA"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM hive.nrg.n1 a JOIN hive.nrg.n1 b ON a.v IS NOT DISTINCT FROM b.v AND a.id = b.id"
+
+[[case]]
+id = "N12"
+expect = "RECUSA"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM hive.nrg.n1 a JOIN (SELECT * FROM hive.nrg.n1) b ON a.v IS NOT DISTINCT FROM b.v AND a.id = b.id"
+
+[[case]]
+id = "N13"
+sql = "SELECT count(*) FROM hive.nrg.n1 a JOIN hive.nrg.n1 b ON (a.v IS NOT DISTINCT FROM b.v) AND a.id = b.id"
+
+[[case]]
+id = "N14"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM (SELECT v FROM hive.nrg.n1 UNION ALL SELECT NULL) a JOIN hive.nrg.n1 b ON a.v IS NOT DISTINCT FROM b.v"
+
+[[case]]
+id = "N15"
+sql = "SELECT count(*) FROM (SELECT v FROM hive.nrg.n1 EXCEPT SELECT v FROM hive.nrg.n1 WHERE id < 3)"
+
+[[case]]
+id = "N16"
+sql = "SELECT * FROM (SELECT v FROM hive.nrg.n1 EXCEPT SELECT v FROM hive.nrg.n1 WHERE id < 3)"
+
+[[case]]
+id = "N17"
+sql = "SELECT count(*) FROM hive.nrg.n1 a WHERE a.v IS NOT DISTINCT FROM (SELECT max(v) FROM hive.nrg.n1 WHERE id = 3)"
+
+[[case]]
+id = "N18"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT * FROM hive.nrg.c1 EXCEPT SELECT * FROM hive.nrg.c1"
+
+[[case]]
+id = "N19"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM (SELECT * FROM hive.nrg.c1 INTERSECT SELECT * FROM hive.nrg.c1)"
+
+[[case]]
+id = "N20"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT * FROM hive.nrg.c1 INTERSECT SELECT * FROM hive.nrg.c1 ORDER BY id"
+
+[[case]]
+id = "N21"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM hive.nrg.c1 a JOIN hive.nrg.c1 b ON a.v IS NOT DISTINCT FROM b.v"
+
+[[case]]
+id = "N22"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT a.id, b.id FROM hive.nrg.c1 a JOIN hive.nrg.c1 b ON a.v IS NOT DISTINCT FROM b.v ORDER BY 1, 2"
+
+[[case]]
+id = "N23"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT id FROM hive.nrg.c1 a WHERE NOT EXISTS (SELECT 1 FROM hive.nrg.c1 b WHERE b.v IS NOT DISTINCT FROM a.v) ORDER BY id"
+
+[[case]]
+id = "N24"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT id FROM hive.nrg.c1 a WHERE EXISTS (SELECT 1 FROM hive.nrg.c1 b WHERE b.v IS NOT DISTINCT FROM a.v) ORDER BY id"
+
+[[case]]
+id = "N25"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM hive.nrg.c1 a LEFT JOIN hive.nrg.c1 b ON a.v IS NOT DISTINCT FROM b.v WHERE b.id IS NULL"
+
+[[case]]
+id = "N26"
+sql = "SELECT count(*) FROM hive.nrg.c1 a RIGHT JOIN hive.nrg.c1 b ON a.v IS NOT DISTINCT FROM b.v WHERE a.id IS NULL"
+
+[[case]]
+id = "N27"
+sql = "SELECT count(*) FROM hive.nrg.c1 a FULL JOIN hive.nrg.c1 b ON a.v IS NOT DISTINCT FROM b.v WHERE a.id IS NULL OR b.id IS NULL"
+
+[[case]]
+id = "N28"
+expect = "RECUSA"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM hive.nrg.c1 a JOIN hive.nrg.c1 b ON a.v IS NOT DISTINCT FROM b.v AND a.id = b.id"
+
+[[case]]
+id = "N29"
+expect = "RECUSA"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM hive.nrg.c1 a JOIN (SELECT * FROM hive.nrg.c1) b ON a.v IS NOT DISTINCT FROM b.v AND a.id = b.id"
+
+[[case]]
+id = "N30"
+sql = "SELECT count(*) FROM hive.nrg.c1 a JOIN hive.nrg.c1 b ON (a.v IS NOT DISTINCT FROM b.v) AND a.id = b.id"
+
+[[case]]
+id = "N31"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM (SELECT v FROM hive.nrg.c1 UNION ALL SELECT NULL) a JOIN hive.nrg.c1 b ON a.v IS NOT DISTINCT FROM b.v"
+
+[[case]]
+id = "N32"
+sql = "SELECT count(*) FROM (SELECT v FROM hive.nrg.c1 EXCEPT SELECT v FROM hive.nrg.c1 WHERE id < 3)"
+
+[[case]]
+id = "N33"
+sql = "SELECT * FROM (SELECT v FROM hive.nrg.c1 EXCEPT SELECT v FROM hive.nrg.c1 WHERE id < 3)"
+
+[[case]]
+id = "N34"
+sql = "SELECT count(*) FROM hive.nrg.c1 a WHERE a.v IS NOT DISTINCT FROM (SELECT max(v) FROM hive.nrg.c1 WHERE id = 3)"
+
+[[case]]
+id = "N35"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT * FROM hive.nrg.n1 EXCEPT SELECT * FROM hive.nrg.c1"
+
+[[case]]
+id = "N36"
+sql = "SELECT * FROM hive.nrg.c1 EXCEPT SELECT * FROM hive.nrg.n1"
+
+[[case]]
+id = "N37"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM (SELECT * FROM hive.nrg.c1 INTERSECT SELECT * FROM hive.nrg.n1)"
+
+[[case]]
+id = "N38"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM hive.nrg.n2 a JOIN hive.nrg.n2 b ON a.k IS NOT DISTINCT FROM b.k"
+
+[[case]]
+id = "N39"
+expect = "RECUSA"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM hive.nrg.n2 a JOIN hive.nrg.n2 b ON a.k IS NOT DISTINCT FROM b.k AND a.d IS NOT DISTINCT FROM b.d"
+
+[[case]]
+id = "N40"
+sql = "SELECT count(*) FROM hive.nrg.n2 a JOIN hive.nrg.n2 b ON a.d IS NOT DISTINCT FROM b.d"
+
+[[case]]
+id = "N41"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM hive.nrg.n2 a JOIN hive.nrg.n2 b ON a.b IS NOT DISTINCT FROM b.b"
+
+[[case]]
+id = "N42"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT * FROM hive.nrg.n2 EXCEPT SELECT * FROM hive.nrg.n2"
+
+[[case]]
+id = "N43"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM (SELECT * FROM hive.nrg.n2 INTERSECT SELECT * FROM hive.nrg.n2)"
+
+[[case]]
+id = "N44"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM hive.nrg.n2 a JOIN hive.nrg.n2 b ON a.b IS NOT DISTINCT FROM b.b AND a.id = b.id"
+
+[[case]]
+id = "N45"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM hive.nrg.n2 a, hive.nrg.n2 b WHERE a.b IS NOT DISTINCT FROM b.b AND a.id <> b.id"
+
+[[case]]
+id = "N46"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM hive.nrg.n2 a, hive.nrg.n2 b WHERE a.b IS DISTINCT FROM b.b OR a.id = b.id"
+
+[[case]]
+id = "N47"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT id, b IS DISTINCT FROM true AND id > 1, b IS NOT DISTINCT FROM false OR id = 3 FROM hive.nrg.n2 ORDER BY id"
+
+[[case]]
+id = "N48"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT id, true IS DISTINCT FROM b = false FROM hive.nrg.n2 ORDER BY id"
+
+[[case]]
+id = "N49"
+sql = "SELECT id, NOT b IS DISTINCT FROM true FROM hive.nrg.n2 ORDER BY id"
+
+[[case]]
+id = "N50"
+sql = "SELECT id FROM hive.nrg.n1 ORDER BY v NULLS FIRST LIMIT 1"
+
+[[case]]
+id = "N51"
+sql = "SELECT id FROM hive.nrg.n1 ORDER BY v DESC NULLS FIRST LIMIT 1"
+
+[[case]]
+id = "N52"
+sql = "SELECT id FROM hive.nrg.n1 ORDER BY v ASC NULLS LAST LIMIT 3"
+
+[[case]]
+id = "N53"
+sql = "SELECT id FROM hive.nrg.n2 ORDER BY k DESC NULLS FIRST LIMIT 2"
+
+[[case]]
+id = "N54"
+sql = "SELECT min(v), max(v), count(v), count(*) FROM hive.nrg.n1"
+
+[[case]]
+id = "N55"
+sql = "SELECT count(*) FROM hive.nrg.n1 a JOIN hive.nrg.n1 b ON a.v = b.v"
+
+[[case]]
+id = "N56"
+sql = "SELECT count(*) FROM hive.nrg.n1 a LEFT JOIN hive.nrg.n1 b ON a.v = b.v WHERE b.id IS NULL"
+
+[[case]]
+id = "N57"
+sql = "SELECT id FROM hive.nrg.n1 a WHERE v NOT IN (SELECT v FROM hive.nrg.n1 WHERE id < 3) ORDER BY id"
+
+[[case]]
+id = "N58"
+expect = "RECUSA"
+known = "ISS-032"
+sql = "SELECT count(*) FROM hive.nrg.n1 a WHERE (SELECT count(*) FROM hive.nrg.n1 b WHERE b.v IS NOT DISTINCT FROM a.v) = 1"
+
+[[case]]
+id = "N-nodf1"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM hive.nrg.n1 a JOIN hive.nrg.n1 b ON a.v IS NOT DISTINCT FROM b.v"
+codelake_session = "enable_dynamic_filtering=false"
+
+[[case]]
+id = "N-nodf2"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT id FROM hive.nrg.n1 a WHERE NOT EXISTS (SELECT 1 FROM hive.nrg.n1 b WHERE b.v IS NOT DISTINCT FROM a.v) ORDER BY id"
+codelake_session = "enable_dynamic_filtering=false"
+
+[[case]]
+id = "N-nodf3"
+expect = "WRONG"
+known = "front/nullsafe-join"
+sql = "SELECT count(*) FROM hive.nrg.n1 a LEFT JOIN hive.nrg.n1 b ON a.v IS NOT DISTINCT FROM b.v WHERE b.id IS NULL"
+codelake_session = "enable_dynamic_filtering=false"
+
+[[case]]
+id = "N-nodf4"
+sql = "SELECT count(*) FROM (SELECT DISTINCT v FROM hive.nrg.n1)"
+codelake_session = "enable_dynamic_filtering=false"

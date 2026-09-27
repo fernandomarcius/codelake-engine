@@ -1,0 +1,25 @@
+# CodeLake under test in the differential gate. Reached only on the gate's
+# private Docker network, created for the run and removed after it (no port is
+# published on the host): the isolated network allow_unauthenticated_network
+# asks for.
+[server]
+pg_listen = "0.0.0.0:5432"
+http_listen = "127.0.0.1:8090"
+allow_unauthenticated_network = true
+shutdown_grace_secs = 1
+
+[server.trino]
+listen = "0.0.0.0:8081"
+
+[memory]
+limit = "2GiB"
+spill_dir = "/tmp/spill"
+spill_limit = "2GiB"
+metadata_cache_limit = "8MiB"
+
+# The warehouse Trino 431 writes too (hive.properties): files one engine
+# writes, the other reads.
+[[source]]
+name = "hive"
+kind = "hive"
+warehouse = "/wh"

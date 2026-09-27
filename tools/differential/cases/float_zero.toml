@@ -1,0 +1,529 @@
+# -0.0 against 0.0 (and NaN) in comparisons, joins, grouping and set operations, over
+# Parquet files Trino wrote (pushed-down filters) and over in-memory tables.
+
+oracle = "trino"
+setup_trino = [
+  "CREATE SCHEMA hive.fz",
+  "CREATE TABLE hive.fz.z (id bigint, x double, r real) WITH (format = 'PARQUET')",
+  "INSERT INTO hive.fz.z VALUES (1, 0.0E0, REAL '0.0')",
+  "INSERT INTO hive.fz.z VALUES (2, -0.0E0, REAL '-0.0')",
+  "INSERT INTO hive.fz.z VALUES (3, 1.0E0, REAL '1.0'), (4, -1.0E0, REAL '-1.0')",
+  "INSERT INTO hive.fz.z VALUES (5, nan(), CAST(nan() AS real)), (6, NULL, NULL)",
+]
+setup = [
+  "CREATE SCHEMA {c}.fzm",
+  "CREATE TABLE {c}.fzm.f (x double, y double, r real)",
+  "INSERT INTO {c}.fzm.f VALUES (0.0E0, -0.0E0, REAL '0.0'), (-0.0E0, 0.0E0, REAL '-0.0'), (nan(), nan(), nan()), (1.0E0, 1.0E0, REAL '1.0'), (NULL, 0.0E0, NULL), (-1.0E0, -0.0E0, REAL '-1.0')",
+  "CREATE TABLE {c}.fzm.g (x double, tag varchar)",
+  "INSERT INTO {c}.fzm.g VALUES (0.0E0, 'pos'), (-0.0E0, 'neg'), (nan(), 'nan')",
+]
+
+[[case]]
+id = "Z1"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x = 0"
+
+[[case]]
+id = "Z2"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x = -0.0E0"
+
+[[case]]
+id = "Z3"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x >= 0"
+
+[[case]]
+id = "Z4"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x > 0"
+
+[[case]]
+id = "Z5"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x < 0"
+
+[[case]]
+id = "Z6"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x <= -0.0E0"
+
+[[case]]
+id = "Z7"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x <> 0"
+
+[[case]]
+id = "Z8"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x IN (0, 1)"
+
+[[case]]
+id = "Z9"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x IN (-0.0E0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27)"
+
+[[case]]
+id = "Z10"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x NOT IN (-0.0E0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27)"
+
+[[case]]
+id = "Z11"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x BETWEEN -0.0E0 AND 0.0E0"
+
+[[case]]
+id = "Z12"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x BETWEEN 0 AND 1"
+
+[[case]]
+id = "Z13"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x IS NOT DISTINCT FROM -0.0E0"
+
+[[case]]
+id = "Z14"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x IS DISTINCT FROM 0"
+
+[[case]]
+id = "Z15"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM hive.fz.z WHERE r = 0"
+
+[[case]]
+id = "Z16"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM hive.fz.z WHERE r = REAL '0.0'"
+
+[[case]]
+id = "Z17"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM hive.fz.z WHERE r = REAL '-0.0'"
+
+[[case]]
+id = "Z18"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM hive.fz.z WHERE r >= 0"
+
+[[case]]
+id = "Z19"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM hive.fz.z WHERE r IS NOT DISTINCT FROM REAL '-0.0'"
+
+[[case]]
+id = "Z20"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM (VALUES REAL '0.0', REAL '-0.0', REAL '1.0') t(r) WHERE r = 0"
+
+[[case]]
+id = "Z21"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM (VALUES REAL '0.0', REAL '-0.0', REAL '1.0') t(r) WHERE r = REAL '0.0'"
+
+[[case]]
+id = "Z22"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT id, x = 0, x <> 0, x < 0, x <= 0, x > 0, x >= 0, x IS DISTINCT FROM 0, x IS NOT DISTINCT FROM -0.0E0 FROM hive.fz.z ORDER BY id"
+
+[[case]]
+id = "Z23"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT id, r = 0, r <> 0, r < 0, r >= 0, r IS DISTINCT FROM REAL '0.0' FROM hive.fz.z ORDER BY id"
+
+[[case]]
+id = "Z24"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT a.id, b.id, a.x = b.x, a.x IS DISTINCT FROM b.x, a.x < b.x, a.x >= b.x FROM hive.fz.z a, hive.fz.z b WHERE a.id IN (1, 2) AND b.id IN (1, 2) ORDER BY 1, 2"
+
+[[case]]
+id = "Z25"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM hive.fz.z a, hive.fz.z b WHERE a.x IS DISTINCT FROM b.x"
+
+[[case]]
+id = "Z26"
+sql = "SELECT count(*) FROM hive.fz.z a, hive.fz.z b WHERE a.x IS NOT DISTINCT FROM b.x"
+
+[[case]]
+id = "Z27"
+sql = "SELECT count(*) FROM hive.fz.z a, hive.fz.z b WHERE a.r IS NOT DISTINCT FROM b.r"
+
+[[case]]
+id = "Z28"
+sql = "SELECT count(*) FROM hive.fz.z a, hive.fz.z b WHERE a.x = b.x"
+
+[[case]]
+id = "Z29"
+sql = "SELECT count(*) FROM hive.fz.z a JOIN hive.fz.z b ON a.x IS NOT DISTINCT FROM b.x"
+
+[[case]]
+id = "Z30"
+sql = "SELECT count(*) FROM (SELECT DISTINCT x FROM hive.fz.z)"
+
+[[case]]
+id = "Z31"
+sql = "SELECT count(*) FROM (SELECT x FROM hive.fz.z GROUP BY x)"
+
+[[case]]
+id = "Z32"
+sql = "SELECT count(*) FROM (SELECT r FROM hive.fz.z GROUP BY r)"
+
+[[case]]
+id = "Z33"
+sql = "SELECT count(DISTINCT x), count(DISTINCT r) FROM hive.fz.z"
+
+[[case]]
+id = "Z34"
+sql = "SELECT count(*) FROM (SELECT x FROM hive.fz.z UNION SELECT -x FROM hive.fz.z)"
+
+[[case]]
+id = "Z35"
+sql = "SELECT count(*) FROM (SELECT x FROM hive.fz.z INTERSECT SELECT -x FROM hive.fz.z)"
+
+[[case]]
+id = "Z36"
+sql = "SELECT count(*) FROM (SELECT x FROM hive.fz.z EXCEPT SELECT -x FROM hive.fz.z)"
+
+[[case]]
+id = "Z37"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT id, CASE x WHEN 0 THEN 'z' ELSE 'o' END, nullif(x, 0) IS NULL FROM hive.fz.z ORDER BY id"
+
+[[case]]
+id = "Z38"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT id, count(*) OVER (PARTITION BY x) FROM hive.fz.z WHERE x = 0 ORDER BY id"
+
+[[case]]
+id = "Z39"
+sql = "SELECT id, count(*) OVER (PARTITION BY x) FROM hive.fz.z WHERE x = 1.0E0 ORDER BY id"
+
+[[case]]
+id = "Z40"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x = 0 AND x = -0.0E0"
+
+[[case]]
+id = "Z41"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x = 0 OR x = 1"
+
+[[case]]
+id = "Z42"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE NOT (x = 0)"
+
+[[case]]
+id = "Z43"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE -x = 0"
+
+[[case]]
+id = "Z44"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x * 1 = 0"
+
+[[case]]
+id = "Z45"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x = DECIMAL '0.0'"
+
+[[case]]
+id = "Z46"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count_if(x = 0), count_if(0 = x), sum(CASE WHEN x = 0 THEN 1 ELSE 0 END) FROM hive.fz.z"
+
+[[case]]
+id = "Z47"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT x = 0 AS z, count(*) FROM hive.fz.z GROUP BY 1 ORDER BY 1"
+
+[[case]]
+id = "Z48"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT -0.0E0 = 0.0E0, -0.0E0 IS DISTINCT FROM 0.0E0, REAL '-0.0' = REAL '0.0', REAL '-0.0' IS DISTINCT FROM 0"
+
+[[case]]
+id = "Z49"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT x, count(*) FROM hive.fz.z GROUP BY ROLLUP (x) ORDER BY 1 NULLS LAST"
+
+[[case]]
+id = "Z50"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM (SELECT x FROM hive.fz.z GROUP BY GROUPING SETS ((x), ())) "
+
+[[case]]
+id = "Z51"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x NOT BETWEEN -0.0E0 AND 0"
+
+[[case]]
+id = "Z52"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x IN (0)"
+
+[[case]]
+id = "Z53"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x NOT IN (0)"
+
+[[case]]
+id = "Z54"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x NOT IN (0, 1)"
+
+[[case]]
+id = "Z55"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE 0 = x"
+
+[[case]]
+id = "Z56"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE 0 > x"
+
+[[case]]
+id = "Z57"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x = 0 AND x >= 0"
+
+[[case]]
+id = "Z58"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x >= 0 AND x > -1 AND x <= 0"
+
+[[case]]
+id = "Z59"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x IN (SELECT -x FROM hive.fz.z)"
+
+[[case]]
+id = "Z60"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x NOT IN (SELECT y FROM (VALUES 0.0E0) t(y))"
+
+[[case]]
+id = "Z61"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT id FROM hive.fz.z WHERE x = (SELECT -0.0E0) ORDER BY id"
+
+[[case]]
+id = "Z62"
+expect = "EXTRA"
+known = "ISS-032"
+sql = "SELECT id, greatest(x, 0) = 0, x = 0 IS NOT DISTINCT FROM true FROM hive.fz.z ORDER BY id"
+
+[[case]]
+id = "Z63"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT sum(x) FILTER (WHERE x = 0), count(*) FILTER (WHERE x >= 0) FROM hive.fz.z"
+
+[[case]]
+id = "Z64"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT id, lag(x = 0) OVER (ORDER BY id) FROM hive.fz.z ORDER BY id"
+
+[[case]]
+id = "Z65"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x IS DISTINCT FROM nan()"
+
+[[case]]
+id = "Z66"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z a, hive.fz.z b WHERE a.x < b.x"
+
+[[case]]
+id = "Z67"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z a, hive.fz.z b WHERE a.x <> b.x"
+
+[[case]]
+id = "Z68"
+sql = "SELECT count(*) FROM hive.fz.z a LEFT JOIN hive.fz.z b ON a.x = b.x AND a.id <> b.id WHERE b.id IS NULL"
+
+[[case]]
+id = "Z69"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z a JOIN hive.fz.z b ON a.x = b.x AND a.r <= b.r"
+
+[[case]]
+id = "Z70"
+sql = "SELECT count(*) FROM hive.fz.z a JOIN hive.fz.z b ON a.x = -b.x"
+
+[[case]]
+id = "Z71"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT id, x IS DISTINCT FROM 0, -x IS DISTINCT FROM 0 FROM hive.fz.z ORDER BY id"
+
+[[case]]
+id = "Z72"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT id, nullif(x, -0.0E0) FROM hive.fz.z WHERE x IS NOT NULL AND NOT is_nan(x) ORDER BY id"
+
+[[case]]
+id = "Z73"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE CASE WHEN x = 0 THEN true END"
+
+[[case]]
+id = "Z74"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE coalesce(x, 1) = 0"
+
+[[case]]
+id = "Z75"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x + 0 = 0"
+
+[[case]]
+id = "Z76"
+sql = "SELECT count(*) FROM hive.fz.z WHERE r = 0 OR r = 1"
+
+[[case]]
+id = "Z77"
+sql = "SELECT count(*) FROM hive.fz.z WHERE r IN (0, 1)"
+
+[[case]]
+id = "Z78"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM hive.fz.z WHERE CAST(r AS double) = 0"
+
+[[case]]
+id = "Z79"
+sql = "SELECT count(*) FROM hive.fz.z WHERE r = x"
+
+[[case]]
+id = "Z80"
+sql = "SELECT count(*) FROM hive.fz.z WHERE x = r"
+
+[[case]]
+id = "ZM1"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM {c}.fzm.f WHERE x = y"
+
+[[case]]
+id = "ZM2"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM {c}.fzm.f WHERE x <> y"
+
+[[case]]
+id = "ZM3"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM {c}.fzm.f WHERE x IS DISTINCT FROM y"
+
+[[case]]
+id = "ZM4"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM {c}.fzm.f WHERE x IN (-0.0E0)"
+
+[[case]]
+id = "ZM5"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM {c}.fzm.f a JOIN {c}.fzm.f b ON a.x = b.y"
+
+[[case]]
+id = "ZM6"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM {c}.fzm.f a JOIN {c}.fzm.g b ON a.x = b.x"
+
+[[case]]
+id = "ZM7"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT b.tag, count(*) FROM {c}.fzm.f a JOIN {c}.fzm.g b ON a.x = b.x GROUP BY b.tag"
+
+[[case]]
+id = "ZM8"
+sql = "SELECT count(*) FROM (SELECT DISTINCT x FROM {c}.fzm.f)"
+
+[[case]]
+id = "ZM9"
+sql = "SELECT count(*) FROM (SELECT x FROM {c}.fzm.f UNION SELECT y FROM {c}.fzm.f)"
+
+[[case]]
+id = "ZM10"
+sql = "SELECT count(*) FROM (SELECT x FROM {c}.fzm.f INTERSECT SELECT y FROM {c}.fzm.f)"
+
+[[case]]
+id = "ZM11"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT x FROM {c}.fzm.f EXCEPT ALL SELECT -0.0E0"
+
+[[case]]
+id = "ZM12"
+expect = "WRONG"
+known = "front/w1-df54"
+sql = "SELECT count(*) FROM (SELECT x FROM {c}.fzm.f EXCEPT ALL SELECT -0.0E0)"
+
+[[case]]
+id = "ZM13"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM {c}.fzm.f WHERE r = REAL '-0.0'"
+
+[[case]]
+id = "ZM14"
+expect = "WRONG"
+known = "ISS-032"
+sql = "SELECT count(*) FROM (VALUES REAL '0.0', REAL '-0.0', REAL '2.0') t(r) WHERE r = 0"
