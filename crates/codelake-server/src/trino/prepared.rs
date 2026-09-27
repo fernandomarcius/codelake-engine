@@ -218,16 +218,16 @@ pub(crate) fn bind(sql: &str, parameters: &[Expr]) -> Result<String, QueryError>
 /// possibly over several header lines.
 pub(crate) fn parse_header<'a>(
     values: impl Iterator<Item = &'a str>,
+    header: &str,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut prepared = BTreeMap::new();
     for value in values {
         for pair in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             let (name, sql) = pair
                 .split_once('=')
-                .ok_or_else(|| format!("Invalid X-Trino-Prepared-Statement header: {pair}"))?;
+                .ok_or_else(|| format!("Invalid {header} header: {pair}"))?;
             let decode = |text: &str| {
-                percent_decode(text.trim())
-                    .map_err(|_| format!("Invalid X-Trino-Prepared-Statement header: {pair}"))
+                percent_decode(text.trim()).map_err(|_| format!("Invalid {header} header: {pair}"))
             };
             prepared.insert(decode(name)?, decode(sql)?);
         }
@@ -315,9 +315,13 @@ mod tests {
 
     #[test]
     fn header_lists_prepared_statements() {
-        let parsed = parse_header(["a=SELECT+1%2C+2", "b=SELECT%20%3F"].into_iter()).unwrap();
+        let parsed = parse_header(
+            ["a=SELECT+1%2C+2", "b=SELECT%20%3F"].into_iter(),
+            "X-CodeLake-Prepared-Statement",
+        )
+        .unwrap();
         assert_eq!(parsed["a"], "SELECT 1, 2");
         assert_eq!(parsed["b"], "SELECT ?");
-        assert!(parse_header(["nope"].into_iter()).is_err());
+        assert!(parse_header(["nope"].into_iter(), "X-CodeLake-Prepared-Statement").is_err());
     }
 }

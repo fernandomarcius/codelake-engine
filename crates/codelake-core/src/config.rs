@@ -84,6 +84,27 @@ pub struct TrinoProtocolConfig {
     /// `QUERY_TEXT_TOO_LARGE`, as with Trino's `query.max-length`.
     #[serde(default = "default_trino_max_query_length")]
     pub max_query_length: usize,
+    /// Prefix of the protocol's headers (`<prefix>User`, `<prefix>Catalog`,
+    /// …; ISS-011). Default `X-CodeLake-`; clients built for another engine
+    /// send that engine's prefix, set here.
+    #[serde(default = "default_header_prefix")]
+    pub header_prefix: String,
+    /// Version the server reports (`/v1/info`, `version()`); default
+    /// `CodeLake`'s. Some clients check it.
+    pub reported_version: Option<String>,
+}
+
+fn default_header_prefix() -> String {
+    "X-CodeLake-".into()
+}
+
+/// Whether `prefix` makes valid header names: `X-`, then letters, digits and
+/// `-`, ending in `-`.
+fn valid_header_prefix(prefix: &str) -> bool {
+    prefix.len() > 3
+        && prefix.get(..2).is_some_and(|x| x.eq_ignore_ascii_case("x-"))
+        && prefix.ends_with('-')
+        && prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 const fn default_trino_max_active_queries() -> usize {
@@ -899,6 +920,19 @@ impl Config {
         }
         if trino.client_timeout_secs == 0 {
             errors.push("server.trino.client_timeout_secs must be > 0".into());
+        }
+        if !valid_header_prefix(&trino.header_prefix) {
+            errors.push(format!(
+                "server.trino.header_prefix `{}` must be `X-`, letters, digits or `-`, ending in `-`",
+                trino.header_prefix
+            ));
+        }
+        if trino
+            .reported_version
+            .as_deref()
+            .is_some_and(|v| v.trim().is_empty())
+        {
+            errors.push("server.trino.reported_version must not be empty".into());
         }
         if trino.max_query_length == 0 {
             errors.push("server.trino.max_query_length must be > 0".into());

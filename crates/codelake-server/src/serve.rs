@@ -136,7 +136,16 @@ async fn start_trino(
         client_timeout: Duration::from_secs(settings.client_timeout_secs),
         max_query_length: settings.max_query_length,
     };
-    let state = trino::TrinoState::new(Arc::clone(engine), limits, settings.listen);
+    let state = trino::TrinoState::new(
+        Arc::clone(engine),
+        limits,
+        settings.listen,
+        &settings.header_prefix,
+        settings
+            .reported_version
+            .as_deref()
+            .unwrap_or(env!("CARGO_PKG_VERSION")),
+    );
     engine
         .context()
         .register_catalog("system", state.system_catalog().map_err(EngineError::from)?);

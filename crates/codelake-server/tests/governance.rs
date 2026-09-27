@@ -70,6 +70,8 @@ shutdown_grace_secs = 1
 
 [server.trino]
 listen = "127.0.0.1:{statement}"
+header_prefix = "X-Trino-"
+reported_version = "431"
 
 [memory]
 limit = "256MiB"

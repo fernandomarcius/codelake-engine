@@ -14,7 +14,7 @@ fn config(dir: &Path, warehouse: &Path, pg: u16, http: u16, trino: u16) -> PathB
     let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
     write!(
         file,
-        "\n[server.trino]\nlisten = \"127.0.0.1:{trino}\"\n\n[[source]]\nname = \"hive\"\nkind = \"hive\"\nwarehouse = \"{}\"\n",
+        "\n[server.trino]\nlisten = \"127.0.0.1:{trino}\"\nheader_prefix = \"X-Trino-\"\nreported_version = \"431\"\n\n[[source]]\nname = \"hive\"\nkind = \"hive\"\nwarehouse = \"{}\"\n",
         warehouse.display()
     )
     .unwrap();

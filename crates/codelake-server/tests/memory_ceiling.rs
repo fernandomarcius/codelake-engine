@@ -83,6 +83,8 @@ shutdown_grace_secs = 1
 
 [server.trino]
 listen = "127.0.0.1:{trino}"
+header_prefix = "X-Trino-"
+reported_version = "431"
 client_timeout_secs = 2
 
 [execution]

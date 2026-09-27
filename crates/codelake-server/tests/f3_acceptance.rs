@@ -103,6 +103,8 @@ allow_unauthenticated_network = true
 
 [server.trino]
 listen = "0.0.0.0:{port}"
+header_prefix = "X-Trino-"
+reported_version = "431"
 max_active_queries = {max_active}
 client_timeout_secs = {client_timeout}
 
