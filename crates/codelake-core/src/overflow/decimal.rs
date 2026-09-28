@@ -184,15 +184,37 @@ struct Kernel {
     s2: i8,
     rp: u8,
     rs: i8,
+    /// `10^rp`, `10^(rs-s1)`, `10^(rs-s2)` and `10^division_factor`, computed
+    /// once per batch (`None`: out of 128 bits).
+    limit: Option<i128>,
+    up1: Option<i128>,
+    up2: Option<i128>,
+    divide_by: Option<i128>,
 }
 
 impl Kernel {
+    fn new(op: Operator, (s1, s2): (i8, i8), (rp, rs): (u8, i8)) -> Self {
+        let mut kernel = Self {
+            op,
+            s1,
+            s2,
+            rp,
+            rs,
+            limit: pow10_i128(u32::from(rp)),
+            up1: pow10_i128(scale_gap(rs, s1)),
+            up2: pow10_i128(scale_gap(rs, s2)),
+            divide_by: None,
+        };
+        kernel.divide_by = pow10_i128(kernel.division_factor());
+        kernel
+    }
+
     fn apply(self, a: i128, b: i128) -> Result<i128, ArrowError> {
         let value = match self.fast(a, b)? {
             Some(value) => value,
             None => self.wide(a, b)?,
         };
-        let limit = pow10_i128(u32::from(self.rp)).ok_or_else(overflow)?;
+        let limit = self.limit.ok_or_else(overflow)?;
         if value.unsigned_abs() >= limit.unsigned_abs() {
             return Err(overflow());
         }
@@ -216,20 +238,21 @@ impl Kernel {
     /// 128-bit evaluation; `None` when an intermediate value does not fit.
     fn fast(self, a: i128, b: i128) -> Result<Option<i128>, ArrowError> {
         self.check_divisor(b)?;
-        let up = |v: i128, from: i8| pow10_i128(scale_gap(self.rs, from)).and_then(|m| v.checked_mul(m));
+        let up = |v: i128, m: Option<i128>| m.and_then(|m| v.checked_mul(m));
         Ok(match self.op {
-            Operator::Plus => up(a, self.s1)
-                .zip(up(b, self.s2))
+            Operator::Plus => up(a, self.up1)
+                .zip(up(b, self.up2))
                 .and_then(|(a, b)| a.checked_add(b)),
-            Operator::Minus => up(a, self.s1)
-                .zip(up(b, self.s2))
+            Operator::Minus => up(a, self.up1)
+                .zip(up(b, self.up2))
                 .and_then(|(a, b)| a.checked_sub(b)),
             Operator::Multiply => a.checked_mul(b),
-            Operator::Divide => pow10_i128(self.division_factor())
+            Operator::Divide => self
+                .divide_by
                 .and_then(|m| a.checked_mul(m))
                 .and_then(|n| divide_rounded_i128(n, b)),
-            _ => up(a, self.s1)
-                .zip(up(b, self.s2))
+            _ => up(a, self.up1)
+                .zip(up(b, self.up2))
                 .and_then(|(a, b)| a.checked_rem(b)),
         })
     }
@@ -417,13 +440,7 @@ impl ScalarUDFImpl for DecimalBinary {
         };
         let left = to_decimal128(left, (p1, s1))?;
         let right = to_decimal128(right, (p2, s2))?;
-        let kernel = Kernel {
-            op: self.op,
-            s1,
-            s2,
-            rp,
-            rs,
-        };
+        let kernel = Kernel::new(self.op, (s1, s2), (rp, rs));
         evaluate(kernel, &left, &right, args.number_rows).map_err(|e| match e {
             DataFusionError::ArrowError(arrow, _) if matches!(*arrow, ArrowError::DivideByZero) => {
                 DataFusionError::from(ArrowError::DivideByZero)
@@ -474,7 +491,7 @@ mod tests {
         (b, s2): (i128, i8),
         (rp, rs): (u8, i8),
     ) -> Result<i128, ArrowError> {
-        Kernel { op, s1, s2, rp, rs }.apply(a, b)
+        Kernel::new(op, (s1, s2), (rp, rs)).apply(a, b)
     }
 
     #[test]
