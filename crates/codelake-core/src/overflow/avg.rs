@@ -4,17 +4,25 @@
 //! from zero, and adds the values without ever overflowing. `DataFusion`
 //! answers `decimal(p+4,s+4)` truncated, and adds in 128 bits with wrapping
 //! arithmetic. [`TrinoAvg`] keeps `DataFusion`'s accumulators but feeds them
-//! the values as `decimal(76,s)` (256 bits: no realistic row count overflows
-//! them) and rounds their `s+4`-digit, truncated result to `s` digits. That
-//! rounding is exact: half a unit of the `s`-th digit is representable with
-//! `s+4` digits, so truncating first never crosses it. Other argument types
-//! are `DataFusion`'s `avg` unchanged.
+//! values they cannot overflow and rounds their `s+4`-digit, truncated result
+//! to `s` digits. That rounding is exact: half a unit of the `s`-th digit is
+//! representable with `s+4` digits, so truncating first never crosses it.
+//!
+//! The values stay in 128 bits (`decimal(38,s)`, the input's own buffer) when
+//! `p <= 19`: a sum of fewer than 2^63 of them is below 10^19 · 2^63 < 2^127,
+//! and scaling it by 10^4 for the result stays in range below ~10^15 rows.
+//! That covers money columns (`decimal(15,2)` and the like); wider decimals go
+//! to `decimal(76,s)` (256 bits), which costs a cast of every value and
+//! arithmetic about four times slower. Other argument types are `DataFusion`'s
+//! `avg` unchanged.
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, BooleanArray};
+use datafusion::arrow::array::{ArrayRef, AsArray, BooleanArray};
 use datafusion::arrow::compute::{CastOptions, cast_with_options};
-use datafusion::arrow::datatypes::{DECIMAL256_MAX_PRECISION, DataType, FieldRef};
+use datafusion::arrow::datatypes::{
+    DECIMAL128_MAX_PRECISION, DECIMAL256_MAX_PRECISION, DataType, Decimal128Type, FieldRef,
+};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::functions_aggregate::average::Avg;
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
@@ -48,8 +56,19 @@ struct Widened {
     result: DataType,
 }
 
+/// Widest precision whose sums stay in 128 bits (see the module documentation).
+const NARROW_PRECISION: u8 = 19;
+
 impl Widened {
     fn new(p: u8, s: i8) -> Self {
+        let max128 = i8::try_from(DECIMAL128_MAX_PRECISION).unwrap_or(i8::MAX);
+        if p <= NARROW_PRECISION && s + 4 <= max128 {
+            return Self {
+                input: DataType::Decimal128(DECIMAL128_MAX_PRECISION, s),
+                inner_result: DataType::Decimal128(DECIMAL128_MAX_PRECISION, s + 4),
+                result: DataType::Decimal128(p, s),
+            };
+        }
         let max = i8::try_from(DECIMAL256_MAX_PRECISION).unwrap_or(i8::MAX);
         Self {
             input: DataType::Decimal256(DECIMAL256_MAX_PRECISION, s),
@@ -82,7 +101,19 @@ impl Widened {
     }
 
     fn widen(&self, values: &[ArrayRef]) -> Result<Vec<ArrayRef>> {
-        values.iter().map(|v| Self::cast(v, &self.input)).collect()
+        values.iter().map(|v| self.widen_one(v)).collect()
+    }
+
+    /// `value` as [`Widened::input`]; a `decimal128` of the same scale only
+    /// gets the wider precision, sharing its buffer (every value fits).
+    fn widen_one(&self, value: &ArrayRef) -> Result<ArrayRef> {
+        if let (DataType::Decimal128(_, from), DataType::Decimal128(p, to)) = (value.data_type(), &self.input)
+            && from == to
+        {
+            let decimals = value.as_primitive::<Decimal128Type>().clone();
+            return Ok(Arc::new(decimals.with_precision_and_scale(*p, *to)?));
+        }
+        Self::cast(value, &self.input)
     }
 
     /// Rounds the inner result half away from zero to Trino's type.
@@ -326,5 +357,47 @@ mod tests {
         assert_eq!(avg.return_type(&[DataType::Float64]).unwrap(), DataType::Float64);
         let widened = Widened::new(38, 38);
         assert_eq!(widened.inner_result, DataType::Decimal256(76, 42));
+        // Money columns stay in 128 bits.
+        let narrow = Widened::new(15, 2);
+        assert_eq!(narrow.input, DataType::Decimal128(38, 2));
+        assert_eq!(narrow.inner_result, DataType::Decimal128(38, 6));
+        assert_eq!(Widened::new(20, 2).input, DataType::Decimal256(76, 2));
+    }
+
+    /// The 128-bit path gives Trino's answer: rounded half away from zero, on
+    /// the input's buffer, with and without groups.
+    #[tokio::test]
+    async fn narrow_decimals_average_in_128_bits_with_trino_rounding() {
+        use datafusion::prelude::SessionContext;
+        let ctx = SessionContext::new();
+        ctx.register_udaf(datafusion::logical_expr::AggregateUDF::new_from_impl(
+            TrinoAvg::default(),
+        ));
+        let sql = "SELECT g, avg(v) AS a FROM (VALUES (1, CAST(0.05 AS DECIMAL(15,2))), (1, CAST(0.10 AS DECIMAL(15,2))), \
+                   (2, CAST(-0.05 AS DECIMAL(15,2))), (2, CAST(-0.10 AS DECIMAL(15,2))), (3, CAST(999999999999.99 AS DECIMAL(15,2)))) t(g, v) \
+                   GROUP BY g ORDER BY g";
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let shown = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+            .unwrap()
+            .to_string();
+        // 0.075 → 0.08, -0.075 → -0.08 (half away from zero), type decimal(15,2).
+        assert!(shown.contains("| 1 | 0.08            |"), "{shown}");
+        assert!(shown.contains("| 2 | -0.08           |"), "{shown}");
+        assert!(shown.contains("| 3 | 999999999999.99 |"), "{shown}");
+        assert_eq!(
+            batches[0].schema().field(1).data_type(),
+            &DataType::Decimal128(15, 2)
+        );
+        let whole = ctx
+            .sql("SELECT avg(v) AS a FROM (VALUES (CAST(1.00 AS DECIMAL(15,2))), (CAST(2.01 AS DECIMAL(15,2)))) t(v)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let shown = datafusion::arrow::util::pretty::pretty_format_batches(&whole)
+            .unwrap()
+            .to_string();
+        assert!(shown.contains("| 1.51 |"), "{shown}");
     }
 }

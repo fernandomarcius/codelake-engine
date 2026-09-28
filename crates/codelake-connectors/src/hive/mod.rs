@@ -54,6 +54,7 @@ use tokio::sync::OnceCell;
 pub use self::catalog::HiveCatalog;
 use self::catalog::HiveCatalogProvider;
 use self::metastore::FileMetastore;
+pub(crate) use self::table::HiveTable;
 
 #[derive(Debug, Clone)]
 pub struct HiveParams {
@@ -244,7 +245,17 @@ impl Connector for HiveConnector {
                 source_name: self.name.clone(),
                 cause: e.into(),
             })?;
+        let swept = hive.metastore().sweep_staging().await;
+        if swept > 0 {
+            tracing::info!(catalog = %self.name, directories = swept, "removed abandoned staging directories");
+        }
         Ok(Arc::new(HiveCatalogProvider(hive)))
+    }
+
+    fn register_object_stores(&self, runtime: &datafusion::execution::runtime_env::RuntimeEnv) {
+        if let Some(hive) = self.catalog.get() {
+            hive.register_store(runtime);
+        }
     }
 
     async fn ping(&self) -> Result<(), ConnectorError> {

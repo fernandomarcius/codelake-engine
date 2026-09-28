@@ -519,6 +519,15 @@ pub(crate) fn uncheck_text_cast(expr: Expr) -> Transformed<Expr> {
     Transformed::no(Expr::ScalarFunction(ScalarFunction { func, args }))
 }
 
+/// Parameters of a [`TextToTimestamp`], for plans that cross a process
+/// boundary (`crate::portable`).
+#[cfg(feature = "portable")]
+impl TextToTimestamp {
+    pub(crate) fn portable(&self) -> (&DataType, bool) {
+        (&self.target, self.safe)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

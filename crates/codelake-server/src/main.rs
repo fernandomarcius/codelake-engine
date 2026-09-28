@@ -17,10 +17,37 @@ use codelake_server::telemetry;
 /// ADR 0003: the memory ceiling is a limit on the process, so memory the
 /// engine frees must go back to the OS. glibc's allocator keeps freed memory in
 /// one arena per thread; after a spilling sort or aggregation the process
-/// stayed hundreds of MiB above what the pool held. jemalloc is built to
-/// purge freed pages at once (`JEMALLOC_SYS_WITH_MALLOC_CONF`, `.cargo/config.toml`).
+/// stayed hundreds of MiB above what the pool held. jemalloc returns freed
+/// pages within a second (`JEMALLOC_SYS_WITH_MALLOC_CONF`, `.cargo/config.toml`),
+/// and at once while the pool is short of memory ([`follow_memory_pressure`]).
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Decay of freed pages while memory is plentiful: jemalloc keeps them for up
+/// to a second, so a query that frees and allocates again reuses them instead
+/// of faulting them back in (ADR 0003).
+const LAZY_DECAY_MS: isize = 1000;
+
+/// Follows the memory pool's pressure (`codelake_core::pool::on_memory_pressure`):
+/// while memory is scarce every freed page goes back to the system at once
+/// (decay 0, which also purges what each arena keeps), so the process stays
+/// within its ceiling; otherwise pages decay over [`LAZY_DECAY_MS`].
+fn follow_memory_pressure(scarce: bool) {
+    use tikv_jemalloc_ctl::{Access as _, AsName as _};
+    let decay = if scarce { 0 } else { LAZY_DECAY_MS };
+    // Arenas created later start with this value.
+    let _ = b"arenas.dirty_decay_ms\0".name().write(decay);
+    let Ok(count) = tikv_jemalloc_ctl::arenas::narenas::read() else {
+        return;
+    };
+    let Ok(mut mib) = b"arena.0.dirty_decay_ms\0".name().mib::<[usize; 3]>() else {
+        return;
+    };
+    for arena in 0..count {
+        mib[1] = arena as usize;
+        let _ = mib.write(decay);
+    }
+}
 
 mod hooks;
 mod import;
@@ -203,6 +230,7 @@ fn config_import(args: &import::ImportArgs) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    codelake_core::pool::on_memory_pressure(follow_memory_pressure);
     let cli = Cli::parse();
     let config = match &cli.command {
         Command::CheckConfig { config } | Command::Serve { config } => config,

@@ -201,6 +201,11 @@ TB-scale joins need scale-out.
   DataFusion 54 train) makes `datafusion-distributed` 3.0.0 the candidate and
   Ballista 54.1 the fallback, and sets the benchmark plan and decision gates;
   single-node stays the default, and nothing merges before the benchmark runs.
+  Implemented behind the `distributed` feature (coordinator/worker roles,
+  codecs, per-worker ceiling, Kubernetes manifests); 22/22 TPC-H match
+  single-node and Trino 431. Scaling not measurable on the k3s cluster (0.33
+  Gbit/s between nodes); see ADR 0011 "Results so far" and
+  bench/reports/2026-09-27-k3s-sf10.md.
 - Coordinator/worker split; the core is already stateless per node.
 - Memory ceiling per worker plus a cluster-wide admission budget.
 

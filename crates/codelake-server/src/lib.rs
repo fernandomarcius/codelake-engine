@@ -2,3 +2,6 @@
 //! directly. The binary (`src/main.rs`) wires them together.
 
 pub mod telemetry;
+
+#[cfg(feature = "distributed")]
+pub mod distributed;

@@ -1,0 +1,44 @@
+# Workers do not authenticate their callers: their execution port is open only
+# to the coordinator and to other workers (stages read from each other).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: codelake-worker
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: codelake, app.kubernetes.io/component: worker }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: codelake }
+      ports:
+        - { port: 50051, protocol: TCP }
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+      ports:
+        - { port: 8080, protocol: TCP }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: codelake-coordinator
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: codelake, app.kubernetes.io/component: coordinator }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { codelake.io/client: "true" }
+      ports:
+        - { port: 5432, protocol: TCP }
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: codelake, app.kubernetes.io/component: worker }
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+      ports:
+        - { port: 8080, protocol: TCP }

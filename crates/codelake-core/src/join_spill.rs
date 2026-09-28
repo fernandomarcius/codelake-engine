@@ -1137,6 +1137,22 @@ pub fn with_sort_merge_oversized_joins(
     rules
 }
 
+#[cfg(feature = "portable")]
+impl JoinSideBudget {
+    /// Bytes this side may hold (`crate::portable`).
+    pub(crate) fn budget(&self) -> usize {
+        self.budget
+    }
+}
+
+#[cfg(feature = "portable")]
+impl SortMergeWithinCeiling {
+    /// Bytes the join may hold (`crate::portable`).
+    pub(crate) fn budget(&self) -> usize {
+        self.budget
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

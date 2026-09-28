@@ -7,7 +7,12 @@ xtask = "run --quiet --package xtask --"
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
-# Allocator of the server binary (ADR 0003): freed memory goes back to the OS at
-# once, so the process stays within the memory ceiling it is sized for.
+# Allocator of the server binary (ADR 0003): freed memory goes back to the OS
+# within a second (a background thread purges it), and at once while the memory
+# pool holds more than an eighth of its limit (the server switches the decay,
+# `codelake_core::pool::on_memory_pressure`), so the process stays within the
+# memory ceiling it is sized for. Purging at once (`dirty_decay_ms:0`) made
+# every free an madvise: TPC-H SF10 took 2.6x the time and 2.8x the CPU on x86
+# (bench/reports/2026-09-27-k3s-sf10.md).
 [env]
-JEMALLOC_SYS_WITH_MALLOC_CONF = "background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0"
+JEMALLOC_SYS_WITH_MALLOC_CONF = "background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0"

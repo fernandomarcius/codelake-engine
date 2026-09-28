@@ -32,6 +32,8 @@ pub mod overflow;
 pub mod parquet_time_zone;
 pub mod plain_views;
 pub mod pool;
+#[cfg(feature = "portable")]
+pub mod portable;
 pub mod runtime;
 #[cfg(test)]
 mod semantics_tests;
@@ -63,7 +65,9 @@ pub use connector::{
 };
 pub use ddl::{RelationKind, update_type as ddl_update_type};
 pub use declared::{PostgresStatement, postgres_statement, trino_type_syntax};
-pub use engine::{Attach, Engine, EngineError, Query, QueryOptions, SourceStatus};
+pub use engine::{
+    Attach, Engine, EngineError, Query, QueryOptions, SessionHook, SourceStatus, rebuild_state,
+};
 pub use governance::Governance;
 pub use runtime::MemoryStats;
 pub use session_properties::{

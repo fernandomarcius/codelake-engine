@@ -283,17 +283,26 @@ where
         self.sums.resize(total_num_groups, T::Native::ZERO);
         self.seen.resize(total_num_groups, false);
         let values = values.as_primitive::<T>();
+        // A group's sum starts at zero, so its first value is added like the
+        // others (`0 + v` cannot overflow).
+        if values.null_count() == 0 && filter.is_none() {
+            for (&group, &value) in group_indices.iter().zip(values.values().iter()) {
+                let sum = self.sums[group];
+                self.sums[group] = sum
+                    .add_checked(value)
+                    .map_err(|_| addition_overflow(&self.data_type, sum, value))?;
+                self.seen[group] = true;
+            }
+            return Ok(());
+        }
         for (row, &group) in group_indices.iter().enumerate() {
             if values.is_null(row) || filter.is_some_and(|f| !f.is_valid(row) || !f.value(row)) {
                 continue;
             }
             let (sum, value) = (self.sums[group], values.value(row));
-            self.sums[group] = if self.seen[group] {
-                sum.add_checked(value)
-                    .map_err(|_| addition_overflow(&self.data_type, sum, value))?
-            } else {
-                value
-            };
+            self.sums[group] = sum
+                .add_checked(value)
+                .map_err(|_| addition_overflow(&self.data_type, sum, value))?;
             self.seen[group] = true;
         }
         Ok(())
@@ -487,5 +496,13 @@ impl AggregateUDFImpl for CheckedSum {
 
     fn set_monotonicity(&self, data_type: &DataType) -> SetMonotonicity {
         self.inner.set_monotonicity(data_type)
+    }
+}
+
+#[cfg(feature = "portable")]
+impl CheckedSum {
+    /// Whether this is [`CheckedSum::trino`] (`crate::portable`).
+    pub(crate) fn is_trino(&self) -> bool {
+        self.trino_decimal
     }
 }

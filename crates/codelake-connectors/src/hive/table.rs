@@ -605,6 +605,13 @@ impl HiveTable {
     }
 }
 
+impl HiveTable {
+    /// See [`crate::distributable`].
+    pub(crate) fn distributable(&self) -> bool {
+        !exact_timestamps::has_nanoseconds(&self.schema, None)
+    }
+}
+
 #[async_trait]
 impl TableProvider for HiveTable {
     fn schema(&self) -> SchemaRef {
