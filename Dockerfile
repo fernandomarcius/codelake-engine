@@ -13,10 +13,12 @@ COPY . .
 # Empty = the release profile as written. Machines too small to link with LTO
 # can pass --build-arg CARGO_PROFILE_RELEASE_LTO=off (never for a release).
 ARG CARGO_PROFILE_RELEASE_LTO
+# Optional cargo features, e.g. `codelake-server/distributed` (M4, ADR 0011).
+ARG CARGO_FEATURES=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     { [ -n "$CARGO_PROFILE_RELEASE_LTO" ] || unset CARGO_PROFILE_RELEASE_LTO; } \
- && cargo build --locked --release --bin codelake \
+ && cargo build --locked --release --bin codelake ${CARGO_FEATURES:+--features "$CARGO_FEATURES"} \
  && install -D target/release/codelake /out/codelake \
  && install -D "$(ldconfig -p | awk '/libz\.so\.1 / {print $NF; exit}')" /out/lib/libz.so.1
 

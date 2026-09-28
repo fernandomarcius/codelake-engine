@@ -434,6 +434,42 @@ impl RecordBatchStream for SizedStream {
     }
 }
 
+/// Rebuilds of [`SliceExec`] and [`SizedBatchesExec`] for plans that cross a
+/// process boundary (`crate::portable`). The pair shares one [`Sizing`]; they
+/// are always in the same stage (no exchange between a projection and its
+/// input), so the node above finds the slice below it and shares its sizing.
+#[cfg(feature = "portable")]
+pub(crate) mod portable {
+    use std::sync::Arc;
+
+    use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+
+    use super::{SizedBatchesExec, Sizing, SliceExec};
+
+    pub(crate) fn slice(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        let sizing = Arc::new(Sizing::new(input.output_partitioning().partition_count()));
+        Arc::new(SliceExec::new(input, sizing))
+    }
+
+    pub(crate) fn sized(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        let mut below = Some(Arc::clone(&input));
+        let mut sizing = None;
+        while let Some(plan) = below {
+            if let Some(slice) = plan.downcast_ref::<SliceExec>() {
+                sizing = Some(Arc::clone(&slice.sizing));
+                break;
+            }
+            below = match plan.children().as_slice() {
+                [only] => Some(Arc::clone(only)),
+                _ => None,
+            };
+        }
+        let sizing =
+            sizing.unwrap_or_else(|| Arc::new(Sizing::new(input.output_partitioning().partition_count())));
+        Arc::new(SizedBatchesExec::new(input, sizing))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::array::{Int64Array, StringViewArray};

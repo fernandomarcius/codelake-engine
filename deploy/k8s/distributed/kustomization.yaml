@@ -1,0 +1,23 @@
+# Distributed execution (ROADMAP M4, ADR 0011): one coordinator, N workers.
+# The image must be built with `--build-arg CARGO_FEATURES=codelake-server/distributed`.
+# Every node reads the same warehouse at the same path: a ReadWriteMany volume
+# (NFS or CephFS) until hive-s3 ships (DataFusion 56 train).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: codelake
+resources:
+  - coordinator.yaml
+  - workers.yaml
+  - networkpolicy.yaml
+  - warehouse-pvc.yaml
+configMapGenerator:
+  - name: codelake-coordinator
+    files:
+      - codelake.toml=coordinator.toml
+  - name: codelake-worker
+    files:
+      - codelake.toml=worker.toml
+images:
+  - name: codelake
+    newName: ghcr.io/fernandomarcius/codelake
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000

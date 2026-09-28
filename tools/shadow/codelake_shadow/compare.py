@@ -666,11 +666,15 @@ def _compare_table(
         return _finish(out, reasons, expected, name_case)
 
     differing_declared = {d["column"] for d in type_differences} if not from_metastore else set()
+    # An expected declared type change stores the column in another type too
+    # (`real` as FLOAT, `double` as DOUBLE): the rule covers both.
+    expected_types = {e["column"] for e in expected if e.get("kind") == "declared_type"}
     storage = [
         {"column": c, "reference": ref_side.storage(c), "candidate": cand_side.storage(c)}
         for c in compared
         if c not in class_mismatch
         and c not in differing_declared
+        and c not in expected_types
         and ref_side.storage(c) != cand_side.storage(c)
     ]
     if storage:

@@ -88,7 +88,7 @@ password_env = "ERP_PASSWORD"   # secrets: keep the *_env keys
 | dbt target | `reference` (any name, `SHADOW_REFERENCE_TARGET`) | `candidate` |
 
 Both warehouses must start in the same state: both empty (then use
-`SHADOW_FULL_REFRESH_FIRST=true`) or one a copy of the other.
+`SHADOW_FULL_REFRESH=first`) or one a copy of the other.
 
 The profile can point both targets at the side being run: the harness exports
 `SHADOW_SIDE`, `SHADOW_ENGINE_URL`, `SHADOW_ENGINE_HOST`, `SHADOW_ENGINE_PORT`
@@ -108,6 +108,23 @@ WHERE "__$start_lsn" <= X'{{ var("shadow_cutoff") }}'
 The cutoff comes from `SHADOW_CUTOFF_SQL` (one value, run on the reference;
 varbinary as upper-case hex, timestamps in ISO 8601) or `SHADOW_CUTOFF_VALUE`.
 Without a cutoff, rows arriving between the two runs show up as divergences.
+
+### Same clock, same history
+
+A model that reads "now" (`localtimestamp`, `current_timestamp`) gets a
+different value on each side, since the sides run one after the other. With
+`SHADOW_CLOCK_VAR=shadow_now` every cycle passes the UTC time it started as
+the dbt variable `shadow_now` (and the same instant in
+`SHADOW_CLOCK_LOCAL_ZONE`, default `America/Sao_Paulo`, as `shadow_now_local`)
+to both sides; a model reads it instead of the engine's clock, e.g. through a
+macro that falls back to `localtimestamp` without the variable.
+
+A model that appends a row per run (a sensor's history) accumulates every
+earlier cycle, including the ones where only one side failed, so its row
+counts drift apart for good. `SHADOW_FULL_REFRESH=always` rebuilds the
+selected models from scratch on every cycle: each cycle compares only the
+rows it built. Use `first` for models whose state the comparison is about
+(an incremental event store).
 
 Take a cutoff both engines represent exactly. A SQL Server `datetime` stores
 1/300 s steps, and the reference compares a pushed-down filter with the stored
@@ -150,7 +167,8 @@ same path inside it.
 | `SHADOW_IGNORE_COLUMNS` | volatile columns (`uuid()`, `localtimestamp`): `schema.table.col`, `table.col` or `col`, globs allowed | — |
 | `SHADOW_CUTOFF_SQL` / `SHADOW_CUTOFF_VALUE` / `SHADOW_CUTOFF_VAR` | the cutoff (above) | — / — / `shadow_cutoff` |
 | `SHADOW_CUTOFF_USER` | user for the cutoff query | `shadow` |
-| `SHADOW_FULL_REFRESH_FIRST` | `--full-refresh` on the first cycle | `false` |
+| `SHADOW_FULL_REFRESH` | `--full-refresh`: `never`, on the `first` cycle, or `always` (above); `SHADOW_FULL_REFRESH_FIRST=true` means `first` | `never` |
+| `SHADOW_CLOCK_VAR`, `SHADOW_CLOCK_LOCAL_ZONE` | dbt variable with the cycle's clock, and the zone of `<var>_local` (above) | none, `America/Sao_Paulo` |
 | `SHADOW_CYCLES`, `SHADOW_INTERVAL_SECS` | cycles per invocation, pause between them | `1`, `0` |
 | `SHADOW_REFERENCE_RSS`, `SHADOW_CANDIDATE_RSS` | memory meter: `pid:<pid>`, `container:<name>`, `cmd:<command printing bytes>` | none |
 | `SHADOW_RSS_INTERVAL_MS` | sampling period | `200` |

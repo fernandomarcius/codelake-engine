@@ -1,0 +1,23 @@
+# Coordinator: clients connect here; it plans every query and sends the
+# stages of Hive-only queries to the workers. Same sources as a single node.
+[server]
+pg_listen = "0.0.0.0:5432"
+http_listen = "0.0.0.0:8080"
+allow_unauthenticated_network = true   # NetworkPolicy restricts who connects
+
+[memory]
+limit = "6GiB"                         # ~75% of the container limit
+spill_dir = "/var/lib/codelake/spill"
+spill_limit = "40GiB"
+
+[[source]]
+name = "hive"
+kind = "hive"
+warehouse = "/warehouse"
+
+[distributed]
+role = "coordinator"
+workers = [
+  "http://codelake-worker-0.codelake-worker:50051",
+  "http://codelake-worker-1.codelake-worker:50051",
+]

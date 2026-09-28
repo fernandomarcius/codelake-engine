@@ -98,6 +98,10 @@ struct RunArgs {
     /// Measure this process's own cgroup (`/sys/fs/cgroup`), for embedded runs.
     #[arg(long)]
     cgroup_self: bool,
+    /// A cgroup v2 directory of the engine, repeated for every pod of a
+    /// distributed engine (coordinator and workers): read as one sum.
+    #[arg(long)]
+    cgroup_dir: Vec<PathBuf>,
     /// Readiness probe; should read data (default: the TPC-H `region` table).
     #[arg(long)]
     ready_sql: Option<String>,
@@ -177,6 +181,9 @@ fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), BoxErro
 fn cgroup(args: &RunArgs) -> Result<Option<Cgroup>, BoxError> {
     if args.cgroup_self {
         return Ok(Some(Cgroup::at(PathBuf::from("/sys/fs/cgroup"))));
+    }
+    if !args.cgroup_dir.is_empty() {
+        return Ok(Some(Cgroup::sum(args.cgroup_dir.clone())));
     }
     match (&args.cgroup_root, &args.container_id) {
         (Some(root), Some(id)) => Cgroup::find(root, id)

@@ -279,6 +279,46 @@ Tie-breaks, in order: CPU-seconds per query at the same wall time, the P1 and P2
 
 Single-node is also judged: where single-node CodeLake finishes a query within 1.2× the distributed wall time, the report recommends it for that query class, because it uses less compute.
 
+## Results so far (2026-09-27)
+
+Spike and F14 implementation on `front/m4-distributed`; numbers in
+`bench/reports/2026-09-27-k3s-sf10.md`.
+
+- **Integration (S1–S3):** datafusion-distributed 3.0.0 builds against the
+  train's lock with no duplicate crate. Two library defects and one DataFusion
+  defect were found and are patched or worked around
+  (`vendor/datafusion-distributed/PATCHES.md`, `docs/upstream/datafusion-distributed-3.md`):
+  user codecs never saw functions (the checked `sum`/`avg` would have come back
+  unchecked), broadcast build sides bypassed the pool (condition 1, now
+  `try_grow`), and a rebuilt session state could lose the engine's functions.
+  Condition 3 (rule ordering) was real: the output rule and the nested loop join
+  guard hide what the library cuts stages at and normalizes, so the coordinator
+  runs them after distribution; before that fix two and four workers returned
+  twice the rows on TPC-H Q11, Q15 and Q22.
+- **Correctness gate:** 22/22 TPC-H queries match single-node and Trino 431
+  (SF 0.01 in the integration tests over Parquet and Hive tables, SF10 on the
+  cluster with one and two workers). Federated sources, views and writes stay
+  on the coordinator (conditions 4 and 5).
+- **Ceiling gate:** each node keeps its `CeilingPool`; broadcast build sides
+  are reserved; connection buffers are sized to 1/16 of `memory.limit`. The
+  memory-ceiling tests hold.
+- **Scaling gate: not measurable on this cluster.** Its two nodes are joined
+  by 0.33 Gbit/s (pod to pod, WireGuard), against the ≥ 10 Gbit/s this ADR's
+  plan requires. Scans scale with a second worker (Q01 3.3 s → 1.5 s); joins
+  that shuffle between the nodes get several times slower; four workers did
+  not fit the cluster's free CPU. E(1→4) stays open until a machine set with
+  the planned network exists.
+- **Compute:** the same work surfaced a single-node cost that dwarfs what
+  distribution could give here: returning every freed page at once cost 2.6×
+  the time and 2.8× the CPU (ADR 0003, amended). Single-node CodeLake now runs
+  TPC-H SF10 in 19.8 s with 178 s of CPU on 16 vCPU, against Trino 431's 24.4 s
+  and 243 s.
+
+Status stays **Proposed**: the scaling gate has not run. Single node remains
+the default; the `distributed` feature and `[distributed]` configuration ship
+for deployments whose data does not fit one node and whose network meets the
+plan.
+
 ## Consequences
 
 - The chosen crate, `datafusion-proto` and a production `tonic`/`arrow-flight` tree join the ADR 0002 block and the `train` gate. This reverses ADR 0010's "no gRPC tree" for the distributed feature only. mTLS on worker channels brings a TLS stack for tonic. A second TLS stack next to tiberius's `native-tls` is likely; which one is unverified.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import shutil
@@ -9,6 +10,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .config import Config, Side
 
@@ -41,7 +43,20 @@ class DbtRun:
             return None
 
 
-def dbt_vars(config: Config, cutoff: str | None) -> str:
+def clock(config: Config, instant: dt.datetime) -> dict[str, str]:
+    """The cycle's clock variables (see `Config.clock_var`), empty without one."""
+    if not config.clock_var:
+        return {}
+    fmt = "%Y-%m-%d %H:%M:%S.%f"
+    utc = instant.astimezone(dt.timezone.utc)
+    local = instant.astimezone(ZoneInfo(config.clock_local_zone))
+    return {
+        config.clock_var: utc.strftime(fmt)[:-3],
+        f"{config.clock_var}_local": local.strftime(fmt)[:-3],
+    }
+
+
+def dbt_vars(config: Config, cutoff: str | None, clock_vars: dict[str, str] | None = None) -> str:
     variables: dict[str, Any] = {}
     if config.extra_vars:
         try:
@@ -53,10 +68,19 @@ def dbt_vars(config: Config, cutoff: str | None) -> str:
         variables.update(extra)
     if cutoff is not None:
         variables[config.cutoff_var] = cutoff
+    variables.update(clock_vars or {})
     return json.dumps(variables, sort_keys=True)
 
 
-def command(config: Config, side: Side, project: str, work: str, cutoff: str | None, full_refresh: bool) -> list[str]:
+def command(
+    config: Config,
+    side: Side,
+    project: str,
+    work: str,
+    cutoff: str | None,
+    full_refresh: bool,
+    clock_vars: dict[str, str] | None = None,
+) -> list[str]:
     args = [
         "dbt", config.dbt_command,
         "--project-dir", project,
@@ -64,7 +88,7 @@ def command(config: Config, side: Side, project: str, work: str, cutoff: str | N
         "--target", side.target,
         "--target-path", os.path.join(work, "target"),
         "--log-path", os.path.join(work, "logs"),
-        "--vars", dbt_vars(config, cutoff),
+        "--vars", dbt_vars(config, cutoff, clock_vars),
         "--no-use-colors",
     ]
     if config.select:
@@ -94,13 +118,21 @@ def side_env(side: Side) -> dict[str, str]:
     return env
 
 
-def run(config: Config, side: Side, project: str, work: str, cutoff: str | None, full_refresh: bool) -> DbtRun:
+def run(
+    config: Config,
+    side: Side,
+    project: str,
+    work: str,
+    cutoff: str | None,
+    full_refresh: bool,
+    clock_vars: dict[str, str] | None = None,
+) -> DbtRun:
     os.makedirs(work, exist_ok=True)
     log_path = os.path.join(work, "dbt.log")
     started = time.monotonic()
     with open(log_path, "w", encoding="utf-8") as log:
         done = subprocess.run(
-            command(config, side, project, work, cutoff, full_refresh),
+            command(config, side, project, work, cutoff, full_refresh, clock_vars),
             stdout=log,
             stderr=subprocess.STDOUT,
             env=side_env(side),

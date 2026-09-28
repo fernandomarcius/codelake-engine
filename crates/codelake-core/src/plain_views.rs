@@ -390,6 +390,17 @@ fn retype(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
 }
 
+#[cfg(feature = "portable")]
+impl RetypeExec {
+    /// Rebuild with its output schema (`crate::portable`).
+    pub(crate) fn portable(
+        input: Arc<dyn ExecutionPlan>,
+        schema: SchemaRef,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Self::below(input, schema)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::array::{Array, AsArray, Int64Array};

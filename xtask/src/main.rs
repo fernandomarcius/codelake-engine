@@ -31,6 +31,10 @@ const FORBIDDEN_IN_CORE: &[&str] = &[
     "iceberg",
     "axum",
     "pgwire",
+    // Distributed execution lives in the server (ADR 0011); the core only
+    // has its plan codec (feature `portable`).
+    "datafusion-distributed",
+    "tonic",
 ];
 
 fn main() -> ExitCode {

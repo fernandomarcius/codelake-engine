@@ -32,11 +32,18 @@
 //! `DataFusion`'s own tables (`df_settings` for `SHOW ALL`, `routines`,
 //! `parameters`) still resolve, but are not listed.
 //!
+//! A filter on `table_schema` or `table_name` (`schema_name` in `schemata`)
+//! by equality or `IN` restricts what is listed: only the matching schemas
+//! and tables are opened, which for a remote catalog is one metadata query
+//! each instead of one per table of the catalog. The engine still applies
+//! the filter (pushdown is inexact), so the rows are the same.
+//!
 //! A listing never fails because of one table: a table whose provider cannot
 //! be built (unreadable metadata, a layout the connector does not read) is
 //! listed without columns and logged; reading it still fails with its own
 //! error. Trino lists such tables too, and dbt lists a whole schema at once.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -53,7 +60,7 @@ use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::MemoryConsumer;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -344,14 +351,11 @@ impl SchemaProvider for TrinoInformationSchema {
         let Some(kind) = Kind::of(name) else {
             return self.datafusion().table(name).await;
         };
-        let rows = Rows {
+        Ok(Some(Arc::new(InformationSchemaTable {
             kind,
-            schema: kind.schema(),
             catalog_name: self.name.clone(),
             catalog: Arc::clone(&self.catalog),
-        };
-        let table = StreamingTable::try_new(kind.schema(), vec![Arc::new(rows)])?;
-        Ok(Some(Arc::new(table)))
+        })))
     }
 
     fn table_exist(&self, name: &str) -> bool {
@@ -378,6 +382,7 @@ struct Rows {
     schema: SchemaRef,
     catalog_name: String,
     catalog: Arc<dyn CatalogProvider>,
+    only: Restriction,
 }
 
 impl PartitionStream for Rows {
@@ -391,6 +396,7 @@ impl PartitionStream for Rows {
             schema: Arc::clone(&self.schema),
             catalog_name: self.catalog_name.clone(),
             catalog: Arc::clone(&self.catalog),
+            only: self.only.clone(),
         };
         let schema = Arc::clone(&self.schema);
         let batch = futures::stream::once(async move { rows.batch(&context).await });
@@ -438,16 +444,20 @@ impl Rows {
             .catalog
             .schema_names()
             .into_iter()
-            .filter(|name| name != INFORMATION_SCHEMA)
+            .filter(|name| {
+                name != INFORMATION_SCHEMA && Restriction::admits(self.only.schemas.as_ref(), name)
+            })
             .filter_map(|name| self.catalog.schema(&name).map(|schema| (name, schema)))
             .collect();
-        schemas.push((
-            INFORMATION_SCHEMA.to_owned(),
-            Arc::new(TrinoInformationSchema {
-                name: self.catalog_name.clone(),
-                catalog: Arc::clone(&self.catalog),
-            }),
-        ));
+        if Restriction::admits(self.only.schemas.as_ref(), INFORMATION_SCHEMA) {
+            schemas.push((
+                INFORMATION_SCHEMA.to_owned(),
+                Arc::new(TrinoInformationSchema {
+                    name: self.catalog_name.clone(),
+                    catalog: Arc::clone(&self.catalog),
+                }),
+            ));
+        }
         schemas.sort_by(|a, b| a.0.cmp(&b.0));
         schemas
     }
@@ -457,6 +467,7 @@ impl Rows {
     async fn relations(&self, each: &mut Visit<'_>) -> Result<()> {
         for (schema_name, schema) in self.schemas() {
             let mut tables = schema.table_names();
+            tables.retain(|name| Restriction::admits(self.only.tables.as_ref(), name));
             tables.sort();
             for table_name in tables {
                 if let Some(table) = schema.table(&table_name).await? {
@@ -519,6 +530,161 @@ impl Rows {
             Kind::ApplicableRoles | Kind::EnabledRoles | Kind::Roles | Kind::TablePrivileges => {}
         }
         Ok(())
+    }
+}
+
+/// The `table_schema` and `table_name` values (`schema_name` in
+/// `schemata`) a scan's filters allow; `None` allows any.
+#[derive(Debug, Clone, Default)]
+struct Restriction {
+    schemas: Option<HashSet<String>>,
+    tables: Option<HashSet<String>>,
+}
+
+impl Restriction {
+    fn admits(allowed: Option<&HashSet<String>>, name: &str) -> bool {
+        allowed.is_none_or(|names| names.contains(name))
+    }
+
+    /// Column a filter restricts and the values it allows, for `column =
+    /// 'text'`, `column IN ('text', …)` and `OR`s of them (the simplifier
+    /// turns short `IN` lists into `OR`s) on one column of `kind` that names
+    /// schemas or tables.
+    fn equality(kind: Kind, filter: &Expr) -> Option<(Target, HashSet<String>)> {
+        if let Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Or,
+            right,
+        }) = filter
+        {
+            let (target, mut values) = Self::equality(kind, left)?;
+            let (other, more) = Self::equality(kind, right)?;
+            if !matches!(
+                (target, other),
+                (Target::Schema, Target::Schema) | (Target::Table, Target::Table)
+            ) {
+                return None;
+            }
+            values.extend(more);
+            return Some((target, values));
+        }
+        let (column, values) = match filter {
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::Eq,
+                right,
+            }) => match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(column), value) | (value, Expr::Column(column)) => {
+                    (column, HashSet::from([text_literal(value)?]))
+                }
+                _ => return None,
+            },
+            Expr::InList(list) if !list.negated => {
+                let Expr::Column(column) = list.expr.as_ref() else {
+                    return None;
+                };
+                (column, list.list.iter().map(text_literal).collect::<Option<_>>()?)
+            }
+            _ => return None,
+        };
+        Some((kind.target(&column.name)?, values))
+    }
+
+    fn from_filters(kind: Kind, filters: &[Expr]) -> Self {
+        let mut only = Self::default();
+        for (target, values) in filters.iter().filter_map(|f| Self::equality(kind, f)) {
+            let slot = match target {
+                Target::Schema => &mut only.schemas,
+                Target::Table => &mut only.tables,
+            };
+            *slot = Some(match slot.take() {
+                Some(previous) => previous.intersection(&values).cloned().collect(),
+                None => values,
+            });
+        }
+        only
+    }
+}
+
+/// What a restricting column names.
+#[derive(Debug, Clone, Copy)]
+enum Target {
+    Schema,
+    Table,
+}
+
+impl Kind {
+    fn target(self, column: &str) -> Option<Target> {
+        match (self, column) {
+            (Self::Schemata, "schema_name")
+            | (Self::Tables | Self::Views | Self::Columns, "table_schema") => Some(Target::Schema),
+            (Self::Tables | Self::Views | Self::Columns, "table_name") => Some(Target::Table),
+            _ => None,
+        }
+    }
+}
+
+fn text_literal(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Literal(
+            ScalarValue::Utf8(Some(value))
+            | ScalarValue::LargeUtf8(Some(value))
+            | ScalarValue::Utf8View(Some(value)),
+            _,
+        ) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// One `information_schema` table. Its rows are computed when scanned, for
+/// the schemas and tables the scan's filters allow (see [`Restriction`]).
+#[derive(Debug)]
+struct InformationSchemaTable {
+    kind: Kind,
+    catalog_name: String,
+    catalog: Arc<dyn CatalogProvider>,
+}
+
+#[async_trait]
+impl TableProvider for InformationSchemaTable {
+    fn schema(&self) -> SchemaRef {
+        self.kind.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::View
+    }
+
+    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Result<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|filter| {
+                if Restriction::equality(self.kind, filter).is_some() {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let rows = Rows {
+            kind: self.kind,
+            schema: self.kind.schema(),
+            catalog_name: self.catalog_name.clone(),
+            catalog: Arc::clone(&self.catalog),
+            only: Restriction::from_filters(self.kind, filters),
+        };
+        StreamingTable::try_new(self.kind.schema(), vec![Arc::new(rows)])?
+            .scan(state, projection, &[], limit)
+            .await
     }
 }
 
@@ -846,6 +1012,83 @@ mod tests {
             err.contains("array<int>"),
             "reading it keeps its own error: {err}"
         );
+    }
+
+    /// Three tables that count how often they are opened, as a remote
+    /// catalog pays one metadata query per table.
+    #[derive(Debug, Default)]
+    struct Counted {
+        opened: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl SchemaProvider for Counted {
+        fn table_names(&self) -> Vec<String> {
+            vec!["t1".into(), "t2".into(), "t3".into()]
+        }
+        async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+            self.opened.lock().unwrap().push(name.to_owned());
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, true),
+                Field::new("b", DataType::Utf8, true),
+            ]));
+            Ok(Some(Arc::new(datafusion::datasource::empty::EmptyTable::new(
+                schema,
+            ))))
+        }
+        fn table_exist(&self, name: &str) -> bool {
+            self.table_names().iter().any(|t| t == name)
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_and_table_filters_open_only_the_matching_tables() {
+        let ctx = ctx();
+        let counted = Arc::new(Counted::default());
+        let remote = MemoryCatalogProvider::new();
+        remote
+            .register_schema("cdc", Arc::clone(&counted) as Arc<dyn SchemaProvider>)
+            .unwrap();
+        remote
+            .register_schema("dbo", Arc::new(Counted::default()))
+            .unwrap();
+        ctx.register_catalog("remote", Arc::new(remote));
+        let opened = || std::mem::take(&mut *counted.opened.lock().unwrap());
+
+        let one = "SELECT count(*) FROM remote.information_schema.columns \
+                   WHERE table_schema = 'cdc' AND table_name = 't2'";
+        assert_eq!(count(&ctx, one).await, 2);
+        assert_eq!(opened(), ["t2"]);
+
+        let listed = "SELECT count(*) FROM remote.information_schema.tables \
+                      WHERE table_schema = 'cdc' AND table_name IN ('t1', 't3', 'missing')";
+        assert_eq!(count(&ctx, listed).await, 2);
+        assert_eq!(opened(), ["t1", "t3"]);
+
+        let case = "SELECT count(*) FROM remote.information_schema.columns \
+                    WHERE table_schema = 'cdc' AND table_name = 'T2'";
+        assert_eq!(
+            count(&ctx, case).await,
+            0,
+            "names compare exactly, as the filter does"
+        );
+        assert!(opened().is_empty());
+
+        let contradiction = "SELECT count(*) FROM remote.information_schema.tables \
+                             WHERE table_name = 't1' AND table_name = 't3'";
+        assert_eq!(count(&ctx, contradiction).await, 0);
+
+        let other = "SELECT count(*) FROM remote.information_schema.columns \
+                     WHERE table_schema = 'cdc' AND table_name LIKE 't%'";
+        assert_eq!(
+            count(&ctx, other).await,
+            6,
+            "an unsupported filter lists the schema"
+        );
+        assert_eq!(opened(), ["t1", "t2", "t3"]);
+
+        let schemata = "SELECT count(*) FROM remote.information_schema.schemata WHERE schema_name = 'dbo'";
+        assert_eq!(count(&ctx, schemata).await, 1);
     }
 
     #[tokio::test]

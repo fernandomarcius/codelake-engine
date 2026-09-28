@@ -11,6 +11,8 @@ publish.workspace = true
 
 [features]
 default = []
+# Distributed execution (M4, ADR 0011): coordinator planner and worker mode.
+distributed = ["dep:datafusion-distributed", "dep:tonic", "dep:url", "codelake-core/portable"]
 
 [[bin]]
 name = "codelake"
@@ -43,8 +45,15 @@ futures.workspace = true
 uuid.workspace = true
 base64.workspace = true
 tikv-jemallocator.workspace = true
+tikv-jemalloc-ctl.workspace = true
+datafusion-distributed = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
 
 [dev-dependencies]
+# TPC-H rows (the dbgen algorithm) for the distributed tests; no arrow dependency.
+tpchgen = "=3.0.0"
+tokio-stream = { version = "0.1", features = ["net"] }
 tokio-postgres = "0.7"
 reqwest = { version = "0.12", default-features = false }
 tower = { version = "0.5", features = ["util"] }

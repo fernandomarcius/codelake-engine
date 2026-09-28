@@ -277,10 +277,13 @@ async fn seed_wrong_results(host: &str, port: u16) {
            (1, 0x01, 0x01000000000000000000),
            (2, 0x0100, 0x02000000000000000000);
          CREATE TABLE dbo.Temporal (
-           Id INT NOT NULL PRIMARY KEY, Dt2 DATETIME2(7) NULL, Dtm DATETIME NULL, DtmB DATETIME NULL);
+           Id INT NOT NULL PRIMARY KEY, Dt2 DATETIME2(7) NULL, Dtm DATETIME NULL, DtmB DATETIME NULL,
+           D3 DATETIME2(3) NULL, Dd DATE NULL);
          INSERT INTO dbo.Temporal VALUES
-           (1, '2026-01-01T00:00:00.1234567', '2020-01-01T00:00:00', '2019-01-01T00:00:00'),
-           (2, '2026-01-01T00:00:00.1234561', '2020-01-01T00:00:00', '2021-01-01T00:00:00');
+           (1, '2026-01-01T00:00:00.1234567', '2020-01-01T00:00:00', '2019-01-01T00:00:00',
+               '2026-01-01T00:00:00.123', '2026-01-01'),
+           (2, '2026-01-01T00:00:00.1234561', '2020-01-01T00:00:00', '2021-01-01T00:00:00',
+               '2026-01-01T00:00:00.124', '2026-01-02');
          CREATE TABLE dbo.Sessao (Id INT NOT NULL PRIMARY KEY);
          INSERT INTO dbo.Sessao VALUES (2), (3), (4);",
     )
@@ -537,6 +540,63 @@ async fn wrong_results(tag: &str) {
         "4f dtm > dtmb returns only row 1",
         same_rows.as_ref() == Ok(&rows(&[&["1"]])),
         format!("got={same_rows:?}"),
+    );
+
+    // --- Temporal literals and pruned columns (shadow run, 2026-09-28) -----
+    for (label, sql, expected, pushed) in [
+        (
+            "4g datetime2(3) > timestamp literal IS pushed and exact at the millisecond",
+            "SELECT id FROM erp1.dbo.temporal WHERE d3 > TIMESTAMP '2026-01-01 00:00:00.123' ORDER BY id",
+            rows(&[&["2"]]),
+            true,
+        ),
+        (
+            "4h datetime2(3) >= the same literal keeps the boundary row",
+            "SELECT id FROM erp1.dbo.temporal WHERE d3 >= TIMESTAMP '2026-01-01 00:00:00.123' ORDER BY id",
+            rows(&[&["1"], &["2"]]),
+            true,
+        ),
+        (
+            "4i date = date literal IS pushed",
+            "SELECT id FROM erp1.dbo.temporal WHERE dd = DATE '2026-01-02' ORDER BY id",
+            rows(&[&["2"]]),
+            true,
+        ),
+        (
+            "4j datetime (1/300 s) vs timestamp literal is NOT pushed (ISS-054)",
+            "SELECT id FROM erp1.dbo.temporal WHERE dtmb > TIMESTAMP '2020-06-01 00:00:00' ORDER BY id",
+            rows(&[&["2"]]),
+            false,
+        ),
+        (
+            "4k datetime2(7) vs timestamp literal is NOT pushed (100 ns truncated)",
+            "SELECT id FROM erp1.dbo.temporal WHERE dt2 > TIMESTAMP '2026-01-01 00:00:00.123456' ORDER BY id",
+            // Both values truncate to .123456 in the engine; SQL Server would return both.
+            rows(&[]),
+            false,
+        ),
+    ] {
+        let got = try_rows(&engine, sql).await;
+        let plan = physical_plan(&engine, sql).await;
+        let remote = plan.as_deref().map(remote_sqls).unwrap_or_default();
+        let has_where = remote.iter().any(|s| s.contains("WHERE"));
+        checks.check(
+            label,
+            got.as_ref() == Ok(&expected) && has_where == pushed,
+            format!("got={got:?} remote={remote:?}"),
+        );
+    }
+    let local_filter = physical_plan(&engine, "SELECT id FROM erp1.dbo.temporal WHERE dt2 > dtm").await;
+    let local_remote = local_filter.as_deref().map(remote_sqls).unwrap_or_default();
+    checks.check(
+        "4l a filter kept in the engine reads only the columns it needs",
+        !local_remote.is_empty()
+            && local_remote.iter().all(|s| {
+                // The outer select list: the inner one only renames every column.
+                let outer = s.split(" FROM ").next().unwrap_or_default();
+                !outer.contains("dtmb") && !outer.contains("[d3]") && !outer.contains("[dd]")
+            }),
+        format!("remote={local_remote:?}"),
     );
 
     // --- Item 8: session options -----------------------------------------

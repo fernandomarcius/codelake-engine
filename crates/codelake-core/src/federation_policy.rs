@@ -14,12 +14,17 @@
 //! through its source); filters embedded in a scan that the policy rejects are
 //! lifted into a local `Filter`.
 
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use datafusion::common::Column;
+use datafusion::common::tree_node::Transformed;
 use datafusion::error::Result;
 use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
-use datafusion::logical_expr::{Extension, Filter, LogicalPlan, TableScan};
+use datafusion::logical_expr::{Expr, Extension, Filter, LogicalPlan, Projection, TableScan};
+use datafusion::optimizer::optimizer::ApplyOrder;
+use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 use datafusion_federation::{FederatedPlanNode, FederationPlanner};
 
 /// Decides whether a single plan node (not its inputs) may run at the source.
@@ -131,6 +136,81 @@ fn lift_scan_filters(
         )?))?,
         None => bare,
     })
+}
+
+/// Name of [`PruneFederatedColumns`], for rule ordering.
+pub const PRUNE_FEDERATED_COLUMNS: &str = "codelake_prune_federated_columns";
+
+/// Sends a source only the columns the engine uses.
+///
+/// Federation runs before `optimize_projections` (see
+/// [`crate::engine::optimizer_rules`]), so a federated node that is not the
+/// whole query (a filter the policy keeps local, a cross-source join) still
+/// outputs every column of its tables, and the source returns them all.
+/// `optimize_projections` then puts the projection the engine needs *above*
+/// the node: it cannot see inside it. This rule, right after it, moves the
+/// columns that projection references into the federated sub-plan, as a
+/// projection of plain columns every source can evaluate, when that sub-plan
+/// is a table scan under filters: over an alias, a join or an aggregation
+/// the unparser can reference a relation it did not name.
+#[derive(Debug, Default)]
+pub struct PruneFederatedColumns;
+
+impl OptimizerRule for PruneFederatedColumns {
+    fn name(&self) -> &'static str {
+        PRUNE_FEDERATED_COLUMNS
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::TopDown)
+    }
+
+    fn rewrite(&self, plan: LogicalPlan, _config: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
+        let LogicalPlan::Projection(projection) = &plan else {
+            return Ok(Transformed::no(plan));
+        };
+        let LogicalPlan::Extension(Extension { node }) = projection.input.as_ref() else {
+            return Ok(Transformed::no(plan));
+        };
+        let Some(federated) = node.as_any().downcast_ref::<FederatedPlanNode>() else {
+            return Ok(Transformed::no(plan));
+        };
+        if !is_filtered_scan(&federated.plan) {
+            return Ok(Transformed::no(plan));
+        }
+        let used: HashSet<&Column> = projection.expr.iter().flat_map(Expr::column_refs).collect();
+        let kept: Vec<Expr> = federated
+            .plan
+            .schema()
+            .columns()
+            .into_iter()
+            .filter(|column| used.contains(column))
+            .map(Expr::Column)
+            .collect();
+        // Nothing to prune, or nothing left: a projection without columns has
+        // no portable SQL (`SELECT FROM …`).
+        if kept.is_empty() || kept.len() == federated.plan.schema().fields().len() {
+            return Ok(Transformed::no(plan));
+        }
+        let pruned = LogicalPlan::Projection(Projection::try_new(kept, Arc::new(federated.plan.clone()))?);
+        let input = federate(pruned, &federated.planner);
+        Ok(Transformed::yes(LogicalPlan::Projection(Projection::try_new(
+            projection.expr.clone(),
+            Arc::new(input),
+        )?)))
+    }
+}
+
+/// Filters over one table scan: a projection of its columns renders as a
+/// plain `SELECT` in every dialect. Over an alias, a join or an aggregation
+/// the unparser can render one that references a relation it did not name
+/// (`missing FROM-clause entry` in PostgreSQL), so those are left alone.
+fn is_filtered_scan(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::TableScan(_) => true,
+        LogicalPlan::Filter(filter) => is_filtered_scan(&filter.input),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -351,6 +431,41 @@ mod tests {
         // The fake source ignores its SQL: the engine applies both terms again
         // only if the text term stayed local, so customer 1 appears here and
         // customer 3 (ACTIVE) does not.
+        let ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(ids.values().iter().all(|id| *id != 3), "{ids:?}");
+    }
+
+    #[tokio::test]
+    async fn a_partly_federated_query_reads_only_the_columns_it_uses() {
+        let ctx = crate::testing::federated_session();
+        let (table, sent) = remote_table_recording(
+            "crm",
+            "contracts",
+            vec![
+                ("customer_id", int64(&[1, 2, 3])),
+                ("status", strings(&["active", "active", "ACTIVE"])),
+                ("notes", strings(&["x", "y", "z"])),
+            ],
+            Some(Arc::new(NoTextFilters)),
+        );
+        ctx.register_table("contracts", table).unwrap();
+        let batches = rows(
+            &ctx,
+            "SELECT customer_id FROM contracts WHERE customer_id >= 2 AND status = 'active'",
+        )
+        .await
+        .unwrap();
+        let sent = sent.lock().unwrap().join("\n");
+        assert!(sent.contains(">= 2"), "numeric term not pushed: {sent}");
+        assert!(
+            sent.contains("customer_id") && sent.contains("status"),
+            "the local filter needs status: {sent}"
+        );
+        assert!(!sent.contains("notes"), "unused column sent for: {sent}");
         let ids = batches[0]
             .column(0)
             .as_any()

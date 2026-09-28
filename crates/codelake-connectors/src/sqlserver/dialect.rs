@@ -12,15 +12,18 @@
 //! | `SUM` of `int`/`smallint` | T-SQL sums in `int` and overflows at 2^31 |
 //! | decimal `/` and `%` | T-SQL and `DataFusion` use different result scales |
 //! | `ORDER BY` | SQL Server sorts NULLs first |
-//! | binary, temporal, boolean and non-ASCII text literals | no faithful T-SQL rendering in the unparser |
+//! | binary, boolean and non-ASCII text literals | no faithful T-SQL rendering in the unparser |
+//! | temporal literals, except compared with a `date`, `smalldatetime` or `datetime2(0..6)` column | the engine shows `datetime` at the millisecond (ISS-054) and truncates `datetime2(7)` to the microsecond |
 //! | functions, `CASE`, `LIKE`, casts other than numeric widening | semantics differ or are unverified |
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use codelake_core::federation_policy::PushdownPolicy;
-use codelake_core::functions::{VARBINARY_LITERAL, as_binary_literal, binary_literal_expr, decode_hex};
-use datafusion::arrow::datatypes::DataType;
+use codelake_core::functions::{
+    EXACT_CAST, VARBINARY_LITERAL, as_binary_literal, binary_literal_expr, decode_hex,
+};
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, ExprSchema, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
@@ -57,6 +60,16 @@ impl Dialect for TsqlDialect {
 
     fn float64_ast_dtype(&self) -> ast::DataType {
         ast::DataType::Float(ast::ExactNumberInfo::None)
+    }
+
+    /// T-SQL `timestamp` is `rowversion`. Timestamp literals are only pushed
+    /// against columns `datetime2(7)` converts to exactly (see
+    /// `exact_temporal_column`), and hold at most microseconds.
+    fn timestamp_cast_dtype(&self, _time_unit: &TimeUnit, _tz: &Option<Arc<str>>) -> ast::DataType {
+        ast::DataType::Custom(
+            ObjectName(vec![ObjectNamePart::Identifier(Ident::new("datetime2"))]),
+            vec!["7".to_owned()],
+        )
     }
 
     fn character_length_style(&self) -> CharacterLengthStyle {
@@ -238,13 +251,103 @@ fn comparable(left: &Expr, left_schema: &DFSchema, right: &Expr, right_schema: &
         );
     }
     if lt.is_temporal() || rt.is_temporal() {
-        // Same SQL type on both sides, and no precision the engine truncates.
-        return matches!(
-            (sql_type_of(left, left_schema), sql_type_of(right, right_schema)),
-            (Some(a), Some(b)) if a == b && !is_truncated_temporal(&a)
-        );
+        let left = widened_column(left, left_schema).unwrap_or(left);
+        let right = widened_column(right, right_schema).unwrap_or(right);
+        return match (sql_type_of(left, left_schema), sql_type_of(right, right_schema)) {
+            // Same SQL type on both sides, and no precision the engine truncates.
+            (Some(a), Some(b)) => a == b && !is_truncated_temporal(&a),
+            (Some(column), None) => lt == rt && exact_temporal_column(&column) && is_temporal_literal(right),
+            (None, Some(column)) => lt == rt && exact_temporal_column(&column) && is_temporal_literal(left),
+            (None, None) => false,
+        };
     }
     lt.is_numeric() && rt.is_numeric()
+}
+
+/// Temporal SQL types the engine reads exactly and SQL Server converts to
+/// `datetime2(7)` without loss, so comparing them with a literal rendered as
+/// `datetime2(7)` (or `date`) agrees with the engine. Not `datetime` (1/300 s
+/// steps shown at the millisecond, ISS-054), `datetime2(7)` (truncated to the
+/// microsecond), `time` or `datetimeoffset`.
+fn exact_temporal_column(sql_type: &str) -> bool {
+    match sql_type {
+        "date" | "smalldatetime" => true,
+        other => other
+            .strip_prefix("datetime2(")
+            .and_then(|p| p.strip_suffix(')'))
+            .and_then(|p| p.parse::<u8>().ok())
+            .is_some_and(|precision| precision <= 6),
+    }
+}
+
+/// Days of 0001-01-01 and 9999-12-31 from the Unix epoch: the range of
+/// `date` and `datetime2`.
+const TEMPORAL_DAYS: std::ops::RangeInclusive<i64> = -719_162..=2_932_896;
+
+/// A date or zoneless timestamp literal inside the range of `datetime2`, with
+/// at most microseconds (`datetime2(7)` holds 100 ns, the unparser renders
+/// `CAST('…' AS datetime2(7))` or `CAST('…' AS DATE)`).
+fn is_temporal_literal(expr: &Expr) -> bool {
+    const DAY: i64 = 86_400;
+    let days = match expr {
+        Expr::Literal(ScalarValue::Date32(Some(days)), _) => i64::from(*days),
+        Expr::Literal(ScalarValue::TimestampSecond(Some(v), None), _) => v.div_euclid(DAY),
+        Expr::Literal(ScalarValue::TimestampMillisecond(Some(v), None), _) => v.div_euclid(DAY * 1_000),
+        Expr::Literal(ScalarValue::TimestampMicrosecond(Some(v), None), _) => v.div_euclid(DAY * 1_000_000),
+        // Rendered in microseconds by `prepare` (`in_microseconds`).
+        Expr::Literal(ScalarValue::TimestampNanosecond(Some(v), None), _) if v % 1_000 == 0 => {
+            v.div_euclid(DAY * 1_000_000_000)
+        }
+        _ => return false,
+    };
+    TEMPORAL_DAYS.contains(&days)
+}
+
+/// Operand of a comparison: a safe expression, or a temporal literal or a
+/// widened timestamp column that [`comparable`] then checks against the other
+/// side.
+fn comparison_operand(expr: &Expr, schema: &DFSchema) -> bool {
+    safe_expr(expr, schema) || is_temporal_literal(expr) || widened_column(expr, schema).is_some()
+}
+
+fn unit_rank(unit: TimeUnit) -> u8 {
+    match unit {
+        TimeUnit::Second => 0,
+        TimeUnit::Millisecond => 1,
+        TimeUnit::Microsecond => 2,
+        TimeUnit::Nanosecond => 3,
+    }
+}
+
+/// The column of `EXACT_CAST(CAST(column AS timestamp(finer unit)))` (or of
+/// the bare cast): the engine compares a timestamp column with a literal of a
+/// finer unit by widening the column, which changes no value. `prepare`
+/// sends the column itself (`without_widening`).
+fn widened_column<'a>(expr: &'a Expr, schema: &DFSchema) -> Option<&'a Expr> {
+    let inner = match expr {
+        Expr::ScalarFunction(function) if function.func.name() == EXACT_CAST => {
+            match function.args.as_slice() {
+                [arg] => arg,
+                _ => return None,
+            }
+        }
+        other => other,
+    };
+    let Expr::Cast(cast) = inner else {
+        return None;
+    };
+    let column = cast.expr.as_ref();
+    if !matches!(column, Expr::Column(_)) {
+        return None;
+    }
+    match (type_of(column, schema)?, cast.field.data_type()) {
+        (DataType::Timestamp(from, None), DataType::Timestamp(to, None))
+            if unit_rank(from) <= unit_rank(*to) =>
+        {
+            Some(column)
+        }
+        _ => None,
+    }
 }
 
 /// Single value usable as a grouping key or `DISTINCT`/`MIN`/`MAX` operand.
@@ -327,7 +430,7 @@ fn safe_expr(expr: &Expr, schema: &DFSchema) -> bool {
         Expr::Between(between) => {
             [&*between.expr, &*between.low, &*between.high]
                 .iter()
-                .all(|e| safe_expr(e, schema))
+                .all(|e| comparison_operand(e, schema))
                 && comparable(&between.expr, schema, &between.low, schema)
                 && comparable(&between.expr, schema, &between.high, schema)
         }
@@ -336,7 +439,7 @@ fn safe_expr(expr: &Expr, schema: &DFSchema) -> bool {
                 && list
                     .list
                     .iter()
-                    .all(|e| safe_expr(e, schema) && comparable(&list.expr, schema, e, schema))
+                    .all(|e| comparison_operand(e, schema) && comparable(&list.expr, schema, e, schema))
         }
         Expr::Cast(cast) => {
             safe_expr(&cast.expr, schema)
@@ -358,7 +461,9 @@ fn safe_binary(binary: &BinaryExpr, schema: &DFSchema) -> bool {
     match binary.op {
         Operator::And | Operator::Or => safe_predicate(left, schema) && safe_predicate(right, schema),
         Operator::Eq | Operator::NotEq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
-            operands && comparable(left, schema, right, schema)
+            comparison_operand(left, schema)
+                && comparison_operand(right, schema)
+                && comparable(left, schema, right, schema)
         }
         // Decimal arithmetic stays local: SQL Server reduces the scale when the
         // result precision would pass 38; the engine keeps it.
@@ -526,12 +631,27 @@ impl PushdownPolicy for SqlServerPolicy {
             if !matches!(node, LogicalPlan::Filter(_) | LogicalPlan::Join(_)) {
                 return Ok(Transformed::no(node));
             }
+            // Columns of a filter's or a join's predicate resolve in its schema.
+            let schema = Arc::clone(node.schema());
             node.map_expressions(|expr| {
-                expr.transform(|e| match &e {
+                // Top-down: `EXACT_CAST(CAST(c))` is replaced whole, before its cast.
+                expr.transform_down(|e| match &e {
                     Expr::Literal(ScalarValue::Binary(Some(bytes)), _) => {
                         Ok(Transformed::yes(binary_literal_expr(bytes)))
                     }
-                    _ => Ok(Transformed::no(e)),
+                    Expr::Literal(ScalarValue::TimestampNanosecond(Some(v), None), metadata)
+                        if v % 1_000 == 0 =>
+                    {
+                        // `datetime2(7)` takes at most 7 fractional digits.
+                        Ok(Transformed::yes(Expr::Literal(
+                            ScalarValue::TimestampMicrosecond(Some(v / 1_000), None),
+                            metadata.clone(),
+                        )))
+                    }
+                    _ => match widened_column(&e, &schema) {
+                        Some(column) => Ok(Transformed::yes(column.clone())),
+                        None => Ok(Transformed::no(e)),
+                    },
                 })
             })
         })
@@ -738,6 +858,22 @@ mod tests {
                 typed("dt_b", ts.clone(), "datetime"),
                 typed("dt2", ts.clone(), "datetime2(7)"),
                 typed("dt2_b", ts, "datetime2(7)"),
+                typed(
+                    "loaded",
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    "datetime2(3)",
+                ),
+                typed(
+                    "dt_ms",
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    "datetime",
+                ),
+                typed(
+                    "minute",
+                    DataType::Timestamp(TimeUnit::Second, None),
+                    "smalldatetime",
+                ),
+                typed("day", DataType::Date32, "date"),
             ]);
             table_scan(Some("t"), &schema, None).unwrap()
         }
@@ -968,6 +1104,125 @@ mod tests {
                     .aggregate(Vec::<Expr>::new(), vec![max(col("dt2"))])
                     .unwrap()
             ));
+        }
+
+        fn ms(value: i64) -> Expr {
+            lit(ScalarValue::TimestampMillisecond(Some(value), None))
+        }
+
+        #[test]
+        fn temporal_literals_are_pushed_only_against_exact_columns() {
+            // 2026-09-28 10:36:03.654, a sink watermark folded from localtimestamp.
+            let watermark = ms(1_790_591_763_654);
+            assert!(
+                pushable(scan().filter(col("loaded").gt(watermark.clone())).unwrap()),
+                "datetime2(3)"
+            );
+            assert!(pushable(
+                scan()
+                    .filter(col("loaded").between(ms(0), watermark.clone()))
+                    .unwrap()
+            ));
+            assert!(pushable(
+                scan().filter(col("loaded").in_list(vec![ms(0)], false)).unwrap()
+            ));
+            assert!(
+                pushable(
+                    scan()
+                        .filter(col("day").eq(lit(ScalarValue::Date32(Some(20_000)))))
+                        .unwrap()
+                ),
+                "date"
+            );
+            assert!(
+                pushable(
+                    scan()
+                        .filter(col("minute").lt(lit(ScalarValue::TimestampSecond(Some(60), None))))
+                        .unwrap()
+                ),
+                "smalldatetime"
+            );
+            assert!(
+                !pushable(scan().filter(col("dt_ms").gt(watermark.clone())).unwrap()),
+                "datetime: 1/300 s steps shown at the millisecond (ISS-054)"
+            );
+            assert!(
+                !pushable(
+                    scan()
+                        .filter(col("dt2").gt(lit(ScalarValue::TimestampMicrosecond(Some(0), None))))
+                        .unwrap()
+                ),
+                "datetime2(7) is truncated by the engine"
+            );
+            assert!(
+                !pushable(
+                    scan()
+                        .filter(col("loaded").gt(lit(ScalarValue::TimestampMillisecond(
+                            Some(0),
+                            Some("UTC".into())
+                        ))))
+                        .unwrap()
+                ),
+                "zoned literal"
+            );
+            assert!(
+                !pushable(scan().filter(col("loaded").gt(ms(i64::MAX / 2))).unwrap()),
+                "outside the range of datetime2"
+            );
+            assert!(
+                !pushable(scan().project(vec![watermark.alias("x")]).unwrap()),
+                "temporal literals are compared at the source, never returned by it"
+            );
+        }
+
+        #[test]
+        fn a_column_widened_to_the_literal_unit_is_compared_at_the_source() {
+            use datafusion::logical_expr::cast;
+            let ns = |v: i64| lit(ScalarValue::TimestampNanosecond(Some(v), None));
+            let widened = || cast(col("loaded"), DataType::Timestamp(TimeUnit::Nanosecond, None));
+            // TIMESTAMP '2026-09-28 10:36:03.654100': microseconds, exact in datetime2(7).
+            let filter = widened().gt(ns(1_790_591_763_654_100_000));
+            assert!(pushable(scan().filter(filter.clone()).unwrap()));
+            assert!(
+                !pushable(
+                    scan()
+                        .filter(widened().gt(ns(1_790_591_763_654_100_001)))
+                        .unwrap()
+                ),
+                "a nanosecond has no datetime2(7) rendering"
+            );
+            let plan = scan().filter(filter).unwrap().build().unwrap();
+            let prepared = SqlServerPolicy.prepare(plan).unwrap();
+            let statement = Unparser::new(&TsqlDialect).plan_to_sql(&prepared).unwrap();
+            let sql = rewrite(statement).unwrap().to_string();
+            assert!(
+                sql.contains("([t].[loaded] > CAST('2026-09-28 10:36:03.654100' AS datetime2(7)))"),
+                "{sql}"
+            );
+        }
+
+        #[test]
+        fn temporal_literals_render_as_exact_tsql_constants() {
+            use datafusion::sql::sqlparser::dialect::MsSqlDialect;
+            use datafusion::sql::sqlparser::parser::Parser;
+            let plan = scan()
+                .filter(
+                    col("loaded")
+                        .gt(ms(1_790_591_763_654))
+                        .and(col("day").lt_eq(lit(ScalarValue::Date32(Some(20_000))))),
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let prepared = SqlServerPolicy.prepare(plan).unwrap();
+            let statement = Unparser::new(&TsqlDialect).plan_to_sql(&prepared).unwrap();
+            let sql = rewrite(statement).unwrap().to_string();
+            assert!(
+                sql.contains("([t].[loaded] > CAST('2026-09-28 10:36:03.654' AS datetime2(7)))"),
+                "{sql}"
+            );
+            assert!(sql.contains("([t].[day] <= CAST('2024-10-04' AS DATE))"), "{sql}");
+            Parser::parse_sql(&MsSqlDialect {}, &sql).unwrap();
         }
 
         #[test]

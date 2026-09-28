@@ -18,6 +18,10 @@ use datafusion::logical_expr::{
 
 pub const VARBINARY_LITERAL: &str = "codelake_varbinary";
 
+/// Identity around a timestamp cast that widens a column's unit and must
+/// stay exact (see `crate::coercion`); pushdown policies recognize it.
+pub use crate::coercion::EXACT_CAST;
+
 /// Decodes an even-length hexadecimal string (either case).
 pub fn decode_hex(hex: &str) -> Option<Vec<u8>> {
     // `from_str_radix` accepts a leading sign: check the digits first.

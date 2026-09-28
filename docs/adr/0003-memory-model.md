@@ -145,12 +145,25 @@
 - When memory and spill are exhausted, the query fails with a resources error;
   the process keeps serving other queries.
 - The server allocator is jemalloc (`tikv-jemallocator`; dependency approved by the
-  owner on 2026-09-24), built to purge freed pages at once
-  (`JEMALLOC_SYS_WITH_MALLOC_CONF` in `.cargo/config.toml`). With glibc's
+  owner on 2026-09-24), built to purge freed pages within a second, from a
+  background thread (`dirty_decay_ms:1000,muzzy_decay_ms:0` in
+  `JEMALLOC_SYS_WITH_MALLOC_CONF`, `.cargo/config.toml`). With glibc's
   per-thread arenas the process stayed hundreds of MiB above what the pool
   held after a spill (aggregation of 1M groups: 636 MiB of growth with glibc,
-  168 MiB with jemalloc; the pool held at most 128). The cost is a page fault
-  when freed memory is reused.
+  168 MiB with jemalloc; the pool held at most 128).
+  Amended 2026-09-27: purging at once (`dirty_decay_ms:0`) turned every free
+  into an `madvise` and the next allocation into page faults. On TPC-H SF10
+  (16 vCPU, x86) it took 2.6× the time and 2.8× the CPU of a one-second decay
+  (sum of p50 51.6 s against 19.8 s, CPU 507 s against 177 s); the one-second
+  decay raised the mean per-query peak from 0.94 to 1.23 GiB (maximum 2.5 to
+  2.9 GiB). A fixed short decay does not hold the ceiling near the limit (a
+  1M-group aggregation under 128 MiB: 188 MiB of growth at 100 ms against a
+  171 MiB budget), so the decay follows the pool: `codelake_core::pool`
+  signals when it holds more than an eighth of its limit (and again under a
+  twentieth), and the server sets every jemalloc arena's `dirty_decay_ms` to 0
+  while memory is scarce and back to 1000 ms after (`tikv-jemalloc-ctl`, the
+  allocator's safe control interface). The memory-ceiling tests hold, 5 of 5
+  runs. See `bench/reports/2026-09-27-k3s-sf10.md`.
 - The runtime runs `execution.target_partitions` workers when it is set: the
   parallelism a query asks for, and the bound of the batches being produced at
   one instant (next section). Trino clients, 12 at once: 267 MiB of growth with
