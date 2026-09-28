@@ -45,6 +45,7 @@ futures.workspace = true
 uuid.workspace = true
 base64.workspace = true
 tikv-jemallocator.workspace = true
+tikv-jemalloc-ctl.workspace = true
 datafusion-distributed = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
 url = { workspace = true, optional = true }

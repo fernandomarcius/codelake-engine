@@ -35,7 +35,8 @@
 //! the join once they do (one batch's keys over the limit at most).
 
 use std::fmt;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use datafusion::common::{human_readable_size, resources_datafusion_err};
 use datafusion::error::Result;
@@ -122,6 +123,29 @@ impl State {
 pub struct CeilingPool {
     limit: usize,
     state: Mutex<State>,
+    /// Whether the pool holds more than [`PRESSURE_ON`] of its limit (until it
+    /// falls under [`PRESSURE_OFF`]); see [`on_memory_pressure`].
+    pressed: AtomicBool,
+}
+
+/// Share of the limit above which memory is scarce ([`on_memory_pressure`]).
+const PRESSURE_ON: (usize, usize) = (1, 8);
+/// Share of the limit under which it is plentiful again. The gap is wide: a
+/// spilling operator gives its reservation back and takes it again, and the
+/// pages it freed must not linger meanwhile (a 1M-group aggregation under 128
+/// MiB went 18 MiB over its budget with the gap at 50% / 40%, and 0.4 MiB over
+/// once in three runs at 25% / 10%).
+const PRESSURE_OFF: (usize, usize) = (1, 20);
+
+static PRESSURE_HOOK: OnceLock<fn(bool)> = OnceLock::new();
+
+/// Installs `hook`, called with `true` when a pool comes to hold more than an
+/// eighth of its limit and with `false` when it is back under a twentieth. The server
+/// uses it to have its allocator return freed memory to the system at once
+/// while memory is scarce, and lazily otherwise (ADR 0003). Only the first
+/// hook installed is kept.
+pub fn on_memory_pressure(hook: fn(bool)) {
+    let _ = PRESSURE_HOOK.set(hook);
 }
 
 impl CeilingPool {
@@ -129,6 +153,24 @@ impl CeilingPool {
         Self {
             limit,
             state: Mutex::new(State::default()),
+            pressed: AtomicBool::new(false),
+        }
+    }
+
+    /// Calls the pressure hook when `total` crosses a threshold.
+    fn follow(&self, total: usize) {
+        let above = |(n, d): (usize, usize)| total.saturating_mul(d) > self.limit.saturating_mul(n);
+        let pressed = self.pressed.load(Ordering::Relaxed);
+        let now = if pressed {
+            above(PRESSURE_OFF)
+        } else {
+            above(PRESSURE_ON)
+        };
+        if now != pressed
+            && self.pressed.swap(now, Ordering::Relaxed) != now
+            && let Some(hook) = PRESSURE_HOOK.get()
+        {
+            hook(now);
         }
     }
 
@@ -200,11 +242,21 @@ impl MemoryPool for CeilingPool {
     }
 
     fn grow(&self, reservation: &MemoryReservation, additional: usize) {
-        self.state().add(reservation.consumer(), additional);
+        let total = {
+            let mut state = self.state();
+            state.add(reservation.consumer(), additional);
+            state.total()
+        };
+        self.follow(total);
     }
 
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
-        self.state().remove(reservation.consumer(), shrink);
+        let total = {
+            let mut state = self.state();
+            state.remove(reservation.consumer(), shrink);
+            state.total()
+        };
+        self.follow(total);
     }
 
     fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
@@ -235,6 +287,9 @@ impl MemoryPool for CeilingPool {
             }
         }
         state.add(consumer, additional);
+        let total = state.total();
+        drop(state);
+        self.follow(total);
         Ok(())
     }
 
@@ -252,6 +307,33 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    static PRESSURES: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+
+    fn record(pressed: bool) {
+        PRESSURES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(pressed);
+    }
+
+    /// The hook fires on crossing an eighth of the limit upwards and a
+    /// twentieth downwards, once per crossing.
+    #[test]
+    fn memory_pressure_is_signalled_on_crossings_only() {
+        on_memory_pressure(record);
+        let pool: Arc<dyn MemoryPool> = Arc::new(CeilingPool::new(1000));
+        let reservation = MemoryConsumer::new("probe").register(&pool);
+        reservation.grow(100);
+        reservation.grow(50); // 150 > 125: scarce
+        reservation.grow(100);
+        reservation.shrink(180); // 70: still above 50
+        reservation.shrink(40); // 30: plentiful
+        reservation.try_grow(300).unwrap(); // 330: scarce again
+        drop(reservation); // 0
+        let seen = PRESSURES.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert_eq!(seen, vec![true, false, true, false]);
+    }
 
     const MIB: usize = 1 << 20;
 
