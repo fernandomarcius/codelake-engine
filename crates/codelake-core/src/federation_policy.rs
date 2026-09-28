@@ -22,7 +22,7 @@ use datafusion::common::Column;
 use datafusion::common::tree_node::Transformed;
 use datafusion::error::Result;
 use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
-use datafusion::logical_expr::{Expr, Extension, Filter, LogicalPlan, Projection, TableScan};
+use datafusion::logical_expr::{Expr, Extension, Filter, LogicalPlan, Projection, SubqueryAlias, TableScan};
 use datafusion::optimizer::optimizer::ApplyOrder;
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 use datafusion_federation::{FederatedPlanNode, FederationPlanner};
@@ -151,8 +151,9 @@ pub const PRUNE_FEDERATED_COLUMNS: &str = "codelake_prune_federated_columns";
 /// the node: it cannot see inside it. This rule, right after it, moves the
 /// columns that projection references into the federated sub-plan, as a
 /// projection of plain columns every source can evaluate, when that sub-plan
-/// is a table scan under filters: over an alias, a join or an aggregation
-/// the unparser can reference a relation it did not name.
+/// is a table scan under filters, aliased or not: over a join or an
+/// aggregation, or above an alias, the unparser can reference a relation it
+/// did not name.
 #[derive(Debug, Default)]
 pub struct PruneFederatedColumns;
 
@@ -175,24 +176,40 @@ impl OptimizerRule for PruneFederatedColumns {
         let Some(federated) = node.as_any().downcast_ref::<FederatedPlanNode>() else {
             return Ok(Transformed::no(plan));
         };
-        if !is_filtered_scan(&federated.plan) {
+        // `FROM t AS r`: the projection goes below the alias, as a plain
+        // `SELECT` of the table (`FROM (SELECT a, b FROM t) AS r`).
+        let (alias, inner) = match &federated.plan {
+            LogicalPlan::SubqueryAlias(aliased) => (Some(aliased.alias.clone()), aliased.input.as_ref()),
+            other => (None, other),
+        };
+        if !is_filtered_scan(inner) {
             return Ok(Transformed::no(plan));
         }
         let used: HashSet<&Column> = projection.expr.iter().flat_map(Expr::column_refs).collect();
-        let kept: Vec<Expr> = federated
+        let positions: Vec<usize> = federated
             .plan
             .schema()
             .columns()
-            .into_iter()
-            .filter(|column| used.contains(column))
-            .map(Expr::Column)
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| used.contains(column))
+            .map(|(position, _)| position)
             .collect();
         // Nothing to prune, or nothing left: a projection without columns has
         // no portable SQL (`SELECT FROM …`).
-        if kept.is_empty() || kept.len() == federated.plan.schema().fields().len() {
+        if positions.is_empty() || positions.len() == federated.plan.schema().fields().len() {
             return Ok(Transformed::no(plan));
         }
-        let pruned = LogicalPlan::Projection(Projection::try_new(kept, Arc::new(federated.plan.clone()))?);
+        // An alias renames the columns of its input, position by position.
+        let kept: Vec<Expr> = positions
+            .iter()
+            .map(|position| Expr::Column(Column::from(inner.schema().qualified_field(*position))))
+            .collect();
+        let pruned = LogicalPlan::Projection(Projection::try_new(kept, Arc::new(inner.clone()))?);
+        let pruned = match alias {
+            Some(alias) => LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(Arc::new(pruned), alias)?),
+            None => pruned,
+        };
         let input = federate(pruned, &federated.planner);
         Ok(Transformed::yes(LogicalPlan::Projection(Projection::try_new(
             projection.expr.clone(),
@@ -202,9 +219,10 @@ impl OptimizerRule for PruneFederatedColumns {
 }
 
 /// Filters over one table scan: a projection of its columns renders as a
-/// plain `SELECT` in every dialect. Over an alias, a join or an aggregation
+/// plain `SELECT` in every dialect. Above an alias, a join or an aggregation
 /// the unparser can render one that references a relation it did not name
-/// (`missing FROM-clause entry` in PostgreSQL), so those are left alone.
+/// (`missing FROM-clause entry` in PostgreSQL), so those are left alone; an
+/// alias over the scan takes the projection below it.
 fn is_filtered_scan(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::TableScan(_) => true,
@@ -465,6 +483,37 @@ mod tests {
             sent.contains("customer_id") && sent.contains("status"),
             "the local filter needs status: {sent}"
         );
+        assert!(!sent.contains("notes"), "unused column sent for: {sent}");
+        let ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(ids.values().iter().all(|id| *id != 3), "{ids:?}");
+    }
+
+    #[tokio::test]
+    async fn an_aliased_scan_reads_only_the_columns_it_uses() {
+        let ctx = crate::testing::federated_session();
+        let (table, sent) = remote_table_recording(
+            "crm",
+            "contracts",
+            vec![
+                ("customer_id", int64(&[1, 2, 3])),
+                ("status", strings(&["active", "active", "ACTIVE"])),
+                ("notes", strings(&["x", "y", "z"])),
+            ],
+            Some(Arc::new(NoTextFilters)),
+        );
+        ctx.register_table("contracts", table).unwrap();
+        let batches = rows(
+            &ctx,
+            "SELECT c.customer_id FROM contracts c WHERE c.customer_id >= 2 AND c.status = 'active'",
+        )
+        .await
+        .unwrap();
+        let sent = sent.lock().unwrap().join("\n");
+        assert!(sent.contains("customer_id") && sent.contains("status"), "{sent}");
         assert!(!sent.contains("notes"), "unused column sent for: {sent}");
         let ids = batches[0]
             .column(0)

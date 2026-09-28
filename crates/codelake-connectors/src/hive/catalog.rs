@@ -367,7 +367,17 @@ impl TableProvider for HiveView {
         if let Some(limit) = limit {
             builder = builder.limit(0, Some(limit))?;
         }
-        state.create_physical_plan(&builder.build()?).await
+        let plan = state.create_physical_plan(&builder.build()?).await?;
+        // The outer plan reads the columns as the view declares them. A column
+        // already of its declared type keeps no cast, and with it the field
+        // metadata of its source (`sqlserver.type`), which the declaration
+        // does not have: DataFusion then refuses the operator above that
+        // compares both (an aggregation over the view).
+        let declared = Arc::new(self.schema.project(&indices)?);
+        if plan.schema() == declared {
+            return Ok(plan);
+        }
+        codelake_core::plain_views::RetypeExec::below(plan, declared)
     }
 }
 
