@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use codelake_core::Engine;
+use codelake_core::join_guard::{NESTED_LOOP_JOIN_SPILL_GUARD, NestedLoopJoinSpillGuard};
 use codelake_core::output::{ACCOUNTED_OUTPUT, AccountedOutput};
 use codelake_core::portable::CoreCodec;
 use datafusion::common::{DataFusionError, Result, extensions_options};
@@ -123,16 +124,26 @@ pub fn coordinate<R: WorkerResolver + 'static>(
     resolver: R,
     customize: impl FnOnce(SessionStateBuilder) -> Result<SessionStateBuilder>,
 ) -> Result<()> {
+    // Two physical rules wrap what the distributed planner looks for:
+    // `AccountedOutput` turns every `CoalescePartitionsExec` into an
+    // `AccountedMergeExec` (stages are cut at the former), and the nested
+    // loop join guard wraps `NestedLoopJoinExec`, which the library must see
+    // to keep a join against a collected side from running once per task
+    // (every task would answer for the whole build side). They run after
+    // planning instead, in their order, on every stage.
+    let rules: Vec<_> = engine
+        .context()
+        .state()
+        .physical_optimizers()
+        .iter()
+        .filter(|rule| !AFTER_DISTRIBUTION.contains(&rule.name()))
+        .cloned()
+        .collect();
     engine.try_map_state(|mut builder| {
-        // The output rule turns every `CoalescePartitionsExec` into an
-        // `AccountedMergeExec`; the distributed planner cuts stages at the
-        // former. It runs after planning instead, on every stage.
-        if let Some(rules) = builder.physical_optimizer_rules() {
-            rules.retain(|rule| rule.name() != ACCOUNTED_OUTPUT);
-        }
         let local = builder.query_planner().clone();
         let mut builder = customize(
             builder
+                .with_physical_optimizer_rules(rules)
                 .with_distributed_option_extension(SessionOptions::default())
                 .with_distributed_user_codec(CoreCodec)
                 .with_distributed_worker_resolver(resolver)
@@ -216,9 +227,14 @@ impl QueryPlanner for CoordinatorPlanner {
                     .await?
             }
         };
-        AccountedOutput.optimize(plan, session_state.config_options())
+        let config = session_state.config_options();
+        let plan = NestedLoopJoinSpillGuard.optimize(plan, config)?;
+        AccountedOutput.optimize(plan, config)
     }
 }
+
+/// Rules of the engine the coordinator runs after planning (see [`coordinate`]).
+const AFTER_DISTRIBUTION: [&str; 2] = [NESTED_LOOP_JOIN_SPILL_GUARD, ACCOUNTED_OUTPUT];
 
 /// The session a worker runs one task in: `base` (the worker engine's
 /// state: functions, codecs, runtime and memory pool), with the task's

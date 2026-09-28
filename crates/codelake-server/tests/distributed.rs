@@ -356,6 +356,42 @@ async fn tpch_on_three_workers_returns_what_one_node_returns() {
     );
 }
 
+/// The coordinator runs the output rule and the nested loop join guard after
+/// distribution, once: they are not among its session's rules, and a plan
+/// has one reserved output at its root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrapping_rules_run_once_after_distribution() {
+    let spill = tempfile::tempdir().unwrap();
+    let mut coordinator = Engine::new(&memory(spill.path()), &ExecutionConfig::default()).unwrap();
+    let url = start_worker(spill.path(), None).await;
+    coordinate(&mut coordinator, StaticWorkers(vec![url]), Ok).unwrap();
+    let names: Vec<String> = coordinator
+        .context()
+        .state()
+        .physical_optimizers()
+        .iter()
+        .map(|rule| rule.name().to_owned())
+        .collect();
+    for rule in [
+        codelake_core::output::ACCOUNTED_OUTPUT,
+        codelake_core::join_guard::NESTED_LOOP_JOIN_SPILL_GUARD,
+    ] {
+        assert!(!names.iter().any(|name| name == rule), "{rule} in {names:?}");
+    }
+    let plan = coordinator
+        .sql("SELECT a.v FROM (VALUES (1), (2)) a(v), (SELECT max(v) AS m FROM (VALUES (3)) t(v)) b WHERE a.v < b.m")
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let shown = datafusion::physical_plan::displayable(plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert_eq!(shown.matches("ReservedOutputExec").count(), 1, "{shown}");
+    assert!(shown.contains("NestedLoopJoinWithoutFallback"), "{shown}");
+}
+
 /// A Hive source over `warehouse`, attached to `engine`.
 async fn attach_hive(engine: &mut Engine, warehouse: &Path) {
     let source: codelake_core::config::SourceConfig = toml::from_str(&format!(
@@ -381,18 +417,9 @@ async fn distributed_plan(engine: &Engine, sql: &str) -> bool {
     display_plan_ascii(plan.as_ref(), false).contains("DistributedExec")
 }
 
-/// Hive tables are split across the workers; a query that also reads a
-/// source the workers cannot scan (here an in-memory table, as federated
-/// sources) stays on the coordinator, with the same answer.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hive_tables_are_distributed_and_other_sources_stay_on_the_coordinator() {
-    let data = tempfile::tempdir().unwrap();
-    let warehouse = tempfile::tempdir().unwrap();
-    let spill = tempfile::tempdir().unwrap();
-    write_tpch(data.path()).await;
-
-    let mut single = engine_with_tpch(data.path(), spill.path()).await;
-    attach_hive(&mut single, warehouse.path()).await;
+/// `single` with every TPC-H table copied into `hive.tpch.*` (a warehouse
+/// the Hive connector wrote).
+async fn copy_to_hive(single: &Engine) {
     single
         .sql("CREATE SCHEMA hive.tpch")
         .await
@@ -400,7 +427,7 @@ async fn hive_tables_are_distributed_and_other_sources_stay_on_the_coordinator()
         .collect()
         .await
         .unwrap();
-    for table in ["customer", "orders", "lineitem"] {
+    for (table, _) in tables() {
         single
             .sql(&format!(
                 "CREATE TABLE hive.tpch.{table} AS SELECT * FROM bench.tpch.{table}"
@@ -411,6 +438,69 @@ async fn hive_tables_are_distributed_and_other_sources_stay_on_the_coordinator()
             .await
             .unwrap();
     }
+}
+
+/// `mem.public.labels`, an in-memory table (a source workers cannot scan), in
+/// both engines.
+fn register_labels(engines: [&Engine; 2]) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, false),
+    ]));
+    let batch = datafusion::arrow::array::RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(datafusion::arrow::array::Int64Array::from(vec![1, 2, 3])),
+            Arc::new(datafusion::arrow::array::StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .unwrap();
+    let labels: Arc<dyn datafusion::catalog::TableProvider> =
+        Arc::new(datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap());
+    for engine in engines {
+        let catalog = MemoryCatalogProvider::new();
+        let schema = MemorySchemaProvider::new();
+        datafusion::catalog::SchemaProvider::register_table(
+            &schema,
+            "labels".to_owned(),
+            Arc::clone(&labels),
+        )
+        .unwrap();
+        catalog.register_schema("public", Arc::new(schema)).unwrap();
+        engine.context().register_catalog("mem", Arc::new(catalog));
+    }
+}
+
+/// `sql` answers the same on both engines; the distributed plan when not.
+async fn same_answer(single: &Engine, coordinator: &Engine, sql: &str) {
+    let (expected, actual) = (rows(single, sql).await, rows(coordinator, sql).await);
+    if expected != actual {
+        let plan = coordinator
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        panic!(
+            "{sql}\ndiffers:\n{expected:?}\n{actual:?}\n{}",
+            display_plan_ascii(plan.as_ref(), false)
+        );
+    }
+}
+
+/// Hive tables are split across the workers; a query that also reads a
+/// source the workers cannot scan (here an in-memory table, as federated
+/// sources) stays on the coordinator, with the same answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hive_tables_are_distributed_and_other_sources_stay_on_the_coordinator() {
+    let data = tempfile::tempdir().unwrap();
+    let warehouse = tempfile::tempdir().unwrap();
+    let spill = tempfile::tempdir().unwrap();
+    write_tpch(data.path()).await;
+    let mut single = engine_with_tpch(data.path(), spill.path()).await;
+    attach_hive(&mut single, warehouse.path()).await;
+    copy_to_hive(&single).await;
 
     let mut urls = Vec::new();
     for _ in 0..3 {
@@ -422,47 +512,30 @@ async fn hive_tables_are_distributed_and_other_sources_stay_on_the_coordinator()
     })
     .unwrap();
     attach_hive(&mut coordinator, warehouse.path()).await;
-    let nations = Arc::new(
-        datafusion::datasource::MemTable::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("key", DataType::Int64, false),
-                Field::new("label", DataType::Utf8, false),
-            ])),
-            vec![vec![
-                datafusion::arrow::array::RecordBatch::try_new(
-                    Arc::new(Schema::new(vec![
-                        Field::new("key", DataType::Int64, false),
-                        Field::new("label", DataType::Utf8, false),
-                    ])),
-                    vec![
-                        Arc::new(datafusion::arrow::array::Int64Array::from(vec![1, 2, 3])),
-                        Arc::new(datafusion::arrow::array::StringArray::from(vec!["a", "b", "c"])),
-                    ],
-                )
-                .unwrap(),
-            ]],
-        )
-        .unwrap(),
-    );
-    for engine in [&single, &coordinator] {
-        let catalog = MemoryCatalogProvider::new();
-        let schema = MemorySchemaProvider::new();
-        datafusion::catalog::SchemaProvider::register_table(
-            &schema,
-            "labels".to_owned(),
-            Arc::clone(&nations) as Arc<dyn datafusion::catalog::TableProvider>,
-        )
-        .unwrap();
-        catalog.register_schema("public", Arc::new(schema)).unwrap();
-        engine.context().register_catalog("mem", Arc::new(catalog));
-    }
+    register_labels([&single, &coordinator]);
 
     let q3 = query(3).replace("bench.tpch", "hive.tpch");
     assert!(
         distributed_plan(&coordinator, &q3).await,
         "Hive tables are distributed"
     );
-    assert_eq!(rows(&coordinator, &q3).await, rows(&single, &q3).await);
+    // A nested loop join against one row (an uncorrelated scalar subquery the
+    // planner turns into a join): split across tasks, each task must not
+    // answer for the whole build side.
+    let one_row = "SELECT count(*), sum(x.c_acctbal) FROM (\
+                     SELECT c_acctbal FROM hive.tpch.customer c WHERE NOT EXISTS (\
+                       SELECT 1 FROM hive.tpch.orders o WHERE o.o_custkey = c.c_custkey)) x, \
+                   (SELECT avg(c_acctbal) AS a FROM hive.tpch.customer WHERE c_acctbal > 0) s \
+                   WHERE x.c_acctbal > s.a";
+    same_answer(&single, &coordinator, one_row).await;
+    for n in 1..=22 {
+        same_answer(
+            &single,
+            &coordinator,
+            &query(n).replace("bench.tpch", "hive.tpch"),
+        )
+        .await;
+    }
 
     let mixed = "SELECT l.label, count(*) FROM hive.tpch.orders o \
                  JOIN mem.public.labels l ON o.o_shippriority + 1 = l.key GROUP BY l.label";
