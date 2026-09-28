@@ -101,14 +101,20 @@ def run_cycle(config: Config, number: int, project: str) -> dict[str, Any]:
     cutoff = cutoff_value(config)
     cycle["cutoff"] = cutoff
     log(f"cycle {number}: cutoff {config.cutoff_var}={cutoff}")
-    full_refresh = config.full_refresh_first and number == 1
+    full_refresh = config.full_refresh == "always" or (config.full_refresh == "first" and number == 1)
+    clock_vars = dbt.clock(config, dt.datetime.now(dt.timezone.utc))
+    if clock_vars:
+        cycle["clock"] = clock_vars
+        log(f"cycle {number}: clock {clock_vars[config.clock_var]} UTC")
     runs = {}
     cycle["sides"] = {}
     for side in (config.reference, config.candidate):
         log(f"cycle {number}: dbt {config.dbt_command} on {side.name} (target {side.target})")
         sampler = Sampler(meter(side), config.rss_interval_ms / 1000)
         with sampler:
-            runs[side.name] = dbt.run(config, side, project, os.path.join(work, side.name), cutoff, full_refresh)
+            runs[side.name] = dbt.run(
+                config, side, project, os.path.join(work, side.name), cutoff, full_refresh, clock_vars
+            )
         cycle["sides"][side.name] = {"dbt": dbt.summary(runs[side.name]), "rss": sampler.result()}
         log(
             f"cycle {number}: {side.name} exit {runs[side.name].exit_code} in "
