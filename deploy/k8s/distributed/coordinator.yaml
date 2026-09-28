@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codelake-coordinator
+  labels: { app.kubernetes.io/name: codelake, app.kubernetes.io/component: coordinator }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: codelake, app.kubernetes.io/component: coordinator }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: codelake, app.kubernetes.io/component: coordinator }
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: codelake
+          image: codelake
+          args: ["serve", "--config", "/etc/codelake/codelake.toml"]
+          ports:
+            - { name: pg, containerPort: 5432 }
+            - { name: http, containerPort: 8080 }
+          envFrom:
+            - secretRef: { name: codelake-sources }
+          resources:
+            requests: { cpu: "4", memory: 8Gi }
+            limits: { memory: 8Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          livenessProbe: { httpGet: { path: /livez, port: http }, periodSeconds: 10 }
+          readinessProbe: { httpGet: { path: /readyz, port: http }, periodSeconds: 5 }
+          volumeMounts:
+            - { name: config, mountPath: /etc/codelake, readOnly: true }
+            - { name: warehouse, mountPath: /warehouse }
+            - { name: spill, mountPath: /var/lib/codelake/spill }
+      volumes:
+        - { name: config, configMap: { name: codelake-coordinator } }
+        - { name: warehouse, persistentVolumeClaim: { claimName: codelake-warehouse } }
+        - { name: spill, emptyDir: { sizeLimit: 50Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codelake
+spec:
+  selector: { app.kubernetes.io/name: codelake, app.kubernetes.io/component: coordinator }
+  ports:
+    - { name: pg, port: 5432 }
+    - { name: http, port: 8080 }

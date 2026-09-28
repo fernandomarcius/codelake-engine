@@ -1,0 +1,20 @@
+# Worker: runs the stages the coordinator sends. Only its Hive sources are
+# attached (the files its stages read); it serves no clients.
+[server]
+pg_listen = "127.0.0.1:5432"           # unused by workers, kept on loopback
+http_listen = "0.0.0.0:8080"           # probes and metrics
+allow_unauthenticated_network = true   # NetworkPolicy restricts who connects
+
+[memory]
+limit = "24GiB"                        # ~75% of the container limit
+spill_dir = "/var/lib/codelake/spill"
+spill_limit = "100GiB"
+
+[[source]]
+name = "hive"
+kind = "hive"
+warehouse = "/warehouse"
+
+[distributed]
+role = "worker"
+listen = "0.0.0.0:50051"

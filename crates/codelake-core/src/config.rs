@@ -1743,6 +1743,25 @@ mod tests {
     }
 
     #[test]
+    fn distributed_deploy_examples_are_valid() {
+        for (file, role) in [
+            (
+                include_str!("../../../deploy/k8s/distributed/coordinator.toml"),
+                DistributedRole::Coordinator,
+            ),
+            (
+                include_str!("../../../deploy/k8s/distributed/worker.toml"),
+                DistributedRole::Worker,
+            ),
+        ] {
+            let config = parse(file);
+            assert_eq!(config.distributed.as_ref().map(|d| d.role), Some(role));
+            let validated = config.validate(&|_| None, &|_| true);
+            assert!(validated.is_ok(), "{role:?}: {:?}", validated.err());
+        }
+    }
+
+    #[test]
     fn distributed_roles_are_checked() {
         let coordinator = format!(
             "{VALID}\n[distributed]\nrole = \"coordinator\"\nworkers = [\"http://worker-0:50051\", \"worker-1\"]\n"

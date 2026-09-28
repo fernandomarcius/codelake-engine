@@ -1,0 +1,10 @@
+# The warehouse every node reads at /warehouse. ReadWriteMany: NFS, CephFS or
+# another shared POSIX file system (writes commit on the coordinator only).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: codelake-warehouse
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests: { storage: 1Ti }
