@@ -218,6 +218,23 @@ pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + S
         Arc::new(datafusion::optimizer::push_down_filter::PushDownFilter::new()),
     );
     rules.insert(position, Arc::new(crate::overflow::UncheckBeforeFederation));
+    // The columns `optimize_projections` keeps above a federated node go
+    // into it (`crate::federation_policy::PruneFederatedColumns`).
+    let projections = rules
+        .iter()
+        .position(|r| r.name() == "optimize_projections")
+        .map_or(rules.len(), |p| p + 1);
+    rules.insert(
+        projections,
+        Arc::new(crate::federation_policy::PruneFederatedColumns),
+    );
+    // `COUNT(DISTINCT x)` beside a count, in two spillable phases
+    // (`crate::distinct_counts`), before `DataFusion`'s own rewrite.
+    let distinct = rules
+        .iter()
+        .position(|r| r.name() == "single_distinct_aggregation_to_group_by")
+        .unwrap_or(rules.len());
+    rules.insert(distinct, Arc::new(crate::distinct_counts::DistinctCountToGroupBy));
     rules.extend(crate::trino_functions::optimizer_rules());
     // `NOT IN` keeps its NULL semantics, and nothing is inferred from the
     // keys of a null-aware join (`crate::join_guard`).
@@ -1860,6 +1877,20 @@ mod tests {
         let projections = names.iter().position(|n| n == "optimize_projections").unwrap();
         assert_eq!(names[federation - 1], "push_down_filter", "{names:?}");
         assert!(decorrelate < federation && federation < projections, "{names:?}");
+        assert_eq!(
+            names[projections + 1],
+            crate::federation_policy::PRUNE_FEDERATED_COLUMNS,
+            "{names:?}"
+        );
+        let distinct = names
+            .iter()
+            .position(|n| n == "single_distinct_aggregation_to_group_by")
+            .unwrap();
+        assert_eq!(
+            names[distinct - 1],
+            crate::distinct_counts::DISTINCT_COUNT_TO_GROUP_BY,
+            "{names:?}"
+        );
     }
 
     #[test]

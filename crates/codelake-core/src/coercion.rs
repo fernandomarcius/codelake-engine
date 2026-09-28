@@ -323,7 +323,7 @@ pub(crate) fn unname_cast(expr: Expr) -> Transformed<Expr> {
 }
 
 /// Name of the identity around a timestamp cast that must stay exact.
-const EXACT_CAST: &str = "codelake_exact_cast";
+pub const EXACT_CAST: &str = "codelake_exact_cast";
 
 /// `codelake_exact_cast(CAST(x AS timestamp(finer)))`: the cast itself.
 ///
