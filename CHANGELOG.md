@@ -5,6 +5,13 @@ versioning: [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Performance
+- Freed memory is returned to the system within a second while the memory pool is below an eighth of its
+  limit, and at once above it (it was always at once). TPC-H SF10 on 16 vCPU: 2.6x faster and 65% less
+  CPU (sum of p50 51.6 s → 19.8 s, CPU 507 s → 177 s; Trino 431: 24.4 s, 243 s). The memory ceiling holds.
+- `avg` of `decimal(p,s)` with `p <= 19` sums in 128 bits instead of 256; decimal operators compute their
+  powers of ten once per batch.
+
 ### Added
 - Distributed execution (M4, ADR 0011), behind the `distributed` feature: a `[distributed]` coordinator
   plans every query and sends the stages of those that read only Hive tables to its workers
