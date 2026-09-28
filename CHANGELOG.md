@@ -11,6 +11,18 @@ versioning: [SemVer](https://semver.org/).
   CPU (sum of p50 51.6 s → 19.8 s, CPU 507 s → 177 s; Trino 431: 24.4 s, 243 s). The memory ceiling holds.
 - `avg` of `decimal(p,s)` with `p <= 19` sums in 128 bits instead of 256; decimal operators compute their
   powers of ten once per batch.
+- Found by the shadow run on production routines (2026-09-28), where CodeLake was far slower than Trino 431:
+  - SQL Server: a comparison of a `date`, `smalldatetime` or `datetime2(0..6)` column with a date or
+    timestamp literal is pushed down, the literal rendered as `CAST('…' AS datetime2(7))` (exact for those
+    types); `datetime` and `datetime2(7)` still compare in the engine. A time window over a sink table
+    (`_sink_loaded_at > now - 60 min`) read the whole table (459 s for 28 tables).
+  - A federated sub-plan below a local operator returns only the columns the engine uses; it returned
+    every column of its tables.
+  - `<catalog>.information_schema` filtered by `table_schema`/`table_name` (or `schema_name`) opens only
+    the matching tables; it opened every table of the catalog, one metadata query each on a remote
+    source (56 lookups of one table each: 288 s).
+  - `COUNT(DISTINCT x)` next to `COUNT(*)` runs in two spillable aggregations; one million distinct
+    tuples exhausted the memory limit.
 
 ### Added
 - Distributed execution (M4, ADR 0011), behind the `distributed` feature: a `[distributed]` coordinator

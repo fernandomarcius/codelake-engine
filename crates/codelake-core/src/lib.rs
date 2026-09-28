@@ -12,6 +12,7 @@ pub mod config;
 pub mod connector;
 mod ddl;
 mod declared;
+mod distinct_counts;
 mod dml_guard;
 pub mod engine;
 pub mod env_refs;
