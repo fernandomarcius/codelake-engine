@@ -72,7 +72,16 @@ class Config:
     cutoff_value: str = ""
     cutoff_var: str = "shadow_cutoff"
     extra_vars: str = ""
-    full_refresh_first: bool = False
+    # When dbt rebuilds the selected models from scratch: "never", on the
+    # "first" cycle of the output directory, or "always" — every cycle, so a
+    # model that appends a row per run (a sensor's history) compares only
+    # this cycle's rows, whatever earlier cycles did on either side.
+    full_refresh: str = "never"
+    # dbt variable holding the cycle's clock, the same on both sides: the UTC
+    # wall-clock time the cycle started (`YYYY-MM-DD HH:MM:SS.fff`), and in
+    # `<var>_local` the same instant in `clock_local_zone`. Empty: no clock.
+    clock_var: str = ""
+    clock_local_zone: str = "America/Sao_Paulo"
     rss_interval_ms: int = 200
     rss_max_ratio: float | None = None
     sample: int = 10
@@ -210,6 +219,11 @@ def load(env: Mapping[str, str] | None = None) -> Config:
     cutoff_value = get("SHADOW_CUTOFF_VALUE", "")
     if cutoff_sql and cutoff_value:
         errors.append("set SHADOW_CUTOFF_SQL or SHADOW_CUTOFF_VALUE, not both")
+    # SHADOW_FULL_REFRESH_FIRST=true is the older spelling of SHADOW_FULL_REFRESH=first.
+    legacy_first = bool(check(_bool, get("SHADOW_FULL_REFRESH_FIRST", "false"), "SHADOW_FULL_REFRESH_FIRST"))
+    full_refresh = get("SHADOW_FULL_REFRESH", "first" if legacy_first else "never")
+    if full_refresh not in {"never", "first", "always"}:
+        errors.append("SHADOW_FULL_REFRESH must be never, first or always")
     ratio = get("SHADOW_RSS_MAX_RATIO", "")
     max_ratio = None
     if ratio:
@@ -236,7 +250,9 @@ def load(env: Mapping[str, str] | None = None) -> Config:
         cutoff_value=cutoff_value,
         cutoff_var=get("SHADOW_CUTOFF_VAR", "shadow_cutoff"),
         extra_vars=get("SHADOW_DBT_VARS", ""),
-        full_refresh_first=bool(check(_bool, get("SHADOW_FULL_REFRESH_FIRST", "false"), "SHADOW_FULL_REFRESH_FIRST")),
+        full_refresh=full_refresh,
+        clock_var=get("SHADOW_CLOCK_VAR", ""),
+        clock_local_zone=get("SHADOW_CLOCK_LOCAL_ZONE", "America/Sao_Paulo"),
         rss_interval_ms=check(_int, get("SHADOW_RSS_INTERVAL_MS", "200"), "SHADOW_RSS_INTERVAL_MS", 10) or 200,
         rss_max_ratio=max_ratio,
         sample=check(_int, get("SHADOW_SAMPLE", "10"), "SHADOW_SAMPLE", 0) or 0,
@@ -257,8 +273,11 @@ def load(env: Mapping[str, str] | None = None) -> Config:
         config.expected = expected.load(config.expected_differences)
     except expected.ExpectedError as err:
         errors.append(str(err))
-    if not config.cutoff_var.replace("_", "a").isalnum():
-        errors.append("SHADOW_CUTOFF_VAR must be a dbt variable name ([A-Za-z0-9_]+)")
+    for name, var in (("SHADOW_CUTOFF_VAR", config.cutoff_var), ("SHADOW_CLOCK_VAR", config.clock_var or "x")):
+        if not var.replace("_", "a").isalnum():
+            errors.append(f"{name} must be a dbt variable name ([A-Za-z0-9_]+)")
+    if config.clock_var:
+        check(time_zone, config.clock_local_zone, "SHADOW_CLOCK_LOCAL_ZONE")
     if errors:
         raise ConfigError("invalid shadow-run configuration:\n  - " + "\n  - ".join(errors))
     return config

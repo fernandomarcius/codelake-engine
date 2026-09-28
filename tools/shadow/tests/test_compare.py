@@ -170,6 +170,21 @@ class CompareTests(unittest.TestCase):
         other = {"differences": [dict(rules["differences"][0], reference="char(*)")]}
         self.assertEqual(self.w.compare(expected=other)["status"], "divergent")
 
+    def test_a_declared_type_rule_covers_the_storage_of_its_column(self) -> None:
+        # ISS-056: approx_percentile of a decimal is real in the reference, double here.
+        self.w.write("ref", "s.t", "SELECT 1 AS id, CAST(1.5 AS FLOAT) AS age",
+                     declared=[("id", "int"), ("age", "float")])
+        self.w.write("cand", "s.t", "SELECT 1 AS id, CAST(1.5 AS DOUBLE) AS age",
+                     declared=[("id", "int"), ("age", "double")])
+        result = self.w.compare()
+        self.assertEqual(result["reasons"], ["declared_types", "storage_types"], result)
+        rules = {"differences": [{"id": "ISS-056", "kind": "declared_type", "reason": "double",
+                                  "table": "s.t", "column": "age",
+                                  "reference": ["float", "real"], "candidate": "double"}]}
+        result = self.w.compare(expected=rules)
+        self.assertEqual(result["status"], "equal", result)
+        self.assertEqual(result["schema"]["storage_type_differences"], [])
+
     def test_a_rule_never_hides_a_value_difference(self) -> None:
         self.w.write("ref", "s.t", "SELECT 1 AS id, 'um' AS label", declared=[("id", "int"), ("label", "varchar(2)")])
         self.w.write("cand", "s.t", "SELECT 1 AS id, 'um ' AS label", declared=[("id", "int"), ("label", "string")])

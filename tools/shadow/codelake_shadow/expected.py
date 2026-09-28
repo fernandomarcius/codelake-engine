@@ -32,8 +32,10 @@ but it must stay visible. A rule file declares them:
   ``declared_type`` rule must constrain at least one side: a rule that would
   accept any type change is refused.
 
-A ``declared_type`` or ``name_case`` rule only classifies a difference of
-**type** or **name case** as expected and documented. Values are always
+A ``declared_type`` rule also covers the storage type of its column (a
+``real`` stored as FLOAT, a ``double`` as DOUBLE). A ``declared_type`` or
+``name_case`` rule only classifies a difference of **type** or **name case**
+as expected and documented. Values are always
 compared: such a rule never turns a checksum, row count or column difference
 into an equal table. The one exception is ``replaced_characters``, for one
 exact table and column: the candidate's values of that column are compared
