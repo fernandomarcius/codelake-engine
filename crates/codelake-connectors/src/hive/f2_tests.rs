@@ -687,6 +687,61 @@ async fn a_view_over_columns_with_source_metadata_can_be_aggregated() {
 }
 
 #[tokio::test]
+async fn a_view_joined_with_a_table_returns_every_row() {
+    // Shadow run, 2026-09-28: a join with a view returned a sixth of the rows.
+    // The view's plan (retyped to its declared schema) reported one partition;
+    // the outer plan split it in six below the retype, which kept reporting
+    // one, and only its first partition was read.
+    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    let lake = lake().await;
+    let meta = std::collections::HashMap::from([("sqlserver.type".to_owned(), "varchar(44)".to_owned())]);
+    let keys: Vec<String> = (0..600).map(|i| format!("obra_{i}")).collect();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("obraid", DataType::Utf8, true).with_metadata(meta),
+        Field::new("v", DataType::Int64, true),
+    ]));
+    let batches: Vec<RecordBatch> = keys
+        .chunks(50)
+        .map(|chunk| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(chunk.to_vec())),
+                    Arc::new(Int64Array::from(vec![1; chunk.len()])),
+                ],
+            )
+            .unwrap()
+        })
+        .collect();
+    let context = lake.engine.context();
+    context
+        .register_table(
+            datafusion::sql::TableReference::full("datafusion", "public", "src"),
+            Arc::new(MemTable::try_new(Arc::clone(&schema), vec![batches.clone()]).unwrap()),
+        )
+        .unwrap();
+    context
+        .register_table(
+            datafusion::sql::TableReference::full("datafusion", "public", "obras"),
+            Arc::new(MemTable::try_new(schema, vec![batches]).unwrap()),
+        )
+        .unwrap();
+    lake.ok("CREATE VIEW hive.s.latest AS SELECT obraid, v FROM datafusion.public.src")
+        .await;
+    assert_eq!(
+        lake.ok("SELECT count(*) FROM datafusion.public.obras o JOIN hive.s.latest p ON p.obraid = o.obraid")
+            .await,
+        rows(&[&["600"]])
+    );
+    assert_eq!(
+        lake.ok("SELECT count(*) FROM hive.s.latest WHERE v = 1").await,
+        rows(&[&["600"]])
+    );
+}
+
+#[tokio::test]
 async fn views_with_quoted_mixed_case_columns_read_back() {
     let lake = lake().await;
     lake.ok("CREATE VIEW hive.s.vm AS SELECT \"MixedCol\" FROM (SELECT 1 AS \"MixedCol\") t")

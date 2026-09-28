@@ -360,10 +360,11 @@ impl ExecutionPlan for RetypeExec {
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match (children.pop(), children.is_empty()) {
-            (Some(input), true) => Ok(Arc::new(Self {
-                input,
-                properties: Arc::clone(&self.properties),
-            })),
+            // The properties follow the new child: an optimizer that splits or
+            // merges the child's partitions (a round-robin repartition below)
+            // changes how many partitions this node has. Kept as they were, a
+            // parent reads only the partitions it was told about.
+            (Some(input), true) => Self::below(input, self.schema()),
             _ => Err(DataFusionError::Internal(
                 "RetypeExec has exactly one child".into(),
             )),
