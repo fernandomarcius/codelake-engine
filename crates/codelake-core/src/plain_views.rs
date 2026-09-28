@@ -297,9 +297,14 @@ pub struct RetypeExec {
 }
 
 impl RetypeExec {
-    /// `input` as `schema` (same columns, other types), with the equivalences,
-    /// orderings and partitioning of `input` carried over column by column.
-    fn below(input: Arc<dyn ExecutionPlan>, schema: SchemaRef) -> Result<Arc<dyn ExecutionPlan>> {
+    /// `input` as `schema` (same columns, other types or field metadata), with
+    /// the equivalences, orderings and partitioning of `input` carried over
+    /// column by column.
+    ///
+    /// # Errors
+    ///
+    /// `schema` does not have the columns of `input`.
+    pub fn below(input: Arc<dyn ExecutionPlan>, schema: SchemaRef) -> Result<Arc<dyn ExecutionPlan>> {
         let input_schema = input.schema();
         let columns = input_schema
             .fields()

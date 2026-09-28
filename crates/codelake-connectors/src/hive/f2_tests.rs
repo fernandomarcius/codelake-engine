@@ -648,6 +648,45 @@ async fn a_view_whose_stored_sql_is_not_a_query_never_runs_it() {
 }
 
 #[tokio::test]
+async fn a_view_over_columns_with_source_metadata_can_be_aggregated() {
+    // Shadow run, 2026-09-28: a view over SQL Server columns (field metadata
+    // `sqlserver.type`) failed under GROUP BY: "Physical input schema should
+    // be the same as the one converted from logical input schema".
+    use datafusion::arrow::array::{Int64Array, TimestampMillisecondArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::datasource::MemTable;
+    let lake = lake().await;
+    let meta = |t: &str| std::collections::HashMap::from([("sqlserver.type".to_owned(), t.to_owned())]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("data_rec", DataType::Timestamp(TimeUnit::Millisecond, None), true)
+            .with_metadata(meta("datetime")),
+        Field::new("v", DataType::Int64, true).with_metadata(meta("bigint")),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(TimestampMillisecondArray::from(vec![1_000, 1_000, 2_000])),
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+        ],
+    )
+    .unwrap();
+    lake.engine
+        .context()
+        .register_table(
+            datafusion::sql::TableReference::full("datafusion", "public", "src"),
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
+        )
+        .unwrap();
+    lake.ok("CREATE VIEW hive.s.recebimentos AS SELECT data_rec, v FROM datafusion.public.src")
+        .await;
+    assert_eq!(
+        lake.ok("SELECT data_rec, sum(v) FROM hive.s.recebimentos GROUP BY data_rec ORDER BY data_rec")
+            .await,
+        rows(&[&["1970-01-01T00:00:01", "3"], &["1970-01-01T00:00:02", "3"]])
+    );
+}
+
+#[tokio::test]
 async fn views_with_quoted_mixed_case_columns_read_back() {
     let lake = lake().await;
     lake.ok("CREATE VIEW hive.s.vm AS SELECT \"MixedCol\" FROM (SELECT 1 AS \"MixedCol\") t")
