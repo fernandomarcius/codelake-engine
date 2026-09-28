@@ -283,10 +283,15 @@ pub(crate) struct MetadataLock {
     _file: FileLock,
 }
 
-/// A statement's private directory under `.codelake/staging/`.
+/// A statement's private directory under `.codelake/staging/`. On a local
+/// warehouse its owner holds `.codelake/locks/staging/<id>` while it lives
+/// (outside the directory: `CREATE OR REPLACE` exchanges the directory with
+/// the table's), so opening the catalog can remove the directories of
+/// processes that died ([`FileMetastore::sweep_staging`]).
 #[derive(Debug, Clone)]
 pub(crate) struct Staging {
     pub(crate) dir: Path,
+    _owner: Arc<FileLock>,
 }
 
 /// Held cross-process lock on one table's data files (ADR 0009); released
@@ -824,15 +829,90 @@ impl FileMetastore {
         Some(local_tables(&dir, &self.names.metadata_file).unwrap_or_default())
     }
 
+    /// The lock file of the staging directory `id` (see [`Staging`]).
+    fn staging_lock_path(&self, id: &str) -> Option<PathBuf> {
+        Some(
+            self.local_dir
+                .as_ref()?
+                .join(CODELAKE_DIR)
+                .join("locks")
+                .join("staging")
+                .join(id),
+        )
+    }
+
+    /// Opens (creating it) the lock file of staging `id` and tries to lock it.
+    fn try_lock_staging(&self, id: &str) -> std::io::Result<Option<std::fs::File>> {
+        let Some(path) = self.staging_lock_path(id) else {
+            return Ok(None);
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => Err(std::io::ErrorKind::WouldBlock.into()),
+            Err(std::fs::TryLockError::Error(err)) => Err(err),
+        }
+    }
+
+    /// Removes the staging directories no living process owns: what a
+    /// process killed in the middle of a statement left (a crash between
+    /// the exchange of `CREATE OR REPLACE` and the removal of the old table
+    /// left the whole old table there). Called when the catalog is opened. A
+    /// directory whose owner still holds its lock (another node on the same
+    /// warehouse) is left alone. Local warehouses only.
+    pub(crate) async fn sweep_staging(&self) -> usize {
+        let Some(dir) = self
+            .local_dir
+            .as_ref()
+            .map(|d| d.join(CODELAKE_DIR).join("staging"))
+        else {
+            return 0;
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return 0;
+        };
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(Some(lock)) = self.try_lock_staging(&id) else {
+                continue;
+            };
+            match remove_local_dir(entry.path()).await {
+                Ok(()) => {
+                    removed += 1;
+                    if let Some(path) = self.staging_lock_path(&id) {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(staging = %entry.path().display(), error = %err, "could not remove an abandoned staging directory");
+                }
+            }
+            drop(lock);
+        }
+        removed
+    }
+
     /// A new private directory for one statement's files.
     pub(crate) fn staging(&self) -> Staging {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        // A new id: nobody else holds its lock. Without a lock (an object
+        // store, or a failure to create it) the directory is only removed by
+        // its own statement.
+        let owner = self.try_lock_staging(&id).ok().flatten();
         Staging {
-            dir: self
-                .root
-                .clone()
-                .join(CODELAKE_DIR)
-                .join("staging")
-                .join(uuid::Uuid::new_v4().simple().to_string()),
+            _owner: Arc::new(FileLock { _file: owner }),
+            dir: self.root.clone().join(CODELAKE_DIR).join("staging").join(id),
         }
     }
 
@@ -842,6 +922,11 @@ impl FileMetastore {
             self.delete_all(&staging.dir).await?;
             if let Some(path) = self.local_path(&staging.dir) {
                 remove_local_dir(path).await?;
+            }
+            if let Some(id) = staging.dir.filename()
+                && let Some(lock) = self.staging_lock_path(id)
+            {
+                let _ = std::fs::remove_file(lock);
             }
             Ok::<_, MetastoreError>(())
         }
@@ -1249,6 +1334,28 @@ mod tests {
     /// Without configured names, the metastore writes `CodeLake`'s (ISS-011):
     /// its own metadata file, permissions directory, view marker and
     /// version; none of the reference engine's names.
+    /// Opening the catalog removes the staging directories of processes that
+    /// died and leaves the ones a living statement owns.
+    #[tokio::test]
+    async fn abandoned_staging_is_swept_and_owned_staging_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let metastore =
+            FileMetastore::new(Arc::new(store), Path::default()).with_local_dir(dir.path().into());
+        let live = metastore.staging();
+        let dead = metastore.staging();
+        for staging in [&live, &dead] {
+            let path = metastore.local_path(&staging.dir).unwrap();
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("part-0.parquet"), b"x").unwrap();
+        }
+        let dead_path = metastore.local_path(&dead.dir).unwrap();
+        drop(dead); // its owner is gone
+        assert_eq!(metastore.sweep_staging().await, 1);
+        assert!(!dead_path.exists());
+        assert!(metastore.local_path(&live.dir).unwrap().exists());
+    }
+
     #[tokio::test]
     async fn default_names_are_codelakes() {
         let dir = tempfile::tempdir().unwrap();

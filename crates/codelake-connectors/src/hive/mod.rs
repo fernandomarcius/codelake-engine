@@ -245,6 +245,10 @@ impl Connector for HiveConnector {
                 source_name: self.name.clone(),
                 cause: e.into(),
             })?;
+        let swept = hive.metastore().sweep_staging().await;
+        if swept > 0 {
+            tracing::info!(catalog = %self.name, directories = swept, "removed abandoned staging directories");
+        }
         Ok(Arc::new(HiveCatalogProvider(hive)))
     }
 
