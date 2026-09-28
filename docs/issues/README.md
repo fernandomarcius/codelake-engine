@@ -65,3 +65,4 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-053](ISS-053-authentication-from-an-identity-service.md) | Client authentication comes from an external identity service | scope decision | 2026-09-27 | open |
 | [ISS-054](ISS-054-sql-server-datetime-compared-as-shown.md) | SQL Server `datetime` compared at the value the engine shows | deliberate divergence | 2026-09-27 | awaiting-confirmation |
 | [ISS-055](ISS-055-cancel-between-messages-races-a-cursor.md) | A cancel request between messages sometimes cancels the next FETCH | defect | 2026-09-27 | open |
+| [ISS-056](ISS-056-approx-percentile-of-decimal-is-double.md) | `approx_percentile` of a decimal is `double` (Trino 431: `real`) | deliberate divergence | 2026-09-28 | open |
