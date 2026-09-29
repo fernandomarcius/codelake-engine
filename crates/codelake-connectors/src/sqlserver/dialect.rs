@@ -13,7 +13,7 @@
 //! | decimal `/` and `%` | T-SQL and `DataFusion` use different result scales |
 //! | `ORDER BY` | SQL Server sorts NULLs first |
 //! | binary, boolean and non-ASCII text literals | no faithful T-SQL rendering in the unparser |
-//! | temporal literals, except compared with a `date`, `smalldatetime` or `datetime2(0..6)` column | the engine shows `datetime` at the millisecond (ISS-054) and truncates `datetime2(7)` to the microsecond |
+//! | temporal literals, except compared with a `date`, `smalldatetime` or `datetime2(0..6)` column (the other temporal columns get whole-second bounds as a superset) | the engine shows `datetime` at the millisecond (ISS-054) and truncates `datetime2(7)` to the microsecond |
 //! | functions, `CASE`, `LIKE`, casts other than numeric widening | semantics differ or are unverified |
 
 use std::ops::ControlFlow;
@@ -336,7 +336,7 @@ fn widened_column<'a>(expr: &'a Expr, schema: &DFSchema) -> Option<&'a Expr> {
     let Expr::Cast(cast) = inner else {
         return None;
     };
-    let column = cast.expr.as_ref();
+    let column = without_identity_casts(cast.expr.as_ref(), schema);
     if !matches!(column, Expr::Column(_)) {
         return None;
     }
@@ -348,6 +348,17 @@ fn widened_column<'a>(expr: &'a Expr, schema: &DFSchema) -> Option<&'a Expr> {
         }
         _ => None,
     }
+}
+
+/// `expr` without the casts to its own type around it (`CAST(c AS
+/// timestamp(3))` of a `timestamp(3)` column), which change no value.
+fn without_identity_casts<'a>(mut expr: &'a Expr, schema: &DFSchema) -> &'a Expr {
+    while let Expr::Cast(cast) = expr
+        && type_of(&cast.expr, schema).is_some_and(|from| &from == cast.field.data_type())
+    {
+        expr = cast.expr.as_ref();
+    }
+    expr
 }
 
 /// Single value usable as a grouping key or `DISTINCT`/`MIN`/`MAX` operand.
@@ -479,7 +490,7 @@ fn safe_binary(binary: &BinaryExpr, schema: &DFSchema) -> bool {
 /// Boolean expression usable as `WHERE`/`ON`: T-SQL has no bare boolean values.
 fn safe_predicate(expr: &Expr, schema: &DFSchema) -> bool {
     if let Some(predicate) = as_superset_filter(expr) {
-        return superset_shape(predicate, schema);
+        return source_superset(predicate, schema);
     }
     match expr {
         Expr::BinaryExpr(_)
@@ -534,18 +545,27 @@ fn whole_second_literal(expr: &Expr) -> bool {
     whole && is_temporal_literal(expr)
 }
 
+/// A predicate SQL Server may evaluate in place of the engine's: a superset
+/// shape, or a predicate it evaluates exactly.
+fn source_superset(expr: &Expr, schema: &DFSchema) -> bool {
+    superset_shape(expr, schema) || safe_predicate(expr, schema)
+}
+
 /// A superset filter [`SqlServerPolicy::superset_of`] produces: text equality
 /// or `IN` against ASCII literals, and whole-second bounds on a temporal
-/// column, combined with `AND`/`OR`. SQL Server keeps at least the rows the
+/// column (`>=` a lower one, `<` an upper one), combined with `AND`/`OR`
+/// (with exact predicates too). SQL Server keeps at least the rows the
 /// engine keeps (its collations ignore case and trailing spaces, and match
-/// whenever the bytes match); the engine applies the exact predicate above.
+/// whenever the bytes match; a value the engine shows at or past a whole
+/// second is at or past it in SQL Server); the engine applies the exact
+/// predicate above.
 fn superset_shape(expr: &Expr, schema: &DFSchema) -> bool {
     match expr {
         Expr::BinaryExpr(BinaryExpr {
             left,
             op: Operator::And | Operator::Or,
             right,
-        }) => superset_shape(left, schema) && superset_shape(right, schema),
+        }) => source_superset(left, schema) && source_superset(right, schema),
         Expr::BinaryExpr(BinaryExpr {
             left,
             op: Operator::Eq,
@@ -556,12 +576,9 @@ fn superset_shape(expr: &Expr, schema: &DFSchema) -> bool {
         }
         Expr::BinaryExpr(BinaryExpr {
             left,
-            op: Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq,
+            op: Operator::GtEq | Operator::Lt,
             right,
-        }) => {
-            (superset_temporal_column(left, schema) && whole_second_literal(right))
-                || (superset_temporal_column(right, schema) && whole_second_literal(left))
-        }
+        }) => superset_temporal_column(left, schema) && whole_second_literal(right),
         Expr::InList(list) => {
             !list.negated && superset_text_column(&list.expr, schema) && list.list.iter().all(ascii_text)
         }
@@ -583,7 +600,11 @@ fn date_of_column<'a>(expr: &'a Expr, schema: &DFSchema) -> Option<&'a Expr> {
 /// Midnight of `days` (from the Unix epoch) in the unit of `column`.
 fn midnight(column: &Expr, schema: &DFSchema, days: i32) -> Option<Expr> {
     const DAY: i64 = 86_400;
-    let seconds = i64::from(days) * DAY;
+    at_second(column, schema, i64::from(days) * DAY)
+}
+
+/// The whole second `seconds` (from the Unix epoch) in the unit of `column`.
+fn at_second(column: &Expr, schema: &DFSchema, seconds: i64) -> Option<Expr> {
     let value = match type_of(column, schema)? {
         DataType::Timestamp(TimeUnit::Second, None) => ScalarValue::TimestampSecond(Some(seconds), None),
         DataType::Timestamp(TimeUnit::Millisecond, None) => {
@@ -596,6 +617,48 @@ fn midnight(column: &Expr, schema: &DFSchema, days: i32) -> Option<Expr> {
     };
     let literal = Expr::Literal(value, None);
     is_temporal_literal(&literal).then_some(literal)
+}
+
+/// The whole second at or before a zoneless timestamp literal, and whether
+/// the literal is that second.
+fn literal_seconds(expr: &Expr) -> Option<(i64, bool)> {
+    let (value, per_second) = match expr {
+        Expr::Literal(ScalarValue::TimestampSecond(Some(v), None), _) => (*v, 1),
+        Expr::Literal(ScalarValue::TimestampMillisecond(Some(v), None), _) => (*v, 1_000),
+        Expr::Literal(ScalarValue::TimestampMicrosecond(Some(v), None), _) => (*v, 1_000_000),
+        Expr::Literal(ScalarValue::TimestampNanosecond(Some(v), None), _) => (*v, 1_000_000_000),
+        _ => return None,
+    };
+    Some((value.div_euclid(per_second), value.rem_euclid(per_second) == 0))
+}
+
+/// A temporal column compared with a literal, as SQL Server holds it: a
+/// plain column or one the engine widened to the literal's unit.
+fn bound_column<'a>(expr: &'a Expr, schema: &DFSchema) -> Option<&'a Expr> {
+    let column = widened_column(expr, schema).unwrap_or(expr);
+    superset_temporal_column(column, schema).then_some(column)
+}
+
+/// `column <op> literal` as whole-second bounds on the column: `>=` the
+/// second at or before the literal (for `>` and `>=`), `<` the first second
+/// past every value the comparison keeps (for `<` and `<=`). A value the
+/// engine keeps lies within them in SQL Server too, whatever fraction the
+/// engine shows (`datetime`'s 1/300 s rounded, ISS-054; `datetime2(7)`
+/// truncated to the microsecond).
+fn second_bounds(column: &Expr, op: Operator, literal: &Expr, schema: &DFSchema) -> Option<Expr> {
+    let (second, whole) = literal_seconds(literal)?;
+    let at = |s: i64| at_second(column, schema, s);
+    let past = second.checked_add(1)?;
+    Some(match op {
+        Operator::Gt | Operator::GtEq => column.clone().gt_eq(at(second)?),
+        Operator::Lt if whole => column.clone().lt(at(second)?),
+        Operator::Lt | Operator::LtEq => column.clone().lt(at(past)?),
+        Operator::Eq => column
+            .clone()
+            .gt_eq(at(second)?)
+            .and(column.clone().lt(at(past)?)),
+        _ => return None,
+    })
 }
 
 fn date_literal(expr: &Expr) -> Option<i32> {
@@ -657,20 +720,39 @@ impl SqlServerPolicy {
                 if let (Some(days), Some(column)) = (date_literal(left), date_of_column(right, schema)) {
                     return date_bounds(column, flipped(*op)?, days, schema);
                 }
-                superset_shape(term, schema).then(|| term.clone())
+                if let Some(column) = bound_column(left, schema)
+                    && literal_seconds(right).is_some()
+                {
+                    return second_bounds(column, *op, right, schema);
+                }
+                if let Some(column) = bound_column(right, schema)
+                    && literal_seconds(left).is_some()
+                {
+                    return second_bounds(column, flipped(*op)?, left, schema);
+                }
+                source_superset(term, schema).then(|| term.clone())
             }
             Expr::Between(between) if !between.negated => {
-                let column = date_of_column(&between.expr, schema)?;
-                let (low, high) = (date_literal(&between.low)?, date_literal(&between.high)?);
-                Some(date_bounds(column, Operator::GtEq, low, schema)?.and(date_bounds(
-                    column,
-                    Operator::LtEq,
-                    high,
-                    schema,
-                )?))
+                if let Some(column) = date_of_column(&between.expr, schema) {
+                    let (low, high) = (date_literal(&between.low)?, date_literal(&between.high)?);
+                    return Some(date_bounds(column, Operator::GtEq, low, schema)?.and(date_bounds(
+                        column,
+                        Operator::LtEq,
+                        high,
+                        schema,
+                    )?));
+                }
+                let column = bound_column(&between.expr, schema)?;
+                Some(
+                    second_bounds(column, Operator::GtEq, &between.low, schema)?.and(second_bounds(
+                        column,
+                        Operator::LtEq,
+                        &between.high,
+                        schema,
+                    )?),
+                )
             }
-            Expr::InList(_) => superset_shape(term, schema).then(|| term.clone()),
-            _ => None,
+            other => source_superset(other, schema).then(|| other.clone()),
         }
     }
 }
@@ -1506,6 +1588,145 @@ mod tests {
                 ),
                 "a bound inside a second depends on datetime's rounding"
             );
+        }
+
+        #[test]
+        fn a_bound_inside_a_second_becomes_whole_second_bounds() {
+            use datafusion::logical_expr::cast;
+            // 2026-09-22 01:01:40.133 (a watermark minus seven days).
+            let (second, fraction) = (1_790_038_900_i64, 133_i64);
+            let at = |s: i64| ms(s * 1_000);
+            let inside = ms(second * 1_000 + fraction);
+            assert_eq!(
+                superset(&col("dt_ms").gt_eq(inside.clone())),
+                Some(col("dt_ms").gt_eq(at(second))),
+                "datetime: the engine rounds 1/300 s steps"
+            );
+            assert_eq!(
+                superset(&col("dt_ms").gt(inside.clone())),
+                Some(col("dt_ms").gt_eq(at(second)))
+            );
+            assert_eq!(
+                superset(&col("dt_ms").lt(inside.clone())),
+                Some(col("dt_ms").lt(at(second + 1)))
+            );
+            assert_eq!(
+                superset(&col("dt_ms").lt_eq(inside.clone())),
+                Some(col("dt_ms").lt(at(second + 1)))
+            );
+            assert_eq!(
+                superset(&col("dt_ms").eq(inside.clone())),
+                Some(
+                    col("dt_ms")
+                        .gt_eq(at(second))
+                        .and(col("dt_ms").lt(at(second + 1)))
+                )
+            );
+            assert_eq!(
+                superset(&inside.clone().lt_eq(col("dt_ms"))),
+                Some(col("dt_ms").gt_eq(at(second))),
+                "literal on the left"
+            );
+            assert_eq!(
+                superset(&col("dt_ms").lt(at(second))),
+                Some(col("dt_ms").lt(at(second)))
+            );
+            assert_eq!(
+                superset(&col("dt_ms").lt_eq(at(second))),
+                Some(col("dt_ms").lt(at(second + 1))),
+                "never `<=`: a value the engine truncates onto the bound lies past it"
+            );
+            assert_eq!(
+                superset(&col("dt2").lt_eq(lit(ScalarValue::TimestampMicrosecond(
+                    Some(second * 1_000_000),
+                    None
+                )))),
+                Some(col("dt2").lt(lit(ScalarValue::TimestampMicrosecond(
+                    Some((second + 1) * 1_000_000),
+                    None
+                )))),
+                "datetime2(7): 100 ns past the second shows as the second"
+            );
+            assert_eq!(
+                superset(&col("dt_ms").between(inside.clone(), ms((second + 5) * 1_000 + 1))),
+                Some(
+                    col("dt_ms")
+                        .gt_eq(at(second))
+                        .and(col("dt_ms").lt(at(second + 6)))
+                )
+            );
+            assert_eq!(superset(&col("dt_ms").not_eq(inside.clone())), None);
+            assert_eq!(
+                superset(&col("dt_ms").gt_eq(lit(ScalarValue::TimestampMillisecond(
+                    Some(0),
+                    Some("UTC".into())
+                )))),
+                None,
+                "zoned literal"
+            );
+            assert_eq!(
+                superset(&col("dt_ms").gt_eq(ms(i64::MAX / 2))),
+                None,
+                "past datetime2"
+            );
+            // CAST(dataregistro AS timestamp(3)) >= date_add('day', -7, TIMESTAMP '…'):
+            // the column cast to its own type, widened to the literal's unit.
+            let ns = |v: i64| lit(ScalarValue::TimestampNanosecond(Some(v), None));
+            let widened = cast(
+                cast(col("dt_ms"), DataType::Timestamp(TimeUnit::Millisecond, None)),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            );
+            assert_eq!(
+                superset(&widened.gt_eq(ns((second * 1_000 + fraction) * 1_000_000))),
+                Some(col("dt_ms").gt_eq(at(second)))
+            );
+            let bound = col("dt_ms").gt_eq(at(second));
+            assert!(pushable(
+                scan()
+                    .filter(codelake_core::functions::superset_filter(bound))
+                    .unwrap()
+            ));
+        }
+
+        #[test]
+        fn a_column_cast_to_its_own_type_is_the_column() {
+            use datafusion::logical_expr::cast;
+            let ns = |v: i64| lit(ScalarValue::TimestampNanosecond(Some(v), None));
+            let widened = cast(
+                cast(col("loaded"), DataType::Timestamp(TimeUnit::Millisecond, None)),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            );
+            assert!(
+                pushable(scan().filter(widened.gt(ns(1_790_591_763_654_000_000))).unwrap()),
+                "datetime2(3) compared exactly"
+            );
+            let narrowed = cast(
+                cast(col("loaded"), DataType::Timestamp(TimeUnit::Second, None)),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            );
+            assert!(
+                !pushable(scan().filter(narrowed.gt(ns(1_790_591_763_000_000_000))).unwrap()),
+                "a cast to seconds changes the value"
+            );
+        }
+
+        #[test]
+        fn a_superset_may_hold_predicates_the_source_evaluates_exactly() {
+            use codelake_core::functions::superset_filter;
+            let range = col("id").gt_eq(lit(2_i64)).and(col("id").lt_eq(lit(9_i64)));
+            assert!(pushable(scan().filter(superset_filter(range)).unwrap()));
+            let keys = col("code")
+                .in_list(vec![lit("A"), lit("B")], false)
+                .or(col("code").is_null());
+            assert!(pushable(scan().filter(superset_filter(keys.clone())).unwrap()));
+            assert_eq!(superset(&keys), Some(keys));
+            let text_range = col("code").gt_eq(lit("A")).and(col("code").lt_eq(lit("B")));
+            assert!(
+                !pushable(scan().filter(superset_filter(text_range.clone())).unwrap()),
+                "a collation orders text unlike the engine"
+            );
+            assert_eq!(superset(&text_range), None);
+            assert_eq!(superset(&col("id").is_null()), Some(col("id").is_null()));
         }
 
         #[test]
