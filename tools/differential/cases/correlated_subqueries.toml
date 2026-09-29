@@ -1,0 +1,130 @@
+# Correlated subqueries in aggregated queries (the daily receipts reports): a scalar
+# subquery in an aggregated SELECT, correlated by a group key or by an expression of
+# one (DATE() of a timestamp), in SELECT, WHERE and HAVING; EXISTS and IN correlated
+# by DATE(); UNNEST(sequence(...)) joined with a table. Operation k has several
+# versions, one per day, and its count is not its key. Memory tables on both engines.
+
+oracle = "trino"
+compare = "multiset"
+setup = [
+  "CREATE SCHEMA {c}.csq",
+  "CREATE TABLE {c}.csq.operacao (operacaoid integer, obraid integer, nome varchar, dataregistro timestamp(3))",
+  """INSERT INTO {c}.csq.operacao VALUES
+     (1, 1, 'op1', TIMESTAMP '2026-09-02 00:00:00.000'), (1, 1, 'op1', TIMESTAMP '2026-09-03 00:00:00.000'),
+     (2, 2, 'op2', TIMESTAMP '2026-09-02 00:00:00.000'), (2, 2, 'op2', TIMESTAMP '2026-09-03 00:00:00.000'),
+     (2, 2, 'op2', TIMESTAMP '2026-09-04 00:00:00.000'),
+     (3, 0, 'op3', TIMESTAMP '2026-09-02 00:00:00.000'), (3, 0, 'op3', TIMESTAMP '2026-09-03 00:00:00.000'),
+     (3, 0, 'op3', TIMESTAMP '2026-09-04 00:00:00.000'), (3, 0, 'op3', TIMESTAMP '2026-09-05 00:00:00.000'),
+     (4, 1, 'op4', TIMESTAMP '2026-09-02 00:00:00.000'),
+     (5, 2, 'op5', TIMESTAMP '2026-09-02 00:00:00.000'), (5, 2, 'op5', TIMESTAMP '2026-09-03 00:00:00.000')""",
+  "CREATE TABLE {c}.csq.recebimento (operacaoid integer, valorrecebimento decimal(18,2), datarecebimento timestamp(3), deleted boolean)",
+  """INSERT INTO {c}.csq.recebimento VALUES
+     (1, 10.50, TIMESTAMP '2026-09-02 10:00:00.000', false), (1, 21.00, TIMESTAMP '2026-09-03 10:00:00.000', false),
+     (1, 31.50, TIMESTAMP '2026-09-04 10:00:00.000', true),
+     (2, 10.50, TIMESTAMP '2026-09-02 10:00:00.000', false), (2, 21.00, TIMESTAMP '2026-09-03 10:00:00.000', false),
+     (2, 31.50, TIMESTAMP '2026-09-04 10:00:00.000', true),
+     (3, 10.50, TIMESTAMP '2026-09-02 10:00:00.000', false), (3, 31.50, TIMESTAMP '2026-09-04 10:00:00.000', true)""",
+  "CREATE TABLE {c}.csq.recebidas (obraid integer, operacaoid integer, data_rec timestamp(3), valor decimal(18,2))",
+  """INSERT INTO {c}.csq.recebidas VALUES
+     (1, 1, TIMESTAMP '2026-09-02 08:00:00.000', 100.00), (1, 1, TIMESTAMP '2026-09-03 00:00:00.000', 50.00),
+     (2, 2, TIMESTAMP '2026-09-02 00:00:00.000', 70.00), (0, 3, TIMESTAMP '2026-09-04 00:00:00.000', 30.00),
+     (2, 2, TIMESTAMP '2026-09-03 00:00:00.000', 20.00), (1, 4, TIMESTAMP '2026-09-02 00:00:00.000', 40.00)""",
+]
+
+[[case]]
+id = "CSQ1"
+note = "scalar subquery in an aggregated SELECT, under an aggregation of its groups"
+sql = """SELECT count(*), count(DISTINCT operacaoid), sum(n) FROM (
+  SELECT o.operacaoid, count(*) n,
+         coalesce((SELECT sum(valorrecebimento) FROM {c}.csq.recebimento r
+                   WHERE r.operacaoid = o.operacaoid AND r.deleted = false), 0) s
+  FROM {c}.csq.operacao o GROUP BY o.operacaoid)"""
+
+[[case]]
+id = "CSQ2"
+sql = """SELECT o.operacaoid, count(*) n,
+         coalesce((SELECT sum(valorrecebimento) FROM {c}.csq.recebimento r
+                   WHERE r.operacaoid = o.operacaoid AND r.deleted = false), 0) s
+  FROM {c}.csq.operacao o GROUP BY o.operacaoid"""
+
+[[case]]
+id = "CSQ3"
+note = "correlated by DATE() of a group key"
+sql = """SELECT o.operacaoid, CAST(o.dataregistro AS date) d, count(*) n,
+  coalesce((SELECT sum(valorrecebimento) FROM {c}.csq.recebimento
+            WHERE operacaoid = o.operacaoid AND DATE(datarecebimento) = date(o.dataregistro) AND deleted = false), 0) m
+FROM {c}.csq.operacao o GROUP BY o.operacaoid, o.dataregistro"""
+
+[[case]]
+id = "CSQ4"
+note = "the same over a UNION ALL, the outer column unqualified, grouped by position"
+sql = """WITH c AS (SELECT operacaoid, data_rec, valor FROM {c}.csq.recebidas WHERE obraid < 2
+                UNION ALL SELECT operacaoid, data_rec, valor FROM {c}.csq.recebidas WHERE obraid >= 2)
+SELECT c.operacaoid, c.data_rec, sum(valor) v,
+  coalesce((SELECT sum(valorrecebimento) FROM {c}.csq.recebimento
+            WHERE operacaoid = c.operacaoid AND DATE(datarecebimento) = date(data_rec) AND deleted = false), 0) m
+FROM c GROUP BY 1, 2"""
+
+[[case]]
+id = "CSQ5"
+note = "the daily receipts report's shape: ROW_NUMBER() dedup, LEFT JOIN, NOT EXISTS by DATE(), GROUP BY position and name"
+sql = """WITH operacao AS (SELECT * FROM (SELECT p.*, ROW_NUMBER() OVER (PARTITION BY operacaoid ORDER BY dataregistro DESC) rn
+                                     FROM {c}.csq.operacao p WHERE dataregistro <= CURRENT_TIMESTAMP) t WHERE rn = 1)
+SELECT op.operacaoid AS operacaoid, c.obraid AS obraid, op.nome, c.data_rec,
+  sum(c.valor) AS valorrecebidodia,
+  coalesce((SELECT sum(valorrecebimento) FROM {c}.csq.recebimento
+            WHERE operacaoid = op.operacaoId AND DATE(datarecebimento) = date(data_rec) AND deleted = false), 0) AS valormanual
+FROM {c}.csq.recebidas c
+LEFT JOIN operacao op ON op.operacaoid = c.operacaoid
+WHERE NOT EXISTS (SELECT 1 FROM {c}.csq.recebimento d
+                  WHERE d.operacaoid = op.operacaoid AND d.deleted = true AND DATE(d.datarecebimento) = date(c.data_rec))
+GROUP BY 1, 2, 3, data_rec, 4"""
+
+[[case]]
+id = "CSQ6"
+note = "correlated by an expression in WHERE"
+sql = """SELECT o.operacaoid, o.dataregistro FROM {c}.csq.operacao o
+WHERE 20 < (SELECT sum(valorrecebimento) FROM {c}.csq.recebimento r
+            WHERE r.operacaoid = o.operacaoid AND DATE(r.datarecebimento) = date(o.dataregistro))"""
+
+[[case]]
+id = "CSQ7"
+note = "HAVING against a count correlated by an expression (no row counts 0)"
+sql = """SELECT o.operacaoid, count(*) n FROM {c}.csq.operacao o GROUP BY o.operacaoid
+HAVING count(*) > (SELECT count(*) FROM {c}.csq.recebimento r WHERE r.operacaoid + 0 = o.operacaoid AND r.deleted = false)"""
+
+[[case]]
+id = "CSQ8"
+note = "the outer side first, two expressions in one filter"
+sql = """SELECT o.operacaoid, o.dataregistro,
+  (SELECT sum(valorrecebimento) FROM {c}.csq.recebimento r
+   WHERE date(o.dataregistro) = DATE(r.datarecebimento) AND r.operacaoid + 0 = o.operacaoid) m
+FROM {c}.csq.operacao o GROUP BY 1, 2"""
+
+[[case]]
+id = "CSQ9"
+sql = """SELECT o.operacaoid, count(*) FROM {c}.csq.operacao o WHERE EXISTS
+  (SELECT 1 FROM {c}.csq.recebimento r WHERE r.operacaoid = o.operacaoid AND DATE(r.datarecebimento) = date(o.dataregistro))
+GROUP BY 1"""
+
+[[case]]
+id = "CSQ10"
+sql = """SELECT o.operacaoid, count(*) FROM {c}.csq.operacao o WHERE DATE(o.dataregistro) IN
+  (SELECT DATE(r.datarecebimento) FROM {c}.csq.recebimento r WHERE r.operacaoid = o.operacaoid AND r.deleted = false)
+GROUP BY 1"""
+
+[[case]]
+id = "CSQ11"
+note = "aggregation over an aggregated derived table"
+sql = """SELECT count(*), count(DISTINCT operacaoid), sum(c) FROM
+  (SELECT o.operacaoid, count(*) c FROM {c}.csq.operacao o GROUP BY o.operacaoid)"""
+
+[[case]]
+id = "CSQ12"
+sql = """WITH d AS (SELECT dia FROM UNNEST(sequence(DATE '2026-09-01', DATE '2026-09-03', interval '1' day)) AS t(dia))
+SELECT count(*) FROM d INNER JOIN {c}.csq.operacao o ON true"""
+
+[[case]]
+id = "CSQ13"
+sql = """WITH d AS (SELECT dia FROM UNNEST(sequence(DATE '2026-09-01', DATE '2026-09-05', interval '1' day)) AS t(dia))
+SELECT d.dia, count(o.operacaoid) FROM d LEFT JOIN {c}.csq.operacao o ON CAST(o.dataregistro AS date) = d.dia GROUP BY 1"""

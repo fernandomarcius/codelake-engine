@@ -246,10 +246,10 @@ pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + S
 /// wrote), `RANGE` frames without offsets on keys without range arithmetic as
 /// `GROUPS` (module `window_frames`), then Trino's decimal types and common types (module
 /// `coercion`) right before type coercion (which then recomputes every
-/// schema), then checked arithmetic ([`crate::overflow`]) and the one-row
-/// rule of scalar subqueries ([`crate::subquery`]), which need the types
-/// coercion settles, and `INTERSECT ALL`/`EXCEPT ALL` as multiset
-/// operations (module `set_operations`).
+/// schema), then checked arithmetic ([`crate::overflow`]), the one-row rule
+/// and the correlated expression keys of scalar subqueries
+/// ([`crate::subquery`]), which need the types coercion settles, and
+/// `INTERSECT ALL`/`EXCEPT ALL` as multiset operations (module `set_operations`).
 pub fn analyzer_rules() -> Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Send + Sync>> {
     let mut rules = datafusion::optimizer::Analyzer::new().rules;
     let coercion = rules
@@ -262,6 +262,7 @@ pub fn analyzer_rules() -> Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Sen
     rules.insert(coercion, Arc::new(crate::window_frames::RangeFramesAsGroups));
     rules.push(Arc::new(crate::overflow::CheckedArithmetic));
     rules.push(Arc::new(crate::subquery::EnforceScalarSubqueryRows));
+    rules.push(Arc::new(crate::subquery::CorrelatedExpressionKeys));
     rules.push(Arc::new(crate::set_operations::MultisetOperations));
     rules
 }
