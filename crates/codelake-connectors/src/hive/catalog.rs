@@ -283,7 +283,7 @@ impl TableProvider for HiveView {
             .cloned()
             .collect();
         let mut view_state =
-            codelake_core::rebuild_state(state, |builder| builder.with_physical_optimizer_rules(rules));
+            codelake_core::rebuild_state(state, |builder| builder.with_physical_optimizer_rules(rules))?;
         let defaults = &mut view_state.config_mut().options_mut().catalog;
         if let Some(catalog) = &self.definition.catalog {
             defaults.default_catalog.clone_from(catalog);

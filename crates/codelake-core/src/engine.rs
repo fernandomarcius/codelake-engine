@@ -715,40 +715,26 @@ pub struct SourceStatus {
 /// `state` rebuilt through `f` (`SessionStateBuilder::new_from_existing`),
 /// with the functions `state` resolves kept.
 ///
-/// `new_from_existing` re-registers every entry of the function maps, the
-/// alias entries of the built-ins the engine replaced among them
-/// (`datepart` → `DataFusion`'s `date_part`), in hash order (`DataFusion`
-/// 54.1): the built-in can take its name back, and `extract(year …)` turns
-/// into `DataFusion`'s `date_part` (an `int`, not Trino's `bigint`) from one
-/// rebuild to the next. Each function is registered again under its own name,
-/// updated for the rebuilt configuration (the session time zone).
+/// `new_from_existing` registers every entry of the function maps again, in
+/// hash order, updated for the rebuilt configuration (the session time zone):
+/// a built-in the engine replaced could take its name back (`to_char`, alias
+/// `date_format`). The states the engine builds are settled
+/// (`function_names`), so the order does not matter; `state` is settled
+/// first in case functions were registered on it since, and the rebuilt
+/// state after `f`, which can add functions.
+///
+/// # Errors
+///
+/// `state` or the rebuilt state cannot be settled (`function_names::settle`).
 pub fn rebuild_state(
     state: &datafusion::execution::SessionState,
     f: impl FnOnce(SessionStateBuilder) -> SessionStateBuilder,
-) -> datafusion::execution::SessionState {
-    let mut rebuilt = f(SessionStateBuilder::new_from_existing(state.clone())).build();
-    let config = rebuilt.config_options().as_ref().clone();
-    for (name, udf) in state.scalar_functions() {
-        if name == udf.name() {
-            let udf = udf
-                .inner()
-                .with_updated_config(&config)
-                .map_or_else(|| Arc::clone(udf), Arc::new);
-            // Registering replaces; there is no failure to report.
-            let _ = rebuilt.register_udf(udf);
-        }
-    }
-    for (name, udaf) in state.aggregate_functions() {
-        if name == udaf.name() {
-            let _ = rebuilt.register_udaf(Arc::clone(udaf));
-        }
-    }
-    for (name, udwf) in state.window_functions() {
-        if name == udwf.name() {
-            let _ = rebuilt.register_udwf(Arc::clone(udwf));
-        }
-    }
-    rebuilt
+) -> Result<datafusion::execution::SessionState, DataFusionError> {
+    let mut settled = state.clone();
+    crate::function_names::settle(&mut settled)?;
+    let mut rebuilt = f(SessionStateBuilder::new_from_existing(settled)).build();
+    crate::function_names::settle(&mut rebuilt)?;
+    Ok(rebuilt)
 }
 
 /// Last step of every query's session configuration (see
@@ -842,6 +828,8 @@ impl Engine {
         ctx.register_udf(crate::coercion::named_cast());
         ctx.register_udf(crate::coercion::exact_cast());
         crate::trino_functions::install(&mut ctx)?;
+        // Every derived state resolves each name as this one does.
+        crate::function_names::settle(&mut ctx.state_ref().write())?;
         let mut properties = PropertyRegistry::default();
         for (name, value) in [
             (QUERY_MAX_RUN_TIME, &governance.query_max_run_time),
@@ -870,8 +858,16 @@ impl Engine {
     /// Rebuilds the engine's session state through `f`, keeping its catalogs,
     /// functions, rules and runtime: how a layer outside the core (the
     /// distributed planner, M4) wraps the query planner or adds codecs.
-    pub fn map_state(&mut self, f: impl FnOnce(SessionStateBuilder) -> SessionStateBuilder) {
-        self.ctx = SessionContext::new_with_state(rebuild_state(&self.ctx.state(), f));
+    ///
+    /// # Errors
+    ///
+    /// The rebuilt state cannot be settled (see [`rebuild_state`]); the
+    /// engine is left unchanged.
+    pub fn map_state(
+        &mut self,
+        f: impl FnOnce(SessionStateBuilder) -> SessionStateBuilder,
+    ) -> Result<(), DataFusionError> {
+        self.try_map_state(|builder| Ok(f(builder)))
     }
 
     /// [`Engine::map_state`] with a step that can fail; the engine is left
@@ -879,8 +875,9 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// What `f` returns.
-    pub fn try_map_state<E>(
+    /// What `f` returns, or the rebuilt state cannot be settled (see
+    /// [`rebuild_state`]).
+    pub fn try_map_state<E: From<DataFusionError>>(
         &mut self,
         f: impl FnOnce(SessionStateBuilder) -> Result<SessionStateBuilder, E>,
     ) -> Result<(), E> {
@@ -895,7 +892,7 @@ impl Engine {
         if let Some(err) = failure {
             return Err(err);
         }
-        self.ctx = SessionContext::new_with_state(rebuilt);
+        self.ctx = SessionContext::new_with_state(rebuilt?);
         Ok(())
     }
 
@@ -997,6 +994,7 @@ impl Engine {
             // Replacing a built-in is the point; the previous one is not needed.
             state.register_udf(Arc::clone(function))?;
         }
+        crate::function_names::settle(&mut state)?;
         if let Some(hook) = &self.session_hook {
             hook(state.config_mut());
         }
@@ -1899,13 +1897,231 @@ mod tests {
             let mut config = base.config().clone();
             config.options_mut().execution.time_zone = Some("America/Sao_Paulo".to_owned());
             config.options_mut().execution.batch_size = 1024;
-            let rebuilt = rebuild_state(&base, |builder| builder.with_config(config));
+            let rebuilt = rebuild_state(&base, |builder| builder.with_config(config)).unwrap();
             let ctx = SessionContext::new_with_state(rebuilt);
             let df = ctx
                 .sql("SELECT date_part('year', DATE '2020-05-01') AS y")
                 .await
                 .unwrap();
             assert_eq!(df.schema().field(0).data_type(), &DataType::Int64);
+        }
+    }
+
+    /// A copy of `state` with its scalar and aggregate functions registered
+    /// again in the order `seed` gives: what `new_from_existing` does with
+    /// the hash order of the maps.
+    fn reregistered(
+        state: &datafusion::execution::SessionState,
+        seed: u64,
+    ) -> datafusion::execution::SessionState {
+        use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+        let rank = |name: &str| BuildHasherDefault::<DefaultHasher>::default().hash_one((seed, name));
+        let mut scalars: Vec<_> = state.scalar_functions().iter().collect();
+        scalars.sort_by_key(|(name, _)| rank(name));
+        let mut aggregates: Vec<_> = state.aggregate_functions().iter().collect();
+        aggregates.sort_by_key(|(name, _)| rank(name));
+        let mut again = state.clone();
+        for (_, f) in scalars {
+            again.register_udf(Arc::clone(f)).unwrap();
+        }
+        for (_, f) in aggregates {
+            again.register_udaf(Arc::clone(f)).unwrap();
+        }
+        again
+    }
+
+    /// Names whose functions differ between `state` and `expected`.
+    fn differences(
+        state: &datafusion::execution::SessionState,
+        expected: &datafusion::execution::SessionState,
+    ) -> Vec<String> {
+        let mut wrong: Vec<String> = expected
+            .scalar_functions()
+            .iter()
+            .filter(|(name, f)| state.scalar_functions().get(*name) != Some(*f))
+            .map(|(name, _)| name.clone())
+            .chain(
+                expected
+                    .aggregate_functions()
+                    .iter()
+                    .filter(|(name, f)| state.aggregate_functions().get(*name) != Some(*f))
+                    .map(|(name, _)| name.clone()),
+            )
+            .collect();
+        let extra = |mut names: Vec<&String>, known: &dyn Fn(&str) -> bool| {
+            names.retain(|name| !known(name));
+            names.into_iter().cloned().collect::<Vec<_>>()
+        };
+        wrong.extend(extra(state.scalar_functions().keys().collect(), &|name| {
+            expected.scalar_functions().contains_key(name)
+        }));
+        wrong.extend(extra(state.aggregate_functions().keys().collect(), &|name| {
+            expected.aggregate_functions().contains_key(name)
+        }));
+        wrong.sort();
+        wrong
+    }
+
+    /// The names `DataFusion` defines and the engine resolves to another
+    /// function: the built-ins it replaced.
+    fn replaced(base: &datafusion::execution::SessionState) -> Vec<String> {
+        let defaults = SessionStateBuilder::new().with_default_features().build();
+        let mut names: Vec<String> = defaults
+            .scalar_functions()
+            .iter()
+            .filter(|(name, f)| base.scalar_functions().get(*name).is_some_and(|g| g != *f))
+            .map(|(name, _)| name.clone())
+            .chain(
+                defaults
+                    .aggregate_functions()
+                    .iter()
+                    .filter(|(name, f)| base.aggregate_functions().get(*name).is_some_and(|g| g != *f))
+                    .map(|(name, _)| name.clone()),
+            )
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Every state derived from the engine's resolves every name to the
+    /// function the engine's resolves it to, whatever order the derivation
+    /// registers the functions in: a built-in the engine replaced never takes
+    /// its name back (`date_format` → `to_char`, `length` →
+    /// `character_length`, `element_at` → `map_extract`).
+    #[test]
+    fn derived_states_resolve_every_name_as_the_engine_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        let base = engine.context().state();
+        let replaced = replaced(&base);
+        for name in [
+            "array_join",
+            "arrays_overlap",
+            "avg",
+            "current_date",
+            "date_format",
+            "date_part",
+            "date_trunc",
+            "element_at",
+            "length",
+            "position",
+            "strpos",
+        ] {
+            assert!(replaced.iter().any(|r| r == name), "{name} not in {replaced:?}");
+        }
+        // Names only a replaced built-in answered to are gone.
+        for gone in [
+            "datepart",
+            "datetrunc",
+            "today",
+            "instr",
+            "mean",
+            "covar",
+            "list_sort",
+        ] {
+            assert!(
+                !base.scalar_functions().contains_key(gone) && !base.aggregate_functions().contains_key(gone),
+                "{gone}"
+            );
+        }
+        // No window or higher-order function was replaced: all are kept.
+        let defaults = SessionStateBuilder::new().with_default_features().build();
+        for name in defaults.window_functions().keys() {
+            assert!(base.window_functions().contains_key(name), "{name}");
+        }
+        for name in defaults.higher_order_functions().keys() {
+            assert!(base.higher_order_functions().contains_key(name), "{name}");
+        }
+        let rebuilt = rebuild_state(&base, |builder| builder).unwrap();
+        let derived = [
+            ("rebuild_state", rebuilt.clone()),
+            (
+                "rebuild of a rebuild",
+                rebuild_state(&rebuilt, |builder| builder).unwrap(),
+            ),
+            (
+                "new_from_existing",
+                SessionStateBuilder::new_from_existing(base.clone()).build(),
+            ),
+        ];
+        for (how, state) in derived {
+            assert_eq!(differences(&state, &base), Vec::<String>::new(), "{how}");
+        }
+        proptest::proptest!(proptest::test_runner::Config::with_cases(64), |(seed: u64)| {
+            let state = reregistered(&base, seed);
+            proptest::prop_assert_eq!(differences(&state, &base), Vec::<String>::new());
+        });
+    }
+
+    /// `map_state` rebuilds the engine's state through its step; a step that
+    /// fails leaves the engine as it was.
+    #[test]
+    fn map_state_rebuilds_the_engine_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        assert!(!engine.context().state().physical_optimizers().is_empty());
+        let failed = engine.try_map_state(|_| Err(DataFusionError::Plan("refused".into())));
+        assert_eq!(failed.unwrap_err().to_string(), "Error during planning: refused");
+        assert!(!engine.context().state().physical_optimizers().is_empty());
+        engine
+            .map_state(|builder| builder.with_physical_optimizer_rules(vec![]))
+            .unwrap();
+        assert!(engine.context().state().physical_optimizers().is_empty());
+    }
+
+    /// A query's own functions are settled too: one that takes an alias of a
+    /// built-in (`char_length`, of `character_length`) keeps it in every
+    /// state derived from the query's.
+    #[test]
+    fn a_query_function_keeps_its_names_in_derived_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        let mut options = QueryOptions::for_user("u");
+        let upper = datafusion::functions::string::upper();
+        options.functions = vec![Arc::new(upper.as_ref().clone().with_aliases(["char_length"]))];
+        let session = engine.session(&options).unwrap().state();
+        assert_eq!(session.scalar_functions()["char_length"].name(), "upper");
+        assert_eq!(
+            session.scalar_functions()["character_length"].aliases(),
+            [] as [String; 0]
+        );
+        for seed in 0..32 {
+            let state = reregistered(&session, seed);
+            assert_eq!(differences(&state, &session), Vec::<String>::new(), "seed {seed}");
+        }
+        let rebuilt = rebuild_state(&session, |builder| builder).unwrap();
+        assert_eq!(differences(&rebuilt, &session), Vec::<String>::new());
+    }
+
+    /// The defect of the shadow run: a view reading `date_format(…, '%i')`
+    /// failed with "Cast error: Format error" in some processes (the view ran
+    /// `to_char`), the same expression outside the view answered. Each engine
+    /// here has its own hash order; the distributed coordinator rebuilds the
+    /// engine's state (`map_state`) before any query.
+    #[tokio::test]
+    async fn replaced_functions_answer_in_every_rebuilt_engine() {
+        let select = "SELECT date_format(TIMESTAMP '2020-01-02 03:04:05.000', '%Y-%m-%d %H:%i:%s') AS d, \
+                      element_at(ARRAY[10, 20, 30], 2) AS e";
+        for attempt in 0..16 {
+            let dir = tempfile::tempdir().unwrap();
+            let mut engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+            engine.map_state(|builder| builder).unwrap();
+            run(&engine, "CREATE SCHEMA datafusion.s").await.unwrap();
+            run(&engine, &format!("CREATE VIEW datafusion.s.v AS {select}"))
+                .await
+                .unwrap_or_else(|e| panic!("engine {attempt}: {e}"));
+            for sql in [select, "SELECT d, e FROM datafusion.s.v"] {
+                let batches = run(&engine, sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("engine {attempt}, {sql}: {e}"));
+                let text = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+                    .unwrap()
+                    .to_string();
+                assert!(
+                    text.contains("| 2020-01-02 03:04:05 | 20 |"),
+                    "engine {attempt}, {sql}:\n{text}"
+                );
+            }
         }
     }
 

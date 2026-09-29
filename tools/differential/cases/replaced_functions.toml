@@ -1,0 +1,119 @@
+# Functions CodeLake defines over DataFusion built-ins of the same name or
+# alias, read through Hive views. A view's plan is built in a state rebuilt
+# from the query's, which registers the functions again in hash order: in some
+# processes a replaced built-in took its name back (the shadow run's
+# incremental model: `date_format(…, '%i')` in a view ran `to_char`, "Cast
+# error: Format error", while the same SELECT outside the view answered).
+# Each engine reads the views it wrote: CodeLake hive.rfc, Trino hive.rft.
+# Array results go through array_join: a Hive view cannot declare an array
+# column yet.
+
+oracle = "trino"
+
+setup_trino = [
+  "CREATE SCHEMA hive.rft",
+  "CREATE VIEW hive.rft.v AS SELECT date_format(TIMESTAMP '2020-01-02 03:04:05.000', '%Y-%m-%d %H:%i:%s') AS df, length('abcd') AS len, element_at(ARRAY[10, 20, 30], 2) AS ea, element_at(MAP(ARRAY['k'], ARRAY[7]), 'k') AS em, array_join(ARRAY['a', 'b'], '-') AS aj, arrays_overlap(ARRAY[1, 2], ARRAY[2, 3]) AS ao, date_trunc('month', TIMESTAMP '2020-05-17 10:00:00.000') AS dt, strpos('abcabc', 'c') AS sp, position('c' IN 'abcabc') AS po, array_position(ARRAY[5, 6, 7], 7) AS ap, array_max(ARRAY[3, 9, 1]) AS am, array_join(array_sort(ARRAY[3, 1, 2]), ',') AS so, array_join(array_distinct(ARRAY[1, 1, 2]), ',') AS ad, extract(year FROM DATE '2020-05-01') AS ex",
+  "CREATE VIEW hive.rft.a AS SELECT avg(x) AS m FROM (VALUES 1, 2, 4) AS t(x)",
+]
+
+setup_codelake = [
+  "CREATE SCHEMA hive.rfc",
+  "CREATE VIEW hive.rfc.v AS SELECT date_format(TIMESTAMP '2020-01-02 03:04:05.000', '%Y-%m-%d %H:%i:%s') AS df, length('abcd') AS len, element_at(ARRAY[10, 20, 30], 2) AS ea, element_at(MAP(ARRAY['k'], ARRAY[7]), 'k') AS em, array_join(ARRAY['a', 'b'], '-') AS aj, arrays_overlap(ARRAY[1, 2], ARRAY[2, 3]) AS ao, date_trunc('month', TIMESTAMP '2020-05-17 10:00:00.000') AS dt, strpos('abcabc', 'c') AS sp, position('c' IN 'abcabc') AS po, array_position(ARRAY[5, 6, 7], 7) AS ap, array_max(ARRAY[3, 9, 1]) AS am, array_join(array_sort(ARRAY[3, 1, 2]), ',') AS so, array_join(array_distinct(ARRAY[1, 1, 2]), ',') AS ad, extract(year FROM DATE '2020-05-01') AS ex",
+  "CREATE VIEW hive.rfc.a AS SELECT avg(x) AS m FROM (VALUES 1, 2, 4) AS t(x)",
+]
+
+[[case]]
+id = "RF1"
+sql = "SELECT df FROM hive.rfc.v"
+oracle_sql = "SELECT df FROM hive.rft.v"
+note = "`date_format` with `%i` (minutes): `to_char` refused it (\"Cast error: Format error\")"
+
+[[case]]
+id = "RF2"
+sql = "SELECT len FROM hive.rfc.v"
+oracle_sql = "SELECT len FROM hive.rft.v"
+note = "`length`, not `character_length`"
+
+[[case]]
+id = "RF3"
+sql = "SELECT ea FROM hive.rfc.v"
+oracle_sql = "SELECT ea FROM hive.rft.v"
+note = "`element_at` of an array, not `map_extract`"
+
+[[case]]
+id = "RF4"
+sql = "SELECT em FROM hive.rfc.v"
+oracle_sql = "SELECT em FROM hive.rft.v"
+note = "`element_at` of a map: the value, not `map_extract`'s list"
+
+[[case]]
+id = "RF5"
+sql = "SELECT aj FROM hive.rfc.v"
+oracle_sql = "SELECT aj FROM hive.rft.v"
+note = "`array_join`, not `array_to_string`"
+
+[[case]]
+id = "RF6"
+sql = "SELECT ao FROM hive.rfc.v"
+oracle_sql = "SELECT ao FROM hive.rft.v"
+note = "`arrays_overlap`, not `array_has_any`"
+
+[[case]]
+id = "RF7"
+sql = "SELECT dt FROM hive.rfc.v"
+oracle_sql = "SELECT dt FROM hive.rft.v"
+note = "`date_trunc`"
+
+[[case]]
+id = "RF8"
+sql = "SELECT sp FROM hive.rfc.v"
+oracle_sql = "SELECT sp FROM hive.rft.v"
+note = "`strpos`"
+
+[[case]]
+id = "RF9"
+sql = "SELECT po FROM hive.rfc.v"
+oracle_sql = "SELECT po FROM hive.rft.v"
+note = "`position(… IN …)`"
+
+[[case]]
+id = "RF10"
+sql = "SELECT ap FROM hive.rfc.v"
+oracle_sql = "SELECT ap FROM hive.rft.v"
+note = "`array_position`"
+
+[[case]]
+id = "RF11"
+sql = "SELECT am FROM hive.rfc.v"
+oracle_sql = "SELECT am FROM hive.rft.v"
+note = "`array_max`"
+
+[[case]]
+id = "RF12"
+sql = "SELECT so FROM hive.rfc.v"
+oracle_sql = "SELECT so FROM hive.rft.v"
+note = "`array_sort`"
+
+[[case]]
+id = "RF13"
+sql = "SELECT ad FROM hive.rfc.v"
+oracle_sql = "SELECT ad FROM hive.rft.v"
+note = "`array_distinct`"
+
+[[case]]
+id = "RF14"
+sql = "SELECT ex FROM hive.rfc.v"
+oracle_sql = "SELECT ex FROM hive.rft.v"
+note = "`extract(year …)`: a `bigint`"
+
+[[case]]
+id = "RF15"
+sql = "SELECT m FROM hive.rfc.a"
+oracle_sql = "SELECT m FROM hive.rft.a"
+note = "`avg` (alias `mean` of the built-in)"
+
+[[case]]
+id = "RF16"
+sql = "SELECT df, len, ea, aj FROM hive.rfc.v"
+oracle_sql = "SELECT df, len, ea, aj FROM hive.rft.v"
+note = "several replaced functions in one view"
