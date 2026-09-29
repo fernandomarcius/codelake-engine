@@ -160,8 +160,9 @@ fn without_local_supersets(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// locally and puts below them, in a filter that can then be pushed, its safe
 /// terms and a superset of each unsafe term the policy offers one for
 /// ([`PushdownPolicy::superset`], marked so the policy accepts it and never
-/// offered again). Rewritten only when both halves are non-empty; the filter
-/// below has no unsafe term, so recursion terminates.
+/// offered again; a marked term the policy rejects is offered as the
+/// predicate it marks). Rewritten only when both halves are non-empty; the
+/// filter below has no unsafe term, so recursion terminates.
 fn split_filter(plan: LogicalPlan, policy: &dyn PushdownPolicy) -> Result<LogicalPlan> {
     let LogicalPlan::Filter(filter) = plan else {
         return Ok(plan);
@@ -175,7 +176,10 @@ fn split_filter(plan: LogicalPlan, policy: &dyn PushdownPolicy) -> Result<Logica
         });
     let supersets = unsafe_terms
         .iter()
-        .filter_map(|term| policy.superset(term, input.schema()))
+        .filter_map(|term| {
+            let term = crate::functions::as_superset_filter(term).unwrap_or(term);
+            policy.superset(term, input.schema())
+        })
         .map(crate::functions::superset_filter)
         .filter(|marked| {
             Filter::try_new(marked.clone(), Arc::clone(&input))

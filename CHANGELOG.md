@@ -23,6 +23,18 @@ versioning: [SemVer](https://semver.org/).
     source (56 lookups of one table each: 288 s).
   - `COUNT(DISTINCT x)` next to `COUNT(*)` runs in two spillable aggregations; one million distinct
     tuples exhausted the memory limit.
+  - The nightly reconciliation (dbt, 921 s against 75 s) filters SQL Server tables by the keys of a local
+    replica (`id IN (SELECT id FROM hive…)`) and a window (`CAST(dataregistro AS timestamp(3)) >=
+    date_add('day', -7, TIMESTAMP '… .133')`); neither reached SQL Server, which returned whole tables:
+    - A hash join's dynamic filter reaches the federated scan it probes: its keys as an `IN` list
+      (`execution.dynamic_filter_max_keys`, 150), their min/max always, each term sent as the source's
+      policy accepts it (SQL Server: text keys as an `IN` superset under its collation, never a text
+      min/max; ADR 0006).
+    - SQL Server: a `datetime` or `datetime2(7)` column compared with a literal inside a second is sent
+      whole-second bounds (`>=` the second before, `<` the second after) as a superset. Upper bounds are
+      always strict: a `datetime2(7)` value 100 ns past a whole-second `<=` bound was lost at the source.
+    - Reproduction (2 million rows in SQL Server 2022, 13 936 local keys): 11.4 s → 0.50 s, SQL Server
+      returns 58 521 rows instead of 2 000 000; same result.
 
 ### Added
 - Distributed execution (M4, ADR 0011), behind the `distributed` feature: a `[distributed]` coordinator

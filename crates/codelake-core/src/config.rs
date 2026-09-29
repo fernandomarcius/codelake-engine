@@ -309,6 +309,14 @@ pub struct ExecutionConfig {
     /// Seconds allowed for connecting to every source at startup.
     #[serde(default = "default_startup_timeout_secs")]
     pub source_startup_timeout_secs: u64,
+    /// Distinct join keys a hash join's dynamic filter lists (a federated
+    /// source receives them as an `IN` list); past it, or past
+    /// `dynamic_filter_max_key_bytes`, only their min/max remain.
+    #[serde(default = "default_dynamic_filter_max_keys")]
+    pub dynamic_filter_max_keys: usize,
+    /// Size of those keys per build partition.
+    #[serde(default = "default_dynamic_filter_max_key_bytes")]
+    pub dynamic_filter_max_key_bytes: ByteSize,
 }
 
 impl Default for ExecutionConfig {
@@ -317,6 +325,8 @@ impl Default for ExecutionConfig {
             batch_size: default_batch_size(),
             target_partitions: None,
             source_startup_timeout_secs: default_startup_timeout_secs(),
+            dynamic_filter_max_keys: default_dynamic_filter_max_keys(),
+            dynamic_filter_max_key_bytes: default_dynamic_filter_max_key_bytes(),
         }
     }
 }
@@ -615,6 +625,14 @@ const fn default_batch_size() -> usize {
 }
 const fn default_startup_timeout_secs() -> u64 {
     60
+}
+/// `DataFusion`'s defaults (`hash_join_inlist_pushdown_max_distinct_values`
+/// and `hash_join_inlist_pushdown_max_size`).
+const fn default_dynamic_filter_max_keys() -> usize {
+    150
+}
+const fn default_dynamic_filter_max_key_bytes() -> ByteSize {
+    ByteSize::b(128 * 1024)
 }
 const fn default_metadata_cache() -> ByteSize {
     ByteSize::mib(64)
@@ -1590,6 +1608,20 @@ mod tests {
         assert_eq!(errors_of(&doc, &full_env).len(), 1);
         let doc = VALID.replace("[memory]", "[execution]\nbatch_size = 1048576\n\n[memory]");
         assert!(parse(&doc).validate(&full_env, &|_| true).is_ok());
+    }
+
+    #[test]
+    fn dynamic_filter_keys_are_read() {
+        let execution = parse(VALID).execution;
+        assert_eq!(execution.dynamic_filter_max_keys, 150);
+        assert_eq!(execution.dynamic_filter_max_key_bytes, ByteSize::b(128 * 1024));
+        let doc = VALID.replace(
+            "[memory]",
+            "[execution]\ndynamic_filter_max_keys = 5000\ndynamic_filter_max_key_bytes = \"1MiB\"\n\n[memory]",
+        );
+        let execution = parse(&doc).execution;
+        assert_eq!(execution.dynamic_filter_max_keys, 5000);
+        assert_eq!(execution.dynamic_filter_max_key_bytes, ByteSize::mib(1));
     }
 
     #[test]

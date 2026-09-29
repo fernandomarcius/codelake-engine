@@ -64,6 +64,22 @@ dynamic filter, so the whole remote table would be read on every run.
    `NOT IN` compared with a constant or over a correlated subquery is
    rewritten before decorrelation (ADR 0014).
 
+9. A hash join's dynamic filter reaches a federated scan on its probe side
+   (`codelake_core::federated_dynamic_filters`). The federation barrier keeps
+   the dynamic filters offered to it (reporting them unsupported: the join
+   still filters exactly) and, when the remote query starts, after the
+   build side, adds to it what they say about plain columns of the table:
+   the keys as an `IN` list while the build side has at most
+   `execution.dynamic_filter_max_keys` of them (150), their min/max always.
+   Each term goes through the source's policy as a superset filter: sent as
+   it is, as the superset the policy offers, or not at all (SQL Server: text
+   keys as an `IN` superset under its collation, never text min/max). Only
+   over a table scan under filters, plain column projections and aliases;
+   a source without a policy gets nothing. SQL Server compares a
+   `datetime`/`datetime2(7)` column with a literal inside a second through
+   whole-second bounds (`>=` the second at or before it, `<` the first
+   second past what it keeps), a superset of what the engine keeps.
+
 ## Consequences
 
 - Correctness first: some operators Trino pushes down run locally here, moving

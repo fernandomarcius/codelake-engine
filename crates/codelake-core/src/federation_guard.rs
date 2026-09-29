@@ -17,6 +17,10 @@
 //! Remove only when an upstream fix is released **and** the integration test
 //! `mysql::joins_across_mysql_and_postgres` passes without this rule.
 //!
+//! The barrier keeps the join dynamic filters offered to it (still reported
+//! unsupported) and adds what the source can evaluate of them to its query
+//! when it starts ([`crate::federated_dynamic_filters`]).
+//!
 //! Because the barrier sits on every remote node, it is also where a remote
 //! node is traced: one `codelake.remote` span per federated scan, for every
 //! SQL source, with the executor name, rows returned, duration and errors.
@@ -30,7 +34,12 @@ use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
+};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, PlanProperties};
+use futures::{StreamExt, TryStreamExt};
 use tracing::field::Empty;
 
 use crate::trace::{self, TARGET, TracedStream};
@@ -81,14 +90,16 @@ impl PhysicalOptimizerRule for FederationFilterGuard {
     }
 }
 
-/// Transparent node whose only behaviour is the trait default for filter
-/// pushdown: every parent filter is reported as unsupported.
+/// Transparent node that reports every parent filter as unsupported, and
+/// keeps the dynamic ones for its remote query.
 #[derive(Debug)]
 pub struct FederationFilterBarrier {
     input: Arc<dyn ExecutionPlan>,
     properties: Arc<PlanProperties>,
     /// `SQLExecutor::name()` of the wrapped remote node, for its span.
     executor: String,
+    /// Parent filters holding a join dynamic filter, on this node's columns.
+    dynamic_filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl FederationFilterBarrier {
@@ -99,6 +110,23 @@ impl FederationFilterBarrier {
             input,
             properties,
             executor,
+            dynamic_filters: Vec::new(),
+        }
+    }
+
+    fn with_dynamic_filters(&self, dynamic_filters: Vec<Arc<dyn PhysicalExpr>>) -> Self {
+        Self {
+            dynamic_filters,
+            ..Self::new(Arc::clone(&self.input))
+        }
+    }
+
+    /// The input, narrowed by the dynamic filters complete by now. Narrowing
+    /// is only an optimization: a plan it cannot build keeps the input.
+    fn narrowed_input(&self) -> Arc<dyn ExecutionPlan> {
+        match crate::federated_dynamic_filters::narrowed(&self.input, &self.dynamic_filters) {
+            Ok(Some(narrowed)) => narrowed,
+            _ => Arc::clone(&self.input),
         }
     }
 }
@@ -120,7 +148,12 @@ fn executor_name(plan: &dyn ExecutionPlan) -> String {
 
 impl DisplayAs for FederationFilterBarrier {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "FederationFilterBarrier")
+        write!(f, "FederationFilterBarrier")?;
+        if !self.dynamic_filters.is_empty() {
+            let filters: Vec<String> = self.dynamic_filters.iter().map(ToString::to_string).collect();
+            write!(f, ": dynamic_filters=[{}]", filters.join(", "))?;
+        }
+        Ok(())
     }
 }
 
@@ -155,7 +188,35 @@ impl ExecutionPlan for FederationFilterBarrier {
                 children.len()
             ))
         })?;
-        Ok(Arc::new(Self::new(child)))
+        Ok(Arc::new(Self {
+            dynamic_filters: self.dynamic_filters.clone(),
+            ..Self::new(child)
+        }))
+    }
+
+    /// Every parent filter stays with its parent; the dynamic ones (offered
+    /// after the physical plan is final) are also kept here.
+    fn handle_child_pushdown_result(
+        &self,
+        phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        let parents = child_pushdown_result.parent_filters;
+        let dynamic: Vec<_> = parents
+            .iter()
+            .map(|f| &f.filter)
+            .filter(|f| phase == FilterPushdownPhase::Post && crate::federated_dynamic_filters::is_dynamic(f))
+            .cloned()
+            .collect();
+        let updated_node = (!dynamic.is_empty()).then(|| {
+            let kept = self.dynamic_filters.iter().cloned().chain(dynamic).collect();
+            Arc::new(self.with_dynamic_filters(kept)) as Arc<dyn ExecutionPlan>
+        });
+        Ok(FilterPushdownPropagation {
+            filters: vec![PushedDown::No; parents.len()],
+            updated_node,
+        })
     }
 
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
@@ -170,6 +231,20 @@ impl ExecutionPlan for FederationFilterBarrier {
             db.response.returned_rows = Empty,
             codelake.cancelled = Empty,
         );
+        if !self.dynamic_filters.is_empty() {
+            // The join has built its side by the time it reads this one: the
+            // remote query is planned then, with the filters complete.
+            let this = self.with_dynamic_filters(self.dynamic_filters.clone());
+            let schema = self.schema();
+            let started = span.clone();
+            let stream = futures::stream::once(async move {
+                let input = this.narrowed_input();
+                started.in_scope(|| input.execute(partition, context))
+            })
+            .try_flatten();
+            let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()));
+            return Ok(Box::pin(TracedStream::new(stream, span)));
+        }
         // Connectors start their remote work inside `execute`: their spans
         // become children of this one.
         match span.in_scope(|| self.input.execute(partition, context)) {
@@ -228,6 +303,85 @@ mod tests {
             .unwrap();
         let child = &description.parent_filters()[0];
         assert!(child.iter().all(|f| matches!(f.discriminant, PushedDown::No)));
+    }
+
+    #[test]
+    fn barrier_keeps_only_the_dynamic_filters_offered_after_planning() {
+        use datafusion::physical_expr::expressions::{BinaryExpr, Column, DynamicFilterPhysicalExpr, lit};
+        use datafusion::physical_plan::filter_pushdown::ChildFilterPushdownResult;
+
+        let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let dynamic: Arc<dyn PhysicalExpr> = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            lit(true),
+        ));
+        let fixed: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            column,
+            datafusion::logical_expr::Operator::Gt,
+            lit(1_i64),
+        ));
+        let offered = || ChildPushdownResult {
+            parent_filters: [&fixed, &dynamic]
+                .into_iter()
+                .map(|filter| ChildFilterPushdownResult {
+                    filter: Arc::clone(filter),
+                    child_results: vec![PushedDown::No],
+                })
+                .collect(),
+            self_filters: vec![vec![]],
+        };
+        let barrier = FederationFilterBarrier::new(Arc::new(EmptyExec::new(schema())));
+        let config = ConfigOptions::default();
+        let before = barrier
+            .handle_child_pushdown_result(FilterPushdownPhase::Pre, offered(), &config)
+            .unwrap();
+        assert!(
+            before.updated_node.is_none(),
+            "dynamic filters come after planning"
+        );
+        assert!(before.filters.iter().all(|f| matches!(f, PushedDown::No)));
+        let after = barrier
+            .handle_child_pushdown_result(FilterPushdownPhase::Post, offered(), &config)
+            .unwrap();
+        assert_eq!(after.filters.len(), 2);
+        assert!(
+            after.filters.iter().all(|f| matches!(f, PushedDown::No)),
+            "the join and the filters above still filter"
+        );
+        let node = after.updated_node.unwrap();
+        let kept = node.downcast_ref::<FederationFilterBarrier>().unwrap();
+        assert_eq!(kept.dynamic_filters.len(), 1);
+        assert!(Arc::ptr_eq(&kept.dynamic_filters[0], &dynamic));
+        // Kept through later rewrites of the plan.
+        let rebuilt = Arc::clone(&node)
+            .with_new_children(vec![Arc::new(EmptyExec::new(schema()))])
+            .unwrap();
+        let rebuilt = rebuilt.downcast_ref::<FederationFilterBarrier>().unwrap();
+        assert_eq!(rebuilt.dynamic_filters.len(), 1);
+        let again = rebuilt
+            .handle_child_pushdown_result(FilterPushdownPhase::Post, offered(), &config)
+            .unwrap();
+        let again = again.updated_node.unwrap();
+        assert_eq!(
+            again
+                .downcast_ref::<FederationFilterBarrier>()
+                .unwrap()
+                .dynamic_filters
+                .len(),
+            2,
+            "a second offer adds to the first"
+        );
+        let shown = datafusion::physical_plan::displayable(node.as_ref())
+            .one_line()
+            .to_string();
+        assert!(
+            shown.starts_with("FederationFilterBarrier: dynamic_filters=[DynamicFilter"),
+            "{shown}"
+        );
+        let plain = datafusion::physical_plan::displayable(&barrier)
+            .one_line()
+            .to_string();
+        assert_eq!(plain.trim(), "FederationFilterBarrier");
     }
 
     /// Reproduces the upstream defect without Docker (see `crate::testing`).
