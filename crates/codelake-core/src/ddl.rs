@@ -23,8 +23,8 @@ use datafusion::sql::TableReference;
 use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
     AlterTableOperation, ColumnDef, ColumnOption, CreateTableOptions, Expr as SqlExpr, ObjectName,
-    ObjectNamePart, RenameTableNameKind, ShowStatementFilter, ShowStatementFilterPosition, SqlOption,
-    Statement, Value,
+    ObjectNamePart, RenameTableNameKind, ShowCreateObject, ShowStatementFilter, ShowStatementFilterPosition,
+    SqlOption, Statement, Value,
 };
 use datafusion::sql::sqlparser::dialect::{Dialect, GenericDialect};
 use datafusion::sql::sqlparser::keywords::Keyword;
@@ -78,6 +78,11 @@ pub(crate) enum Prepared {
         /// `ALTER TABLE IF EXISTS`: a missing source is not an error.
         if_exists: bool,
     },
+    /// `SHOW CREATE TABLE`, answered from the catalog: the SQL planner reads
+    /// it from an `information_schema` column the engine's does not have.
+    ShowCreateTable(TableReference),
+    /// `SHOW CREATE VIEW`, which the SQL planner does not plan.
+    ShowCreateView(TableReference),
 }
 
 /// Trino statements that `sqlparser` rejects, recognized from their tokens.
@@ -411,6 +416,14 @@ pub(crate) fn prepare(statement: &mut DFStatement, security: ViewSecurity) -> Re
                 "only ALTER TABLE … ADD COLUMN and RENAME TO are supported".into(),
             )),
         },
+        Statement::ShowCreate {
+            obj_type: ShowCreateObject::Table,
+            obj_name,
+        } => Ok(Some(Prepared::ShowCreateTable(table_reference(obj_name)?))),
+        Statement::ShowCreate {
+            obj_type: ShowCreateObject::View,
+            obj_name,
+        } => Ok(Some(Prepared::ShowCreateView(table_reference(obj_name)?))),
         _ => Ok(None),
     }
 }
@@ -513,6 +526,24 @@ mod tests {
             let mut statement = parsed(sql);
             assert!(prepare(&mut statement, ViewSecurity::Definer).is_err(), "{sql}");
         }
+    }
+
+    #[test]
+    fn show_create_names_its_relation() {
+        let mut table = parsed("SHOW CREATE TABLE hive.Raw.\"T\"");
+        assert_eq!(
+            prepare(&mut table, ViewSecurity::Definer).unwrap(),
+            Some(Prepared::ShowCreateTable(TableReference::full(
+                "hive", "raw", "T"
+            )))
+        );
+        let mut view = parsed("SHOW CREATE VIEW s.v");
+        assert_eq!(
+            prepare(&mut view, ViewSecurity::Definer).unwrap(),
+            Some(Prepared::ShowCreateView(TableReference::partial("s", "v")))
+        );
+        let mut function = parsed("SHOW CREATE FUNCTION f");
+        assert_eq!(prepare(&mut function, ViewSecurity::Definer).unwrap(), None);
     }
 
     #[test]

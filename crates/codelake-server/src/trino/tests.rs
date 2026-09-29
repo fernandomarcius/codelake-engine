@@ -602,6 +602,55 @@ async fn statements_report_like_trino() {
 }
 
 #[tokio::test]
+async fn show_create_answers_one_varchar_row() {
+    let h = harness();
+    for statement in [
+        "CREATE SCHEMA datafusion.sc",
+        "CREATE TABLE datafusion.sc.t (id char(36) NOT NULL, gestorid integer, ts timestamp(3) NOT NULL)",
+        "CREATE VIEW datafusion.sc.v AS SELECT id FROM datafusion.sc.t",
+    ] {
+        let out = h.run(statement, &[]).await;
+        assert_eq!(out.state(), "FINISHED", "{statement}: {}", out.last);
+    }
+    let table = "CREATE TABLE datafusion.sc.t (\n   id char(36) NOT NULL,\n   gestorid integer,\n   \
+                 ts timestamp(3) NOT NULL\n)";
+    let shown = h.run("SHOW CREATE TABLE datafusion.sc.t", &[]).await;
+    assert_eq!(
+        shown.columns,
+        [("Create Table".to_owned(), format!("varchar({})", table.len()))]
+    );
+    assert_eq!(shown.rows, [[serde_json::json!(table)]]);
+    let view = "CREATE VIEW datafusion.sc.v SECURITY DEFINER AS\nSELECT id\nFROM\n  datafusion.sc.t";
+    let shown = h.run("SHOW CREATE VIEW datafusion.sc.v", &[]).await;
+    assert_eq!(
+        shown.columns,
+        [("Create View".to_owned(), format!("varchar({})", view.len()))]
+    );
+    assert_eq!(shown.rows, [[serde_json::json!(view)]]);
+    for (sql, error, message) in [
+        (
+            "SHOW CREATE TABLE datafusion.sc.nope",
+            "TABLE_NOT_FOUND",
+            "Table 'datafusion.sc.nope' does not exist",
+        ),
+        (
+            "SHOW CREATE TABLE datafusion.sc.v",
+            "NOT_SUPPORTED",
+            "Relation 'datafusion.sc.v' is a view, not a table",
+        ),
+        (
+            "SHOW CREATE VIEW datafusion.sc.t",
+            "NOT_SUPPORTED",
+            "Relation 'datafusion.sc.t' is a table, not a view",
+        ),
+    ] {
+        let out = h.run(sql, &[]).await;
+        assert_eq!(out.error_name(), Some(error), "{sql}: {}", out.last);
+        assert_eq!(out.last["error"]["message"], message, "{sql}");
+    }
+}
+
+#[tokio::test]
 async fn show_session_filters_and_formats_defaults() {
     let h = harness();
     let out = h.run("SHOW SESSION LIKE 'query_max_run%'", &[]).await;

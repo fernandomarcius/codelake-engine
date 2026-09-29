@@ -66,7 +66,8 @@ A separate listener (`[server.trino]`, off by default) serves:
   `X-Trino-Set-Session`, `X-Trino-Clear-Session`. `USE` of a catalog or schema
   that does not exist fails (`NOT_FOUND`). `SHOW SESSION [LIKE …]` lists the
   properties, durations in airlift's text (`100.00d`). `DESCRIBE <table>`
-  answers Trino's `Column, Type, Extra, Comment`.
+  answers Trino's `Column, Type, Extra, Comment`; `SHOW CREATE TABLE|VIEW` one
+  `Create Table|View` row, answered by the engine from the catalog.
 - **Prepared statements** travel in headers, as in Trino: `PREPARE name FROM
   sql` answers `X-Trino-Added-Prepare`, the client sends them back in
   `X-Trino-Prepared-Statement`, `DEALLOCATE PREPARE` answers

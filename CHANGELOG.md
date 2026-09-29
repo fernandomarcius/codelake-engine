@@ -207,6 +207,11 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- `SHOW CREATE TABLE` failed for every table (`COLUMN_NOT_FOUND: No field named definition`) and `SHOW CREATE
+  VIEW` was refused. Both answer the statement as the reference engine prints it, one `varchar(n)` row: types
+  in SQL syntax, `NOT NULL` where the source refuses nulls, reserved and irregular names quoted, a hive
+  table's `WITH (format = '…')` and a view's `SECURITY` mode. A view is not a table (`NOT_SUPPORTED`), nor
+  a table a view; a missing one is `TABLE_NOT_FOUND`.
 - A session state rebuilt with another configuration could resolve `extract(...)` to DataFusion's
   `date_part` (an `int`) instead of the engine's (`bigint`): `rebuild_state` keeps the engine's functions.
 - SQL Server `datetime`, `smalldatetime`, `datetime2(p)` and `datetimeoffset(p)` keep the precision they declare

@@ -14,6 +14,7 @@
 //!   `data_type` and `is_nullable`, `schemata`, `views`) in the in-memory
 //!   catalog (`memory` in Trino, `datafusion` in `CodeLake`) and in `hive`
 //!   (Trino's file metastore on both sides, separate warehouses);
+//! - `SHOW CREATE TABLE` and `SHOW CREATE VIEW` in both catalogs;
 //! - TPC-H Q01, Q08, Q14 and Q17 on SF 0.01 (`tpch.tiny`), the same rows
 //!   loaded into both engines.
 //!
@@ -390,5 +391,6 @@ async fn expect_same(setup: &[&str], queries: &[&str], zone: Option<&str>) -> Re
 
 mod decimal;
 mod information_schema;
+mod show_create;
 mod timestamps;
 mod tpch;

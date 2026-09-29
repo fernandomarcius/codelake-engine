@@ -4,6 +4,7 @@
 //! the dependency points one way: connectors depend on core, never the reverse
 //! (enforced by `cargo xtask arch`).
 
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -150,6 +151,23 @@ pub trait WritableCatalog: Send + Sync + Debug {
     ) -> DfResult<()>;
 
     async fn drop_view(&self, schema: &str, view: &str, if_exists: bool) -> DfResult<()>;
+
+    /// The properties `SHOW CREATE TABLE` prints in the `WITH` clause of
+    /// table `schema.table` (`format`), each a text value. The engine has
+    /// checked that the table exists and is not a view. The default has none:
+    /// the statement then has no `WITH` clause.
+    async fn table_properties(&self, schema: &str, table: &str) -> DfResult<BTreeMap<String, String>> {
+        let _ = (schema, table);
+        Ok(BTreeMap::new())
+    }
+
+    /// The `SECURITY` mode view `schema.view` was created with, for `SHOW
+    /// CREATE VIEW`. The engine has checked that the view exists. The
+    /// default is `DEFINER`, a view's mode when its statement has none.
+    async fn view_security(&self, schema: &str, view: &str) -> DfResult<ViewSecurity> {
+        let _ = (schema, view);
+        Ok(ViewSecurity::Definer)
+    }
 
     /// `ALTER TABLE … ADD COLUMN`. `column` carries its name, Arrow type and
     /// the [`DECLARED_TYPE`] / [`COLUMN_COMMENT`] metadata of the statement.

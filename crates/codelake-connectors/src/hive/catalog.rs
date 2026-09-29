@@ -1162,6 +1162,38 @@ impl WritableCatalog for HiveCatalog {
         self.refresh().await
     }
 
+    /// The table's storage format, as the metastore records it (`PARQUET`).
+    async fn table_properties(&self, schema: &str, table: &str) -> Result<BTreeMap<String, String>> {
+        let metadata = self
+            .metastore
+            .table(&hive_name(schema), &hive_name(table))
+            .await
+            .map_err(metastore_error)?;
+        Ok(metadata
+            .and_then(|metadata| metadata.storage_format)
+            .map(|format| BTreeMap::from([("format".to_owned(), format)]))
+            .unwrap_or_default())
+    }
+
+    /// `INVOKER` when the view's definition runs as its invoker.
+    async fn view_security(&self, schema: &str, view: &str) -> Result<ViewSecurity> {
+        let metadata = self
+            .metastore
+            .table(&hive_name(schema), &hive_name(view))
+            .await
+            .map_err(metastore_error)?;
+        let text = metadata.and_then(|metadata| metadata.view_original_text);
+        let invoker = match text {
+            Some(text) => TrinoView::decode(&text, &self.metastore.names().view_marker)?.run_as_invoker,
+            None => false,
+        };
+        Ok(if invoker {
+            ViewSecurity::Invoker
+        } else {
+            ViewSecurity::Definer
+        })
+    }
+
     async fn rename_table(&self, schema: &str, table: &str, new_schema: &str, new_table: &str) -> Result<()> {
         let (schema, table) = (&hive_name(schema), &hive_name(table));
         rename_relation(self, false, (schema, table), (new_schema, new_table)).await
