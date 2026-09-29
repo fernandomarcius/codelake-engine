@@ -2,6 +2,7 @@
 //! connector contract. This crate must not depend on any concrete connector or on
 //! the server (see `cargo xtask arch`).
 
+mod batch_schema;
 pub mod bytes;
 mod casts;
 pub mod catalog;

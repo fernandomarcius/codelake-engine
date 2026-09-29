@@ -213,6 +213,10 @@ versioning: [SemVer](https://semver.org/).
     first; a NULL field or element the comparison reaches is `NOT_SUPPORTED`. A NaN key ranks below every
     number for `max_by` and above for `min_by`, so it is picked only when every key is NaN (such a group
     answered NULL, and the `n` form dropped NaN keys).
+  - `CREATE TABLE AS` (and `CREATE OR REPLACE`) of a `UNION ALL` whose branches differ in field metadata
+    failed (`target schema is not superset of current schema`): SQL Server columns record their type
+    (`numeric` in one branch, `decimal` in another). A batch now takes the announced schema when only
+    metadata and nullability differ; another difference is still an error.
 - `SHOW CREATE TABLE` failed for every table (`COLUMN_NOT_FOUND: No field named definition`) and `SHOW CREATE
   VIEW` was refused. Both answer the statement as the reference engine prints it, one `varchar(n)` row: types
   in SQL syntax, `NOT NULL` where the source refuses nulls, reserved and irregular names quoted, a hive

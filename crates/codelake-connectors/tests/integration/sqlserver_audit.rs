@@ -287,7 +287,11 @@ async fn seed_wrong_results(host: &str, port: u16) {
          CREATE TABLE dbo.Textos (Id INT NOT NULL PRIMARY KEY, Nome VARCHAR(10) NULL);
          INSERT INTO dbo.Textos VALUES (1, 'ativo'), (2, 'ATIVO'), (3, 'ativo '), (4, 'outro');
          CREATE TABLE dbo.Sessao (Id INT NOT NULL PRIMARY KEY);
-         INSERT INTO dbo.Sessao VALUES (2), (3), (4);",
+         INSERT INTO dbo.Sessao VALUES (2), (3), (4);
+         CREATE TABLE dbo.Vendas (Id INT NOT NULL PRIMARY KEY, Grupo VARCHAR(10) NULL, Valor NUMERIC(18,6) NULL);
+         INSERT INTO dbo.Vendas VALUES (1, 'a', 10.500000), (2, NULL, NULL);
+         CREATE TABLE dbo.Compras (Id INT NOT NULL PRIMARY KEY, Grupo VARCHAR(10) NULL, Valor DECIMAL(18,6) NULL);
+         INSERT INTO dbo.Compras VALUES (1, 'b', 2.250000);",
     )
     .await;
 }
@@ -725,6 +729,51 @@ async fn wrong_results(tag: &str) {
         "8b integer division by zero is an error, not a silent NULL (ARITHABORT/ANSI_WARNINGS ON)",
         div0.is_err(),
         format!("got={div0:?}"),
+    );
+
+    // --- Item 9: UNION ALL of branches that differ in field metadata -------
+    // `numeric` in one branch, `decimal` in the other (each column records
+    // its SQL Server type), and a literal (not nullable) where the other
+    // branch reads a nullable column: `CREATE TABLE AS` writes every row.
+    let union = "SELECT 'vendas' AS tabela, grupo, true AS critico, TIMESTAMP '2026-01-01 00:00:00.000' AS medido, \
+                 CAST(valor AS decimal(18,6)) AS valor FROM erp1.dbo.vendas \
+                 UNION ALL SELECT 'compras', grupo, false, TIMESTAMP '2026-01-02 00:00:00.000', \
+                 CAST(valor AS decimal(18,6)) FROM erp1.dbo.compras";
+    let expected = rows(&[
+        &["compras", "b", "false", "2026-01-02T00:00:00", "2.250000"],
+        &["vendas", "NULL", "true", "2026-01-01T00:00:00", "NULL"],
+        &["vendas", "a", "true", "2026-01-01T00:00:00", "10.500000"],
+    ]);
+    let sorted = |rows: Result<Rows, String>| {
+        rows.map(|mut rows| {
+            rows.sort();
+            rows
+        })
+    };
+    let selected = sorted(try_rows(&engine, union).await);
+    checks.check(
+        "9a UNION ALL of numeric and decimal branches returns every row",
+        selected.as_ref() == Ok(&expected),
+        format!("got={selected:?}"),
+    );
+    let _ = try_rows(&engine, "CREATE SCHEMA hive.u").await;
+    let created = try_rows(
+        &engine,
+        &format!("CREATE TABLE hive.u.conc WITH (format = 'PARQUET') AS {union}"),
+    )
+    .await;
+    let stored = sorted(try_rows(&engine, "SELECT * FROM hive.u.conc").await);
+    checks.check(
+        "9b CREATE TABLE AS of that UNION ALL writes every row",
+        created.as_ref() == Ok(&rows(&[&["3"]])) && stored.as_ref() == Ok(&expected),
+        format!("created={created:?} stored={stored:?}"),
+    );
+    let inserted = try_rows(&engine, &format!("INSERT INTO hive.u.conc {union}")).await;
+    let count = try_rows(&engine, "SELECT count(*), count(valor) FROM hive.u.conc").await;
+    checks.check(
+        "9c INSERT of that UNION ALL writes every row",
+        inserted.as_ref() == Ok(&rows(&[&["3"]])) && count.as_ref() == Ok(&rows(&[&["6", "4"]])),
+        format!("inserted={inserted:?} count={count:?}"),
     );
 
     checks.finish(&format!("F1 audit: wrong results on SQL Server {tag}"));
