@@ -268,9 +268,10 @@ fn sql_type(field: &Field) -> String {
             format!("array({})", sql_type(element))
         }
         DataType::Map(entries, _) => match entries.data_type() {
-            DataType::Struct(fields) if fields.len() == 2 => {
-                format!("map({}, {})", sql_type(&fields[0]), sql_type(&fields[1]))
-            }
+            DataType::Struct(fields) => match &fields[..] {
+                [key, value] => format!("map({}, {})", sql_type(key), sql_type(value)),
+                _ => display_name(field.data_type()),
+            },
             _ => display_name(field.data_type()),
         },
         DataType::Struct(fields) => {
@@ -386,7 +387,11 @@ mod tests {
                 "entries",
                 DataType::Struct(Fields::from(vec![
                     Field::new("key", DataType::Utf8, false),
-                    Field::new("value", DataType::new_list(DataType::Int32, true), true),
+                    Field::new(
+                        "value",
+                        DataType::new_list(DataType::Decimal128(12, 2), true),
+                        true,
+                    ),
                 ])),
                 false,
             )),
@@ -407,7 +412,7 @@ mod tests {
                 Field::new("a", DataType::new_list(row, true), true),
                 "array(ROW(x decimal(12, 2), \"y z\" varchar))",
             ),
-            (Field::new("m", map, true), "map(varchar, array(integer))"),
+            (Field::new("m", map, true), "map(varchar, array(decimal(12, 2)))"),
             (
                 Field::new(
                     "tz",
