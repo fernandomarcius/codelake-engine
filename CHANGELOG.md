@@ -207,6 +207,21 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- Found running the daily receipts reports against the reference engine on the same SQL Server catalogs
+  (2026-09-29):
+  - **Wrong result**: a grouping federated alone (below a join the engine keeps, as the decorrelated
+    scalar subquery of an aggregated `SELECT` puts above it) was sent as `SELECT count(1), k … GROUP BY k`,
+    aggregates before groups, and read by position: every group came back as `(count, key)`
+    (`count(DISTINCT k)` 99 instead of 184). It is now sent with its groups first.
+  - An aggregation over a derived table that computes a column (`SELECT count(DISTINCT o.k) FROM (SELECT
+    o.k, count(*) c … GROUP BY o.k)`) failed on SQL Server (`The multi-part identifier "o.k" could not be
+    bound`): it runs in the engine, the inner grouping still reaches the source.
+  - A filter of an aliased table (`FROM t o WHERE o.c = 1`) sent alone or under a grouping named the table
+    instead of the alias (`could not be bound`); it names the alias.
+  - `UNNEST(...)` joined with a federated table failed (`Assertion failed: expr.is_empty()`).
+  - A scalar subquery correlated by an expression (`DATE(r.paid_at) = date(o.day)`), in `SELECT`, `WHERE` or
+    `HAVING`, failed (`Physical plan does not support logical expression ScalarSubquery`): the expression is
+    computed as a column of the subquery and decorrelated like a plain one.
 - Found by the shadow run on production routines (2026-09-29):
   - `max_by`/`min_by` (and the `n` form) accept a row or an array as the key (`FUNCTION_NOT_FOUND`
     before), as the reference orders them: rows field by field, arrays element by element with a prefix

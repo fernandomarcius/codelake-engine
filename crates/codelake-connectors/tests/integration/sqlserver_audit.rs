@@ -228,8 +228,18 @@ fn remote_sqls(plan: &str) -> Vec<String> {
 }
 
 fn sqlserver_connector(host: &str, port: u16, database: &str, pool_size: u32) -> Arc<SqlServerConnector> {
+    sqlserver_catalog("erp1", host, port, database, pool_size)
+}
+
+fn sqlserver_catalog(
+    name: &str,
+    host: &str,
+    port: u16,
+    database: &str,
+    pool_size: u32,
+) -> Arc<SqlServerConnector> {
     Arc::new(SqlServerConnector::new(
-        "erp1".into(),
+        name.into(),
         SqlServerParams {
             host: host.to_owned(),
             port,
@@ -1208,4 +1218,331 @@ async fn pre_evaluation(tag: &str) {
 #[tokio::test]
 async fn sqlserver_audit_pre_evaluation_2022() {
     pre_evaluation("2022-latest").await;
+}
+
+// ---------------------------------------------------------------------------
+// Item 12: subqueries and aggregations of the daily receipts reports, with
+// the reference engine's answers.
+// ---------------------------------------------------------------------------
+
+async fn seed_reports(host: &str, port: u16) {
+    exec(
+        host,
+        port,
+        "master",
+        "CREATE DATABASE Rel; CREATE DATABASE Rel1; CREATE DATABASE Rel2",
+    )
+    .await;
+    // Operation k (1..20) has k % 4 + 1 versions, one per day from 2026-09-02,
+    // on work k % 3: 50 rows. The count of a group is never its key, so a
+    // count read as the key (or the reverse) changes the answers.
+    exec(
+        host,
+        port,
+        "Rel",
+        "CREATE TABLE dbo.operacao (id INT IDENTITY PRIMARY KEY, operacaoid INT NOT NULL,
+           obraid INT NOT NULL, nome VARCHAR(40) NULL, dataregistro DATETIME2(3) NULL);
+         WITH n AS (SELECT TOP 20 ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS k FROM sys.objects)
+         INSERT INTO dbo.operacao (operacaoid, obraid, nome, dataregistro)
+         SELECT a.k, a.k % 3, CONCAT('op', a.k), DATEADD(day, b.k, '2026-09-01')
+         FROM n a JOIN n b ON b.k <= a.k % 4 + 1;
+         CREATE TABLE dbo.recebimentodiariomanual (id INT IDENTITY PRIMARY KEY, operacaoid INT NOT NULL,
+           valorrecebimento DECIMAL(18,2) NULL, datarecebimento DATETIME2(3) NULL, deleted BIT NOT NULL);
+         WITH n AS (SELECT TOP 10 ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS k FROM sys.objects)
+         INSERT INTO dbo.recebimentodiariomanual (operacaoid, valorrecebimento, datarecebimento, deleted)
+         SELECT a.k, 10.50 * b.k, DATEADD(hour, 10, DATEADD(day, b.k, '2026-09-01')),
+                CASE WHEN b.k = 3 THEN 1 ELSE 0 END
+         FROM n a CROSS JOIN (VALUES (1), (2), (3)) b(k);",
+    )
+    .await;
+    for (database, values) in [
+        (
+            "Rel1",
+            "(1, 1, '2026-09-02 08:00', 100), (1, 1, '2026-09-03', 50), (2, 2, '2026-09-02', 70), \
+             (0, 3, '2026-09-04', 30)",
+        ),
+        ("Rel2", "(2, 2, '2026-09-03', 20), (1, 4, '2026-09-02', 40)"),
+    ] {
+        exec(
+            host,
+            port,
+            database,
+            &format!(
+                "CREATE TABLE dbo.vd_recebidas (id INT IDENTITY PRIMARY KEY, obraid INT NOT NULL,
+                   operacaoid INT NOT NULL, data_rec DATETIME NULL, valor DECIMAL(18,2) NULL);
+                 INSERT INTO dbo.vd_recebidas (obraid, operacaoid, data_rec, valor) VALUES {values};"
+            ),
+        )
+        .await;
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one audit item per block, read top to bottom"
+)]
+async fn report_subqueries(tag: &str) {
+    let mut checks = Checks::new();
+    let mssql = start_mssql(tag).await;
+    let host = common::host();
+    let port = mssql.get_host_port_ipv4(1433).await.unwrap();
+    seed_reports(&host, port).await;
+    let spill = tempfile::tempdir().unwrap();
+    let mut engine = common::engine(spill.path());
+    for (catalog, database) in [("warehouse", "Rel"), ("erp1", "Rel1"), ("erp2", "Rel2")] {
+        common::attach(
+            &mut engine,
+            sqlserver_catalog(catalog, &host, port, database, 4) as Arc<dyn Connector>,
+        )
+        .await;
+    }
+    let direct_counts = direct(
+        &host,
+        port,
+        "Rel",
+        "SELECT CAST(count(*) AS BIGINT), CAST(count(DISTINCT operacaoid) AS BIGINT) FROM dbo.operacao",
+    )
+    .await;
+    checks.check(
+        "12 seed: 50 versions of 20 operations",
+        direct_counts == rows(&[&["50", "20"]]),
+        format!("direct={direct_counts:?}"),
+    );
+
+    // --- A scalar subquery in an aggregated SELECT (wrong result) ---------
+    // The decorrelated subquery keeps the join above the grouping in the
+    // engine, and the grouping alone reaches SQL Server: its SELECT listed
+    // the count before the key, the engine read them by position, and each
+    // group came back as (count, key).
+    let manual = "SELECT o.operacaoid, count(*) n, \
+         coalesce((SELECT sum(valorrecebimento) FROM warehouse.dbo.recebimentodiariomanual r \
+                   WHERE r.operacaoid = o.operacaoid AND r.deleted = false), 0) s \
+         FROM warehouse.dbo.operacao o GROUP BY o.operacaoid";
+    let totals = format!("SELECT count(*), count(DISTINCT operacaoid), sum(n) FROM ({manual})");
+    let got = try_rows(&engine, &totals).await;
+    checks.check(
+        "12a scalar subquery in an aggregated SELECT: 20 groups, 20 keys, 50 rows",
+        got.as_ref() == Ok(&rows(&[&["20", "20", "50"]])),
+        format!("got={got:?}"),
+    );
+    let groups = try_rows(&engine, &format!("{manual} ORDER BY 1")).await;
+    let expected: Rows = (1..=20)
+        .map(|k| {
+            vec![
+                k.to_string(),
+                (k % 4 + 1).to_string(),
+                if k <= 10 { "31.50" } else { "0.00" }.to_owned(),
+            ]
+        })
+        .collect();
+    let plan = physical_plan(&engine, &totals).await;
+    let remote = plan.as_deref().map(remote_sqls).unwrap_or_default();
+    checks.check(
+        "12b every group with its own count and manual amount; the grouping sent lists its key first",
+        groups.as_ref() == Ok(&expected)
+            && remote
+                .iter()
+                .any(|s| s.starts_with("SELECT [o].[operacaoid], COUNT_BIG(1)")),
+        format!("got={groups:?} remote={remote:?}"),
+    );
+
+    // --- An aggregation over an aggregated derived table ------------------
+    let nested = "SELECT count(*), count(DISTINCT operacaoid), sum(c) FROM \
+         (SELECT o.operacaoid, count(*) c FROM warehouse.dbo.operacao o GROUP BY o.operacaoid)";
+    let got = try_rows(&engine, nested).await;
+    checks.check(
+        "12c aggregation over an aggregated derived table (no unbound multi-part identifier)",
+        got.as_ref() == Ok(&rows(&[&["20", "20", "50"]])),
+        format!("got={got:?}"),
+    );
+    for (label, sql, expected) in [
+        (
+            "12d the inner grouping still reaches SQL Server with its HAVING",
+            "SELECT count(*) FROM (SELECT o.operacaoid, count(*) c FROM warehouse.dbo.operacao o \
+             GROUP BY o.operacaoid) WHERE c > 3",
+            rows(&[&["5"]]),
+        ),
+        (
+            "12e max over an aggregated derived table",
+            "SELECT max(c) FROM (SELECT o.obraid, count(*) c FROM warehouse.dbo.operacao o GROUP BY o.obraid)",
+            rows(&[&["17"]]),
+        ),
+        (
+            "12f DISTINCT over a derived table of an aliased, filtered table",
+            "SELECT DISTINCT obraid FROM (SELECT o.operacaoid, o.obraid FROM warehouse.dbo.operacao o \
+             WHERE o.obraid = 1) ORDER BY 1",
+            rows(&[&["1"]]),
+        ),
+        (
+            "12g count of an aliased table filtered through its alias",
+            "SELECT count(*) FROM warehouse.dbo.operacao o WHERE o.obraid = 1",
+            rows(&[&["17"]]),
+        ),
+        (
+            "12h an aliased table filtered through its alias, with TOP",
+            "SELECT o.obraid FROM warehouse.dbo.operacao o WHERE o.obraid = 1 LIMIT 2",
+            rows(&[&["1"], &["1"]]),
+        ),
+    ] {
+        let got = try_rows(&engine, sql).await;
+        let plan = physical_plan(&engine, sql).await;
+        let remote = plan.as_deref().map(remote_sqls).unwrap_or_default();
+        checks.check(
+            label,
+            got.as_ref() == Ok(&expected)
+                && remote
+                    .iter()
+                    .all(|s| !s.contains("[operacao].[") && !s.contains("derived_projection")),
+            format!("got={got:?} remote={remote:?}"),
+        );
+    }
+
+    // --- UNNEST beside a remote table --------------------------------------
+    let days = "WITH d AS (SELECT dia FROM UNNEST(sequence(DATE '2026-09-01', DATE '2026-09-05', \
+         interval '1' day)) AS t(dia))";
+    for (label, sql, expected) in [
+        (
+            "12i UNNEST(sequence(...)) joined ON true with a remote table",
+            format!("{days} SELECT count(*) FROM d INNER JOIN warehouse.dbo.operacao o ON true"),
+            rows(&[&["250"]]),
+        ),
+        (
+            "12j UNNEST(sequence(...)) LEFT JOIN a remote table on a column",
+            format!(
+                "{days} SELECT d.dia, count(o.operacaoid) FROM d LEFT JOIN warehouse.dbo.operacao o \
+                 ON CAST(o.dataregistro AS date) = d.dia GROUP BY 1 ORDER BY 1"
+            ),
+            rows(&[
+                &["2026-09-01", "0"],
+                &["2026-09-02", "20"],
+                &["2026-09-03", "15"],
+                &["2026-09-04", "10"],
+                &["2026-09-05", "5"],
+            ]),
+        ),
+        (
+            "12k UNNEST(ARRAY[...]) joined with a remote table on its key",
+            "SELECT x, count(*) FROM UNNEST(ARRAY[1, 2, 3]) AS t(x) JOIN warehouse.dbo.operacao o \
+             ON o.operacaoid = t.x GROUP BY 1 ORDER BY 1"
+                .to_owned(),
+            rows(&[&["1", "2"], &["2", "3"], &["3", "4"]]),
+        ),
+    ] {
+        let got = try_rows(&engine, &sql).await;
+        checks.check(label, got.as_ref() == Ok(&expected), format!("got={got:?}"));
+    }
+
+    // --- Correlated by an expression of the group's keys --------------------
+    let base = "WITH base AS (SELECT obraid, operacaoid, data_rec, valor FROM erp1.dbo.vd_recebidas \
+         UNION ALL SELECT obraid, operacaoid, data_rec, valor FROM erp2.dbo.vd_recebidas)";
+    for (label, sql, expected) in [
+        (
+            "12l scalar subquery correlated by DATE() of a group key",
+            "SELECT o.operacaoid, CAST(o.dataregistro AS date) d, count(*) n, \
+             coalesce((SELECT sum(valorrecebimento) FROM warehouse.dbo.recebimentodiariomanual \
+                       WHERE operacaoid = o.operacaoid AND DATE(datarecebimento) = date(o.dataregistro) \
+                       AND deleted = false), 0) m \
+             FROM warehouse.dbo.operacao o GROUP BY o.operacaoid, o.dataregistro ORDER BY 1, 2 LIMIT 4"
+                .to_owned(),
+            rows(&[
+                &["1", "2026-09-02", "1", "10.50"],
+                &["1", "2026-09-03", "1", "21.00"],
+                &["2", "2026-09-02", "1", "10.50"],
+                &["2", "2026-09-03", "1", "21.00"],
+            ]),
+        ),
+        (
+            "12m the same over a UNION ALL of two catalogs, the outer column unqualified",
+            format!(
+                "{base} SELECT c.operacaoid, c.data_rec, sum(valor) v, \
+                 coalesce((SELECT sum(valorrecebimento) FROM warehouse.dbo.recebimentodiariomanual \
+                           WHERE operacaoid = c.operacaoid AND DATE(datarecebimento) = date(data_rec) \
+                           AND deleted = false), 0) m \
+                 FROM base c GROUP BY 1, 2 ORDER BY 1, 2"
+            ),
+            rows(&[
+                &["1", "2026-09-02T08:00:00", "100.00", "10.50"],
+                &["1", "2026-09-03T00:00:00", "50.00", "21.00"],
+                &["2", "2026-09-02T00:00:00", "70.00", "10.50"],
+                &["2", "2026-09-03T00:00:00", "20.00", "21.00"],
+                &["3", "2026-09-04T00:00:00", "30.00", "0.00"],
+                &["4", "2026-09-02T00:00:00", "40.00", "10.50"],
+            ]),
+        ),
+        (
+            // The report's shape: a CTE deduplicated by ROW_NUMBER, LEFT JOIN,
+            // NOT EXISTS correlated by DATE(), GROUP BY by position and name.
+            "12n the daily receipts report shape",
+            format!(
+                "{base}, operacao AS (SELECT * FROM (SELECT p.*, ROW_NUMBER() OVER \
+                   (PARTITION BY operacaoid ORDER BY dataregistro DESC) rn FROM warehouse.dbo.operacao p \
+                   WHERE dataregistro <= CURRENT_TIMESTAMP) t WHERE rn = 1) \
+                 SELECT op.operacaoid AS operacaoid, c.obraid AS obraid, op.nome, c.data_rec, \
+                   sum(c.valor) AS valorrecebidodia, \
+                   coalesce((SELECT sum(valorrecebimento) FROM warehouse.dbo.recebimentodiariomanual \
+                             WHERE operacaoid = op.operacaoId AND DATE(datarecebimento) = date(data_rec) \
+                             AND deleted = false), 0) AS valormanual \
+                 FROM base c LEFT JOIN operacao op ON op.operacaoid = c.operacaoid \
+                 WHERE NOT EXISTS (SELECT 1 FROM warehouse.dbo.recebimentodiariomanual d \
+                   WHERE d.operacaoid = op.operacaoid AND d.deleted = true \
+                   AND DATE(d.datarecebimento) = date(c.data_rec)) \
+                 GROUP BY 1, 2, 3, data_rec, 4 ORDER BY op.operacaoid, c.obraid, data_rec"
+            ),
+            rows(&[
+                &["1", "1", "op1", "2026-09-02T08:00:00", "100.00", "10.50"],
+                &["1", "1", "op1", "2026-09-03T00:00:00", "50.00", "21.00"],
+                &["2", "2", "op2", "2026-09-02T00:00:00", "70.00", "10.50"],
+                &["2", "2", "op2", "2026-09-03T00:00:00", "20.00", "21.00"],
+                &["4", "1", "op4", "2026-09-02T00:00:00", "40.00", "10.50"],
+            ]),
+        ),
+        (
+            "12o scalar subquery correlated by an expression in WHERE",
+            "SELECT o.operacaoid, o.dataregistro FROM warehouse.dbo.operacao o \
+             WHERE 20 < (SELECT sum(valorrecebimento) FROM warehouse.dbo.recebimentodiariomanual r \
+                         WHERE r.operacaoid = o.operacaoid AND DATE(r.datarecebimento) = date(o.dataregistro)) \
+             ORDER BY 1, 2 LIMIT 3"
+                .to_owned(),
+            rows(&[
+                &["1", "2026-09-03T00:00:00"],
+                &["2", "2026-09-03T00:00:00"],
+                &["2", "2026-09-04T00:00:00"],
+            ]),
+        ),
+        (
+            "12p HAVING against a count correlated by an expression",
+            "SELECT o.operacaoid, count(*) n FROM warehouse.dbo.operacao o GROUP BY o.operacaoid \
+             HAVING count(*) > (SELECT count(*) FROM warehouse.dbo.recebimentodiariomanual r \
+                                WHERE r.operacaoid + 0 = o.operacaoid AND r.deleted = false) \
+             ORDER BY 1 LIMIT 3"
+                .to_owned(),
+            rows(&[&["2", "3"], &["3", "4"], &["6", "3"]]),
+        ),
+        (
+            "12q EXISTS correlated by DATE() with a grouping",
+            "SELECT o.operacaoid, count(*) FROM warehouse.dbo.operacao o WHERE EXISTS \
+             (SELECT 1 FROM warehouse.dbo.recebimentodiariomanual r WHERE r.operacaoid = o.operacaoid \
+              AND DATE(r.datarecebimento) = date(o.dataregistro)) GROUP BY 1 ORDER BY 1 LIMIT 3"
+                .to_owned(),
+            rows(&[&["1", "2"], &["2", "3"], &["3", "3"]]),
+        ),
+        (
+            "12r IN of DATE() correlated with a grouping",
+            "SELECT o.operacaoid, count(*) FROM warehouse.dbo.operacao o WHERE DATE(o.dataregistro) IN \
+             (SELECT DATE(r.datarecebimento) FROM warehouse.dbo.recebimentodiariomanual r \
+              WHERE r.operacaoid = o.operacaoid AND r.deleted = false) GROUP BY 1 ORDER BY 1 LIMIT 3"
+                .to_owned(),
+            rows(&[&["1", "2"], &["2", "2"], &["3", "2"]]),
+        ),
+    ] {
+        let got = try_rows(&engine, &sql).await;
+        checks.check(label, got.as_ref() == Ok(&expected), format!("got={got:?}"));
+    }
+
+    checks.finish(&format!("F1 audit: report subqueries on SQL Server {tag}"));
+}
+
+#[tokio::test]
+async fn sqlserver_audit_report_subqueries_2022() {
+    report_subqueries("2022-latest").await;
 }
