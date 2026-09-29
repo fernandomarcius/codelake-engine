@@ -1619,6 +1619,7 @@ mod tests {
             Greater
         );
         assert_eq!(order(&large(&[Some(1)]), &large(&[Some(1), Some(5)]), true), Less);
+        assert!(refusal(&large(&[Some(1), None]), &large(&[Some(1), Some(5)])).contains("ARRAY comparison"));
         let fixed = |values: &[Option<i32>]| {
             ScalarValue::FixedSizeList(Arc::new(
                 datafusion::arrow::array::FixedSizeListArray::from_iter_primitive::<
@@ -1636,6 +1637,7 @@ mod tests {
             order(&fixed(&[Some(1), Some(4)]), &fixed(&[Some(1), Some(3)]), true),
             Greater
         );
+        assert!(refusal(&fixed(&[Some(1), None]), &fixed(&[Some(1), Some(3)])).contains("ARRAY comparison"));
     }
 
     #[test]

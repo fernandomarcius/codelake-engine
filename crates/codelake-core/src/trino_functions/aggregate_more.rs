@@ -1415,6 +1415,35 @@ mod tests {
     }
 
     #[test]
+    fn top_n_merges_row_keys_from_another_state() {
+        let y_type = row(0, None).data_type();
+        let mut partial = ByNAccumulator::new(2, true, DataType::Int64, y_type.clone());
+        for (x, y) in [(1, row(1, Some(2))), (2, row(0, Some(9)))] {
+            partial.offer(ScalarValue::Int64(Some(x)), y).unwrap();
+        }
+        let state: Vec<ArrayRef> = partial
+            .state()
+            .unwrap()
+            .iter()
+            .map(|s| s.to_array().unwrap())
+            .collect();
+        let mut merged = ByNAccumulator::new(2, true, DataType::Int64, y_type.clone());
+        merged
+            .offer(ScalarValue::Int64(Some(3)), row(1, Some(3)))
+            .unwrap();
+        merged.merge_batch(&state).unwrap();
+        assert_eq!(
+            kept(&merged),
+            vec![ScalarValue::Int64(Some(3)), ScalarValue::Int64(Some(1))]
+        );
+        // A kept key with a NULL field the merged one reaches is refused.
+        let mut refusing = ByNAccumulator::new(2, true, DataType::Int64, y_type);
+        refusing.offer(ScalarValue::Int64(Some(4)), row(1, None)).unwrap();
+        let error = refusing.merge_batch(&state).unwrap_err().to_string();
+        assert!(error.contains("NOT_SUPPORTED: ROW comparison"), "{error}");
+    }
+
+    #[test]
     fn top_n_refuses_a_null_field_it_has_to_compare() {
         let mut acc = ByNAccumulator::new(2, true, DataType::Int64, row(0, None).data_type());
         acc.offer(ScalarValue::Int64(Some(1)), row(1, None)).unwrap();
