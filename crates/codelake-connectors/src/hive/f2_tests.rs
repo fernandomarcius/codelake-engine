@@ -892,3 +892,41 @@ async fn an_insert_that_cannot_commit_leaves_no_file() {
     assert_eq!(before.len(), after.len(), "{after:?}");
     assert_eq!(lake.ok("SELECT v FROM hive.s.t").await, rows(&[&["1"]]));
 }
+
+// ---------------------------------------------------------------------------
+// SHOW CREATE
+// ---------------------------------------------------------------------------
+
+/// A table shows its storage format as `WITH (format = …)`, none when the
+/// metadata records none; a view its `SECURITY` mode.
+#[tokio::test]
+async fn show_create_prints_the_format_and_the_view_security() {
+    let lake = lake().await;
+    lake.ok("CREATE TABLE hive.s.t (id bigint, ts timestamp) WITH (format = 'PARQUET')")
+        .await;
+    lake.ok("CREATE VIEW hive.s.d AS SELECT id FROM hive.s.t").await;
+    lake.ok("CREATE VIEW hive.s.i SECURITY INVOKER AS SELECT id FROM hive.s.t")
+        .await;
+    let columns = "CREATE TABLE hive.s.t (\n   id bigint,\n   ts timestamp(3)\n)";
+    assert_eq!(
+        lake.ok("SHOW CREATE TABLE hive.s.t").await,
+        rows(&[&[&format!("{columns}\nWITH (\n   format = 'PARQUET'\n)")]])
+    );
+    for (view, security) in [("d", "DEFINER"), ("i", "INVOKER")] {
+        assert_eq!(
+            lake.ok(&format!("SHOW CREATE VIEW hive.s.{view}")).await,
+            rows(&[&[&format!(
+                "CREATE VIEW hive.s.{view} SECURITY {security} AS\nSELECT id\nFROM\n  hive.s.t"
+            )]])
+        );
+    }
+    lake.patch("t", |metadata| {
+        metadata.as_object_mut().unwrap().remove("storageFormat");
+    });
+    assert_eq!(lake.ok("SHOW CREATE TABLE hive.s.t").await, rows(&[&[columns]]));
+    assert!(
+        lake.err("SHOW CREATE TABLE hive.s.d")
+            .await
+            .contains("Relation 'hive.s.d' is a view, not a table")
+    );
+}

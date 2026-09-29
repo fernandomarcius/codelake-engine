@@ -964,3 +964,58 @@ async fn sqlserver_acceptance_case_sensitive_2019() {
 async fn sqlserver_acceptance_case_sensitive_2022() {
     case_sensitive_database("2022-latest").await;
 }
+
+/// `SHOW CREATE TABLE` of a SQL Server table: columns as the catalog exposes
+/// them, `NOT NULL` where SQL Server refuses nulls, and no `WITH` clause (the
+/// source has no table properties). A `CHAR(n)` column is exposed as
+/// `varchar`, in `DESCRIBE` as here, so the key is a `VARCHAR(36)`.
+async fn show_create_table(tag: &str) {
+    let mut checks = Checks::new(Scope::Rows);
+    let mssql = start_mssql(tag, false).await;
+    let host = common::host();
+    let port = mssql.get_host_port_ipv4(1433).await.unwrap();
+    exec(&host, port, "master", "CREATE DATABASE Cadastro").await;
+    exec(
+        &host,
+        port,
+        "Cadastro",
+        "CREATE TABLE dbo.Bancos (Id VARCHAR(36) NOT NULL PRIMARY KEY, BancoId VARCHAR(50) NOT NULL, \
+         GestorId INT NULL, DataRegistro DATETIME2(3) NOT NULL, Deleted BIT NULL, _sink_loaded_at DATETIME2(3) NULL);",
+    )
+    .await;
+    let spill = tempfile::tempdir().unwrap();
+    let mut engine = common::engine(spill.path());
+    let attached = engine
+        .attach(
+            sqlserver_connector(&host, port, "Cadastro") as Arc<dyn Connector>,
+            true,
+            common::ATTACH_TIMEOUT,
+        )
+        .await;
+    let shown = match attached {
+        Ok(_) => try_rows(&engine, "SHOW CREATE TABLE erp1.dbo.bancos").await,
+        Err(e) => Err(format!("attach: {e}")),
+    };
+    let expected = "CREATE TABLE erp1.dbo.bancos (\n   id varchar(36) NOT NULL,\n   bancoid varchar(50) NOT NULL,\n   \
+                    gestorid integer,\n   dataregistro timestamp(3) NOT NULL,\n   deleted boolean,\n   \
+                    _sink_loaded_at timestamp(3)\n)";
+    checks.check(
+        "SC1 SHOW CREATE TABLE marks NOT NULL columns and has no WITH clause",
+        shown.as_ref() == Ok(&rows(&[&[expected]])),
+        format!("{shown:?}"),
+    );
+    let missing = try_rows(&engine, "SHOW CREATE TABLE erp1.dbo.nope").await;
+    checks.check(
+        "SC2 SHOW CREATE TABLE of a missing table fails",
+        missing
+            .as_ref()
+            .is_err_and(|e| e.contains("Table 'erp1.dbo.nope' does not exist")),
+        format!("{missing:?}"),
+    );
+    checks.finish(&format!("SHOW CREATE TABLE on SQL Server {tag}"));
+}
+
+#[tokio::test]
+async fn sqlserver_acceptance_show_create_table_2022() {
+    show_create_table("2022-latest").await;
+}

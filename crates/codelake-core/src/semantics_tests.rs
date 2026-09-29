@@ -1006,3 +1006,89 @@ async fn case_and_coalesce_of_text_declare_the_common_type() {
     )
     .await;
 }
+
+/// `SHOW CREATE TABLE` and `SHOW CREATE VIEW` answer one `varchar(n)` row,
+/// as the reference engine answers the same statements (its `memory`
+/// catalog refuses `NOT NULL`); a relation of the other kind or none at all
+/// fails.
+#[tokio::test]
+async fn relations_show_the_statement_that_creates_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    for statement in [
+        "CREATE SCHEMA datafusion.sc",
+        "CREATE TABLE datafusion.sc.t (id bigint NOT NULL, dc decimal(12,3), \"from\" varchar(10))",
+        "CREATE VIEW datafusion.sc.v AS SELECT id, dc * 2 AS dc2 FROM datafusion.sc.t WHERE id > 1",
+    ] {
+        run(&engine, statement).await;
+    }
+    let table = "CREATE TABLE datafusion.sc.t (\n   id bigint NOT NULL,\n   dc decimal(12, 3),\n   \
+                 \"from\" varchar(10)\n)";
+    let view = "CREATE VIEW datafusion.sc.v SECURITY DEFINER AS\nSELECT\n  id\n, (dc * 2) dc2\nFROM\n  \
+                datafusion.sc.t\nWHERE (id > 1)";
+    let length = |text: &str| format!("varchar({})", text.chars().count());
+    assert_same(
+        &engine,
+        &[
+            (
+                "SHOW CREATE TABLE datafusion.sc.t",
+                answer(&[&length(table)], &[&[table]]),
+            ),
+            (
+                "show create table \"datafusion\".SC.T",
+                answer(&[&length(table)], &[&[table]]),
+            ),
+            (
+                "SHOW CREATE VIEW datafusion.sc.v",
+                answer(&[&length(view)], &[&[view]]),
+            ),
+        ],
+    )
+    .await;
+    let options = QueryOptions {
+        catalog: Some("datafusion".into()),
+        schema: Some("sc".into()),
+        ..QueryOptions::for_user("test")
+    };
+    let frame = engine.sql_with(&options, "SHOW CREATE TABLE t").await.unwrap();
+    let batches = frame.collect().await.unwrap();
+    assert_eq!(batches[0].schema().field(0).name(), "Create Table");
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap()
+            .value(0),
+        table
+    );
+    for (sql, message) in [
+        (
+            "SHOW CREATE TABLE datafusion.sc.v",
+            "Relation 'datafusion.sc.v' is a view, not a table",
+        ),
+        (
+            "SHOW CREATE VIEW datafusion.sc.t",
+            "Relation 'datafusion.sc.t' is a table, not a view",
+        ),
+        (
+            "SHOW CREATE TABLE datafusion.sc.nope",
+            "Table 'datafusion.sc.nope' does not exist",
+        ),
+        (
+            "SHOW CREATE TABLE datafusion.nope.t",
+            "Table 'datafusion.nope.t' does not exist",
+        ),
+        (
+            "SHOW CREATE TABLE nocat.sc.t",
+            "Table 'nocat.sc.t' does not exist",
+        ),
+        (
+            "SHOW CREATE VIEW datafusion.sc.nope",
+            "View 'datafusion.sc.nope' does not exist",
+        ),
+        ("SHOW CREATE VIEW nocat.sc.v", "View 'nocat.sc.v' does not exist"),
+    ] {
+        assert_error(&engine, sql, message).await;
+    }
+}

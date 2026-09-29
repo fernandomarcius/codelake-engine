@@ -1055,6 +1055,18 @@ impl Engine {
             }) => {
                 return traced(Phase::Execute, self.rename(ctx, *kind, from, to, *if_exists)).await;
             }
+            Some(Prepared::ShowCreateTable(table)) => {
+                let (catalog, schema, name) = Self::resolve(ctx, table);
+                let writable = self.writable(&catalog);
+                let show = crate::show_create::create_table(ctx, [&catalog, &schema, &name], writable);
+                return traced(Phase::Execute, show).await;
+            }
+            Some(Prepared::ShowCreateView(view)) => {
+                let (catalog, schema, name) = Self::resolve(ctx, view);
+                let writable = self.writable(&catalog);
+                let show = crate::show_create::create_view(ctx, [&catalog, &schema, &name], writable);
+                return traced(Phase::Execute, show).await;
+            }
             Some(Prepared::View { .. }) | None => {}
         }
         let plan = traced(Phase::Plan, state.statement_to_plan(statement)).await?;
@@ -2865,6 +2877,14 @@ mod tests {
                 None,
             );
             schema.register_table("v".into(), Arc::new(view)).unwrap();
+            let defined = datafusion::catalog::view::ViewTable::new(
+                LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
+                    produce_one_row: true,
+                    schema: Arc::new(datafusion::common::DFSchema::empty()),
+                }),
+                Some("SELECT 1 AS x".into()),
+            );
+            schema.register_table("w".into(), Arc::new(defined)).unwrap();
             let catalog = MemoryCatalogProvider::new();
             catalog.register_schema("raw", Arc::new(schema)).unwrap();
             catalog
@@ -2937,6 +2957,35 @@ mod tests {
             );
         }
         assert_eq!(recorder.calls.lock().unwrap().len(), 5);
+    }
+
+    /// A writable catalog without table properties or view security of its
+    /// own: no `WITH` clause, `DEFINER` views.
+    #[tokio::test]
+    async fn writable_catalogs_show_create_with_the_defaults() {
+        use datafusion::arrow::array::AsArray;
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        engine
+            .attach(Arc::new(WritableSource(Arc::default())), true, FAST)
+            .await
+            .unwrap();
+        for (sql, expected) in [
+            (
+                "SHOW CREATE TABLE lake.raw.t",
+                "CREATE TABLE lake.raw.t (\n   a bigint\n)",
+            ),
+            (
+                "SHOW CREATE VIEW lake.raw.w",
+                "CREATE VIEW lake.raw.w SECURITY DEFINER AS\nSELECT 1 x",
+            ),
+        ] {
+            let batches = run(&engine, sql).await.unwrap();
+            let text = batches[0].column(0).as_string::<i32>().value(0).to_owned();
+            assert_eq!(text, expected, "{sql}");
+        }
+        let error = message(run(&engine, "SHOW CREATE VIEW lake.raw.v").await);
+        assert!(error.contains("View 'lake.raw.v' has no definition"), "{error}");
     }
 
     #[tokio::test]

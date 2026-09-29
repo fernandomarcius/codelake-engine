@@ -40,6 +40,7 @@ pub mod runtime;
 mod semantics_tests;
 pub mod session_properties;
 mod set_operations;
+mod show_create;
 pub mod statement_policy;
 pub mod statistics_guard;
 pub mod subquery;
