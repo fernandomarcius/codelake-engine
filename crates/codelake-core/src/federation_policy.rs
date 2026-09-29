@@ -72,7 +72,59 @@ fn federate_prepared(
     policy: &dyn PushdownPolicy,
     planner: &Arc<dyn FederationPlanner>,
 ) -> Result<LogicalPlan> {
-    Ok(federate(policy.prepare(unmark_supersets(plan)?)?, planner))
+    let prepared = policy.prepare(unmark_supersets(plan)?)?;
+    Ok(federate(
+        with_select_list(aliased_scan_filters(prepared)?)?,
+        planner,
+    ))
+}
+
+/// An aggregation at the root of a sub-plan renders its aggregates before its
+/// groups (`SELECT count(1), k … GROUP BY k`), the reverse of its schema; the
+/// engine reads the source's columns by position, so each value would land
+/// in another column, without any error when the types cast. A projection of
+/// its columns renders them in schema order.
+fn with_select_list(plan: LogicalPlan) -> Result<LogicalPlan> {
+    if !matches!(plan, LogicalPlan::Aggregate(_)) {
+        return Ok(plan);
+    }
+    let columns = plan.schema().columns().into_iter().map(Expr::Column).collect();
+    Ok(LogicalPlan::Projection(Projection::try_new(
+        columns,
+        Arc::new(plan),
+    )?))
+}
+
+/// `FROM t AS r WHERE …` reaches here as filters between the alias and the
+/// scan that name the table, which the unparser renders as written
+/// (`FROM t AS [r] WHERE [t].[c] = 1`, "could not be bound"). As filters of
+/// the scan, it renders them against the alias.
+fn aliased_scan_filters(plan: LogicalPlan) -> Result<LogicalPlan> {
+    plan.transform_up(|node| {
+        let LogicalPlan::SubqueryAlias(aliased) = &node else {
+            return Ok(Transformed::no(node));
+        };
+        let mut filters = Vec::new();
+        let mut input = aliased.input.as_ref();
+        while let LogicalPlan::Filter(filter) = input {
+            filters.extend(split_conjunction_owned(filter.predicate.clone()));
+            input = filter.input.as_ref();
+        }
+        let LogicalPlan::TableScan(scan) = input else {
+            return Ok(Transformed::no(node));
+        };
+        if filters.is_empty() || scan.fetch.is_some() {
+            return Ok(Transformed::no(node));
+        }
+        let mut scan = scan.clone();
+        scan.filters.extend(filters);
+        let alias = aliased.alias.clone();
+        let scan = Arc::new(LogicalPlan::TableScan(scan));
+        Ok(Transformed::yes(LogicalPlan::SubqueryAlias(
+            SubqueryAlias::try_new(scan, alias)?,
+        )))
+    })
+    .data()
 }
 
 /// The superset filters of a sub-plan about to be sent to its source, as the
@@ -94,6 +146,7 @@ fn unmark_supersets(plan: LogicalPlan) -> Result<LogicalPlan> {
 
 fn fully_pushable(plan: &LogicalPlan, policy: &dyn PushdownPolicy) -> bool {
     !projection_over_projection(plan)
+        && !aggregate_over_derived_columns(plan)
         && policy.node_is_pushable(plan)
         && plan
             .inputs()
@@ -108,6 +161,23 @@ fn fully_pushable(plan: &LogicalPlan, policy: &dyn PushdownPolicy) -> bool {
 /// the lower one, with what is below it, still reaches the source.
 fn projection_over_projection(plan: &LogicalPlan) -> bool {
     matches!(plan, LogicalPlan::Projection(p) if matches!(p.input.as_ref(), LogicalPlan::Projection(_)))
+}
+
+/// An aggregation over a projection that computes a column renders the
+/// projection as a derived table, and the aggregation keeps naming the
+/// projection's other columns by their table (`SELECT count(DISTINCT [o].[k])
+/// FROM (SELECT [o].[k], count(1) AS [c] …) AS [derived_projection]`, "could
+/// not be bound"): the aggregation runs in the engine. A projection of plain
+/// columns is left to the policy's `prepare`, which can drop it.
+fn aggregate_over_derived_columns(plan: &LogicalPlan) -> bool {
+    let LogicalPlan::Aggregate(aggregate) = plan else {
+        return false;
+    };
+    let LogicalPlan::Projection(projection) = aggregate.input.as_ref() else {
+        return false;
+    };
+    !projection.expr.iter().all(|e| matches!(e, Expr::Column(_)))
+        && projection.schema.iter().any(|(qualifier, _)| qualifier.is_some())
 }
 
 fn split(
@@ -129,7 +199,7 @@ fn split(
         .map(|child| split(child, policy, planner))
         .collect::<Result<Vec<_>>>()?;
     // Runs in the engine: its arithmetic is checked again (see `crate::overflow`).
-    let local = without_local_supersets(plan.with_new_exprs(plan.expressions(), children)?)?;
+    let local = without_local_supersets(with_new_inputs(&plan, children)?)?;
     crate::overflow::check_local_node(local)
 }
 
@@ -344,7 +414,19 @@ fn prune(plan: LogicalPlan, needed: Needed, changed: &mut bool) -> Result<Logica
     if *changed == before {
         return Ok(plan);
     }
-    plan.with_new_exprs(plan.expressions(), inputs)
+    with_new_inputs(&plan, inputs)
+}
+
+/// `plan` over `inputs`, its expressions unchanged. An unnest lists the
+/// columns it expands among its expressions but takes none back
+/// (`with_new_exprs` asserts it gets none), so it is rebuilt from its inputs
+/// alone.
+fn with_new_inputs(plan: &LogicalPlan, inputs: Vec<LogicalPlan>) -> Result<LogicalPlan> {
+    let expressions = match plan {
+        LogicalPlan::Unnest(_) => Vec::new(),
+        _ => plan.expressions(),
+    };
+    plan.with_new_exprs(expressions, inputs)
 }
 
 /// The federated table scan `federated` (under filters, aliased or not)
@@ -937,6 +1019,267 @@ mod tests {
             panic!("expected a table scan");
         };
         assert!(bare.filters.is_empty());
+    }
+
+    /// Pushes aggregations but not the projections above them.
+    #[derive(Debug)]
+    struct AggregatesWithoutProjections;
+
+    impl PushdownPolicy for AggregatesWithoutProjections {
+        fn node_is_pushable(&self, plan: &LogicalPlan) -> bool {
+            matches!(
+                plan,
+                LogicalPlan::TableScan(_) | LogicalPlan::SubqueryAlias(_) | LogicalPlan::Aggregate(_)
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn an_aggregation_sent_alone_returns_its_groups_first() {
+        let ctx = crate::testing::federated_session();
+        let (table, sent) = remote_table_recording(
+            "crm",
+            "contracts",
+            vec![("customer_id", int64(&[1, 2, 1]))],
+            Some(Arc::new(AggregatesWithoutProjections)),
+        );
+        ctx.register_table("contracts", table).unwrap();
+        // The fake source cannot count: only the statement is asserted. The
+        // engine reads its columns by position, groups first.
+        let _ = rows(
+            &ctx,
+            "SELECT customer_id, count(*) AS n FROM contracts GROUP BY customer_id",
+        )
+        .await;
+        let sent = sent.lock().unwrap().join("\n");
+        let list = sent.split(" FROM ").next().unwrap_or_default();
+        let group = list.find("customer_id");
+        let count = list.find("count(");
+        assert!(group.is_some() && count.is_some() && group < count, "{sent}");
+    }
+
+    /// Pushes aggregations, projections, filters and scans.
+    #[derive(Debug)]
+    struct Aggregates;
+
+    impl PushdownPolicy for Aggregates {
+        fn node_is_pushable(&self, plan: &LogicalPlan) -> bool {
+            matches!(
+                plan,
+                LogicalPlan::TableScan(_)
+                    | LogicalPlan::SubqueryAlias(_)
+                    | LogicalPlan::Aggregate(_)
+                    | LogicalPlan::Projection(_)
+                    | LogicalPlan::Filter(_)
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn an_aggregation_over_computed_derived_columns_runs_in_the_engine() {
+        let ctx = crate::testing::federated_session();
+        let (table, sent) = remote_table_recording(
+            "crm",
+            "contracts",
+            vec![("customer_id", int64(&[1, 2, 1]))],
+            Some(Arc::new(Aggregates)),
+        );
+        ctx.register_table("contracts", table).unwrap();
+        let _ = rows(
+            &ctx,
+            "SELECT count(DISTINCT customer_id), sum(n) FROM \
+             (SELECT c.customer_id, count(*) AS n FROM contracts c GROUP BY c.customer_id)",
+        )
+        .await;
+        let sent = sent.lock().unwrap().join("\n");
+        assert!(sent.contains("GROUP BY"), "the inner aggregation is sent: {sent}");
+        assert!(!sent.contains("DISTINCT"), "the outer one stays local: {sent}");
+    }
+
+    #[tokio::test]
+    async fn a_filter_of_an_aliased_table_is_sent_against_the_alias() {
+        let ctx = crate::testing::federated_session();
+        let (table, sent) = remote_table_recording(
+            "crm",
+            "contracts",
+            vec![("customer_id", int64(&[1, 2, 3])), ("amount", int64(&[5, 6, 7]))],
+            Some(Arc::new(NumericFilters)),
+        );
+        ctx.register_table("contracts", table).unwrap();
+        let _ = rows(&ctx, "SELECT c.customer_id FROM contracts c WHERE c.amount >= 6")
+            .await
+            .unwrap();
+        let sent = sent.lock().unwrap().join("\n");
+        assert!(sent.contains("c.amount >= 6"), "{sent}");
+        assert!(!sent.contains("contracts.amount"), "the table is aliased: {sent}");
+    }
+
+    #[tokio::test]
+    async fn an_unnest_beside_a_federated_table_is_rebuilt() {
+        let ctx = contracts(Some(Arc::new(ScansAndProjectionsOnly)));
+        let batches = rows(
+            &ctx,
+            "SELECT count(*) FROM unnest([1, 2, 3]) AS t(x) CROSS JOIN contracts",
+        )
+        .await
+        .unwrap();
+        let counts = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(counts.values(), &[12]);
+    }
+
+    fn table(name: &str) -> LogicalPlanBuilder {
+        let schema = datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new(
+                "a",
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
+            datafusion::arrow::datatypes::Field::new(
+                "b",
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
+        ]);
+        datafusion::logical_expr::table_scan(Some(name), &schema, None).unwrap()
+    }
+
+    #[test]
+    fn only_an_aggregation_over_computed_qualified_columns_is_kept_local() {
+        let count = || datafusion::functions_aggregate::count::count(lit(1_i64));
+        let over = |projection: Vec<Expr>| {
+            table("t")
+                .project(projection)
+                .unwrap()
+                .aggregate(Vec::<Expr>::new(), vec![count()])
+                .unwrap()
+                .build()
+                .unwrap()
+        };
+        assert!(aggregate_over_derived_columns(&over(vec![
+            col("t.a"),
+            (col("t.b") + lit(1_i64)).alias("c"),
+        ])));
+        // Plain columns: the policy's `prepare` can drop the projection.
+        assert!(!aggregate_over_derived_columns(&over(vec![
+            col("t.a"),
+            col("t.b")
+        ])));
+        // Only new names: the aggregation names them without a table.
+        assert!(!aggregate_over_derived_columns(&over(vec![
+            (col("t.b") + lit(1_i64)).alias("c")
+        ])));
+        let direct = table("t")
+            .aggregate(Vec::<Expr>::new(), vec![count()])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(!aggregate_over_derived_columns(&direct));
+        let projected = table("t")
+            .project(vec![col("t.a"), (col("t.b") + lit(1_i64)).alias("c")])
+            .unwrap()
+            .project(vec![col("t.a")])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(!aggregate_over_derived_columns(&projected));
+    }
+
+    #[test]
+    fn filters_between_an_alias_and_its_scan_become_scan_filters() {
+        let aliased = table("t")
+            .filter(col("t.a").gt(lit(1_i64)))
+            .unwrap()
+            .filter(col("t.b").lt(lit(9_i64)))
+            .unwrap()
+            .alias("r")
+            .unwrap()
+            .build()
+            .unwrap();
+        let folded = aliased_scan_filters(aliased.clone()).unwrap();
+        let LogicalPlan::SubqueryAlias(alias) = &folded else {
+            panic!("{folded}");
+        };
+        let LogicalPlan::TableScan(scan) = alias.input.as_ref() else {
+            panic!("{folded}");
+        };
+        assert_eq!(scan.filters.len(), 2, "{folded}");
+        assert_eq!(folded.schema(), aliased.schema());
+
+        // A scan that stops early would filter only the rows it returned.
+        let mut limited = table("t").build().unwrap();
+        if let LogicalPlan::TableScan(scan) = &mut limited {
+            scan.fetch = Some(1);
+        }
+        let limited = LogicalPlanBuilder::from(limited)
+            .filter(col("t.a").gt(lit(1_i64)))
+            .unwrap()
+            .alias("r")
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(aliased_scan_filters(limited.clone()).unwrap(), limited);
+
+        for untouched in [
+            table("t").alias("r").unwrap().build().unwrap(),
+            table("t")
+                .filter(col("t.a").gt(lit(1_i64)))
+                .unwrap()
+                .build()
+                .unwrap(),
+            table("t")
+                .project(vec![col("t.a")])
+                .unwrap()
+                .filter(col("t.a").gt(lit(1_i64)))
+                .unwrap()
+                .alias("r")
+                .unwrap()
+                .build()
+                .unwrap(),
+        ] {
+            assert_eq!(aliased_scan_filters(untouched.clone()).unwrap(), untouched);
+        }
+    }
+
+    #[test]
+    fn only_an_aggregation_gets_a_select_list() {
+        let aggregate = table("t")
+            .aggregate(
+                vec![col("t.a")],
+                vec![datafusion::functions_aggregate::count::count(lit(1_i64))],
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let listed = with_select_list(aggregate.clone()).unwrap();
+        let LogicalPlan::Projection(projection) = &listed else {
+            panic!("{listed}");
+        };
+        assert_eq!(projection.input.as_ref(), &aggregate);
+        assert_eq!(listed.schema(), aggregate.schema());
+        let scan = table("t").build().unwrap();
+        assert_eq!(with_select_list(scan.clone()).unwrap(), scan);
+    }
+
+    #[test]
+    fn an_unnest_takes_new_inputs_without_its_expressions() {
+        let unnest = LogicalPlanBuilder::empty(true)
+            .project(vec![
+                datafusion::functions_nested::expr_fn::make_array(vec![lit(1_i64)]).alias("xs"),
+            ])
+            .unwrap()
+            .unnest_column("xs")
+            .unwrap()
+            .build()
+            .unwrap();
+        let inputs = unnest.inputs().into_iter().cloned().collect();
+        assert_eq!(with_new_inputs(&unnest, inputs).unwrap(), unnest);
+        let projection = table("t").project(vec![col("t.a")]).unwrap().build().unwrap();
+        let inputs = projection.inputs().into_iter().cloned().collect();
+        assert_eq!(with_new_inputs(&projection, inputs).unwrap(), projection);
     }
 
     #[test]
