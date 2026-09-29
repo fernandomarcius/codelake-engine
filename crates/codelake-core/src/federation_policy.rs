@@ -93,11 +93,21 @@ fn unmark_supersets(plan: LogicalPlan) -> Result<LogicalPlan> {
 }
 
 fn fully_pushable(plan: &LogicalPlan, policy: &dyn PushdownPolicy) -> bool {
-    policy.node_is_pushable(plan)
+    !projection_over_projection(plan)
+        && policy.node_is_pushable(plan)
         && plan
             .inputs()
             .into_iter()
             .all(|input| fully_pushable(input, policy))
+}
+
+/// A projection straight over another (a hive view read through its declared
+/// columns) renders as nested derived tables whose outer columns keep the
+/// inner table's name, which SQL Server and PostgreSQL reject ("could not be
+/// bound", "missing FROM-clause entry"): the upper one runs in the engine and
+/// the lower one, with what is below it, still reaches the source.
+fn projection_over_projection(plan: &LogicalPlan) -> bool {
+    matches!(plan, LogicalPlan::Projection(p) if matches!(p.input.as_ref(), LogicalPlan::Projection(_)))
 }
 
 fn split(
