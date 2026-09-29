@@ -367,7 +367,7 @@ mod tests {
             Ok(Arc::new(Field::new("field", DataType::Int8, false)))
         }
         fn is_nullable(&self, _: &[Expr], _: &dyn ExprSchema) -> bool {
-            false
+            self.updated
         }
         fn invoke_with_args(&self, _: ScalarFunctionArgs) -> Result<ColumnarValue> {
             Ok(ColumnarValue::Scalar(ScalarValue::Int64(Some(7))))
@@ -382,7 +382,7 @@ mod tests {
             })
         }
         fn short_circuits(&self) -> bool {
-            true
+            !self.updated
         }
         fn conditional_arguments<'a>(&self, args: &'a [Expr]) -> Option<(Vec<&'a Expr>, Vec<&'a Expr>)> {
             Some((args.iter().collect(), vec![]))
@@ -390,14 +390,18 @@ mod tests {
         fn evaluate_bounds(&self, _: &[&Interval]) -> Result<Interval> {
             Interval::make(Some(3_i64), Some(4_i64))
         }
-        fn propagate_constraints(&self, _: &Interval, _: &[&Interval]) -> Result<Option<Vec<Interval>>> {
-            Ok(None)
+        fn propagate_constraints(
+            &self,
+            interval: &Interval,
+            _: &[&Interval],
+        ) -> Result<Option<Vec<Interval>>> {
+            Ok(self.updated.then(|| vec![interval.clone()]))
         }
         fn output_ordering(&self, _: &[ExprProperties]) -> Result<SortProperties> {
             Ok(SortProperties::Singleton)
         }
         fn preserves_lex_ordering(&self, _: &[ExprProperties]) -> Result<bool> {
-            Ok(true)
+            Ok(!self.updated)
         }
         fn coerce_types(&self, _: &[DataType]) -> Result<Vec<DataType>> {
             Ok(vec![DataType::Int64])
@@ -482,6 +486,7 @@ mod tests {
 
     /// An update keeps the aliases; narrowing twice does not wrap twice.
     #[test]
+    #[expect(deprecated, reason = "the wrapper delegates the deprecated methods too")]
     fn unaliased_keeps_its_aliases_through_updates() {
         let f = probe("p", &["a", "b"]);
         let u = Unaliased::new(&f, vec!["a".into()]);
@@ -489,6 +494,20 @@ mod tests {
         assert_eq!(updated.aliases(), ["a"]);
         let inner = &updated.inner().downcast_ref::<Unaliased>().unwrap().inner;
         assert!(inner.downcast_ref::<Probe>().unwrap().updated);
+        // The updated probe answers the other way: no constant answer passes.
+        assert!(
+            updated
+                .inner()
+                .is_nullable(&[], &datafusion::common::DFSchema::empty())
+        );
+        assert!(!updated.inner().short_circuits());
+        let interval = Interval::make(Some(0_i64), Some(9_i64)).unwrap();
+        assert_eq!(
+            updated.inner().propagate_constraints(&interval, &[]).unwrap(),
+            Some(vec![interval])
+        );
+        let properties = [ExprProperties::new_unknown()];
+        assert!(!updated.inner().preserves_lex_ordering(&properties).unwrap());
         // The probe updates once.
         assert!(
             updated
