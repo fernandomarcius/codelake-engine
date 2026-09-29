@@ -18,8 +18,8 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use datafusion::common::Column;
-use datafusion::common::tree_node::Transformed;
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion::common::{Column, DFSchema};
 use datafusion::error::Result;
 use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
 use datafusion::logical_expr::{Expr, Extension, Filter, LogicalPlan, Projection, SubqueryAlias, TableScan};
@@ -36,6 +36,15 @@ pub trait PushdownPolicy: Send + Sync + Debug {
     /// output is not folded again.
     fn prepare(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
         Ok(plan)
+    }
+
+    /// A predicate the source may evaluate in place of `term` (a filter term
+    /// the policy keeps local) because it keeps *at least* the rows `term`
+    /// keeps: text equality under a case-insensitive collation, a date range
+    /// on a timestamp. The source then sends fewer rows; `term` itself still
+    /// runs in the engine, which keeps the result exact.
+    fn superset(&self, _term: &Expr, _schema: &DFSchema) -> Option<Expr> {
+        None
     }
 }
 
@@ -63,7 +72,24 @@ fn federate_prepared(
     policy: &dyn PushdownPolicy,
     planner: &Arc<dyn FederationPlanner>,
 ) -> Result<LogicalPlan> {
-    Ok(federate(policy.prepare(plan)?, planner))
+    Ok(federate(policy.prepare(unmark_supersets(plan)?)?, planner))
+}
+
+/// The superset filters of a sub-plan about to be sent to its source, as the
+/// plain predicates the source evaluates.
+fn unmark_supersets(plan: LogicalPlan) -> Result<LogicalPlan> {
+    plan.transform_up(|node| {
+        if !matches!(node, LogicalPlan::Filter(_)) {
+            return Ok(Transformed::no(node));
+        }
+        node.map_expressions(|expr| {
+            expr.transform(|e| match crate::functions::as_superset_filter(&e) {
+                Some(predicate) => Ok(Transformed::yes(predicate.clone())),
+                None => Ok(Transformed::no(e)),
+            })
+        })
+    })
+    .data()
 }
 
 fn fully_pushable(plan: &LogicalPlan, policy: &dyn PushdownPolicy) -> bool {
@@ -93,12 +119,39 @@ fn split(
         .map(|child| split(child, policy, planner))
         .collect::<Result<Vec<_>>>()?;
     // Runs in the engine: its arithmetic is checked again (see `crate::overflow`).
-    crate::overflow::check_local_node(plan.with_new_exprs(plan.expressions(), children)?)
+    let local = without_local_supersets(plan.with_new_exprs(plan.expressions(), children)?)?;
+    crate::overflow::check_local_node(local)
+}
+
+/// A superset filter only serves a source: in the engine it repeats an exact
+/// term that stays above it (`split_filter`), so a filter left local drops
+/// it, and a filter of nothing else is removed.
+fn without_local_supersets(plan: LogicalPlan) -> Result<LogicalPlan> {
+    let LogicalPlan::Filter(filter) = plan else {
+        return Ok(plan);
+    };
+    let terms = split_conjunction_owned(filter.predicate.clone());
+    if !terms
+        .iter()
+        .any(|term| crate::functions::as_superset_filter(term).is_some())
+    {
+        return Ok(LogicalPlan::Filter(filter));
+    }
+    let kept = terms
+        .into_iter()
+        .filter(|term| crate::functions::as_superset_filter(term).is_none());
+    match conjunction(kept) {
+        Some(predicate) => Ok(LogicalPlan::Filter(Filter::try_new(predicate, filter.input)?)),
+        None => Ok(Arc::unwrap_or_clone(filter.input)),
+    }
 }
 
 /// A rejected `Filter` whose predicate is a conjunction keeps its unsafe terms
-/// locally and puts the safe ones in a filter below, which can then be pushed.
-/// Rewritten only when both halves are non-empty, so recursion terminates.
+/// locally and puts below them, in a filter that can then be pushed, its safe
+/// terms and a superset of each unsafe term the policy offers one for
+/// ([`PushdownPolicy::superset`], marked so the policy accepts it and never
+/// offered again). Rewritten only when both halves are non-empty; the filter
+/// below has no unsafe term, so recursion terminates.
 fn split_filter(plan: LogicalPlan, policy: &dyn PushdownPolicy) -> Result<LogicalPlan> {
     let LogicalPlan::Filter(filter) = plan else {
         return Ok(plan);
@@ -110,6 +163,15 @@ fn split_filter(plan: LogicalPlan, policy: &dyn PushdownPolicy) -> Result<Logica
             Filter::try_new(term.clone(), Arc::clone(&input))
                 .is_ok_and(|f| policy.node_is_pushable(&LogicalPlan::Filter(f)))
         });
+    let supersets = unsafe_terms
+        .iter()
+        .filter_map(|term| policy.superset(term, input.schema()))
+        .map(crate::functions::superset_filter)
+        .filter(|marked| {
+            Filter::try_new(marked.clone(), Arc::clone(&input))
+                .is_ok_and(|f| policy.node_is_pushable(&LogicalPlan::Filter(f)))
+        });
+    let safe: Vec<Expr> = safe.into_iter().chain(supersets).collect();
     match (conjunction(safe), conjunction(unsafe_terms)) {
         (Some(safe), Some(rest)) => {
             let lower = LogicalPlan::Filter(Filter::try_new(safe, input)?);
@@ -521,6 +583,124 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert!(ids.values().iter().all(|id| *id != 3), "{ids:?}");
+    }
+
+    /// Pushes no text filter as such, but sends text equality as a superset.
+    #[derive(Debug)]
+    struct CaseInsensitiveSource;
+
+    impl PushdownPolicy for CaseInsensitiveSource {
+        fn node_is_pushable(&self, plan: &LogicalPlan) -> bool {
+            match plan {
+                LogicalPlan::Filter(f) => split_conjunction_owned(f.predicate.clone()).iter().all(|term| {
+                    crate::functions::as_superset_filter(term).is_some() || !term.to_string().contains("Utf8")
+                }),
+                LogicalPlan::TableScan(_) | LogicalPlan::Projection(_) | LogicalPlan::SubqueryAlias(_) => {
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        fn superset(&self, term: &Expr, _schema: &DFSchema) -> Option<Expr> {
+            term.to_string().contains("Utf8").then(|| term.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_superset_reaches_the_source_and_the_exact_term_stays_local() {
+        let ctx = crate::testing::federated_session();
+        let (table, sent) = remote_table_recording(
+            "crm",
+            "contracts",
+            vec![
+                ("customer_id", int64(&[1, 2, 3])),
+                ("status", strings(&["active", "active", "ACTIVE"])),
+            ],
+            Some(Arc::new(CaseInsensitiveSource)),
+        );
+        ctx.register_table("contracts", table).unwrap();
+        let batches = rows(
+            &ctx,
+            "SELECT customer_id FROM contracts WHERE status = 'active' ORDER BY 1",
+        )
+        .await
+        .unwrap();
+        let sent = sent.lock().unwrap().join("\n");
+        assert!(sent.contains("'active'"), "superset not sent: {sent}");
+        assert!(
+            !sent.contains("codelake_superset"),
+            "the marker is not SQL: {sent}"
+        );
+        // The fake source ignores its SQL, as a case-insensitive one would
+        // return ACTIVE too: the engine keeps only the exact matches.
+        let ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[1, 2]);
+    }
+
+    #[tokio::test]
+    async fn a_superset_below_a_cross_source_join_reaches_its_source() {
+        let ctx = crate::testing::federated_session();
+        let (contracts, sent) = remote_table_recording(
+            "crm",
+            "contracts",
+            vec![
+                ("customer_id", int64(&[1, 2, 3])),
+                ("amount", int64(&[300, 300, 10])),
+                ("status", strings(&["active", "ACTIVE", "active"])),
+            ],
+            Some(Arc::new(CaseInsensitiveSource)),
+        );
+        ctx.register_table("contracts", contracts).unwrap();
+        ctx.register_table(
+            "customers",
+            remote_table(
+                "erp",
+                "customers",
+                vec![("id", int64(&[1, 2, 3]))],
+                Some(Arc::new(NumericFilters)),
+            ),
+        )
+        .unwrap();
+        let batches = rows(
+            &ctx,
+            "SELECT c.id FROM customers c JOIN contracts k ON k.customer_id = c.id \
+             WHERE k.amount >= 200 AND k.status = 'active' ORDER BY 1",
+        )
+        .await
+        .unwrap();
+        let plan = ctx
+            .sql("EXPLAIN SELECT c.id FROM customers c JOIN contracts k ON k.customer_id = c.id WHERE k.amount >= 200 AND k.status = 'active'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let plan = datafusion::arrow::util::pretty::pretty_format_batches(&plan)
+            .unwrap()
+            .to_string();
+        let sent = sent.lock().unwrap().join("\n");
+        assert!(
+            sent.contains("'active'") && sent.contains("200"),
+            "superset not sent: {sent}\n{plan}"
+        );
+        assert!(
+            !plan.contains("FilterExec: codelake_superset"),
+            "marker left in the engine: {plan}"
+        );
+        let ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        // The fake source ignores its SQL (the amount term, pushed as exact,
+        // is not applied here): the text term, sent only as a superset, still
+        // runs in the engine, so ACTIVE (customer 2) is not returned.
+        assert!(ids.values().contains(&1) && !ids.values().contains(&2), "{ids:?}");
     }
 
     #[test]
