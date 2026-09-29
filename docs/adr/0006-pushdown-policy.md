@@ -73,7 +73,10 @@ dynamic filter, so the whole remote table would be read on every run.
    `execution.dynamic_filter_max_keys` of them (150), their min/max always.
    Each term goes through the source's policy as a superset filter: sent as
    it is, as the superset the policy offers, or not at all (SQL Server: text
-   keys as an `IN` superset under its collation, never text min/max). Only
+   keys as an `IN` superset under its collation, never text min/max). A
+   null-safe join's filter (`(bounds AND keys) OR key IS NULL`, ADR 0014) is
+   split term by term (`(keys OR key IS NULL) AND ...`) so its keys still go
+   when the bounds do not. Only
    over a table scan under filters, plain column projections and aliases;
    a source without a policy gets nothing. SQL Server compares a
    `datetime`/`datetime2(7)` column with a literal inside a second through

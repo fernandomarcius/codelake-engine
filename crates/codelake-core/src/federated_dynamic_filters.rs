@@ -64,7 +64,10 @@ pub(crate) fn superset_of(filter: &Arc<dyn PhysicalExpr>, schema: &DFSchema) -> 
                 (Some(l), Some(r)) => Some(l.and(r)),
                 (one, None) | (None, one) => one,
             },
-            Operator::Or => Some(or(superset_of(left, schema)?, superset_of(right, schema)?)),
+            Operator::Or => Some(or_by_term(
+                superset_of(left, schema)?,
+                superset_of(right, schema)?,
+            )),
             op @ (Operator::Eq
             | Operator::NotEq
             | Operator::Lt
@@ -130,6 +133,27 @@ pub(crate) fn superset_of(filter: &Arc<dyn PhysicalExpr>, schema: &DFSchema) -> 
     None
 }
 
+/// `a OR b`, as `(a1 OR b) AND (a2 OR b) ...` when one side is a single
+/// term: a source's policy judges each term on its own, so the dynamic
+/// filter of a null-safe join (`(bounds AND keys) OR key IS NULL`,
+/// [`crate::join_guard::NullKeysKept`]) still sends its keys when the policy
+/// refuses its bounds.
+fn or_by_term(a: Expr, b: Expr) -> Expr {
+    let (a, b) = (split_conjunction_owned(a), split_conjunction_owned(b));
+    let (terms, single) = match (a.len(), b.len()) {
+        (_, 1) => (a, b),
+        (1, _) => (b, a),
+        _ => {
+            return or(
+                conjunction(a).unwrap_or(lit(true)),
+                conjunction(b).unwrap_or(lit(true)),
+            );
+        }
+    };
+    let single = conjunction(single).unwrap_or(lit(true));
+    conjunction(terms.into_iter().map(|term| or(term, single.clone()))).unwrap_or(lit(true))
+}
+
 /// `a OR b`, without a side that keeps nothing.
 fn or(a: Expr, b: Expr) -> Expr {
     let nothing = |e: &Expr| matches!(e, Expr::Literal(ScalarValue::Boolean(Some(false)), _));
@@ -143,6 +167,9 @@ fn or(a: Expr, b: Expr) -> Expr {
 /// A column, literal or cast of one, as a logical expression on `schema`.
 fn value_of(expr: &Arc<dyn PhysicalExpr>, schema: &DFSchema) -> Option<Expr> {
     if let Some(column) = expr.downcast_ref::<PhysicalColumn>() {
+        if column.index() >= schema.fields().len() {
+            return None;
+        }
         let (qualifier, field) = schema.qualified_field(column.index());
         // A physical column names its field; anything else is not this schema.
         return (field.name() == column.name()).then(|| Expr::Column(Column::from((qualifier, field))));
@@ -173,8 +200,11 @@ fn typed_like(value: Expr, other: &Expr, schema: &DFSchema) -> Option<Expr> {
     if scalar.data_type() == target {
         return Some(value);
     }
+    // Only a cast that changes no value (1.5 as an integer would move a
+    // bound).
     let cast: ScalarValue = scalar.cast_to(&target).ok()?;
-    Some(Expr::Literal(cast, metadata.clone()))
+    let back = cast.cast_to(&scalar.data_type()).ok()?;
+    (back == *scalar).then(|| Expr::Literal(cast, metadata.clone()))
 }
 
 /// `input` with the federated scan below it (through single-child wrappers)
@@ -259,18 +289,15 @@ fn narrowed_remote(remote: &VirtualExecutionPlan, predicate: Expr) -> Result<Opt
 
 /// `plan` (see [`passes_columns`]) without its filters: the same columns.
 fn without_filters(plan: &LogicalPlan) -> Result<LogicalPlan> {
-    match plan {
-        LogicalPlan::TableScan(_) => Ok(plan.clone()),
-        LogicalPlan::Filter(filter) => without_filters(&filter.input),
-        _ => {
-            let inputs = plan
-                .inputs()
-                .into_iter()
-                .map(without_filters)
-                .collect::<Result<Vec<_>>>()?;
-            plan.with_new_exprs(plan.expressions(), inputs)
-        }
+    if let LogicalPlan::Filter(filter) = plan {
+        return without_filters(&filter.input);
     }
+    let inputs = plan
+        .inputs()
+        .into_iter()
+        .map(without_filters)
+        .collect::<Result<Vec<_>>>()?;
+    plan.with_new_exprs(plan.expressions(), inputs)
 }
 
 /// A table scan under filters, plain column projections and aliases: each
@@ -458,6 +485,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_null_safe_join_gets_the_null_keys_from_the_source() {
+        let ctx = session();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let wanted = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![Some(3), None]))],
+        )
+        .unwrap();
+        ctx.register_table(
+            "wanted",
+            Arc::new(MemTable::try_new(schema, vec![vec![wanted]]).unwrap()),
+        )
+        .unwrap();
+        let (table, statements) = remote_table_recording(
+            "crm",
+            "contracts",
+            vec![(
+                "customer_id",
+                Arc::new(Int64Array::from(vec![Some(1), None, Some(3), Some(5)])),
+            )],
+            Some(Arc::new(TextInAsSuperset)),
+        );
+        ctx.register_table("contracts", table).unwrap();
+        for sql in [
+            "SELECT id FROM wanted INTERSECT SELECT customer_id FROM contracts",
+            "SELECT k.customer_id FROM wanted w JOIN contracts k ON k.customer_id IS NOT DISTINCT FROM w.id",
+        ] {
+            statements.lock().unwrap().clear();
+            let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            let (rows, nulls) = batches.iter().fold((0, 0), |(rows, nulls), b| {
+                (rows + b.num_rows(), nulls + b.column(0).null_count())
+            });
+            assert_eq!((rows, nulls), (2, 1), "{sql}");
+            let sent = sent(&statements);
+            assert!(sent.contains("IN (3)"), "{sql}: {sent}");
+            assert!(
+                sent.contains("customer_id IN (3) OR ") && sent.contains(".customer_id IS NULL)"),
+                "a source honouring its SQL would drop the NULL key: {sent}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn without_a_policy_nothing_is_added() {
         let ctx = session();
         local(&ctx, "wanted", &[2], &["x"]);
@@ -538,6 +608,70 @@ mod tests {
         .await;
         let sent = sent(&statements);
         assert!(!sent.contains("WHERE"), "{sent}");
+        assert_eq!(rows, vec![3]);
+    }
+
+    /// Any projection, sort and limit, and a text term only as a superset
+    /// of itself (marked).
+    #[derive(Debug)]
+    struct Everything;
+
+    impl PushdownPolicy for Everything {
+        fn node_is_pushable(&self, plan: &LogicalPlan) -> bool {
+            match plan {
+                LogicalPlan::Filter(f) => split_conjunction_owned(f.predicate.clone())
+                    .iter()
+                    .all(|term| as_superset_filter(term).is_some() || !has_text(term)),
+                LogicalPlan::TableScan(_)
+                | LogicalPlan::Projection(_)
+                | LogicalPlan::SubqueryAlias(_)
+                | LogicalPlan::Sort(_)
+                | LogicalPlan::Limit(_) => true,
+                _ => false,
+            }
+        }
+        fn superset(&self, term: &Expr, _schema: &DFSchema) -> Option<Expr> {
+            has_text(term).then(|| term.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn keys_go_only_where_each_row_is_a_row_of_the_table() {
+        let ctx = session();
+        local(&ctx, "wanted", &[3], &["x"]);
+        let statements = contracts(&ctx, Some(Arc::new(Everything)));
+        for sql in [
+            // Above a LIMIT the keys would change which rows it keeps.
+            "SELECT k.customer_id FROM wanted w
+             JOIN (SELECT customer_id FROM contracts ORDER BY customer_id LIMIT 4) k ON k.customer_id = w.id",
+            // A computed column is not the table's.
+            "SELECT k.customer_id FROM wanted w
+             JOIN (SELECT customer_id * 2 AS customer_id FROM contracts) k ON k.customer_id = w.id",
+        ] {
+            statements.lock().unwrap().clear();
+            ids(&ctx, sql).await;
+            let sent = sent(&statements);
+            assert!(!sent.contains(" IN (") && !sent.contains(">= 3"), "{sql}: {sent}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_policy_judges_the_keys_alone_not_the_filters_already_sent() {
+        let ctx = session();
+        local(&ctx, "wanted", &[3], &["x"]);
+        let statements = contracts(&ctx, Some(Arc::new(Everything)));
+        // `status = 'b'` was sent as a superset (then unmarked): judged again,
+        // it would stay local and nothing would be added.
+        let rows = ids(
+            &ctx,
+            "SELECT k.customer_id FROM wanted w JOIN contracts k ON k.customer_id = w.id WHERE k.status = 'b'",
+        )
+        .await;
+        let sent = sent(&statements);
+        assert!(
+            sent.contains("\"status\" = 'b'") && sent.contains("IN (3)"),
+            "{sent}"
+        );
         assert_eq!(rows, vec![3]);
     }
 
@@ -773,6 +907,44 @@ mod tests {
     }
 
     #[test]
+    fn an_or_with_a_single_term_is_sent_term_by_term() {
+        let schema = schema();
+        let bounds = binary(
+            binary(a(), Operator::GtEq, plit(2_i64)),
+            Operator::And,
+            binary(s(), Operator::Eq, plit("x")),
+        );
+        let null_key: Arc<dyn PhysicalExpr> = Arc::new(IsNullExpr::new(a()));
+        let expected = column("a")
+            .gt_eq(lit(2_i64))
+            .or(column("a").is_null())
+            .and(column("s").eq(lit("x")).or(column("a").is_null()));
+        assert_eq!(
+            superset_of(
+                &binary(Arc::clone(&bounds), Operator::Or, Arc::clone(&null_key)),
+                &schema
+            ),
+            Some(expected),
+            "the dynamic filter of a null-safe join"
+        );
+        assert_eq!(
+            superset_of(
+                &binary(Arc::clone(&null_key), Operator::Or, Arc::clone(&bounds)),
+                &schema
+            ),
+            Some(
+                column("a")
+                    .gt_eq(lit(2_i64))
+                    .or(column("a").is_null())
+                    .and(column("s").eq(lit("x")).or(column("a").is_null()))
+            )
+        );
+        let both = superset_of(&binary(Arc::clone(&bounds), Operator::Or, bounds), &schema);
+        let one = column("a").gt_eq(lit(2_i64)).and(column("s").eq(lit("x")));
+        assert_eq!(both, Some(one.clone().or(one)), "two conjunctions stay one term");
+    }
+
+    #[test]
     fn literals_take_the_column_type_and_columns_must_match_the_schema() {
         let schema = schema();
         let view = plit(ScalarValue::Utf8View(Some("x".into())));
@@ -790,6 +962,16 @@ mod tests {
         assert_eq!(
             superset_of(&two_literals, &schema),
             Some(lit(1_i64).eq(lit(ScalarValue::Int32(Some(1)))))
+        );
+        assert_eq!(
+            superset_of(&binary(a(), Operator::Lt, plit(1.5_f64)), &schema),
+            None,
+            "1.5 as an integer would move the bound"
+        );
+        let past: Arc<dyn PhysicalExpr> = Arc::new(physical::Column::new("a", 2));
+        assert_eq!(
+            superset_of(&binary(past, Operator::Eq, plit(1_i64)), &schema),
+            None
         );
         let renamed: Arc<dyn PhysicalExpr> = Arc::new(physical::Column::new("b", 0));
         assert_eq!(

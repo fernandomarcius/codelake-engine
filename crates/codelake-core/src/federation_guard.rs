@@ -19,7 +19,7 @@
 //!
 //! The barrier keeps the join dynamic filters offered to it (still reported
 //! unsupported) and adds what the source can evaluate of them to its query
-//! when it starts ([`crate::federated_dynamic_filters`]).
+//! when it starts (module `federated_dynamic_filters`).
 //!
 //! Because the barrier sits on every remote node, it is also where a remote
 //! node is traced: one `codelake.remote` span per federated scan, for every

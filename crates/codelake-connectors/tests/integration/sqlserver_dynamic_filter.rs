@@ -474,6 +474,47 @@ async fn local_keys_and_time_windows_reach_sql_server() {
         &host,
         port,
         "chaves",
+        "SELECT chave FROM hive.pilot.chaves INTERSECT SELECT chave FROM warehouse.dbo.chaves ORDER BY 1",
+    )
+    .await;
+    checks.check(
+        "text keys, INTERSECT: NULL matches NULL",
+        rows == ["K-1", "K-3", ""],
+        format!("{rows:?}"),
+    );
+    checks.check(
+        "text keys, INTERSECT: the NULL key is not filtered out at the source",
+        !sent_any(&sent, &[" IN ("]) || sent_any(&sent, &[" IN (", " IS NULL"]),
+        format!("{sent:?}"),
+    );
+    let (rows, sent) = traced(
+        &engine,
+        &host,
+        port,
+        "chaves",
+        "SELECT c.id FROM hive.pilot.chaves p JOIN warehouse.dbo.chaves c ON c.chave IS NOT DISTINCT FROM p.chave
+         ORDER BY 1",
+    )
+    .await;
+    checks.check(
+        "text keys, IS NOT DISTINCT FROM: NULL matches NULL",
+        rows == ["1", "5", "6"],
+        format!("{rows:?}"),
+    );
+    // Its dynamic filter is `(bounds AND keys) OR chave IS NULL`: the keys go
+    // with the NULL key, the text bounds stay out.
+    checks.check(
+        "text keys, IS NOT DISTINCT FROM: keys and the NULL key sent",
+        sent_any(&sent, &["[chave] IN (", "[chave] IS NULL"])
+            && !sent_any(&sent, &["[chave] >="])
+            && sent_any(&sent, &["5 rows in"]),
+        format!("{sent:?}"),
+    );
+    let (rows, sent) = traced(
+        &engine,
+        &host,
+        port,
+        "chaves",
         "SELECT c.id FROM hive.pilot.chaves p JOIN warehouse.dbo.chaves c ON c.chave = p.chave ORDER BY 1",
     )
     .await;
@@ -556,14 +597,20 @@ async fn local_keys_and_time_windows_reach_sql_server() {
     checks.finish();
 }
 
+/// Hand-run benchmark settings: `CODELAKE_BENCH_ROWS` rows in SQL Server
+/// (2 000 000), the pilot holds the versions since `CODELAKE_BENCH_SINCE`
+/// (five days) and each configuration runs `CODELAKE_BENCH_RUNS` times (3).
+fn bench_setting(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_owned())
+}
+
 #[tokio::test]
 #[ignore = "benchmark: CODELAKE_BENCH_ROWS rows in SQL Server, run by hand"]
 #[allow(clippy::print_stdout, reason = "the measurement is the output")]
 async fn reconciliation_benchmark() {
-    let rows: u64 = std::env::var("CODELAKE_BENCH_ROWS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2_000_000);
+    let rows: u64 = bench_setting("CODELAKE_BENCH_ROWS", "2000000").parse().unwrap();
+    let since = bench_setting("CODELAKE_BENCH_SINCE", "2026-09-24 01:00:00");
+    let runs: u32 = bench_setting("CODELAKE_BENCH_RUNS", "3").parse().unwrap();
     let mssql = start_mssql().await;
     let host = common::host();
     let port = mssql.get_host_port_ipv4(1433).await.unwrap();
@@ -574,8 +621,8 @@ async fn reconciliation_benchmark() {
     let spill = tempfile::tempdir().unwrap();
     let warehouse = tempfile::tempdir().unwrap();
     let engine = attached(spill.path(), warehouse.path(), &host, port, 150).await;
-    // Five days of versions: ~14 000 keys, as the nightly routine's pilot.
-    copy_pilot(&engine, "2026-09-24 01:00:00").await;
+    // Five days of 2 million rows: ~14 000 keys, as the nightly routine's pilot.
+    copy_pilot(&engine, &since).await;
     let pilot = text(
         &run(
             &engine,
@@ -587,14 +634,21 @@ async fn reconciliation_benchmark() {
     let explain = text(&run(&engine, &format!("EXPLAIN {RECONCILE}")).await);
     println!("===== EXPLAIN =====\n{}", explain.join("\n"));
     let listing = attached(spill.path(), warehouse.path(), &host, port, 20_000).await;
+    let unfiltered = attached(spill.path(), warehouse.path(), &host, port, 150).await;
+    unfiltered
+        .context()
+        .sql("SET datafusion.optimizer.enable_join_dynamic_filter_pushdown = false")
+        .await
+        .unwrap();
     for (name, engine) in [
+        ("no dynamic filter", &unfiltered),
         ("150 keys listed (default)", &engine),
         ("20 000 keys listed", &listing),
     ] {
         let mut report = String::new();
         let mut result = Vec::new();
         exec(&host, port, "master", "DBCC FREEPROCCACHE").await;
-        for attempt in 0..3 {
+        for attempt in 0..runs {
             let started = Instant::now();
             result = text(&run(engine, RECONCILE).await);
             let _ = writeln!(report, "run {attempt}: {:?}", started.elapsed());

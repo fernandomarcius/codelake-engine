@@ -110,7 +110,7 @@ pub(crate) fn remote_table_recording(
     let schema = Arc::new(Schema::new(
         columns
             .iter()
-            .map(|(name, array)| Field::new(*name, array.data_type().clone(), false))
+            .map(|(name, array)| Field::new(*name, array.data_type().clone(), array.null_count() > 0))
             .collect::<Vec<_>>(),
     ));
     let statements = Arc::new(Mutex::new(Vec::new()));

@@ -33,8 +33,13 @@ versioning: [SemVer](https://semver.org/).
     - SQL Server: a `datetime` or `datetime2(7)` column compared with a literal inside a second is sent
       whole-second bounds (`>=` the second before, `<` the second after) as a superset. Upper bounds are
       always strict: a `datetime2(7)` value 100 ns past a whole-second `<=` bound was lost at the source.
-    - Reproduction (2 million rows in SQL Server 2022, 13 936 local keys): 11.4 s → 0.50 s, SQL Server
-      returns 58 521 rows instead of 2 000 000; same result.
+    - A null-safe join's dynamic filter (`(bounds AND keys) OR key IS NULL`) is sent term by term, so its keys
+      still go when the source refuses its bounds (text); a build-side literal is never cast to a type that
+      changes its value.
+    - Reproduction (15 million rows in SQL Server 2022, 14 850 local text keys): 93–108 s → 1.9–2.5 s,
+      SQL Server returns 453 522 rows instead of 15 000 000; same result. The keys are past the `IN` limit,
+      so the window does the work; listing them all (`dynamic_filter_max_keys = 20000`) returns 14 570 rows
+      but takes 3.1 s (SQL Server compiles the 14 850-literal `IN`).
 
 ### Added
 - Distributed execution (M4, ADR 0011), behind the `distributed` feature: a `[distributed]` coordinator
