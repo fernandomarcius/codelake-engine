@@ -219,10 +219,12 @@ pub const PRUNE_FEDERATED_COLUMNS: &str = "codelake_prune_federated_columns";
 /// [`crate::engine::optimizer_rules`]), so a federated node that is not the
 /// whole query (a filter the policy keeps local, a cross-source join) still
 /// outputs every column of its tables, and the source returns them all.
-/// `optimize_projections` then puts the projection the engine needs *above*
-/// the node: it cannot see inside it. This rule, right after it, moves the
-/// columns that projection references into the federated sub-plan, as a
-/// projection of plain columns every source can evaluate, when that sub-plan
+/// `optimize_projections` cannot see inside the node, and puts nothing above
+/// it under a join. This rule, right after it, carries the columns each node
+/// reads down the plan (projections, filters, joins with their keys, sorts,
+/// windows, aggregations, aliases, unions) to every federated node, and
+/// narrows it to those, as a projection of plain columns every source can
+/// evaluate, when that sub-plan
 /// is a table scan under filters, aliased or not: over a join or an
 /// aggregation, or above an alias, the unparser can reference a relation it
 /// did not name.
@@ -235,59 +237,172 @@ impl OptimizerRule for PruneFederatedColumns {
     }
 
     fn apply_order(&self) -> Option<ApplyOrder> {
-        Some(ApplyOrder::TopDown)
+        None
     }
 
     fn rewrite(&self, plan: LogicalPlan, _config: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
-        let LogicalPlan::Projection(projection) = &plan else {
-            return Ok(Transformed::no(plan));
-        };
-        let LogicalPlan::Extension(Extension { node }) = projection.input.as_ref() else {
-            return Ok(Transformed::no(plan));
-        };
-        let Some(federated) = node.as_any().downcast_ref::<FederatedPlanNode>() else {
-            return Ok(Transformed::no(plan));
-        };
-        // `FROM t AS r`: the projection goes below the alias, as a plain
-        // `SELECT` of the table (`FROM (SELECT a, b FROM t) AS r`).
-        let (alias, inner) = match &federated.plan {
-            LogicalPlan::SubqueryAlias(aliased) => (Some(aliased.alias.clone()), aliased.input.as_ref()),
-            other => (None, other),
-        };
-        if !is_filtered_scan(inner) {
-            return Ok(Transformed::no(plan));
+        let mut changed = false;
+        // A plan this cannot rebuild keeps every column: pruning is only an
+        // optimization, never a reason to fail the query.
+        match prune(plan.clone(), None, &mut changed) {
+            Ok(pruned) if changed => Ok(Transformed::yes(pruned)),
+            _ => Ok(Transformed::no(plan)),
         }
-        let used: HashSet<&Column> = projection.expr.iter().flat_map(Expr::column_refs).collect();
-        let positions: Vec<usize> = federated
-            .plan
-            .schema()
-            .columns()
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| used.contains(column))
-            .map(|(position, _)| position)
-            .collect();
-        // Nothing to prune, or nothing left: a projection without columns has
-        // no portable SQL (`SELECT FROM …`).
-        if positions.is_empty() || positions.len() == federated.plan.schema().fields().len() {
-            return Ok(Transformed::no(plan));
-        }
-        // An alias renames the columns of its input, position by position.
-        let kept: Vec<Expr> = positions
-            .iter()
-            .map(|position| Expr::Column(Column::from(inner.schema().qualified_field(*position))))
-            .collect();
-        let pruned = LogicalPlan::Projection(Projection::try_new(kept, Arc::new(inner.clone()))?);
-        let pruned = match alias {
-            Some(alias) => LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(Arc::new(pruned), alias)?),
-            None => pruned,
-        };
-        let input = federate(pruned, &federated.planner);
-        Ok(Transformed::yes(LogicalPlan::Projection(Projection::try_new(
-            projection.expr.clone(),
-            Arc::new(input),
-        )?)))
     }
+}
+
+/// Columns a node's parent reads from it; `None` when unknown (all of them).
+type Needed = Option<HashSet<Column>>;
+
+fn columns_of<'a>(exprs: impl IntoIterator<Item = &'a Expr>) -> HashSet<Column> {
+    exprs
+        .into_iter()
+        .flat_map(|e| e.column_refs().into_iter().cloned())
+        .collect()
+}
+
+fn within(needed: &HashSet<Column>, schema: &DFSchema) -> HashSet<Column> {
+    needed.iter().filter(|c| schema.has_column(c)).cloned().collect()
+}
+
+/// What each input of `plan` must provide, from what its parent needs of it.
+fn needs_of_inputs(plan: &LogicalPlan, needed: Needed) -> Vec<Needed> {
+    let with = |mut needed: HashSet<Column>, more: HashSet<Column>| {
+        needed.extend(more);
+        needed
+    };
+    match plan {
+        LogicalPlan::Projection(p) => vec![Some(columns_of(&p.expr))],
+        LogicalPlan::Aggregate(a) => vec![Some(columns_of(a.group_expr.iter().chain(&a.aggr_expr)))],
+        LogicalPlan::Filter(f) => vec![needed.map(|n| with(n, columns_of([&f.predicate])))],
+        LogicalPlan::Sort(s) => vec![needed.map(|n| with(n, columns_of(s.expr.iter().map(|e| &e.expr))))],
+        LogicalPlan::Limit(_) => vec![needed],
+        LogicalPlan::Window(w) => {
+            vec![needed.map(|n| within(&with(n, columns_of(&w.window_expr)), w.input.schema()))]
+        }
+        LogicalPlan::Join(j) => match needed {
+            None => vec![None, None],
+            Some(n) => {
+                let keys = j.on.iter().flat_map(|(l, r)| [l, r]).chain(j.filter.as_ref());
+                let all = with(n, columns_of(keys));
+                vec![
+                    Some(within(&all, j.left.schema())),
+                    Some(within(&all, j.right.schema())),
+                ]
+            }
+        },
+        // An alias and a union rename their input's columns position by position.
+        LogicalPlan::SubqueryAlias(_) | LogicalPlan::Union(_) => match needed {
+            None => plan.inputs().iter().map(|_| None).collect(),
+            Some(n) => {
+                let positions: Vec<usize> = plan
+                    .schema()
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| n.contains(c))
+                    .map(|(i, _)| i)
+                    .collect();
+                plan.inputs()
+                    .iter()
+                    .map(|input| {
+                        Some(
+                            positions
+                                .iter()
+                                .map(|i| Column::from(input.schema().qualified_field(*i)))
+                                .collect(),
+                        )
+                    })
+                    .collect()
+            }
+        },
+        _ => plan.inputs().iter().map(|_| None).collect(),
+    }
+}
+
+/// `plan` with each federated table scan below it narrowed to the columns
+/// the nodes above it read.
+fn prune(plan: LogicalPlan, needed: Needed, changed: &mut bool) -> Result<LogicalPlan> {
+    if let LogicalPlan::Extension(Extension { node }) = &plan {
+        if let (Some(federated), Some(needed)) = (node.as_any().downcast_ref::<FederatedPlanNode>(), &needed)
+            && let Some(pruned) = prune_federated(federated, needed)?
+        {
+            *changed = true;
+            return Ok(pruned);
+        }
+        return Ok(plan);
+    }
+    let needs = needs_of_inputs(&plan, needed);
+    let before = *changed;
+    let inputs = plan
+        .inputs()
+        .into_iter()
+        .cloned()
+        .zip(needs)
+        .map(|(input, need)| prune(input, need, changed))
+        .collect::<Result<Vec<_>>>()?;
+    if *changed == before {
+        return Ok(plan);
+    }
+    plan.with_new_exprs(plan.expressions(), inputs)
+}
+
+/// The federated table scan `federated` (under filters, aliased or not)
+/// returning only the columns in `needed`; `None` when there is nothing to
+/// prune or it is not such a scan.
+fn prune_federated(federated: &FederatedPlanNode, needed: &HashSet<Column>) -> Result<Option<LogicalPlan>> {
+    // Federation wraps each input of a cross-source join in a projection of
+    // its plain columns: that list is what narrows.
+    if let LogicalPlan::Projection(projection) = &federated.plan
+        && projection.expr.iter().all(|e| matches!(e, Expr::Column(_)))
+    {
+        let kept: Vec<Expr> = projection
+            .expr
+            .iter()
+            .zip(federated.plan.schema().columns())
+            .filter(|(_, column)| needed.contains(column))
+            .map(|(expr, _)| expr.clone())
+            .collect();
+        if kept.is_empty() || kept.len() == projection.expr.len() {
+            return Ok(None);
+        }
+        let pruned = LogicalPlan::Projection(Projection::try_new(kept, Arc::clone(&projection.input))?);
+        return Ok(Some(federate(pruned, &federated.planner)));
+    }
+    // `FROM t AS r`: the projection goes below the alias, as a plain
+    // `SELECT` of the table (`FROM (SELECT a, b FROM t) AS r`).
+    let (alias, inner) = match &federated.plan {
+        LogicalPlan::SubqueryAlias(aliased) => (Some(aliased.alias.clone()), aliased.input.as_ref()),
+        other => (None, other),
+    };
+    if !is_filtered_scan(inner) {
+        return Ok(None);
+    }
+    let positions: Vec<usize> = federated
+        .plan
+        .schema()
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| needed.contains(column))
+        .map(|(position, _)| position)
+        .collect();
+    // Nothing to prune, or nothing left: a projection without columns has
+    // no portable SQL (`SELECT FROM …`).
+    if positions.is_empty() || positions.len() == federated.plan.schema().fields().len() {
+        return Ok(None);
+    }
+    // An alias renames the columns of its input, position by position.
+    let kept: Vec<Expr> = positions
+        .iter()
+        .map(|position| Expr::Column(Column::from(inner.schema().qualified_field(*position))))
+        .collect();
+    let pruned = LogicalPlan::Projection(Projection::try_new(kept, Arc::new(inner.clone()))?);
+    let pruned = match alias {
+        Some(alias) => LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(Arc::new(pruned), alias)?),
+        None => pruned,
+    };
+    Ok(Some(federate(pruned, &federated.planner)))
 }
 
 /// Filters over one table scan: a projection of its columns renders as a
@@ -711,6 +826,57 @@ mod tests {
         // is not applied here): the text term, sent only as a superset, still
         // runs in the engine, so ACTIVE (customer 2) is not returned.
         assert!(ids.values().contains(&1) && !ids.values().contains(&2), "{ids:?}");
+    }
+
+    #[tokio::test]
+    async fn each_side_of_a_join_reads_only_the_columns_it_uses() {
+        let ctx = crate::testing::federated_session();
+        let (contracts, sent_contracts) = remote_table_recording(
+            "crm",
+            "contracts",
+            vec![
+                ("customer_id", int64(&[1, 2, 3])),
+                ("amount", int64(&[300, 100, 500])),
+                ("notes", strings(&["x", "y", "z"])),
+            ],
+            Some(Arc::new(NumericFilters)),
+        );
+        let (customers, sent_customers) = remote_table_recording(
+            "erp",
+            "customers",
+            vec![
+                ("id", int64(&[1, 2, 3])),
+                ("name", strings(&["a", "b", "c"])),
+                ("city", strings(&["p", "q", "r"])),
+            ],
+            Some(Arc::new(NumericFilters)),
+        );
+        ctx.register_table("contracts", contracts).unwrap();
+        ctx.register_table("customers", customers).unwrap();
+        let batches = rows(
+            &ctx,
+            "SELECT c.name, k.amount FROM customers c JOIN contracts k ON k.customer_id = c.id ORDER BY k.amount",
+        )
+        .await
+        .unwrap();
+        let contracts = sent_contracts.lock().unwrap().join("\n");
+        let customers = sent_customers.lock().unwrap().join("\n");
+        assert!(!contracts.contains("notes"), "unused column sent: {contracts}");
+        assert!(
+            contracts.contains("customer_id") && contracts.contains("amount"),
+            "{contracts}"
+        );
+        assert!(!customers.contains("city"), "unused column sent: {customers}");
+        assert!(
+            customers.contains("name") && customers.contains("id"),
+            "{customers}"
+        );
+        let amounts = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(amounts.values(), &[100, 300, 500]);
     }
 
     #[test]
