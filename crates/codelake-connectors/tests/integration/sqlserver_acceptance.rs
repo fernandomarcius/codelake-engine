@@ -616,7 +616,8 @@ async fn dod(tag: &str, scope: Scope) {
         format!("{spaced:?}"),
     );
 
-    // 4. EXPLAIN of the join: numeric WHERE pushed as T-SQL, text WHERE local.
+    // 4. EXPLAIN of the join: numeric WHERE pushed as T-SQL; text WHERE sent as a
+    //    superset and applied exactly in the engine (3a-3c check the rows).
     let plan = physical_plan(&engine, &join("ativo")).await;
     let remote = plan.as_deref().map(remote_sqls).unwrap_or_default();
     let parceiros = remote.iter().find(|s| s.contains("[dbo].[Parceiros]"));
@@ -629,8 +630,8 @@ async fn dod(tag: &str, scope: Scope) {
         format!("remote={remote:?}"),
     );
     checks.check(
-        "4b EXPLAIN: text filter NOT in the remote SQL, evaluated locally",
-        parceiros.is_some_and(|s| !s.to_lowercase().contains("ativo"))
+        "4b EXPLAIN: text filter sent as a superset (SQL Server's collation keeps more rows), evaluated locally",
+        parceiros.is_some_and(|s| s.to_lowercase().contains("ativo"))
             && plan.as_deref().is_ok_and(|p| {
                 p.lines()
                     .any(|l| l.contains("FilterExec") && l.contains("situacao") && l.contains("ativo"))

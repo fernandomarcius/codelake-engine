@@ -334,7 +334,15 @@ impl TableProvider for HiveView {
             .iter()
             .map(|index| {
                 let field = &fields[*index];
-                let value = cast(Expr::Column(columns[*index].clone()), field.data_type().clone());
+                // Only a type that changes is cast: a no-op cast survives until
+                // the simplifier's next pass, after federation, and a filter on
+                // the view reaches its source only through plain columns.
+                let column = Expr::Column(columns[*index].clone());
+                let value = if output.field(*index).data_type() == field.data_type() {
+                    column
+                } else {
+                    cast(column, field.data_type().clone())
+                };
                 // A char(n) column holds its values padded, as Trino shows
                 // them (`codelake_core::char_semantics`): only trailing
                 // spaces are padding, a trailing tab or line feed is text.

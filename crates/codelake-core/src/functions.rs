@@ -22,6 +22,65 @@ pub const VARBINARY_LITERAL: &str = "codelake_varbinary";
 /// stay exact (see `crate::coercion`); pushdown policies recognize it.
 pub use crate::coercion::EXACT_CAST;
 
+/// `codelake_superset(<predicate>)`: a predicate a source may evaluate
+/// instead of the engine because it keeps *at least* the rows the engine
+/// keeps (see `crate::federation_policy`); the exact predicate stays above
+/// it. Removed before the SQL is rendered; evaluated locally it is the
+/// predicate itself.
+pub const SUPERSET_FILTER: &str = "codelake_superset";
+
+/// `predicate` marked as a superset filter ([`SUPERSET_FILTER`]).
+pub fn superset_filter(predicate: Expr) -> Expr {
+    static UDF: std::sync::LazyLock<Arc<ScalarUDF>> = std::sync::LazyLock::new(|| {
+        Arc::new(ScalarUDF::new_from_impl(SupersetFilter {
+            signature: Signature::exact(vec![DataType::Boolean], Volatility::Immutable),
+        }))
+    });
+    UDF.call(vec![predicate])
+}
+
+/// The predicate inside [`superset_filter`], if `expr` is one.
+pub fn as_superset_filter(expr: &Expr) -> Option<&Expr> {
+    let Expr::ScalarFunction(function) = expr else {
+        return None;
+    };
+    if function.name() != SUPERSET_FILTER {
+        return None;
+    }
+    if let [predicate] = function.args.as_slice() {
+        Some(predicate)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct SupersetFilter {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for SupersetFilter {
+    fn name(&self) -> &'static str {
+        SUPERSET_FILTER
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if let [predicate] = args.args.as_slice() {
+            Ok(predicate.clone())
+        } else {
+            exec_err!("{SUPERSET_FILTER} expects one argument")
+        }
+    }
+}
+
 /// Decodes an even-length hexadecimal string (either case).
 pub fn decode_hex(hex: &str) -> Option<Vec<u8>> {
     // `from_str_radix` accepts a leading sign: check the digits first.

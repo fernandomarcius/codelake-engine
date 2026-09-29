@@ -284,6 +284,8 @@ async fn seed_wrong_results(host: &str, port: u16) {
                '2026-01-01T00:00:00.123', '2026-01-01'),
            (2, '2026-01-01T00:00:00.1234561', '2020-01-01T00:00:00', '2021-01-01T00:00:00',
                '2026-01-01T00:00:00.124', '2026-01-02');
+         CREATE TABLE dbo.Textos (Id INT NOT NULL PRIMARY KEY, Nome VARCHAR(10) NULL);
+         INSERT INTO dbo.Textos VALUES (1, 'ativo'), (2, 'ATIVO'), (3, 'ativo '), (4, 'outro');
          CREATE TABLE dbo.Sessao (Id INT NOT NULL PRIMARY KEY);
          INSERT INTO dbo.Sessao VALUES (2), (3), (4);",
     )
@@ -304,10 +306,25 @@ async fn wrong_results(tag: &str) {
     checks.note(format!("server: {}", version[0][0].lines().next().unwrap_or("")));
 
     let spill = tempfile::tempdir().unwrap();
+    let warehouse = tempfile::tempdir().unwrap();
     let mut engine = common::engine(spill.path());
     common::attach(
         &mut engine,
         sqlserver_connector(&host, port, "Audit", 4) as Arc<dyn Connector>,
+    )
+    .await;
+    common::attach(
+        &mut engine,
+        Arc::new(codelake_connectors::hive::HiveConnector::new(
+            "hive".into(),
+            codelake_connectors::hive::HiveParams {
+                warehouse: warehouse.path().display().to_string(),
+                s3_endpoint: None,
+                s3_region: "us-east-1".into(),
+                credentials: None,
+                path_style: false,
+            },
+        )) as Arc<dyn Connector>,
     )
     .await;
 
@@ -586,6 +603,70 @@ async fn wrong_results(tag: &str) {
             format!("got={got:?} remote={remote:?}"),
         );
     }
+    // Superset filters: SQL Server returns at least the rows, the engine the exact ones.
+    for (label, sql, expected) in [
+        (
+            "4m text = 'ativo' reaches SQL Server as a superset; the engine keeps only 'ativo'",
+            "SELECT id FROM erp1.dbo.textos WHERE nome = 'ativo' ORDER BY id",
+            rows(&[&["1"]]),
+        ),
+        (
+            "4n text IN reaches SQL Server as a superset; exact rows",
+            "SELECT id FROM erp1.dbo.textos WHERE nome IN ('ATIVO', 'outro') ORDER BY id",
+            rows(&[&["2"], &["4"]]),
+        ),
+        (
+            "4o DATE(datetime) range reaches SQL Server as midnight bounds; exact rows",
+            "SELECT id FROM erp1.dbo.temporal WHERE DATE(dtmb) >= DATE '2020-06-01' AND DATE(dtmb) <= DATE '2021-01-01' ORDER BY id",
+            rows(&[&["2"]]),
+        ),
+    ] {
+        let got = try_rows(&engine, sql).await;
+        let plan = physical_plan(&engine, sql).await;
+        let remote = plan.as_deref().map(remote_sqls).unwrap_or_default();
+        let pushed = remote.iter().any(|s| s.contains("WHERE"));
+        checks.check(
+            label,
+            got.as_ref() == Ok(&expected) && pushed,
+            format!("got={got:?} remote={remote:?}"),
+        );
+    }
+    // Through a hive view (as Warehouse reads SQL Server): the same filters reach
+    // SQL Server, and the rows stay exact.
+    for ddl in [
+        "CREATE SCHEMA hive.v",
+        "CREATE VIEW hive.v.textos AS SELECT id, nome FROM erp1.dbo.textos",
+        "CREATE VIEW hive.v.temporal AS SELECT id, dtmb, d3 FROM erp1.dbo.temporal",
+    ] {
+        let _ = try_rows(&engine, ddl).await;
+    }
+    for (label, sql, expected) in [
+        (
+            "4p text superset reaches SQL Server through a hive view; exact rows",
+            "SELECT id FROM hive.v.textos WHERE nome = 'ativo' ORDER BY id",
+            rows(&[&["1"]]),
+        ),
+        (
+            "4q DATE() bounds reach SQL Server through a hive view; exact rows",
+            "SELECT id FROM hive.v.temporal WHERE DATE(dtmb) >= DATE '2020-06-01' ORDER BY id",
+            rows(&[&["2"]]),
+        ),
+        (
+            "4r an exact temporal filter reaches SQL Server through a hive view",
+            "SELECT id FROM hive.v.temporal WHERE d3 > TIMESTAMP '2026-01-01 00:00:00.123' ORDER BY id",
+            rows(&[&["2"]]),
+        ),
+    ] {
+        let got = try_rows(&engine, sql).await;
+        let plan = physical_plan(&engine, sql).await;
+        let remote = plan.as_deref().map(remote_sqls).unwrap_or_default();
+        checks.check(
+            label,
+            got.as_ref() == Ok(&expected) && remote.iter().any(|s| s.contains("WHERE")),
+            format!("got={got:?} remote={remote:?}"),
+        );
+    }
+
     let local_filter = physical_plan(&engine, "SELECT id FROM erp1.dbo.temporal WHERE dt2 > dtm").await;
     let local_remote = local_filter.as_deref().map(remote_sqls).unwrap_or_default();
     checks.check(

@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use codelake_core::federation_policy::PushdownPolicy;
 use codelake_core::functions::{
-    EXACT_CAST, VARBINARY_LITERAL, as_binary_literal, binary_literal_expr, decode_hex,
+    EXACT_CAST, VARBINARY_LITERAL, as_binary_literal, as_superset_filter, binary_literal_expr, decode_hex,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
@@ -478,6 +478,9 @@ fn safe_binary(binary: &BinaryExpr, schema: &DFSchema) -> bool {
 
 /// Boolean expression usable as `WHERE`/`ON`: T-SQL has no bare boolean values.
 fn safe_predicate(expr: &Expr, schema: &DFSchema) -> bool {
+    if let Some(predicate) = as_superset_filter(expr) {
+        return superset_shape(predicate, schema);
+    }
     match expr {
         Expr::BinaryExpr(_)
         | Expr::Not(_)
@@ -486,6 +489,189 @@ fn safe_predicate(expr: &Expr, schema: &DFSchema) -> bool {
         | Expr::Between(_)
         | Expr::InList(_) => safe_expr(expr, schema),
         _ => false,
+    }
+}
+
+/// Text a comparison can send as a superset filter: a plain column of a
+/// character type T-SQL compares with `=` (not `text`/`ntext`).
+fn superset_text_column(expr: &Expr, schema: &DFSchema) -> bool {
+    matches!(expr, Expr::Column(_))
+        && type_of(expr, schema).is_some_and(|t| is_text(&t))
+        && sql_type_of(expr, schema).is_some_and(|t| {
+            ["char", "varchar", "nchar", "nvarchar"]
+                .iter()
+                .any(|base| t == *base || t.starts_with(&format!("{base}(")))
+        })
+}
+
+fn ascii_text(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Literal(ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)), _)
+            if s.is_ascii()
+    )
+}
+
+/// A plain temporal column of a type SQL Server compares with a whole-second
+/// literal exactly as the engine shows its values.
+fn superset_temporal_column(expr: &Expr, schema: &DFSchema) -> bool {
+    matches!(expr, Expr::Column(_))
+        && matches!(type_of(expr, schema), Some(DataType::Timestamp(_, None)))
+        && sql_type_of(expr, schema)
+            .is_some_and(|t| t == "datetime" || t == "smalldatetime" || t.starts_with("datetime2"))
+}
+
+/// A zoneless timestamp literal at a whole second: every SQL Server temporal
+/// type holds it exactly, so a bound there does not depend on the fraction
+/// the engine shows (`datetime`'s 1/300 s, ISS-054; `datetime2(7)`'s 100 ns).
+fn whole_second_literal(expr: &Expr) -> bool {
+    let whole = match expr {
+        Expr::Literal(ScalarValue::TimestampSecond(Some(_), None), _) => true,
+        Expr::Literal(ScalarValue::TimestampMillisecond(Some(v), None), _) => v % 1_000 == 0,
+        Expr::Literal(ScalarValue::TimestampMicrosecond(Some(v), None), _) => v % 1_000_000 == 0,
+        _ => false,
+    };
+    whole && is_temporal_literal(expr)
+}
+
+/// A superset filter [`SqlServerPolicy::superset_of`] produces: text equality
+/// or `IN` against ASCII literals, and whole-second bounds on a temporal
+/// column, combined with `AND`/`OR`. SQL Server keeps at least the rows the
+/// engine keeps (its collations ignore case and trailing spaces, and match
+/// whenever the bytes match); the engine applies the exact predicate above.
+fn superset_shape(expr: &Expr, schema: &DFSchema) -> bool {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::And | Operator::Or,
+            right,
+        }) => superset_shape(left, schema) && superset_shape(right, schema),
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Eq,
+            right,
+        }) => {
+            (superset_text_column(left, schema) && ascii_text(right))
+                || (superset_text_column(right, schema) && ascii_text(left))
+        }
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq,
+            right,
+        }) => {
+            (superset_temporal_column(left, schema) && whole_second_literal(right))
+                || (superset_temporal_column(right, schema) && whole_second_literal(left))
+        }
+        Expr::InList(list) => {
+            !list.negated && superset_text_column(&list.expr, schema) && list.list.iter().all(ascii_text)
+        }
+        _ => false,
+    }
+}
+
+/// `date(column)` of a temporal column (Trino's `DATE(x)`).
+fn date_of_column<'a>(expr: &'a Expr, schema: &DFSchema) -> Option<&'a Expr> {
+    let Expr::ScalarFunction(function) = expr else {
+        return None;
+    };
+    match function.args.as_slice() {
+        [column] if function.name() == "date" && superset_temporal_column(column, schema) => Some(column),
+        _ => None,
+    }
+}
+
+/// Midnight of `days` (from the Unix epoch) in the unit of `column`.
+fn midnight(column: &Expr, schema: &DFSchema, days: i32) -> Option<Expr> {
+    const DAY: i64 = 86_400;
+    let seconds = i64::from(days) * DAY;
+    let value = match type_of(column, schema)? {
+        DataType::Timestamp(TimeUnit::Second, None) => ScalarValue::TimestampSecond(Some(seconds), None),
+        DataType::Timestamp(TimeUnit::Millisecond, None) => {
+            ScalarValue::TimestampMillisecond(Some(seconds.checked_mul(1_000)?), None)
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+            ScalarValue::TimestampMicrosecond(Some(seconds.checked_mul(1_000_000)?), None)
+        }
+        _ => return None,
+    };
+    let literal = Expr::Literal(value, None);
+    is_temporal_literal(&literal).then_some(literal)
+}
+
+fn date_literal(expr: &Expr) -> Option<i32> {
+    match expr {
+        Expr::Literal(ScalarValue::Date32(Some(days)), _) => Some(*days),
+        _ => None,
+    }
+}
+
+/// `date(column) <op> DATE d` as bounds on the column itself: `>= d` is
+/// `column >= d 00:00`, `<= d` is `column < (d + 1) 00:00`. Exact, since a
+/// timestamp is on day `d` exactly when it lies in `[d 00:00, d+1 00:00)`.
+fn date_bounds(column: &Expr, op: Operator, days: i32, schema: &DFSchema) -> Option<Expr> {
+    let at = |d: i32| midnight(column, schema, d);
+    let next = days.checked_add(1)?;
+    Some(match op {
+        Operator::GtEq => column.clone().gt_eq(at(days)?),
+        Operator::Gt => column.clone().gt_eq(at(next)?),
+        Operator::Lt => column.clone().lt(at(days)?),
+        Operator::LtEq => column.clone().lt(at(next)?),
+        Operator::Eq => column.clone().gt_eq(at(days)?).and(column.clone().lt(at(next)?)),
+        _ => return None,
+    })
+}
+
+fn flipped(op: Operator) -> Option<Operator> {
+    Some(match op {
+        Operator::Eq => Operator::Eq,
+        Operator::Lt => Operator::Gt,
+        Operator::LtEq => Operator::GtEq,
+        Operator::Gt => Operator::Lt,
+        Operator::GtEq => Operator::LtEq,
+        _ => return None,
+    })
+}
+
+impl SqlServerPolicy {
+    /// See [`PushdownPolicy::superset`].
+    fn superset_of(term: &Expr, schema: &DFSchema) -> Option<Expr> {
+        match term {
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::Or,
+                right,
+            }) => Some(Self::superset_of(left, schema)?.or(Self::superset_of(right, schema)?)),
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::And,
+                right,
+            }) => match (Self::superset_of(left, schema), Self::superset_of(right, schema)) {
+                (Some(a), Some(b)) => Some(a.and(b)),
+                (Some(one), None) | (None, Some(one)) => Some(one),
+                (None, None) => None,
+            },
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                if let (Some(column), Some(days)) = (date_of_column(left, schema), date_literal(right)) {
+                    return date_bounds(column, *op, days, schema);
+                }
+                if let (Some(days), Some(column)) = (date_literal(left), date_of_column(right, schema)) {
+                    return date_bounds(column, flipped(*op)?, days, schema);
+                }
+                superset_shape(term, schema).then(|| term.clone())
+            }
+            Expr::Between(between) if !between.negated => {
+                let column = date_of_column(&between.expr, schema)?;
+                let (low, high) = (date_literal(&between.low)?, date_literal(&between.high)?);
+                Some(date_bounds(column, Operator::GtEq, low, schema)?.and(date_bounds(
+                    column,
+                    Operator::LtEq,
+                    high,
+                    schema,
+                )?))
+            }
+            Expr::InList(_) => superset_shape(term, schema).then(|| term.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -581,6 +767,10 @@ impl PushdownPolicy for SqlServerPolicy {
             }),
             _ => false,
         }
+    }
+
+    fn superset(&self, term: &Expr, schema: &DFSchema) -> Option<Expr> {
+        Self::superset_of(term, schema)
     }
 
     /// Adapts a subtree about to be unparsed:
@@ -874,6 +1064,8 @@ mod tests {
                     "smalldatetime",
                 ),
                 typed("day", DataType::Date32, "date"),
+                typed("code", DataType::Utf8, "varchar(5)"),
+                typed("memo", DataType::Utf8, "text"),
             ]);
             table_scan(Some("t"), &schema, None).unwrap()
         }
@@ -1223,6 +1415,97 @@ mod tests {
             );
             assert!(sql.contains("([t].[day] <= CAST('2024-10-04' AS DATE))"), "{sql}");
             Parser::parse_sql(&MsSqlDialect {}, &sql).unwrap();
+        }
+
+        fn date_of(column: Expr) -> Expr {
+            use datafusion::logical_expr::{ColumnarValue, create_udf};
+            let udf = create_udf(
+                "date",
+                vec![DataType::Timestamp(TimeUnit::Millisecond, None)],
+                DataType::Date32,
+                datafusion::logical_expr::Volatility::Immutable,
+                Arc::new(|_: &[ColumnarValue]| unreachable!("planned only")),
+            );
+            udf.call(vec![column])
+        }
+
+        fn superset(term: &Expr) -> Option<Expr> {
+            let plan = scan().build().unwrap();
+            SqlServerPolicy.superset(term, plan.schema())
+        }
+
+        #[test]
+        fn text_equality_is_sent_as_a_superset_the_engine_narrows() {
+            let term = col("code").in_list(vec![lit("GBVRF"), lit("GBVRI")], false);
+            assert_eq!(
+                superset(&term),
+                Some(term.clone()),
+                "the collation keeps at least these rows"
+            );
+            let either = col("code").eq(lit("A")).or(col("code").eq(lit("B")));
+            assert_eq!(superset(&either), Some(either));
+            assert!(
+                !pushable(scan().filter(term.clone()).unwrap()),
+                "never as the exact filter"
+            );
+            assert!(pushable(
+                scan()
+                    .filter(codelake_core::functions::superset_filter(term))
+                    .unwrap()
+            ));
+            assert_eq!(superset(&col("code").eq(lit("ação"))), None, "non-ASCII literal");
+            assert_eq!(superset(&col("memo").eq(lit("a"))), None, "text/ntext have no =");
+            assert_eq!(
+                superset(&col("code").not_eq(lit("A"))),
+                None,
+                "<> is not a superset"
+            );
+            assert_eq!(superset(&col("code").like(lit("A%"))), None);
+        }
+
+        #[test]
+        fn a_date_of_a_timestamp_becomes_midnight_bounds() {
+            // 2026-09-01 is day 20697 from the epoch.
+            let day = |d: i32| lit(ScalarValue::Date32(Some(d)));
+            let midnight = |d: i64| ms(d * 86_400_000);
+            assert_eq!(
+                superset(&date_of(col("dt_ms")).gt_eq(day(20_697))),
+                Some(col("dt_ms").gt_eq(midnight(20_697))),
+                "datetime: midnight is exact in 1/300 s steps"
+            );
+            assert_eq!(
+                superset(&date_of(col("dt_ms")).lt_eq(day(20_726))),
+                Some(col("dt_ms").lt(midnight(20_727)))
+            );
+            assert_eq!(
+                superset(&day(20_697).lt_eq(date_of(col("loaded")))),
+                Some(col("loaded").gt_eq(midnight(20_697))),
+                "literal on the left"
+            );
+            assert_eq!(
+                superset(&date_of(col("loaded")).between(day(20_697), day(20_726))),
+                Some(
+                    col("loaded")
+                        .gt_eq(midnight(20_697))
+                        .and(col("loaded").lt(midnight(20_727)))
+                )
+            );
+            assert_eq!(superset(&date_of(col("dt_ms")).not_eq(day(20_697))), None);
+            let bound = col("dt_ms").gt_eq(midnight(20_697));
+            assert!(pushable(
+                scan()
+                    .filter(codelake_core::functions::superset_filter(bound))
+                    .unwrap()
+            ));
+            let fraction = col("dt_ms").gt_eq(ms(20_697 * 86_400_000 + 1));
+            assert!(
+                !pushable(
+                    scan()
+                        .filter(codelake_core::functions::superset_filter(fraction))
+                        .unwrap()
+                ),
+                "a bound inside a second depends on datetime's rounding"
+            );
         }
 
         #[test]
