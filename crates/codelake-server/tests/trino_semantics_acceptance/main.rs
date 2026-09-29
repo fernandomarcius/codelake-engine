@@ -15,6 +15,7 @@
 //!   catalog (`memory` in Trino, `datafusion` in `CodeLake`) and in `hive`
 //!   (Trino's file metastore on both sides, separate warehouses);
 //! - `SHOW CREATE TABLE` and `SHOW CREATE VIEW` in both catalogs;
+//! - `max_by`/`min_by` with row and array keys;
 //! - TPC-H Q01, Q08, Q14 and Q17 on SF 0.01 (`tpch.tiny`), the same rows
 //!   loaded into both engines.
 //!
@@ -391,6 +392,7 @@ async fn expect_same(setup: &[&str], queries: &[&str], zone: Option<&str>) -> Re
 
 mod decimal;
 mod information_schema;
+mod max_by;
 mod show_create;
 mod timestamps;
 mod tpch;

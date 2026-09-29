@@ -24,7 +24,9 @@ use super::aggregate_types::{
 };
 use super::binary::xxhash64_bytes;
 use super::sketch::{Hll, QuantileSketch, Run};
-use super::support::{invalid_argument, is_decimal, is_float, is_integer, is_string, not_found};
+use super::support::{
+    invalid_argument, is_decimal, is_float, is_integer, is_string, not_found, not_supported,
+};
 
 /// Trino's `ChecksumAggregationFunction.PRIME64`.
 const PRIME64: u64 = 0x9E37_79B1_85EB_CA87;
@@ -404,8 +406,16 @@ struct By {
     max: bool,
 }
 
+/// Types with an order: the scalars, and rows and arrays of them (compared
+/// field by field and element by element, see [`key_order`]); maps have none.
 pub(crate) fn orderable(t: &DataType) -> bool {
-    hashable(t) || matches!(t, DataType::Time32(_) | DataType::Time64(_))
+    match t {
+        DataType::Struct(fields) => fields.iter().all(|f| orderable(f.data_type())),
+        DataType::List(element) | DataType::LargeList(element) | DataType::FixedSizeList(element, _) => {
+            orderable(element.data_type())
+        }
+        t => hashable(t) || matches!(t, DataType::Time32(_) | DataType::Time64(_)),
+    }
 }
 
 impl AggregateUDFImpl for By {
@@ -518,6 +528,74 @@ pub(crate) fn compare(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
     }
 }
 
+const ROW_NULL_FIELD: &str = "ROW comparison not supported for fields with null elements";
+const ARRAY_NULL_ELEMENT: &str = "ARRAY comparison not supported for arrays with null elements";
+
+/// Order of two non-null keys of `max_by`/`min_by`. Rows compare field by
+/// field and arrays element by element, a prefix before the longer array; a
+/// NULL field or element the comparison reaches is an error (a NULL past the
+/// first difference is not). NaN is below every number when `nan_low` (the
+/// order `max_by` uses) and above otherwise (`min_by`), so a NaN key is
+/// picked only when every key is NaN; `-0.0` is below `0.0`.
+pub(crate) fn key_order(a: &ScalarValue, b: &ScalarValue, nan_low: bool) -> Result<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (ScalarValue::Struct(a), ScalarValue::Struct(b)) => {
+            for (a, b) in a.columns().iter().zip(b.columns()) {
+                let order = element_order(a, b, 0, nan_low, ROW_NULL_FIELD)?;
+                if order.is_ne() {
+                    return Ok(order);
+                }
+            }
+            Ok(Ordering::Equal)
+        }
+        (ScalarValue::List(a), ScalarValue::List(b)) => elements_order(&a.value(0), &b.value(0), nan_low),
+        (ScalarValue::LargeList(a), ScalarValue::LargeList(b)) => {
+            elements_order(&a.value(0), &b.value(0), nan_low)
+        }
+        (ScalarValue::FixedSizeList(a), ScalarValue::FixedSizeList(b)) => {
+            elements_order(&a.value(0), &b.value(0), nan_low)
+        }
+        _ => Ok(match (is_nan(a), is_nan(b)) {
+            (false, false) => compare(a, b),
+            (true, true) => Ordering::Equal,
+            (true, false) if nan_low => Ordering::Less,
+            (false, true) if nan_low => Ordering::Greater,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+        }),
+    }
+}
+
+/// [`key_order`] of two arrays' elements, then of their lengths.
+fn elements_order(a: &ArrayRef, b: &ArrayRef, nan_low: bool) -> Result<std::cmp::Ordering> {
+    for i in 0..a.len().min(b.len()) {
+        let order = element_order(a, b, i, nan_low, ARRAY_NULL_ELEMENT)?;
+        if order.is_ne() {
+            return Ok(order);
+        }
+    }
+    Ok(a.len().cmp(&b.len()))
+}
+
+/// [`key_order`] of `a[i]` and `b[i]`; `null` is the error when either is NULL.
+fn element_order(
+    a: &ArrayRef,
+    b: &ArrayRef,
+    i: usize,
+    nan_low: bool,
+    null: &str,
+) -> Result<std::cmp::Ordering> {
+    if a.is_null(i) || b.is_null(i) {
+        return Err(not_supported(null));
+    }
+    key_order(
+        &ScalarValue::try_from_array(a, i)?,
+        &ScalarValue::try_from_array(b, i)?,
+        nan_low,
+    )
+}
+
 impl ByAccumulator {
     fn offer(&mut self, xs: &ArrayRef, ys: &ArrayRef) -> Result<()> {
         for i in 0..ys.len() {
@@ -525,12 +603,8 @@ impl ByAccumulator {
                 continue;
             }
             let y = ScalarValue::try_from_array(ys, i)?;
-            if is_nan(&y) {
-                // Trino never picks a NaN key (NaN compares false both ways).
-                continue;
-            }
             let better = self.best_y.is_null() || {
-                let order = compare(&y, &self.best_y);
+                let order = key_order(&y, &self.best_y, self.max)?;
                 if self.max { order.is_gt() } else { order.is_lt() }
             };
             if better {
@@ -1416,5 +1490,248 @@ mod tests {
         let mut merged = ChecksumAccumulator::default();
         merged.merge_batch(&state).unwrap();
         assert_eq!(merged.evaluate().unwrap(), y.evaluate().unwrap());
+    }
+
+    fn row(a: Option<i32>, b: Option<f64>) -> ScalarValue {
+        ScalarValue::Struct(Arc::new(StructArray::from(vec![
+            (
+                Arc::new(Field::new("c0", DataType::Int32, true)),
+                Arc::new(datafusion::arrow::array::Int32Array::from(vec![a])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("c1", DataType::Float64, true)),
+                Arc::new(Float64Array::from(vec![b])) as ArrayRef,
+            ),
+        ])))
+    }
+
+    fn list(values: &[Option<i32>]) -> ListArray {
+        ListArray::from_iter_primitive::<datafusion::arrow::datatypes::Int32Type, _, _>(vec![Some(
+            values.to_vec(),
+        )])
+    }
+
+    fn order(a: &ScalarValue, b: &ScalarValue, nan_low: bool) -> std::cmp::Ordering {
+        key_order(a, b, nan_low).unwrap()
+    }
+
+    fn refusal(a: &ScalarValue, b: &ScalarValue) -> String {
+        key_order(a, b, true).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn rows_compare_field_by_field() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        assert_eq!(
+            order(&row(Some(1), Some(2.0)), &row(Some(1), Some(3.0)), true),
+            Less
+        );
+        assert_eq!(
+            order(&row(Some(2), Some(0.0)), &row(Some(1), Some(9.0)), true),
+            Greater
+        );
+        assert_eq!(
+            order(&row(Some(1), Some(2.0)), &row(Some(1), Some(2.0)), false),
+            Equal
+        );
+        // A NULL past the first difference is never reached.
+        assert_eq!(
+            order(&row(Some(2), None), &row(Some(1), Some(3.0)), true),
+            Greater
+        );
+        assert_eq!(order(&row(Some(1), Some(3.0)), &row(Some(2), None), true), Less);
+        let error = refusal(&row(Some(1), None), &row(Some(1), Some(3.0)));
+        assert_eq!(
+            error,
+            "Execution error: NOT_SUPPORTED: ROW comparison not supported for fields with null elements"
+        );
+        assert!(refusal(&row(Some(1), Some(3.0)), &row(Some(1), None)).contains("ROW comparison"));
+        assert!(refusal(&row(None, None), &row(None, None)).contains("ROW comparison"));
+    }
+
+    #[test]
+    fn nan_is_low_for_max_by_and_high_for_min_by() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        let nan = ScalarValue::Float64(Some(f64::NAN));
+        let low = ScalarValue::Float64(Some(f64::NEG_INFINITY));
+        assert_eq!(order(&nan, &low, true), Less);
+        assert_eq!(order(&low, &nan, true), Greater);
+        assert_eq!(order(&nan, &low, false), Greater);
+        assert_eq!(order(&low, &nan, false), Less);
+        assert_eq!(order(&nan, &nan, true), Equal);
+        assert_eq!(order(&nan, &nan, false), Equal);
+        assert_eq!(
+            order(
+                &ScalarValue::Float64(Some(-0.0)),
+                &ScalarValue::Float64(Some(0.0)),
+                true
+            ),
+            Less
+        );
+        // Inside a row too.
+        assert_eq!(
+            order(&row(Some(1), Some(f64::NAN)), &row(Some(1), Some(-1.0)), true),
+            Less
+        );
+        assert_eq!(
+            order(&row(Some(1), Some(f64::NAN)), &row(Some(1), Some(-1.0)), false),
+            Greater
+        );
+    }
+
+    #[test]
+    fn arrays_compare_element_by_element_then_by_length() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        let of = |values: &[Option<i32>]| ScalarValue::List(Arc::new(list(values)));
+        assert_eq!(
+            order(&of(&[Some(1), Some(3)]), &of(&[Some(1), Some(2), Some(0)]), true),
+            Greater
+        );
+        assert_eq!(
+            order(&of(&[Some(1), Some(2)]), &of(&[Some(1), Some(2), Some(0)]), true),
+            Less
+        );
+        assert_eq!(
+            order(&of(&[Some(1), Some(2), Some(0)]), &of(&[Some(1), Some(2)]), true),
+            Greater
+        );
+        assert_eq!(order(&of(&[Some(1)]), &of(&[Some(1)]), true), Equal);
+        assert_eq!(
+            order(&of(&[Some(2), None]), &of(&[Some(1), Some(2)]), true),
+            Greater
+        );
+        assert_eq!(
+            refusal(&of(&[Some(1), None]), &of(&[Some(1), Some(2)])),
+            "Execution error: NOT_SUPPORTED: ARRAY comparison not supported for arrays with null elements"
+        );
+        assert!(refusal(&of(&[Some(1), Some(2)]), &of(&[Some(1), None])).contains("ARRAY comparison"));
+        let large = |values: &[Option<i32>]| {
+            ScalarValue::LargeList(Arc::new(
+                datafusion::arrow::array::LargeListArray::from_iter_primitive::<
+                    datafusion::arrow::datatypes::Int32Type,
+                    _,
+                    _,
+                >(vec![Some(values.to_vec())]),
+            ))
+        };
+        assert_eq!(
+            order(&large(&[Some(2)]), &large(&[Some(1), Some(5)]), true),
+            Greater
+        );
+        assert_eq!(order(&large(&[Some(1)]), &large(&[Some(1), Some(5)]), true), Less);
+        assert!(refusal(&large(&[Some(1), None]), &large(&[Some(1), Some(5)])).contains("ARRAY comparison"));
+        let fixed = |values: &[Option<i32>]| {
+            ScalarValue::FixedSizeList(Arc::new(
+                datafusion::arrow::array::FixedSizeListArray::from_iter_primitive::<
+                    datafusion::arrow::datatypes::Int32Type,
+                    _,
+                    _,
+                >(vec![Some(values.to_vec())], 2),
+            ))
+        };
+        assert_eq!(
+            order(&fixed(&[Some(1), Some(2)]), &fixed(&[Some(1), Some(3)]), true),
+            Less
+        );
+        assert_eq!(
+            order(&fixed(&[Some(1), Some(4)]), &fixed(&[Some(1), Some(3)]), true),
+            Greater
+        );
+        assert!(refusal(&fixed(&[Some(1), None]), &fixed(&[Some(1), Some(3)])).contains("ARRAY comparison"));
+    }
+
+    #[test]
+    fn rows_and_arrays_of_orderable_types_are_orderable() {
+        let int = Arc::new(Field::new("c0", DataType::Int32, true));
+        let map = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Int32, false),
+                        Field::new("value", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        assert!(orderable(&DataType::Struct(
+            vec![Arc::clone(&int), Arc::clone(&int)].into()
+        )));
+        assert!(orderable(&DataType::List(Arc::clone(&int))));
+        assert!(orderable(&DataType::LargeList(Arc::clone(&int))));
+        assert!(orderable(&DataType::FixedSizeList(Arc::clone(&int), 2)));
+        assert!(orderable(&DataType::Time64(TimeUnit::Microsecond)));
+        assert!(!orderable(&map));
+        let with_map = Arc::new(Field::new("c1", map.clone(), true));
+        assert!(!orderable(&DataType::Struct(
+            vec![Arc::clone(&int), Arc::clone(&with_map)].into()
+        )));
+        assert!(!orderable(&DataType::List(Arc::clone(&with_map))));
+        assert!(!orderable(&DataType::LargeList(Arc::clone(&with_map))));
+        assert!(!orderable(&DataType::FixedSizeList(with_map, 2)));
+    }
+
+    #[test]
+    fn max_by_a_row_key() {
+        // The third key is a NULL row: skipped, never compared.
+        let keys: ArrayRef = Arc::new(StructArray::new(
+            vec![
+                Field::new("c0", DataType::Int32, true),
+                Field::new("c1", DataType::Int32, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(datafusion::arrow::array::Int32Array::from(vec![
+                    Some(1),
+                    Some(1),
+                    None,
+                    Some(0),
+                ])),
+                Arc::new(datafusion::arrow::array::Int32Array::from(vec![
+                    Some(2),
+                    Some(3),
+                    None,
+                    Some(9),
+                ])),
+            ],
+            Some(vec![true, true, false, true].into()),
+        ));
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3, 4]));
+        for (max, best) in [(true, 2), (false, 4)] {
+            let mut by = ByAccumulator {
+                best_x: ScalarValue::Int64(None),
+                best_y: ScalarValue::try_from(keys.data_type()).unwrap(),
+                max,
+            };
+            by.update_batch(&[Arc::clone(&values), Arc::clone(&keys)])
+                .unwrap();
+            assert_eq!(
+                by.evaluate().unwrap(),
+                ScalarValue::Int64(Some(best)),
+                "max: {max}"
+            );
+        }
+    }
+
+    #[test]
+    fn max_by_picks_a_nan_key_only_when_every_key_is_nan() {
+        for max in [true, false] {
+            let mut by = ByAccumulator {
+                best_x: ScalarValue::Int64(None),
+                best_y: ScalarValue::Float64(None),
+                max,
+            };
+            let keys: ArrayRef = Arc::new(Float64Array::from(vec![f64::NAN]));
+            by.update_batch(&[Arc::new(Int64Array::from(vec![1])), Arc::clone(&keys)])
+                .unwrap();
+            assert_eq!(by.evaluate().unwrap(), ScalarValue::Int64(Some(1)));
+            let keys: ArrayRef = Arc::new(Float64Array::from(vec![1.0, f64::NAN]));
+            by.update_batch(&[Arc::new(Int64Array::from(vec![2, 3])), keys])
+                .unwrap();
+            assert_eq!(by.evaluate().unwrap(), ScalarValue::Int64(Some(2)), "max: {max}");
+        }
     }
 }

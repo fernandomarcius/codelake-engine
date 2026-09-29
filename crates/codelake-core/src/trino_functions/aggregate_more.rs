@@ -24,7 +24,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::physical_expr::expressions::Literal;
 
-use super::aggregate::{compare, hashable, state_field, udaf_boilerplate};
+use super::aggregate::{hashable, key_order, state_field, udaf_boilerplate};
 use super::aggregate_types::{Retyped, RetypedGroups, engine_args, engine_state_args, fields};
 use super::collections::{build_maps, map_type};
 use super::support::{invalid_argument, is_decimal, is_integer, is_numeric, not_found, out_of_range};
@@ -957,11 +957,19 @@ struct Candidate {
 }
 
 impl Candidate {
-    /// `Greater` when `self` ranks better than `other`.
-    fn rank(&self, other: &Self) -> std::cmp::Ordering {
-        let by_y = compare(&self.y, &other.y);
+    /// `Greater` when `self` ranks better than `other`; an error where the
+    /// keys cannot be compared (see [`key_order`]).
+    fn try_rank(&self, other: &Self) -> Result<std::cmp::Ordering> {
+        let by_y = key_order(&self.y, &other.y, self.max)?;
         let by_y = if self.max { by_y } else { by_y.reverse() };
-        by_y.then_with(|| other.seq.cmp(&self.seq))
+        Ok(by_y.then_with(|| other.seq.cmp(&self.seq)))
+    }
+
+    /// [`Self::try_rank`] for the heap, which cannot fail: keys that cannot
+    /// be compared rank by arrival. [`ByNAccumulator::offer`] compares each
+    /// new key with the worst kept one first, which raises the error.
+    fn rank(&self, other: &Self) -> std::cmp::Ordering {
+        self.try_rank(other).unwrap_or_else(|_| other.seq.cmp(&self.seq))
     }
 }
 
@@ -1012,10 +1020,10 @@ impl ByNAccumulator {
         }
     }
 
-    fn offer(&mut self, x: ScalarValue, y: ScalarValue) {
-        // NULL and NaN keys are never picked (see `max_by`).
-        if y.is_null() || super::aggregate::is_nan(&y) {
-            return;
+    fn offer(&mut self, x: ScalarValue, y: ScalarValue) -> Result<()> {
+        // NULL keys are never picked; NaN ranks last (see `max_by`).
+        if y.is_null() {
+            return Ok(());
         }
         let candidate = Candidate {
             x,
@@ -1024,16 +1032,19 @@ impl ByNAccumulator {
             max: self.max,
         };
         self.seq += 1;
+        let better = match self.best.peek() {
+            Some(worst) => candidate.try_rank(worst)?.is_gt(),
+            None => true,
+        };
         if self.best.len() < self.n {
             self.bytes += candidate.x.size() + candidate.y.size();
             self.best.push(candidate);
-        } else if let Some(mut worst) = self.best.peek_mut()
-            && candidate.rank(&worst).is_gt()
-        {
+        } else if better && let Some(mut worst) = self.best.peek_mut() {
             self.bytes =
                 self.bytes + candidate.x.size() + candidate.y.size() - worst.x.size() - worst.y.size();
             *worst = candidate;
         }
+        Ok(())
     }
 
     /// The kept pairs, best first.
@@ -1060,7 +1071,7 @@ impl Accumulator for ByNAccumulator {
             self.offer(
                 ScalarValue::try_from_array(xs, i)?,
                 ScalarValue::try_from_array(ys, i)?,
-            );
+            )?;
         }
         Ok(())
     }
@@ -1075,7 +1086,7 @@ impl Accumulator for ByNAccumulator {
                 continue;
             }
             for (x, y) in scalars(&xs.value(row))?.into_iter().zip(scalars(&ys.value(row))?) {
-                self.offer(x, y);
+                self.offer(x, y)?;
             }
         }
         Ok(())
@@ -1356,10 +1367,117 @@ mod tests {
     fn top_n_keeps_the_best_in_order() {
         let mut acc = ByNAccumulator::new(2, true, DataType::Utf8, DataType::Int64);
         for (x, y) in [("a", 1), ("b", 3), ("c", 2)] {
-            acc.offer(ScalarValue::from(x), ScalarValue::Int64(Some(y)));
+            acc.offer(ScalarValue::from(x), ScalarValue::Int64(Some(y)))
+                .unwrap();
         }
-        acc.offer(ScalarValue::from("n"), ScalarValue::Int64(None));
+        acc.offer(ScalarValue::from("n"), ScalarValue::Int64(None))
+            .unwrap();
         let xs: Vec<ScalarValue> = acc.ranked().iter().map(|c| c.x.clone()).collect();
         assert_eq!(xs, vec![ScalarValue::from("b"), ScalarValue::from("c")]);
+    }
+
+    fn row(a: i32, b: Option<i32>) -> ScalarValue {
+        ScalarValue::Struct(Arc::new(datafusion::arrow::array::StructArray::from(vec![
+            (
+                Arc::new(Field::new("c0", DataType::Int32, true)),
+                Arc::new(datafusion::arrow::array::Int32Array::from(vec![a])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("c1", DataType::Int32, true)),
+                Arc::new(datafusion::arrow::array::Int32Array::from(vec![b])) as ArrayRef,
+            ),
+        ])))
+    }
+
+    fn kept(acc: &ByNAccumulator) -> Vec<ScalarValue> {
+        acc.ranked().iter().map(|c| c.x.clone()).collect()
+    }
+
+    #[test]
+    fn top_n_ranks_nan_last_and_row_keys_field_by_field() {
+        for (max, expected) in [(true, [2, 3, 1]), (false, [3, 2, 1])] {
+            let mut acc = ByNAccumulator::new(3, max, DataType::Int64, DataType::Float64);
+            for (x, y) in [(1, f64::NAN), (2, 1.0), (3, -1.0), (4, f64::NAN)] {
+                acc.offer(ScalarValue::Int64(Some(x)), ScalarValue::Float64(Some(y)))
+                    .unwrap();
+            }
+            let expected: Vec<ScalarValue> = expected.iter().map(|x| ScalarValue::Int64(Some(*x))).collect();
+            assert_eq!(kept(&acc), expected, "max: {max}");
+        }
+        let mut acc = ByNAccumulator::new(2, true, DataType::Int64, row(0, None).data_type());
+        for (x, y) in [(1, row(1, Some(2))), (2, row(0, Some(9))), (3, row(1, Some(3)))] {
+            acc.offer(ScalarValue::Int64(Some(x)), y).unwrap();
+        }
+        assert_eq!(
+            kept(&acc),
+            vec![ScalarValue::Int64(Some(3)), ScalarValue::Int64(Some(1))]
+        );
+    }
+
+    #[test]
+    fn top_n_merges_row_keys_from_another_state() {
+        let y_type = row(0, None).data_type();
+        let mut partial = ByNAccumulator::new(2, true, DataType::Int64, y_type.clone());
+        for (x, y) in [(1, row(1, Some(2))), (2, row(0, Some(9)))] {
+            partial.offer(ScalarValue::Int64(Some(x)), y).unwrap();
+        }
+        let state: Vec<ArrayRef> = partial
+            .state()
+            .unwrap()
+            .iter()
+            .map(|s| s.to_array().unwrap())
+            .collect();
+        let mut merged = ByNAccumulator::new(2, true, DataType::Int64, y_type.clone());
+        merged
+            .offer(ScalarValue::Int64(Some(3)), row(1, Some(3)))
+            .unwrap();
+        merged.merge_batch(&state).unwrap();
+        assert_eq!(
+            kept(&merged),
+            vec![ScalarValue::Int64(Some(3)), ScalarValue::Int64(Some(1))]
+        );
+        // A kept key with a NULL field the merged one reaches is refused.
+        let mut refusing = ByNAccumulator::new(2, true, DataType::Int64, y_type);
+        refusing.offer(ScalarValue::Int64(Some(4)), row(1, None)).unwrap();
+        let error = refusing.merge_batch(&state).unwrap_err().to_string();
+        assert!(error.contains("NOT_SUPPORTED: ROW comparison"), "{error}");
+    }
+
+    #[test]
+    fn top_n_refuses_a_null_field_it_has_to_compare() {
+        let mut acc = ByNAccumulator::new(2, true, DataType::Int64, row(0, None).data_type());
+        acc.offer(ScalarValue::Int64(Some(1)), row(1, None)).unwrap();
+        let error = acc
+            .offer(ScalarValue::Int64(Some(2)), row(1, Some(3)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("NOT_SUPPORTED: ROW comparison"), "{error}");
+        // A NULL past the first difference is never reached.
+        let mut acc = ByNAccumulator::new(2, false, DataType::Int64, row(0, None).data_type());
+        acc.offer(ScalarValue::Int64(Some(1)), row(1, None)).unwrap();
+        acc.offer(ScalarValue::Int64(Some(2)), row(2, Some(3))).unwrap();
+        acc.offer(ScalarValue::Int64(Some(3)), row(3, Some(3))).unwrap();
+        assert_eq!(
+            kept(&acc),
+            vec![ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(2))]
+        );
+        // The heap's own comparisons of such keys rank them by arrival.
+        let (first, second) = (
+            Candidate {
+                x: ScalarValue::Int64(Some(1)),
+                y: row(1, None),
+                seq: 0,
+                max: true,
+            },
+            Candidate {
+                x: ScalarValue::Int64(Some(2)),
+                y: row(1, None),
+                seq: 1,
+                max: true,
+            },
+        );
+        assert!(first.try_rank(&second).is_err());
+        assert!(first.rank(&second).is_gt());
+        assert!(second.rank(&first).is_lt());
     }
 }

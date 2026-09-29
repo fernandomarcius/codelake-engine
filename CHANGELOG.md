@@ -207,6 +207,16 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- Found by the shadow run on production routines (2026-09-29):
+  - `max_by`/`min_by` (and the `n` form) accept a row or an array as the key (`FUNCTION_NOT_FOUND`
+    before), as the reference orders them: rows field by field, arrays element by element with a prefix
+    first; a NULL field or element the comparison reaches is `NOT_SUPPORTED`. A NaN key ranks below every
+    number for `max_by` and above for `min_by`, so it is picked only when every key is NaN (such a group
+    answered NULL, and the `n` form dropped NaN keys).
+  - `CREATE TABLE AS` (and `CREATE OR REPLACE`) of a `UNION ALL` whose branches differ in field metadata
+    failed (`target schema is not superset of current schema`): SQL Server columns record their type
+    (`numeric` in one branch, `decimal` in another). A batch now takes the announced schema when only
+    metadata and nullability differ; another difference is still an error.
 - `SHOW CREATE TABLE` failed for every table (`COLUMN_NOT_FOUND: No field named definition`) and `SHOW CREATE
   VIEW` was refused. Both answer the statement as the reference engine prints it, one `varchar(n)` row: types
   in SQL syntax, `NOT NULL` where the source refuses nulls, reserved and irregular names quoted, a hive

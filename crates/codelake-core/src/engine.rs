@@ -428,7 +428,8 @@ fn lower_case_columns(
 }
 
 /// `stream` announced with `schema`, which must hold its batches (same
-/// columns, more metadata or nullability).
+/// column types; nullability and field metadata may differ, as between the
+/// branches of a `UNION ALL`, see [`crate::batch_schema`]).
 fn with_schema(
     stream: datafusion::physical_plan::SendableRecordBatchStream,
     schema: datafusion::arrow::datatypes::SchemaRef,
@@ -437,7 +438,7 @@ fn with_schema(
     let announced = Arc::clone(&schema);
     Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
         announced,
-        stream.map(move |batch| batch.and_then(|b| Ok(b.with_schema(Arc::clone(&schema))?))),
+        stream.map(move |batch| batch.and_then(|b| crate::batch_schema::announced(b, &schema))),
     ))
 }
 

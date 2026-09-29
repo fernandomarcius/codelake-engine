@@ -1170,7 +1170,7 @@ async fn defect_06_abs_integer_minimum() {
     .await;
 }
 
-/// NaN: `max_by`/`min_by` never pick a NaN key, `array_max`/`array_min`
+/// NaN: `max_by`/`min_by` pick a NaN key only when every key is NaN, `array_max`/`array_min`
 /// skip NaN, and NaN is not equal to itself in `contains`/`array_position`.
 #[tokio::test]
 async fn defect_07_nan_in_max_by_and_arrays() {

@@ -33,6 +33,10 @@ pub(crate) fn invalid_argument(message: impl Display) -> DataFusionError {
     trino_error("INVALID_FUNCTION_ARGUMENT", message)
 }
 
+pub(crate) fn not_supported(message: impl Display) -> DataFusionError {
+    trino_error("NOT_SUPPORTED", message)
+}
+
 pub(crate) fn out_of_range(message: impl Display) -> DataFusionError {
     trino_error("NUMERIC_VALUE_OUT_OF_RANGE", message)
 }
