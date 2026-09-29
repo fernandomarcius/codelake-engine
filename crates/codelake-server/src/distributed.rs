@@ -261,12 +261,12 @@ fn task_state(base: &SessionState, ctx: WorkerQueryContext) -> Result<SessionSta
         options.extensions.insert(session);
     }
     *config.options_mut() = options;
-    Ok(codelake_core::rebuild_state(base, |builder| {
+    codelake_core::rebuild_state(base, |builder| {
         builder
             .with_config(config)
             .with_runtime_env(Arc::clone(base.runtime_env()))
             .with_distributed_user_codec(CoreCodec)
-    }))
+    })
 }
 
 /// The worker service of `engine`, to mount on a tonic server.

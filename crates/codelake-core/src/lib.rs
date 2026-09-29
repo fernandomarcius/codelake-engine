@@ -19,6 +19,7 @@ pub mod engine;
 pub mod env_refs;
 pub mod federation_guard;
 pub mod federation_policy;
+mod function_names;
 pub mod functions;
 pub mod governance;
 pub mod identifier_case;

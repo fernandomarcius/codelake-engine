@@ -760,6 +760,28 @@ async fn views_with_quoted_mixed_case_columns_read_back() {
     assert_eq!(definition["columns"][0]["name"], "mixedcol");
 }
 
+/// A view's plan is built in a state rebuilt from the query's
+/// (`codelake_core::rebuild_state`), which registers the functions again in
+/// hash order: a built-in the engine replaced could take its name back in
+/// some processes. The shadow run's incremental model failed on a view with
+/// `date_format(…, '%i')` ("Cast error: Format error": `DataFusion`'s
+/// `to_char` ran) while the same `SELECT` outside the view answered. Each
+/// lake is a new engine, with its own hash order.
+#[tokio::test]
+async fn views_resolve_the_functions_the_engine_replaced() {
+    let select = "SELECT date_format(TIMESTAMP '2020-01-02 03:04:05.000', '%Y-%m-%d %H:%i:%s') AS d, \
+                  element_at(ARRAY[10, 20, 30], 2) AS e";
+    for _ in 0..8 {
+        let lake = lake().await;
+        lake.ok(&format!("CREATE VIEW hive.s.v AS {select}")).await;
+        lake.ok("CREATE VIEW hive.s.w AS SELECT d, e FROM hive.s.v").await;
+        let expected = rows(&[&["2020-01-02 03:04:05", "20"]]);
+        assert_eq!(lake.ok(select).await, expected);
+        assert_eq!(lake.ok("SELECT d, e FROM hive.s.v").await, expected);
+        assert_eq!(lake.ok("SELECT d, e FROM hive.s.w").await, expected);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DDL options, names, OR REPLACE
 // ---------------------------------------------------------------------------

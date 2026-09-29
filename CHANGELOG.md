@@ -217,6 +217,15 @@ versioning: [SemVer](https://semver.org/).
     failed (`target schema is not superset of current schema`): SQL Server columns record their type
     (`numeric` in one branch, `decimal` in another). A batch now takes the announced schema when only
     metadata and nullability differ; another difference is still an error.
+  - A view (Hive, or any state rebuilt from the engine's: distributed tasks) could run a `DataFusion`
+    built-in instead of the engine's function of the same name, in about half the processes:
+    `date_format(ts, '%Y-%m-%d %H:%i:%s')` failed (`Cast error: Format error`, `to_char`) while the same
+    `SELECT` outside the view answered; `length`, `element_at`, `array_join`, `arrays_overlap` were exposed
+    the same way. Every name now belongs to one function in every state, whatever order a rebuild registers
+    them in. The names only a replaced built-in answered to are gone (`datepart`, `datetrunc`, `today`,
+    `instr`, `mean`, `covar`, `array_indexof`, `list_position`, `list_indexof`, `list_distinct`,
+    `list_except`, `list_intersect`, `list_max`, `list_remove`, `list_sort`, `list_union`); the reference has
+    none of them.
 - `SHOW CREATE TABLE` failed for every table (`COLUMN_NOT_FOUND: No field named definition`) and `SHOW CREATE
   VIEW` was refused. Both answer the statement as the reference engine prints it, one `varchar(n)` row: types
   in SQL syntax, `NOT NULL` where the source refuses nulls, reserved and irregular names quoted, a hive
