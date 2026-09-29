@@ -17,6 +17,7 @@ mod distinct_counts;
 mod dml_guard;
 pub mod engine;
 pub mod env_refs;
+mod federated_dynamic_filters;
 pub mod federation_guard;
 pub mod federation_policy;
 pub mod functions;

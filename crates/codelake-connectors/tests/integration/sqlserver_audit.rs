@@ -564,46 +564,54 @@ async fn wrong_results(tag: &str) {
     );
 
     // --- Temporal literals and pruned columns (shadow run, 2026-09-28) -----
-    for (label, sql, expected, pushed) in [
+    // `sent`: what the remote WHERE holds (the exact predicate, or the
+    // whole-second superset the engine narrows).
+    for (label, sql, expected, sent) in [
         (
             "4g datetime2(3) > timestamp literal IS pushed and exact at the millisecond",
             "SELECT id FROM erp1.dbo.temporal WHERE d3 > TIMESTAMP '2026-01-01 00:00:00.123' ORDER BY id",
             rows(&[&["2"]]),
-            true,
+            "[d3] > CAST('2026-01-01 00:00:00.123' AS datetime2(7))",
         ),
         (
             "4h datetime2(3) >= the same literal keeps the boundary row",
             "SELECT id FROM erp1.dbo.temporal WHERE d3 >= TIMESTAMP '2026-01-01 00:00:00.123' ORDER BY id",
             rows(&[&["1"], &["2"]]),
-            true,
+            "[d3] >= CAST('2026-01-01 00:00:00.123' AS datetime2(7))",
         ),
         (
             "4i date = date literal IS pushed",
             "SELECT id FROM erp1.dbo.temporal WHERE dd = DATE '2026-01-02' ORDER BY id",
             rows(&[&["2"]]),
-            true,
+            "[dd] = CAST('2026-01-02' AS DATE)",
         ),
         (
-            "4j datetime (1/300 s) vs timestamp literal is NOT pushed (ISS-054)",
+            "4j datetime (1/300 s) vs timestamp literal: only whole-second bounds are sent (ISS-054)",
             "SELECT id FROM erp1.dbo.temporal WHERE dtmb > TIMESTAMP '2020-06-01 00:00:00' ORDER BY id",
             rows(&[&["2"]]),
-            false,
+            "[dtmb] >= CAST('2020-06-01 00:00:00' AS datetime2(7))",
         ),
         (
-            "4k datetime2(7) vs timestamp literal is NOT pushed (100 ns truncated)",
+            "4k datetime2(7) vs timestamp literal: only whole-second bounds are sent (100 ns truncated)",
             "SELECT id FROM erp1.dbo.temporal WHERE dt2 > TIMESTAMP '2026-01-01 00:00:00.123456' ORDER BY id",
             // Both values truncate to .123456 in the engine; SQL Server would return both.
             rows(&[]),
-            false,
+            "[dt2] >= CAST('2026-01-01 00:00:00' AS datetime2(7))",
         ),
     ] {
         let got = try_rows(&engine, sql).await;
         let plan = physical_plan(&engine, sql).await;
         let remote = plan.as_deref().map(remote_sqls).unwrap_or_default();
-        let has_where = remote.iter().any(|s| s.contains("WHERE"));
+        let clauses: Vec<&str> = remote
+            .iter()
+            .filter_map(|s| s.split_once("WHERE").map(|(_, w)| w))
+            .collect();
         checks.check(
             label,
-            got.as_ref() == Ok(&expected) && has_where == pushed,
+            got.as_ref() == Ok(&expected)
+                && clauses.len() == 1
+                && clauses[0].contains(sent)
+                && clauses[0].matches("CAST(").count() == 1,
             format!("got={got:?} remote={remote:?}"),
         );
     }

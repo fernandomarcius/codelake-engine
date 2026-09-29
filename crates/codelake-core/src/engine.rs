@@ -811,6 +811,11 @@ impl Engine {
         if let Some(partitions) = execution.target_partitions {
             session = session.with_target_partitions(partitions);
         }
+        // How many build keys a dynamic filter lists: what a federated scan
+        // can send as an `IN` (`crate::federated_dynamic_filters`).
+        let optimizer = &mut session.options_mut().optimizer;
+        optimizer.hash_join_inlist_pushdown_max_distinct_values = execution.dynamic_filter_max_keys;
+        optimizer.hash_join_inlist_pushdown_max_size = execution.dynamic_filter_max_key_bytes.as_usize();
         // NULLs last in both directions and the UTC session zone (see
         // `trino_functions::session_config`).
         let session = crate::trino_functions::session_config(session);
@@ -1848,6 +1853,32 @@ mod tests {
             ..ExecutionConfig::default()
         };
         Engine::new(&memory, &execution).unwrap()
+    }
+
+    #[test]
+    fn dynamic_filters_list_as_many_keys_as_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = MemoryConfig {
+            limit: ByteSize::mib(64),
+            spill_dir: dir.path().to_owned(),
+            spill_limit: ByteSize::mib(64),
+            metadata_cache_limit: ByteSize::mib(1),
+        };
+        let listed = |execution: &ExecutionConfig| {
+            let engine = Engine::new(&memory, execution).unwrap();
+            let optimizer = &engine.context().state().config().options().optimizer.clone();
+            (
+                optimizer.hash_join_inlist_pushdown_max_distinct_values,
+                optimizer.hash_join_inlist_pushdown_max_size,
+            )
+        };
+        assert_eq!(listed(&ExecutionConfig::default()), (150, 128 * 1024));
+        let execution = ExecutionConfig {
+            dynamic_filter_max_keys: 20_000,
+            dynamic_filter_max_key_bytes: ByteSize::mib(4),
+            ..ExecutionConfig::default()
+        };
+        assert_eq!(listed(&execution), (20_000, 4 * 1024 * 1024));
     }
 
     fn source(name: &'static str, behaviour: Behaviour) -> Arc<dyn Connector> {

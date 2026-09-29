@@ -23,6 +23,23 @@ versioning: [SemVer](https://semver.org/).
     source (56 lookups of one table each: 288 s).
   - `COUNT(DISTINCT x)` next to `COUNT(*)` runs in two spillable aggregations; one million distinct
     tuples exhausted the memory limit.
+  - The nightly reconciliation (dbt, 921 s against 75 s) filters SQL Server tables by the keys of a local
+    replica (`id IN (SELECT id FROM hive…)`) and a window (`CAST(dataregistro AS timestamp(3)) >=
+    date_add('day', -7, TIMESTAMP '… .133')`); neither reached SQL Server, which returned whole tables:
+    - A hash join's dynamic filter reaches the federated scan it probes: its keys as an `IN` list
+      (`execution.dynamic_filter_max_keys`, 150), their min/max always, each term sent as the source's
+      policy accepts it (SQL Server: text keys as an `IN` superset under its collation, never a text
+      min/max; ADR 0006).
+    - SQL Server: a `datetime` or `datetime2(7)` column compared with a literal inside a second is sent
+      whole-second bounds (`>=` the second before, `<` the second after) as a superset. Upper bounds are
+      always strict: a `datetime2(7)` value 100 ns past a whole-second `<=` bound was lost at the source.
+    - A null-safe join's dynamic filter (`(bounds AND keys) OR key IS NULL`) is sent term by term, so its keys
+      still go when the source refuses its bounds (text); a build-side literal is never cast to a type that
+      changes its value.
+    - Reproduction (15 million rows in SQL Server 2022, 14 850 local text keys): 93–108 s → 1.9–2.5 s,
+      SQL Server returns 453 522 rows instead of 15 000 000; same result. The keys are past the `IN` limit,
+      so the window does the work; listing them all (`dynamic_filter_max_keys = 20000`) returns 14 570 rows
+      but takes 3.1 s (SQL Server compiles the 14 850-literal `IN`).
 
 ### Added
 - Distributed execution (M4, ADR 0011), behind the `distributed` feature: a `[distributed]` coordinator
