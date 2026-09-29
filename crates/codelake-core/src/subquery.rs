@@ -26,6 +26,13 @@
 //! correlated subquery the aggregation is grouped by the correlation (one
 //! check per outer row), which also lets `DataFusion` decorrelate subqueries it
 //! would otherwise reject as not aggregated.
+//!
+//! `DataFusion` decorrelates an aggregated subquery only when each correlated
+//! equality compares a plain inner column: it groups by that column and
+//! joins on it. `WHERE DATE(r.paid_at) = date(o.day)` names an expression, so
+//! the subquery stays unplanned (`Physical plan does not support logical
+//! expression ScalarSubquery`). [`CorrelatedExpressionKeys`] computes such an
+//! expression as a column below the filter and compares that column instead.
 
 use std::mem::size_of_val;
 use std::sync::{Arc, LazyLock};
@@ -407,6 +414,120 @@ impl AnalyzerRule for EnforceScalarSubqueryRows {
     }
 }
 
+/// Prefix of the columns [`CorrelatedExpressionKeys`] adds to a subquery.
+const CORRELATED_KEY: &str = "codelake_correlated_key";
+
+/// `inner_expr = outer_expr` with an expression, not a plain column, on the
+/// subquery's side: the side over the subquery's columns and the other side,
+/// in that order.
+fn correlated_expression(term: &Expr) -> Option<(&Expr, &Expr)> {
+    let Expr::BinaryExpr(binary) = term else {
+        return None;
+    };
+    if binary.op != datafusion::logical_expr::Operator::Eq {
+        return None;
+    }
+    let inner_only = |e: &Expr| !e.contains_outer() && e.any_column_refs() && !e.is_volatile();
+    let outer_only = |e: &Expr| e.contains_outer() && !e.any_column_refs();
+    let (inner, outer) = match (binary.left.as_ref(), binary.right.as_ref()) {
+        (left, right) if inner_only(left) && outer_only(right) => (left, right),
+        (left, right) if outer_only(left) && inner_only(right) => (right, left),
+        _ => return None,
+    };
+    let plain = match inner {
+        Expr::Cast(cast) => cast.expr.as_ref(),
+        other => other,
+    };
+    (!matches!(plain, Expr::Column(_))).then_some((inner, outer))
+}
+
+/// `filter` with each correlated expression of its conjunction computed as
+/// a new column of a projection below it; `None` when it has none.
+fn keyed_filter(filter: &datafusion::logical_expr::Filter, next: &mut usize) -> Result<Option<LogicalPlan>> {
+    let terms = datafusion::logical_expr::utils::split_conjunction(&filter.predicate);
+    if !terms.iter().any(|term| correlated_expression(term).is_some()) {
+        return Ok(None);
+    }
+    let mut keys = Vec::new();
+    let mut rewritten = Vec::new();
+    for term in terms {
+        match correlated_expression(term) {
+            Some((inner, outer)) => {
+                let name = format!("{CORRELATED_KEY}_{}", *next);
+                *next += 1;
+                keys.push(inner.clone().alias(&name));
+                rewritten.push(Expr::Column(Column::new_unqualified(name)).eq(outer.clone()));
+            }
+            None => rewritten.push(term.clone()),
+        }
+    }
+    let input = filter.input.as_ref();
+    let columns = input.schema().columns().into_iter().map(Expr::Column).chain(keys);
+    let keyed = LogicalPlanBuilder::from(input.clone())
+        .project(columns)?
+        .build()?;
+    let Some(predicate) = datafusion::logical_expr::utils::conjunction(rewritten) else {
+        return Ok(None);
+    };
+    Ok(Some(LogicalPlanBuilder::from(keyed).filter(predicate)?.build()?))
+}
+
+/// `plan` (a subquery's) with the filters below its aggregations keyed by
+/// [`keyed_filter`]; its schema is unchanged: an aggregation or a
+/// projection above them drops the new columns.
+fn keyed(plan: LogicalPlan, below_aggregate: bool, next: &mut usize) -> Result<Transformed<LogicalPlan>> {
+    let below = below_aggregate
+        || matches!(&plan, LogicalPlan::Aggregate(aggregate) if !aggregate.aggr_expr.is_empty());
+    let rewritten = plan.map_children(|child| keyed(child, below, next))?;
+    let rewritten = if rewritten.transformed {
+        rewritten.map_data(LogicalPlan::recompute_schema)?
+    } else {
+        rewritten
+    };
+    if !below_aggregate {
+        return Ok(rewritten);
+    }
+    rewritten.transform_data(|node| match &node {
+        LogicalPlan::Filter(filter) => Ok(match keyed_filter(filter, next)? {
+            Some(keyed) => Transformed::yes(keyed),
+            None => Transformed::no(node),
+        }),
+        _ => Ok(Transformed::no(node)),
+    })
+}
+
+/// Analyzer rule: see the module documentation.
+#[derive(Debug, Default)]
+pub struct CorrelatedExpressionKeys;
+
+impl AnalyzerRule for CorrelatedExpressionKeys {
+    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+        plan.transform_up_with_subqueries(|node| {
+            node.map_expressions(|expr| {
+                expr.transform_up(|e| match e {
+                    Expr::ScalarSubquery(subquery) => {
+                        let mut next = 0;
+                        let rewritten = keyed(subquery.subquery.as_ref().clone(), false, &mut next)?;
+                        Ok(if rewritten.transformed {
+                            Transformed::yes(Expr::ScalarSubquery(
+                                subquery.with_plan(Arc::new(rewritten.data)),
+                            ))
+                        } else {
+                            Transformed::no(Expr::ScalarSubquery(subquery))
+                        })
+                    }
+                    other => Ok(Transformed::no(other)),
+                })
+            })
+        })
+        .data()
+    }
+
+    fn name(&self) -> &'static str {
+        "codelake_correlated_expression_keys"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,5 +820,104 @@ mod tests {
             "{}",
             view.input.display_indent()
         );
+    }
+
+    async fn payments() -> SessionContext {
+        let ctx = SessionContext::new();
+        for ddl in [
+            "CREATE TABLE o AS SELECT * FROM (VALUES \
+             (1, TIMESTAMP '2026-09-02 10:00:00'), (1, TIMESTAMP '2026-09-02 11:00:00'), \
+             (2, TIMESTAMP '2026-09-03 10:00:00'), (3, TIMESTAMP '2026-09-04 10:00:00')) AS v(k, d)",
+            "CREATE TABLE r AS SELECT * FROM (VALUES \
+             (1, 10, TIMESTAMP '2026-09-02 08:00:00'), (1, 2, TIMESTAMP '2026-09-02 09:00:00'), \
+             (1, 100, TIMESTAMP '2026-09-03 09:00:00'), (2, 3, TIMESTAMP '2026-09-03 09:00:00')) \
+             AS v(k, amount, paid_at)",
+        ] {
+            ctx.sql(ddl).await.unwrap().collect().await.unwrap();
+        }
+        ctx
+    }
+
+    /// The paid amount of each group's day, correlated by an expression.
+    const PAID_THAT_DAY: &str = "SELECT o.k, o.d, (SELECT sum(r.amount) FROM r \
+         WHERE r.k = o.k AND date_trunc('day', r.paid_at) = date_trunc('day', o.d)) AS m \
+         FROM o GROUP BY o.k, o.d ORDER BY 1, 2";
+
+    async fn paid(ctx: &SessionContext, sql: &str) -> Result<Vec<Option<i64>>> {
+        let batches = ctx.sql(sql).await?.collect().await?;
+        Ok(batches
+            .iter()
+            .flat_map(|b| b.column(2).as_primitive::<Int64Type>().iter().collect::<Vec<_>>())
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn a_subquery_correlated_by_an_expression_is_decorrelated() {
+        let ctx = payments().await;
+        let without = paid(&ctx, PAID_THAT_DAY).await.unwrap_err();
+        assert!(without.to_string().contains("ScalarSubquery"), "{without}");
+        ctx.add_analyzer_rule(Arc::new(CorrelatedExpressionKeys));
+        let expected = vec![Some(12), Some(12), Some(3), None];
+        assert_eq!(paid(&ctx, PAID_THAT_DAY).await.unwrap(), expected);
+        // The outer side first, and a second expression in the same filter.
+        let swapped = "SELECT o.k, o.d, (SELECT sum(r.amount) FROM r \
+             WHERE date_trunc('day', o.d) = date_trunc('day', r.paid_at) AND r.k + 0 = o.k) AS m \
+             FROM o GROUP BY o.k, o.d ORDER BY 1, 2";
+        assert_eq!(paid(&ctx, swapped).await.unwrap(), expected);
+    }
+
+    #[test]
+    fn the_keys_follow_the_one_row_rule() {
+        let names: Vec<String> = crate::engine::analyzer_rules()
+            .iter()
+            .map(|r| r.name().to_owned())
+            .collect();
+        let position = |name: &str| names.iter().position(|n| n == name);
+        let keys = position("codelake_correlated_expression_keys");
+        assert!(keys.is_some(), "{names:?}");
+        assert!(position(EnforceScalarSubqueryRows.name()) < keys, "{names:?}");
+    }
+
+    async fn keyed_plan(sql: &str) -> bool {
+        let ctx = payments().await;
+        let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+        let plan = CorrelatedExpressionKeys
+            .analyze(plan, &ConfigOptions::default())
+            .unwrap();
+        let mut keyed = false;
+        plan.apply_with_subqueries(|node| {
+            keyed |= node
+                .schema()
+                .fields()
+                .iter()
+                .any(|f| f.name().starts_with(CORRELATED_KEY));
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        keyed
+    }
+
+    #[tokio::test]
+    async fn only_expressions_of_an_aggregated_subquery_become_keys() {
+        assert!(keyed_plan(PAID_THAT_DAY).await);
+        for sql in [
+            // A plain column, cast or not.
+            "SELECT (SELECT sum(r.amount) FROM r WHERE r.k = o.k) FROM o",
+            "SELECT (SELECT sum(r.amount) FROM r WHERE CAST(r.k AS DOUBLE) = o.k) FROM o",
+            // Not aggregated, or grouped without aggregates.
+            "SELECT (SELECT r.amount FROM r WHERE r.k + 0 = o.k LIMIT 1) FROM o",
+            "SELECT (SELECT r.k FROM r WHERE r.k + 0 = o.k GROUP BY r.k) FROM o",
+            // Not an equality of one side with the other.
+            "SELECT (SELECT sum(r.amount) FROM r WHERE r.k + 0 < o.k) FROM o",
+            "SELECT (SELECT sum(r.amount) FROM r WHERE r.k + o.k = 2) FROM o",
+            "SELECT (SELECT sum(r.amount) FROM r WHERE r.k + 0 = o.k + r.amount) FROM o",
+            "SELECT (SELECT sum(r.amount) FROM r WHERE o.k = r.k + o.k) FROM o",
+            "SELECT (SELECT sum(r.amount) FROM r WHERE r.amount * random() = o.k) FROM o",
+            // Uncorrelated, or correlated above the aggregation.
+            "SELECT (SELECT sum(r.amount) FROM r WHERE r.k + 0 = 1) FROM o",
+            "SELECT (SELECT sum(r.amount) FROM r GROUP BY r.k HAVING r.k + 0 = o.k) FROM o",
+        ] {
+            assert!(!keyed_plan(sql).await, "{sql}");
+        }
     }
 }
