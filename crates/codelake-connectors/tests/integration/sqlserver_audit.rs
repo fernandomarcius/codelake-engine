@@ -667,6 +667,32 @@ async fn wrong_results(tag: &str) {
         );
     }
 
+    // A remote table joined with a hive view (the commission report's shape)
+    // reads only the columns the query uses.
+    let _ = try_rows(&engine, "CREATE SCHEMA hive.j").await;
+    let _ = try_rows(
+        &engine,
+        "CREATE VIEW hive.j.textos AS SELECT id, nome FROM erp1.dbo.textos",
+    )
+    .await;
+    let join =
+        "SELECT t.id, x.nome FROM erp1.dbo.temporal t JOIN hive.j.textos x ON x.id = t.id ORDER BY t.id";
+    let joined = try_rows(&engine, join).await;
+    let join_plan = physical_plan(&engine, join).await;
+    let join_remote = join_plan.as_deref().map(remote_sqls).unwrap_or_default();
+    checks.check(
+        "4s a remote table joined with a view reads only its used columns",
+        joined.as_ref() == Ok(&rows(&[&["1", "ativo"], &["2", "ATIVO"]]))
+            && join_remote
+                .iter()
+                .filter(|s| s.contains("[dbo].[Temporal]"))
+                .all(|s| {
+                    let outer = s.split(" FROM ").next().unwrap_or_default().to_lowercase();
+                    !outer.contains("dtmb") && !outer.contains("[d3]") && !outer.contains("dt2")
+                }),
+        format!("got={joined:?} remote={join_remote:?}"),
+    );
+
     let local_filter = physical_plan(&engine, "SELECT id FROM erp1.dbo.temporal WHERE dt2 > dtm").await;
     let local_remote = local_filter.as_deref().map(remote_sqls).unwrap_or_default();
     checks.check(
