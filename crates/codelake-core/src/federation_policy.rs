@@ -315,13 +315,9 @@ impl OptimizerRule for PruneFederatedColumns {
     }
 
     fn rewrite(&self, plan: LogicalPlan, _config: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
-        let mut changed = false;
         // A plan this cannot rebuild keeps every column: pruning is only an
         // optimization, never a reason to fail the query.
-        match prune(plan.clone(), None, &mut changed) {
-            Ok(pruned) if changed => Ok(Transformed::yes(pruned)),
-            _ => Ok(Transformed::no(plan)),
-        }
+        prune(plan.clone(), None).or_else(|_| Ok(Transformed::no(plan)))
     }
 }
 
@@ -395,30 +391,64 @@ fn needs_of_inputs(plan: &LogicalPlan, needed: Needed) -> Vec<Needed> {
 }
 
 /// `plan` with each federated table scan below it narrowed to the columns
-/// the nodes above it read.
-fn prune(plan: LogicalPlan, needed: Needed, changed: &mut bool) -> Result<LogicalPlan> {
+/// the nodes above it read. Each input says whether it changed: a node is
+/// rebuilt when any of its inputs did, whatever was pruned elsewhere in the
+/// plan (every branch of a union, both sides of a join).
+fn prune(plan: LogicalPlan, needed: Needed) -> Result<Transformed<LogicalPlan>> {
     if let LogicalPlan::Extension(Extension { node }) = &plan {
         if let (Some(federated), Some(needed)) = (node.as_any().downcast_ref::<FederatedPlanNode>(), &needed)
             && let Some(pruned) = prune_federated(federated, needed)?
         {
-            *changed = true;
-            return Ok(pruned);
+            return Ok(Transformed::yes(pruned));
         }
-        return Ok(plan);
+        return Ok(Transformed::no(plan));
     }
     let needs = needs_of_inputs(&plan, needed);
-    let before = *changed;
     let inputs = plan
         .inputs()
         .into_iter()
         .cloned()
-        .zip(needs)
-        .map(|(input, need)| prune(input, need, changed))
+        .zip(needs.iter().cloned())
+        .map(|(input, need)| prune(input, need))
         .collect::<Result<Vec<_>>>()?;
-    if *changed == before {
-        return Ok(plan);
+    if !inputs.iter().any(|input| input.transformed) {
+        return Ok(Transformed::no(plan));
     }
-    with_new_inputs(&plan, inputs)
+    let inputs: Vec<LogicalPlan> = inputs.into_iter().map(|input| input.data).collect();
+    if !lined_up(&plan, &needs, &inputs) {
+        return Ok(Transformed::no(plan));
+    }
+    with_new_inputs(&plan, inputs).map(Transformed::yes)
+}
+
+/// A union reads its inputs by position, so its narrowed `inputs` must still
+/// line up: each returns every column it did, or each exactly the columns
+/// the union reads (`needs`). One input narrowed and another not (a
+/// sub-plan [`prune_federated`] leaves alone), or each keeping other columns
+/// of its own (a filter's), would put another column at a position: such a
+/// union keeps its inputs as they were. Any other plan names its columns.
+fn lined_up(plan: &LogicalPlan, needs: &[Needed], inputs: &[LogicalPlan]) -> bool {
+    let LogicalPlan::Union(union) = plan else {
+        return true;
+    };
+    let columns = |input: &LogicalPlan| input.schema().columns();
+    let as_before = union
+        .inputs
+        .iter()
+        .zip(inputs)
+        .all(|(before, input)| columns(before) == columns(input));
+    let as_needed = union
+        .inputs
+        .iter()
+        .zip(needs)
+        .zip(inputs)
+        .all(|((before, need), input)| {
+            need.as_ref().is_some_and(|need| {
+                let kept: Vec<Column> = columns(before).into_iter().filter(|c| need.contains(c)).collect();
+                kept == columns(input)
+            })
+        });
+    as_before || as_needed
 }
 
 /// `plan` over `inputs`, its expressions unchanged. An unnest lists the
@@ -963,6 +993,215 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(amounts.values(), &[100, 300, 500]);
+    }
+
+    /// Five remote tables of one source, more than the optimizer has passes,
+    /// and the local keys that pick their rows. The policy sends no filter,
+    /// so the fake source's rows are the query's.
+    fn replicas() -> (SessionContext, Vec<Arc<std::sync::Mutex<Vec<String>>>>) {
+        let ctx = crate::testing::federated_session();
+        let mut sent = Vec::new();
+        for name in ["t1", "t2", "t3", "t4", "t5"] {
+            let (table, statements) = remote_table_recording(
+                "crm",
+                name,
+                vec![
+                    ("k", int64(&[1, 1, 2, 3])),
+                    ("seq", int64(&[1, 2, 1, 1])),
+                    ("deleted", int64(&[0, 0, 0, 1])),
+                    ("v", int64(&[10, 11, 20, 30])),
+                    ("notes", strings(&["a", "b", "c", "d"])),
+                ],
+                Some(Arc::new(ScansAndProjectionsOnly)),
+            );
+            ctx.register_table(name, table).unwrap();
+            sent.push(statements);
+        }
+        let keys = RecordBatch::try_from_iter([("k", int64(&[1, 3]))]).unwrap();
+        ctx.register_batch("keys", keys).unwrap();
+        (ctx, sent)
+    }
+
+    /// Every statement the source received, sorted.
+    fn statements(sent: &[Arc<std::sync::Mutex<Vec<String>>>]) -> Vec<String> {
+        let mut all: Vec<String> = sent.iter().flat_map(|s| s.lock().unwrap().clone()).collect();
+        all.sort_unstable();
+        all
+    }
+
+    fn pairs(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
+        let column = |batch: &RecordBatch, i: usize| {
+            batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
+        let mut pairs: Vec<(i64, i64)> = batches
+            .iter()
+            .flat_map(|b| column(b, 0).into_iter().zip(column(b, 1)))
+            .collect();
+        pairs.sort_unstable();
+        pairs
+    }
+
+    /// The newest row of each key the local table lists, as a reconciliation
+    /// writes it: every column and a row number, filtered outside.
+    fn newest(table: &str) -> String {
+        format!(
+            "SELECT k, v FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY k ORDER BY seq DESC) AS rn \
+             FROM {table} WHERE lower(CAST(k AS varchar)) IN (SELECT DISTINCT lower(CAST(k AS varchar)) FROM keys)) z \
+             WHERE rn = 1 AND deleted = 0"
+        )
+    }
+
+    #[tokio::test]
+    async fn every_scan_of_a_union_reads_only_the_columns_it_uses() {
+        let (ctx, sent) = replicas();
+        let sql = ["t1", "t2", "t3", "t4", "t5"].map(newest).join(" UNION ALL ");
+        let batches = rows(&ctx, &sql).await.unwrap();
+        // A window over `SELECT *` reads its keys and what the query returns.
+        assert_eq!(
+            statements(&sent),
+            ["t1", "t2", "t3", "t4", "t5"]
+                .map(|t| format!("SELECT {t}.k, {t}.seq, {t}.deleted, {t}.v FROM {t}"))
+        );
+        assert_eq!(pairs(&batches), [(1, 11); 5]);
+    }
+
+    #[tokio::test]
+    async fn every_scan_under_joins_reads_only_the_columns_it_uses() {
+        let (ctx, sent) = replicas();
+        // Outer joins, an anti join and a semi join, the tables aliased: the
+        // projection goes below each alias.
+        let batches = rows(
+            &ctx,
+            "SELECT a.k, b.v FROM t1 a \
+             FULL JOIN t2 b ON b.k = a.k AND b.seq = a.seq \
+             LEFT JOIN t3 c ON c.k = a.k AND c.seq = a.seq \
+             WHERE a.deleted = 0 AND c.k IS NOT NULL \
+               AND a.k NOT IN (SELECT d.k FROM t4 d WHERE d.v = 20) \
+               AND EXISTS (SELECT 1 FROM t5 e WHERE e.k = a.k AND e.v > 10)",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            statements(&sent),
+            [
+                "SELECT * FROM (SELECT t1.k, t1.seq, t1.deleted FROM t1) AS a",
+                "SELECT * FROM (SELECT t2.k, t2.seq, t2.v FROM t2) AS b",
+                "SELECT * FROM (SELECT t3.k, t3.seq FROM t3) AS c",
+                "SELECT t4.k, t4.v FROM t4",
+                "SELECT t5.k, t5.v FROM t5",
+            ]
+        );
+        assert_eq!(pairs(&batches), [(1, 10), (1, 11)]);
+    }
+
+    /// The scan of a remote table `name(a, b, c)`.
+    fn remote_scan(name: &str) -> LogicalPlanBuilder {
+        let fields = ["a", "b", "c"].map(|column| {
+            datafusion::arrow::datatypes::Field::new(
+                column,
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            )
+        });
+        let schema = datafusion::arrow::datatypes::Schema::new(fields.to_vec());
+        datafusion::logical_expr::table_scan(Some(name), &schema, None).unwrap()
+    }
+
+    /// `SELECT <column> FROM (<t> UNION ALL <u>)`, each input built by
+    /// `input` over the federated sub-plan `remote` returns for its table.
+    fn union_reading(
+        column: &str,
+        remote: impl Fn(&str) -> LogicalPlanBuilder,
+        input: impl Fn(&str, LogicalPlan) -> LogicalPlanBuilder,
+    ) -> LogicalPlan {
+        let planner: Arc<dyn FederationPlanner> =
+            Arc::new(SQLFederationPlanner::new(crate::testing::executor("crm")));
+        let side = |name: &str| {
+            let federated = federate(remote(name).build().unwrap(), &planner);
+            input(name, federated).build().unwrap()
+        };
+        LogicalPlanBuilder::from(side("t"))
+            .union(side("u"))
+            .unwrap()
+            .project(vec![col(column)])
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    /// The columns each federated sub-plan of `plan` returns.
+    fn federated_columns(plan: &LogicalPlan) -> Vec<Vec<String>> {
+        let mut found = Vec::new();
+        plan.apply(|node| {
+            if let LogicalPlan::Extension(Extension { node }) = node
+                && let Some(federated) = node.as_any().downcast_ref::<FederatedPlanNode>()
+            {
+                let columns = federated.plan().schema().columns();
+                found.push(columns.iter().map(Column::flat_name).collect());
+            }
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        found
+    }
+
+    #[test]
+    fn the_inputs_of_a_union_are_narrowed_alike() {
+        let union = union_reading("b", remote_scan, |_, scan| LogicalPlanBuilder::from(scan));
+        let pruned = prune(union, None).unwrap();
+        assert!(pruned.transformed);
+        assert_eq!(federated_columns(&pruned.data), [["t.b"], ["u.b"]]);
+    }
+
+    #[test]
+    fn inputs_of_a_union_that_return_what_they_did_are_narrowed_below() {
+        // Each input names two columns, the union's reader one of them.
+        let union = union_reading("a", remote_scan, |name, scan| {
+            let (a, b) = (format!("{name}.a"), format!("{name}.b"));
+            LogicalPlanBuilder::from(scan)
+                .project(vec![col(a), col(b)])
+                .unwrap()
+        });
+        let pruned = prune(union, None).unwrap();
+        assert!(pruned.transformed);
+        assert_eq!(federated_columns(&pruned.data), [["t.a", "t.b"], ["u.a", "u.b"]]);
+    }
+
+    #[test]
+    fn a_union_with_an_input_that_is_not_narrowed_keeps_its_inputs() {
+        // The second sub-plan stops early: not a scan the rule narrows.
+        let union = union_reading(
+            "b",
+            |name| match name {
+                "u" => remote_scan(name).limit(0, Some(1)).unwrap(),
+                _ => remote_scan(name),
+            },
+            |_, scan| LogicalPlanBuilder::from(scan),
+        );
+        let pruned = prune(union.clone(), None).unwrap();
+        assert!(!pruned.transformed, "{}", pruned.data.display_indent());
+        assert_eq!(pruned.data, union);
+    }
+
+    #[test]
+    fn a_union_whose_inputs_keep_other_columns_of_their_own_keeps_its_inputs() {
+        // Each filter runs in the engine and reads another column: narrowed,
+        // the inputs would return (a, b) and (b, c).
+        let union = union_reading("b", remote_scan, |name, scan| {
+            let filtered = if name == "t" { "t.a" } else { "u.c" };
+            LogicalPlanBuilder::from(scan)
+                .filter(col(filtered).gt(lit(1_i64)))
+                .unwrap()
+        });
+        let pruned = prune(union.clone(), None).unwrap();
+        assert!(!pruned.transformed, "{}", pruned.data.display_indent());
+        assert_eq!(pruned.data, union);
     }
 
     #[test]

@@ -40,6 +40,11 @@ versioning: [SemVer](https://semver.org/).
       SQL Server returns 453 522 rows instead of 15 000 000; same result. The keys are past the `IN` limit,
       so the window does the work; listing them all (`dynamic_filter_max_keys = 20000`) returns 14 570 rows
       but takes 3.1 s (SQL Server compiles the 14 850-literal `IN`).
+- Every federated scan of a query returns only the columns the engine uses; only the first one found in
+  each optimizer pass did, three for a query. Found by the shadow run (2026-09-30): the nightly row-level
+  reconciliation (eleven scans of SQL Server, each under `SELECT *, ROW_NUMBER() OVER (…)`) asked eight of
+  them for every column, 380 s against Trino 431's 197 s. Reproduction (SQL Server 2022, 70 columns, three
+  tables of 5 million rows and four of 500 000): 211–213 s → 38–39 s, Trino 431 36–55 s; same rows.
 
 ### Added
 - Distributed execution (M4, ADR 0011), behind the `distributed` feature: a `[distributed]` coordinator
