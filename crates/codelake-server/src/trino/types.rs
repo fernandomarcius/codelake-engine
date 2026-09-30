@@ -485,7 +485,7 @@ fn values(list: &ArrayRef, encoding: Encoding) -> Result<Value> {
 }
 
 /// [`value`] of a column declaring a narrower Trino type: a `timestamp(p)`
-/// shows `p` fraction digits, a `char(n)` its padding.
+/// shows `p` fraction digits, a `char(n)` its value without trailing spaces.
 pub(crate) fn declared_value(
     array: &ArrayRef,
     row: usize,
@@ -505,12 +505,9 @@ pub(crate) fn declared_value(
             };
             timestamp_value_digits(array, row, *unit, zone.as_deref(), digits)
         }
-        (Some(Declared::Char(n)), _) => match value(array, row, encoding)? {
-            Value::String(text) => {
-                let width = usize::try_from(n).unwrap_or(usize::MAX);
-                let padding = width.saturating_sub(text.chars().count());
-                Ok(json!(format!("{text}{}", " ".repeat(padding))))
-            }
+        // Never padded (Trino pads to `n` characters, ISS-059).
+        (Some(Declared::Char(_)), _) => match value(array, row, encoding)? {
+            Value::String(text) => Ok(json!(codelake_core::char_semantics::unpadded(&text))),
             other => Ok(other),
         },
         _ => value(array, row, encoding),
@@ -826,6 +823,31 @@ mod tests {
         assert_eq!(
             one(Time32MillisecondArray::from(vec![36_000_120]), M),
             json!("10:00:00.120")
+        );
+    }
+
+    /// A `char(n)` value leaves as the engine holds it, without trailing
+    /// spaces, never padded to `n` (Trino 431 pads it, ISS-059).
+    #[test]
+    fn char_values_are_not_padded() {
+        use codelake_core::trino_types::Declared;
+        let texts = arr(StringArray::from(vec![
+            Some("ab"),
+            Some("a\t"),
+            Some(""),
+            Some("ab  "),
+            None,
+        ]));
+        let got: Vec<Value> = (0..5)
+            .map(|row| declared_value(&texts, row, M, Some(Declared::Char(5))).unwrap())
+            .collect();
+        assert_eq!(
+            got,
+            [json!("ab"), json!("a\t"), json!(""), json!("ab"), Value::Null]
+        );
+        assert_eq!(
+            declared_value(&texts, 3, M, Some(Declared::Varchar(5))).unwrap(),
+            json!("ab  ")
         );
     }
 

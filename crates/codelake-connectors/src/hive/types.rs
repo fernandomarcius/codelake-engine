@@ -8,12 +8,13 @@
 //! - `varchar(n)` ([`HIVE_TYPE`]): reads cut values to `n` characters, as
 //!   Trino's reader does; writes refuse longer values, as Trino's `INSERT`;
 //! - `char(n)` ([`HIVE_TYPE`]): values are stored without trailing spaces and
-//!   read padded to `n` characters, as Trino shows them (`'ab   '`, length
-//!   5); writes refuse longer values. The engine compares them as Trino does
-//!   (`ch = 'ab'` is true, see `codelake_core::char_semantics`). A filter
-//!   the scan receives is applied again above it and never prunes files by
-//!   statistics of a char column: the scan rewrites the column to its padded
-//!   value (`columns.rs`), which statistics of the stored text cannot answer;
+//!   read so, cut to `n` characters (Trino shows them padded to `n`
+//!   characters, `'ab   '`; the engine does not pad, ISS-059); writes refuse
+//!   longer values. The engine compares them as Trino does (`ch = 'ab'` is
+//!   true, see `codelake_core::char_semantics`). A filter the scan receives
+//!   is applied again above it and never prunes files by statistics of a
+//!   char column: the scan rewrites the column's values (`columns.rs`),
+//!   which statistics of the stored text cannot answer;
 //! - a type `CodeLake` cannot read yet ([`UNSUPPORTED`]: `array`, `map`,
 //!   `struct`): the table stays listed and readable, and only a query that
 //!   reads the column, or writes the table, fails. Never a wrong value.

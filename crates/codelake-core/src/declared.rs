@@ -25,9 +25,10 @@
 //! the engine records on the new table's fields, and [`check_insert`] adds
 //! Trino's length check to an `INSERT` into such columns.
 //!
-//! A `char(n)` value is held padded with spaces to `n` characters, as the
-//! reference engine shows it; comparing it with other text is the business
-//! of [`crate::char_semantics`]. Text keeps the Arrow type it came with
+//! A `char(n)` value is held without trailing spaces (the reference engine
+//! shows it padded with spaces to `n` characters; the engine does not,
+//! ISS-059); comparing it with other text is the business of
+//! [`crate::char_semantics`]. Text keeps the Arrow type it came with
 //! (`Utf8View` in, `Utf8View` out): a table's column and the values an
 //! `INSERT` writes into it must agree.
 
@@ -142,19 +143,21 @@ fn result_type(declared: Option<Declared>, input: &DataType) -> Result<DataType>
     })
 }
 
-/// `from_char`: the value is a `char(n)` one (Trino names its source type
-/// `char(n)` in the message, `varchar(n)` otherwise).
-fn too_long(mode: Mode, text: &str, declared: Declared, from_char: bool) -> ArrowError {
+/// `from_char`: the value is a `char(n)` one, `Some(n)` (Trino names its
+/// source type `char(n)` in the message, `varchar(its length)` otherwise).
+fn too_long(mode: Mode, text: &str, declared: Declared, from_char: Option<u32>) -> ArrowError {
     let target = declared.name(&DataType::Utf8);
-    let source = if from_char { "char" } else { "varchar" };
+    let source = match from_char {
+        Some(n) => format!("char({n})"),
+        None => format!("varchar({})", text.chars().count()),
+    };
     match mode {
         // Named like the function library's errors (`<errorName>: …`), so
         // every layer reports it the same way, whichever catalog the table
         // is in.
         Mode::Insert => ArrowError::InvalidArgumentError(format!(
-            "INVALID_CAST_ARGUMENT: Cannot truncate non-space characters when casting from {source}({}) to \
-             {target} on INSERT",
-            text.chars().count()
+            "INVALID_CAST_ARGUMENT: Cannot truncate non-space characters when casting from {source} to \
+             {target} on INSERT"
         )),
         _ => ArrowError::CastError(format!("Value {text} cannot be represented as {target}")),
     }
@@ -163,19 +166,19 @@ fn too_long(mode: Mode, text: &str, declared: Declared, from_char: bool) -> Arro
 /// [`bounded_from`] of a value that is not a `char(n)` one.
 #[cfg(test)]
 fn bounded(mode: Mode, text: &str, declared: Declared, length: u32) -> Result<String, ArrowError> {
-    bounded_from(mode, text, declared, length, false)
+    bounded_from(mode, text, declared, length, None)
 }
 
-/// A text as a `varchar(n)` / `char(n)` value (`char` padded with spaces to
-/// `n` characters).
+/// A text as a `varchar(n)` / `char(n)` value (`char` without trailing
+/// spaces).
 ///
-/// `from_char`: the value is a `char(n)` one.
+/// `from_char`: the value is a `char(n)` one, `Some(n)`.
 fn bounded_from(
     mode: Mode,
     text: &str,
     declared: Declared,
     length: u32,
-    from_char: bool,
+    from_char: Option<u32>,
 ) -> Result<String, ArrowError> {
     let length = usize::try_from(length).unwrap_or(usize::MAX);
     let mut value: String = if text.chars().count() <= length {
@@ -189,8 +192,7 @@ fn bounded_from(
         }
     };
     if matches!(declared, Declared::Char(_)) {
-        let count = value.chars().count();
-        value.extend(std::iter::repeat_n(' ', length.saturating_sub(count)));
+        value.truncate(crate::char_semantics::unpadded(&value).len());
     }
     Ok(value)
 }
@@ -292,7 +294,10 @@ impl ScalarUDFImpl for TrinoTyped {
         let from_char = args
             .arg_fields
             .first()
-            .is_some_and(|f| matches!(crate::trino_types::declared(f), Some(Declared::Char(_))));
+            .and_then(|f| match crate::trino_types::declared(f) {
+                Some(Declared::Char(n)) => Some(n),
+                _ => None,
+            });
         let array = value.to_array(args.number_rows)?;
         let result: ArrayRef = match declared {
             None => array,
@@ -774,7 +779,8 @@ pub(crate) fn with_declared(
 }
 
 /// `INSERT` into `varchar(n)` / `char(n)` columns: each value checked as Trino
-/// checks it (see the module documentation), a char value padded. So is
+/// checks it (see the module documentation), a char value without trailing
+/// spaces. So is
 /// every value an `UPDATE` writes.
 pub(crate) fn check_insert(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let LogicalPlan::Dml(dml) = plan else {
@@ -876,17 +882,19 @@ mod tests {
             bounded(Mode::Insert, "abcdefghij   ", v10, 10).unwrap(),
             "abcdefghij"
         );
-        let error = bounded_from(Mode::Insert, "ab  yyyy ", Declared::Char(5), 5, true)
+        let error = bounded_from(Mode::Insert, "ab  yyyy", Declared::Char(5), 5, Some(9))
             .unwrap_err()
             .to_string();
         assert!(error.contains("from char(9) to char(5) on INSERT"), "{error}");
         let c3 = Declared::Char(3);
         assert_eq!(bounded(Mode::Cast, "abcdefg", c3, 3).unwrap(), "abc");
-        assert_eq!(bounded(Mode::Cast, "a  ", c3, 3).unwrap(), "a  ");
-        assert_eq!(bounded(Mode::Cast, "a", c3, 3).unwrap(), "a  ");
-        assert_eq!(bounded(Mode::Cast, "", c3, 3).unwrap(), "   ");
-        assert_eq!(bounded(Mode::Cast, "çã", c3, 3).unwrap(), "çã ");
-        assert_eq!(bounded(Mode::Insert, "ab    ", c3, 3).unwrap(), "ab ");
+        assert_eq!(bounded(Mode::Cast, "a  ", c3, 3).unwrap(), "a");
+        assert_eq!(bounded(Mode::Cast, "a", c3, 3).unwrap(), "a");
+        assert_eq!(bounded(Mode::Cast, "", c3, 3).unwrap(), "");
+        assert_eq!(bounded(Mode::Cast, "çã", c3, 3).unwrap(), "çã");
+        assert_eq!(bounded(Mode::Cast, "a b c", c3, 3).unwrap(), "a b");
+        assert_eq!(bounded(Mode::Cast, "a\t ", c3, 3).unwrap(), "a\t");
+        assert_eq!(bounded(Mode::Insert, "ab    ", c3, 3).unwrap(), "ab");
         assert!(bounded(Mode::Insert, "abcd", c3, 3).is_err());
     }
 
@@ -927,9 +935,9 @@ mod tests {
         assert_eq!(cut.data_type(), &DataType::Utf8View);
         let cut: Vec<Option<&str>> = cut.as_string_view().iter().collect();
         assert_eq!(cut, [Some("abc"), None, Some("ab")]);
-        let padded = call(&lenient, text, "char(3)").unwrap();
-        let padded: Vec<Option<&str>> = padded.as_string_view().iter().collect();
-        assert_eq!(padded, [Some("abc"), None, Some("ab ")]);
+        let chars = call(&lenient, text, "char(3)").unwrap();
+        let chars: Vec<Option<&str>> = chars.as_string_view().iter().collect();
+        assert_eq!(chars, [Some("abc"), None, Some("ab")]);
         // A number too long for the type: NULL, where CAST fails.
         let numbers: ArrayRef = Arc::new(StringArray::from(vec!["12345", "12"]));
         let strict = ScalarUDF::new_from_impl(TrinoTyped::new(Mode::Strict, true));

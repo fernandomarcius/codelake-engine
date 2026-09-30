@@ -1,6 +1,7 @@
 # char(n) values against Trino 431: the CH red-team probes (hive tables Trino wrote),
 # the wrong-result shapes of ISS-025 and the W1 verdict probes (in-memory tables).
-# main refuses many char comparisons until ISS-024 lands: those are known, not green.
+# The engine never pads a char(n) value (ISS-059): where Trino 431 outputs the padding
+# (the value, its length, a cast to varchar, ||, substr) the case is an accepted WRONG.
 
 oracle = "trino"
 setup = [
@@ -118,14 +119,23 @@ sql = "SELECT id, coalesce(ch, v) = 'ab' FROM {c}.chp.t ORDER BY 1"
 
 [[case]]
 id = "P-coalesce-length"
+expect = "WRONG"
+accepted = "ISS-059"
+note = "length of the value without the padding of char(65536): 2, not 65536"
 sql = "SELECT id, length(coalesce(ch, v)) FROM {c}.chp.t ORDER BY 1"
 
 [[case]]
 id = "P-cast-char-length"
+expect = "WRONG"
+accepted = "ISS-059"
+note = "length of the value without padding (2, not 5); || of the value as held ('abx', not 'ab   x')"
 sql = "SELECT length(CAST('ab' AS char(5))), CAST('ab' AS char(5)) || 'x'"
 
 [[case]]
 id = "P-cast-char-hex"
+expect = "WRONG"
+accepted = "ISS-059"
+note = "CAST(char AS varchar) is the value without padding ('ab', not 'ab   ')"
 sql = "SELECT to_hex(to_utf8(CAST(CAST('ab' AS char(5)) AS varchar)))"
 
 [[case]]
@@ -138,10 +148,16 @@ sql = "SELECT CAST('abcdef' AS varchar(3))"
 
 [[case]]
 id = "P-max-char-memory"
+expect = "WRONG"
+accepted = "ISS-059"
+note = "the char values without padding"
 sql = "SELECT max(ch), min(c3) FROM {c}.chp.t"
 
 [[case]]
 id = "P-max-char-hive"
+expect = "WRONG"
+accepted = "ISS-059"
+note = "the char value without padding"
 sql = "SELECT max(ch) FROM hive.chs.cht"
 
 [[case]]
@@ -156,9 +172,9 @@ sql = "SELECT CAST(' 1.5' AS char(6)) AS a, CAST(CAST(' 1.5' AS char(6)) AS doub
 
 [[case]]
 id = "V2"
-expect = "ERRO"
-accepted = "ISS-024"
-note = "both engines refuse; the error codes differ"
+expect = "EXTRA"
+known = "ISS-032"
+note = "as V1: the reference has no cast from char(n) to a number; the engine casts the value, which parses without the padding (ISS-059; before, the padded value failed to parse)"
 sql = "SELECT CAST(CAST('12' AS char(5)) AS bigint) AS a"
 
 [[case]]
@@ -170,16 +186,23 @@ sql = "SELECT DISTINCT ARRAY[ch] AS r FROM {c}.chp.t ORDER BY 1"
 
 [[case]]
 id = "V4"
-expect = "TIPO"
-known = "ISS-051"
+expect = "WRONG"
+accepted = "ISS-059"
+note = "the elements without padding; the element type is also varchar (ISS-051, known)"
 sql = "SELECT array_agg(ch ORDER BY id) AS a FROM {c}.chp.t"
 
 [[case]]
 id = "V5"
+expect = "WRONG"
+accepted = "ISS-059"
+note = "the char values without padding"
 sql = "SELECT ch AS a, c3 AS b, count(*) AS n FROM {c}.chp.t GROUP BY ROLLUP (ch, c3) ORDER BY 1, 2"
 
 [[case]]
 id = "V6"
+expect = "WRONG"
+accepted = "ISS-059"
+note = "the char(7) value without padding"
 sql = "SELECT coalesce(element_at(array_agg(c3 ORDER BY id), 2), CAST('x' AS char(7))) AS a FROM {c}.chp.t"
 
 [[case]]
@@ -192,8 +215,9 @@ sql = "SELECT element_at(array_agg(ch ORDER BY id), 1) = 'ab' AS a, array_agg(c3
 
 [[case]]
 id = "V9"
-expect = "TIPO"
-known = "ISS-051"
+expect = "WRONG"
+accepted = "ISS-059"
+note = "the keys without padding; the key type is also varchar (ISS-051, known)"
 sql = "SELECT histogram(c3) AS a FROM {c}.chp.t"
 
 [[case]]
@@ -214,6 +238,9 @@ sql = "SELECT id AS i, EXISTS (SELECT 1 FROM {c}.chp.u WHERE n = x.id * 10) AS r
 
 [[case]]
 id = "V13"
+expect = "WRONG"
+accepted = "ISS-059"
+note = "the char values without padding (same order)"
 sql = "SELECT id AS i, ch AS r FROM {c}.chp.t ORDER BY ch DESC, id LIMIT 3"
 
 [[case]]
@@ -236,18 +263,23 @@ sql = "SELECT id AS i, min(c3) OVER (ORDER BY ch ROWS BETWEEN 1 PRECEDING AND CU
 
 [[case]]
 id = "V17"
-expect = "TIPO"
-known = "ISS-051"
+expect = "WRONG"
+accepted = "ISS-059"
+note = "the elements without padding; the element type is also varchar (ISS-051, known)"
 sql = "SELECT id, ARRAY[ch, c3] AS r FROM {c}.chp.t x ORDER BY id"
 
 [[case]]
 id = "V18"
+expect = "WRONG"
+accepted = "ISS-059"
+note = "|| of the value as held ('abx', not 'ab   x')"
 sql = "SELECT id, ARRAY[ch, c3][2] = 'a' AS a, element_at(ARRAY[ch], 1) = 'ab' AS b, ARRAY[ch, v3][1] || 'x' AS c FROM {c}.chp.t x ORDER BY id"
 
 [[case]]
 id = "V19"
-expect = "TIPO"
-known = "ISS-051"
+expect = "WRONG"
+accepted = "ISS-059"
+note = "the elements without padding; the element type is also varchar (ISS-051, known)"
 sql = "SELECT id, ARRAY[ch, v3] AS r FROM {c}.chp.t x ORDER BY id"
 
 [[case]]
@@ -290,6 +322,9 @@ sql = "SELECT id, checksum(ch) AS r FROM {c}.chp.t x ORDER BY id"
 
 [[case]]
 id = "V27"
+expect = "WRONG"
+accepted = "ISS-059"
+note = "the char(7) values without padding"
 sql = "SELECT id, coalesce(element_at(ARRAY[c3], 1), CAST('x' AS char(7))) AS a FROM {c}.chp.t x ORDER BY id"
 
 [[case]]
@@ -409,14 +444,23 @@ sql = "SELECT id, strpos(ch, ' ') AS r FROM {c}.chp.t x ORDER BY id"
 
 [[case]]
 id = "V49"
+expect = "WRONG"
+accepted = "ISS-059"
+note = "substr of the value without padding"
 sql = "SELECT id, substr(ch, 1, 3) AS r FROM {c}.chp.t x ORDER BY id"
 
 [[case]]
 id = "V50"
+expect = "WRONG"
+accepted = "ISS-059"
+note = "substr of the value without padding"
 sql = "SELECT id, substr(ch, 2) AS r FROM {c}.chp.t x ORDER BY id"
 
 [[case]]
 id = "V51"
+expect = "WRONG"
+accepted = "ISS-059"
+note = "substr of the value without padding"
 sql = "SELECT id, substring(ch FROM 4) AS r FROM {c}.chp.t x ORDER BY id"
 
 [[case]]
@@ -487,8 +531,31 @@ sql = "SELECT id FROM {c}.chp.t WHERE contains(ARRAY[ch], CAST('ab' AS char(5)))
 id = "R6-array-distinct-count"
 sql = "SELECT count(DISTINCT ARRAY[ch]) FROM {c}.chp.t WHERE id IN (1, 2)"
 
-# CAST of char(n) to varchar keeps the padding on every protocol (ISS-037 round 5 finding).
+# CAST of char(n) to varchar is the same on every protocol (ISS-037 round 5 finding); without
+# the padding (ISS-059).
 [[case]]
 id = "R6-pg-cast-varchar"
+expect = "WRONG"
+accepted = "ISS-059"
+note = "CAST(char AS varchar) and its length without the padding, on the PostgreSQL wire too"
 protocol = "pg"
 sql = "SELECT id, CAST(ch AS varchar) AS v, length(CAST(ch AS varchar)) AS n FROM {c}.chp.t WHERE id IN (1, 2, 7) ORDER BY id"
+
+# Without the padding (ISS-059) char values are still ordered and matched with `LIKE` as the
+# reference does, padded: a tab after a common prefix sorts below the padding.
+[[case]]
+id = "NP1-order-by"
+sql = "SELECT i FROM (VALUES (1, CAST('a' AS char(3))), (2, CAST('a' || chr(9) AS char(3))), (3, CAST('a b' AS char(3))), (4, CAST(NULL AS char(3)))) AS t(i, x) ORDER BY x DESC, i"
+compare = "ordered"
+
+[[case]]
+id = "NP2-min-max"
+sql = "SELECT max(x) = 'a', min(x) = 'a' || chr(9), max_by(i, x), min_by(i, x), count(*) FILTER (WHERE x < 'a'), bool_and(greatest(x, CAST('a' AS char(3))) = 'a') FROM (VALUES (1, CAST('a' AS char(3))), (2, CAST('a' || chr(9) AS char(3)))) AS t(i, x)"
+
+[[case]]
+id = "NP3-window-like"
+sql = "SELECT i, rank() OVER (ORDER BY x), x LIKE 'a%', x LIKE 'a _', x LIKE '%' || chr(9) || ' ' FROM (VALUES (1, CAST('a' AS char(3))), (2, CAST('a' || chr(9) AS char(3)))) AS t(i, x) ORDER BY i"
+
+[[case]]
+id = "NP4-table-like"
+sql = "SELECT id, ch LIKE 'a %', ch LIKE 'ab', c3 LIKE '%  ', ch < c3 FROM {c}.chp.t ORDER BY id"

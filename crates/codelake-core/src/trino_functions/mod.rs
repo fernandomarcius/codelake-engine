@@ -69,6 +69,7 @@ mod url;
 mod zeros;
 mod zone;
 
+pub(crate) use aggregate::by as value_by;
 pub(crate) use collections::SUBSCRIPT;
 pub(crate) use try_expr::{BARRIER, GUARDED_TRY, TRY};
 

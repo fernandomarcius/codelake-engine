@@ -1210,11 +1210,17 @@ async fn finding_8(s: &Shared, checks: &mut Checks) {
         &s.trino.sql(&read.replace("{t}", "by_trino")).await,
     );
     let read = read.replace("{t}", "by_trino");
+    // The engine never pads a char value (ISS-059): Trino's, without its
+    // trailing spaces.
+    let unpadded = read.replace(
+        "CAST(ch AS varchar), length(ch)",
+        "rtrim(ch, ' '), length(rtrim(ch, ' '))",
+    );
     checks.same(
         "F8",
         "both read the rows Trino wrote",
         &cl_try(&s.engine, &read).await,
-        &s.trino.sql(&read).await,
+        &s.trino.sql(&unpadded).await,
     );
     let created = cl_try(
         &s.engine,
@@ -2320,8 +2326,10 @@ const CHAR_PROBES: &[(&str, &str)] = &[
 /// `char(n)` values compared where the first char rules did not look (set
 /// operations, `USING` joins, functions that compare: CH1–CH16) and where
 /// three independent verifications found wrong rows (P1–P16), over tables
-/// Trino 431 wrote: each answer is Trino's. The matrix of every operation
-/// is `char_matrix`.
+/// Trino 431 wrote: each answer is Trino's, its char values without
+/// trailing spaces (the engine never pads them, ISS-059; P12's cast of a
+/// char value to `varchar` is Trino's `rtrim(…, ' ')`). The matrix of
+/// every operation is `char_matrix`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w1t_char_values_compared_outside_predicates_like_trino_431() {
     let s = Shared::new("codelake-w1t-trino-char").await;
@@ -2339,8 +2347,23 @@ async fn w1t_char_values_compared_outside_predicates_like_trino_431() {
     s.trino
         .ok("INSERT INTO hive.s.vct VALUES (1, 'ab'), (3, 'cd')")
         .await;
+    let unpadded = |rows: Result<Rows, String>| {
+        rows.map(|rows| {
+            rows.into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| v.trim_end_matches(' ').to_owned())
+                        .collect()
+                })
+                .collect::<Rows>()
+        })
+    };
     for (id, q) in CHAR_PROBES {
-        let (codelake, trino) = (cl_try(&s.engine, q).await, s.trino.sql(q).await);
+        let oracle = q.replace(
+            "CAST(CAST('ab' AS char(5)) AS varchar)",
+            "rtrim(CAST('ab' AS char(5)), ' ')",
+        );
+        let (codelake, trino) = (cl_try(&s.engine, q).await, unpadded(s.trino.sql(&oracle).await));
         checks.same(id, q, &codelake, &trino);
     }
     // P16: Trino 431 fails on a scalar subquery in `VALUES` ("Unexpected

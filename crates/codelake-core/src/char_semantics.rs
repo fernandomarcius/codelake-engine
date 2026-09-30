@@ -1,12 +1,16 @@
-//! `char(n)` semantics of the reference engine (Trino 431).
+//! `char(n)` semantics of the reference engine (Trino 431), without its
+//! padding.
 //!
 //! A `char(n)` column is text to the engine (Arrow has no char type), with
 //! `char(n)` in its field metadata ([`crate::trino_types::TRINO_TYPE`]).
-//! Every char value is held padded with spaces to `n` characters, wherever
-//! it comes from: a catalog's scan (padded when read), `CAST` and `TRY_CAST`
-//! to `char(n)`, an `INSERT` or `UPDATE` of a char column, and the rewrites
-//! below. Two values of one `char(n)` therefore compare, group, join and
-//! sort as the text they are.
+//! Every char value is held without trailing spaces, wherever it comes
+//! from: a catalog's scan, `CAST` and `TRY_CAST` to `char(n)`, an `INSERT`
+//! or `UPDATE` of a char column, and the rewrites below. The reference
+//! pads it with spaces to `n` characters; the padding protects no data, and
+//! the engine neither holds nor outputs it (ISS-059). Two values of one
+//! `char(n)` therefore test equal, group and join as the text they are;
+//! they are ordered as the reference orders them, padded
+//! (`codelake_char_compare`, `codelake_char_order`).
 //!
 //! Where char values meet other text, the reference engine converts both to
 //! a common type first, and so does [`CharSemantics`] (analyzer, before type
@@ -18,35 +22,40 @@
 //!   `NULL` takes the other type;
 //! - a comparison (`=`, `<`, `IN`, `BETWEEN`, `= ANY`, `< ALL`,
 //!   `IS DISTINCT FROM`, a simple `CASE`, `nullif`, a join condition, rows
-//!   and arrays written out, `contains`) compares the two values padded to
-//!   the common length: trailing spaces never matter to equality, and
-//!   `'ab' || chr(9)` sorts below `'ab'` because the tab is compared with a
-//!   space. Equality is planned on the values without trailing spaces
-//!   (`codelake_char_key`), ordering with `codelake_char_compare`, and a
-//!   text literal short enough is padded to the char's length instead;
-//!   `ANY`/`ALL` become the `EXISTS` tests they mean;
+//!   and arrays written out, `contains`) compares the two values as the
+//!   reference does, padded to the common length: trailing spaces never
+//!   matter to equality, and `'ab' || chr(9)` sorts below `'ab'` because
+//!   the tab is compared with a space. Equality is planned on the values
+//!   without trailing spaces (`codelake_char_key`; a text literal short
+//!   enough is written so instead), ordering with `codelake_char_compare`
+//!   (also of two values of one `char(n)`); `ANY`/`ALL` become the `EXISTS`
+//!   tests they mean; `ORDER BY` (of a query, a window or an aggregate),
+//!   `min`, `max`, `greatest` and `least` order char values the same way;
 //! - rows and arrays written out (`ROW(ch, 1) = ROW('ab', 1)`,
 //!   `ARRAY[ch] IN (ARRAY['ab'])`, also as the planner folds them into
 //!   literals) are compared value by value, each pair with the rules above:
 //!   `=` is false when a pair differs, `NULL` when none differs but a pair
 //!   is `NULL`; a constant `IN` list of several items without `NULL`s is a
 //!   set lookup, `NULL` for a row holding a `NULL`, as in the reference;
-//! - a value that is output in the common type is padded to its length: the
+//! - a value that is output in the common type is converted to it (without
+//!   trailing spaces, its length recorded): the
 //!   branches of `CASE`, `coalesce`, `nvl`, `ifnull`, `nvl2`, `greatest`,
 //!   `least`, the default of `lag`/`lead`, the elements of an array, the
 //!   columns of `UNION`, `INTERSECT`, `EXCEPT` and `VALUES`, and the columns
 //!   of a `USING` join (`codelake_char`, which also records the type in the
 //!   field);
-//! - `||` and `concat` of a char value give `char(total length)`, each text
-//!   padded to its own length (`char(3) || varchar(2)` is `char(5)`); with
-//!   unbounded `varchar` or an untyped `NULL` the reference engine fails,
-//!   and so does this rule;
-//! - functions keep the padded value: `upper`/`lower` give `char(n)`,
-//!   `substr` gives `varchar(n)` of the padded text, the trims (`ltrim`,
-//!   `rtrim`, `trim`) `varchar(n)` of the text without its padding, `LIKE`
-//!   matches the padded text, `length` counts the padding. Functions the
+//! - `||` and `concat` of a char value give `char(total length)`
+//!   (`char(3) || varchar(2)` is `char(5)`), each text as it is held (the
+//!   reference pads each to its own length); with unbounded `varchar` or an
+//!   untyped `NULL` the reference engine fails, and so does this rule;
+//! - functions see the value as it is held: `upper`/`lower` give `char(n)`,
+//!   `substr` gives `varchar(n)`, the trims (`ltrim`, `rtrim`, `trim`)
+//!   `varchar(n)`, `length` counts the characters of the value (the
+//!   reference counts the padding: `n`), and so do the functions the
 //!   reference engine has no char version of (`strpos`, `replace`, …; it
-//!   refuses them) see the padded text, as `CAST(ch AS varchar)` gives it;
+//!   refuses them), as `CAST(ch AS varchar)` gives it. `LIKE` is a
+//!   comparison: it matches the value padded to `n` characters, as the
+//!   reference does (`codelake_char_padded`);
 //! - text functions have the result length the reference engine derives
 //!   from their arguments' (`replace(varchar(x), y, varchar(z))` is
 //!   `varchar(x + z * (x + 1))`, `soundex` is `varchar(4)`, an element of
@@ -96,8 +105,8 @@ use datafusion::common::{
     Column, DFSchema, DataFusionError, ExprSchema, Result, ScalarValue, exec_err, plan_err,
 };
 use datafusion::logical_expr::expr::{
-    AggregateFunction, Alias, Between, Case, Cast, Exists, InList, InSubquery, ScalarFunction, SetComparison,
-    SetQuantifier, TryCast, WindowFunction,
+    AggregateFunction, Alias, Between, Case, Cast, Exists, InList, InSubquery, Like, ScalarFunction,
+    SetComparison, SetQuantifier, Sort as SortExpr, TryCast, WindowFunction,
 };
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
 use datafusion::logical_expr::utils::grouping_set_to_exprlist;
@@ -118,8 +127,12 @@ const CONCAT_OPERATOR: &str = "codelake_trino_concat_operator";
 /// Longest `char(n)` of the reference engine.
 const MAX_CHAR: u32 = 65_536;
 
-/// Name of [`CharPad`].
-pub(crate) const CHAR_PAD: &str = "codelake_char";
+/// Name of [`CharValue`].
+pub(crate) const CHAR_VALUE: &str = "codelake_char";
+/// Name of [`CharPadded`].
+pub(crate) const CHAR_PADDED: &str = "codelake_char_padded";
+/// Name of [`CharOrder`].
+pub(crate) const CHAR_ORDER: &str = "codelake_char_order";
 /// Name of [`CharKey`].
 pub(crate) const CHAR_KEY: &str = "codelake_char_key";
 /// Name of [`CharCompare`].
@@ -158,14 +171,21 @@ fn map_text(value: &ColumnarValue, rows: usize, f: impl Fn(&str) -> String) -> R
     })
 }
 
-/// `text` padded with spaces to `length` characters (a longer text as it is).
-pub fn padded(text: &str, length: u32) -> String {
+/// `text` padded with spaces to `length` characters (a longer text as it
+/// is): the text the reference matches `LIKE` against.
+fn padded(text: &str, length: u32) -> String {
     let width = usize::try_from(length).unwrap_or(usize::MAX);
     let count = text.chars().count();
     let mut out = String::with_capacity(text.len() + width.saturating_sub(count));
     out.push_str(text);
     out.extend(std::iter::repeat_n(' ', width.saturating_sub(count)));
     out
+}
+
+/// `text` as a `char(n)` value holds it: without trailing spaces, which are
+/// never significant to a char value (ISS-059).
+pub fn unpadded(text: &str) -> &str {
+    text.trim_end_matches(' ')
 }
 
 /// The reference engine's comparison of char values: both padded with
@@ -185,29 +205,67 @@ fn compare_padded(a: &str, b: &str) -> Ordering {
     }
 }
 
-/// The length argument of [`CharPad`].
+/// Most spaces [`order_key`] counts before a character (30 bits).
+const MAX_SPACES: u32 = (1 << 30) - 1;
+
+/// A text whose order is [`compare_padded`]'s, without padding (text, so a
+/// window's `RANGE` frame can order by it): each character other than a
+/// space, with the count of spaces before it, as `class, count, character`,
+/// and `\u{1}` at the end. A character below the space sorts below the
+/// padding (class `\u{0}`, fewer spaces before it first), one above the
+/// space above it (class `\u{2}`, more spaces before it first); trailing
+/// spaces add nothing. A count is two characters of 15 bits each.
+fn order_key(text: &str) -> String {
+    fn count(out: &mut String, value: u32) {
+        for part in [value >> 15, value & 0x7FFF] {
+            // Below the surrogates: always a character.
+            out.push(char::from_u32(part).unwrap_or('\0'));
+        }
+    }
+    let mut out = String::with_capacity(text.len() * 4 + 1);
+    let mut spaces: u32 = 0;
+    for c in text.chars() {
+        if c == ' ' {
+            spaces = spaces.saturating_add(1).min(MAX_SPACES);
+            continue;
+        }
+        if c < ' ' {
+            out.push('\u{0}');
+            count(&mut out, spaces);
+        } else {
+            out.push('\u{2}');
+            count(&mut out, MAX_SPACES - spaces);
+        }
+        out.push(c);
+        spaces = 0;
+    }
+    out.push('\u{1}');
+    out
+}
+
+/// The length argument of [`CharValue`] and [`CharPadded`].
 fn length_argument(scalar: Option<&ScalarValue>) -> Result<u32> {
     let Some(scalar) = scalar else {
-        return plan_err!("{CHAR_PAD} expects a length as its second argument");
+        return plan_err!("{CHAR_VALUE} expects a length as its second argument");
     };
     match scalar.cast_to(&DataType::Int64)? {
         ScalarValue::Int64(Some(n)) if (1..=i64::from(MAX_CHAR)).contains(&n) => {
             Ok(u32::try_from(n).unwrap_or(MAX_CHAR))
         }
-        other => plan_err!("{CHAR_PAD}: invalid length {other}"),
+        other => plan_err!("{CHAR_VALUE}: invalid length {other}"),
     }
 }
 
-/// `codelake_char(x, n)`: `x` as a `char(n)` value, padded with spaces to
-/// `n` characters, `char(n)` recorded in the result field.
+/// `codelake_char(x, n)`: `x` as a `char(n)` value, without trailing spaces,
+/// `char(n)` recorded in the result field.
 #[derive(Debug, PartialEq, Eq, Hash)]
-struct CharPad {
+struct CharValue {
     signature: Signature,
 }
 
-impl ScalarUDFImpl for CharPad {
+impl ScalarUDFImpl for CharValue {
     fn name(&self) -> &'static str {
-        CHAR_PAD
+        CHAR_VALUE
     }
 
     fn signature(&self) -> &Signature {
@@ -215,18 +273,18 @@ impl ScalarUDFImpl for CharPad {
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        plan_err!("{CHAR_PAD} is typed by its arguments")
+        plan_err!("{CHAR_VALUE} is typed by its arguments")
     }
 
     fn return_field_from_args(&self, args: ReturnFieldArgs<'_>) -> Result<FieldRef> {
         let length = length_argument(args.scalar_arguments.get(1).copied().flatten())?;
         let Some(input) = args.arg_fields.first() else {
-            return plan_err!("{CHAR_PAD} expects two arguments");
+            return plan_err!("{CHAR_VALUE} expects two arguments");
         };
         Ok(Arc::new(
             Field::new(
-                CHAR_PAD,
-                text_result(CHAR_PAD, input.data_type())?,
+                CHAR_VALUE,
+                text_result(CHAR_VALUE, input.data_type())?,
                 input.is_nullable(),
             )
             .with_metadata(Declared::Char(length).metadata()),
@@ -235,13 +293,86 @@ impl ScalarUDFImpl for CharPad {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let [value, length] = args.args.as_slice() else {
-            return exec_err!("{CHAR_PAD} expects two arguments");
+            return exec_err!("{CHAR_VALUE} expects two arguments");
         };
         let ColumnarValue::Scalar(length) = length else {
-            return exec_err!("{CHAR_PAD} expects a constant length");
+            return exec_err!("{CHAR_VALUE} expects a constant length");
+        };
+        length_argument(Some(length))?;
+        map_text(value, args.number_rows, |text| unpadded(text).to_owned())
+    }
+}
+
+/// `codelake_char_padded(x, n)`: `x` padded with spaces to `n` characters,
+/// the text `LIKE` matches a `char(n)` value against. Never output.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct CharPadded {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for CharPadded {
+    fn name(&self) -> &'static str {
+        CHAR_PADDED
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        let [input, _] = arg_types else {
+            return plan_err!("{CHAR_PADDED} expects two arguments");
+        };
+        text_result(CHAR_PADDED, input)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let [value, length] = args.args.as_slice() else {
+            return exec_err!("{CHAR_PADDED} expects two arguments");
+        };
+        let ColumnarValue::Scalar(length) = length else {
+            return exec_err!("{CHAR_PADDED} expects a constant length");
         };
         let length = length_argument(Some(length))?;
         map_text(value, args.number_rows, |text| padded(text, length))
+    }
+}
+
+/// `codelake_char_order(x)`: [`order_key`] of `x`, what char values are
+/// sorted by (`ORDER BY`, `min`, `max`, …).
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct CharOrder {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for CharOrder {
+    fn name(&self) -> &'static str {
+        CHAR_ORDER
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        let [input] = arg_types else {
+            return plan_err!("{CHAR_ORDER} expects one argument");
+        };
+        text_result(CHAR_ORDER, input)?;
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let [value] = args.args.as_slice() else {
+            return exec_err!("{CHAR_ORDER} expects one argument");
+        };
+        let text = cast(&value.to_array(args.number_rows)?, &DataType::Utf8)?;
+        let out: StringArray = text.as_string::<i32>().iter().map(|v| v.map(order_key)).collect();
+        let out: ArrayRef = Arc::new(out);
+        Ok(match value {
+            ColumnarValue::Scalar(_) => ColumnarValue::Scalar(ScalarValue::try_from_array(&out, 0)?),
+            ColumnarValue::Array(_) => ColumnarValue::Array(out),
+        })
     }
 }
 
@@ -279,7 +410,7 @@ impl ScalarUDFImpl for CharKey {
 }
 
 /// `codelake_char_compare(a, b)`: `-1`, `0` or `1` as `a` sorts before, with
-/// or after `b`, both padded with spaces to one length.
+/// or after `b`, both compared as if padded with spaces to one length.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct CharCompare {
     signature: Signature,
@@ -397,9 +528,19 @@ static VARCHAR_OF_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     }))
 });
 
-static CHAR_PAD_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
-    Arc::new(ScalarUDF::new_from_impl(CharPad {
+static CHAR_VALUE_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
+    Arc::new(ScalarUDF::new_from_impl(CharValue {
         signature: Signature::any(2, Volatility::Immutable),
+    }))
+});
+static CHAR_PADDED_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
+    Arc::new(ScalarUDF::new_from_impl(CharPadded {
+        signature: Signature::any(2, Volatility::Immutable),
+    }))
+});
+static CHAR_ORDER_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
+    Arc::new(ScalarUDF::new_from_impl(CharOrder {
+        signature: Signature::any(1, Volatility::Immutable),
     }))
 });
 static CHAR_KEY_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
@@ -416,12 +557,14 @@ static CHAR_COMPARE_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
 /// The functions this module plans, for the engine to register.
 pub(crate) fn functions() -> Vec<ScalarUDF> {
     [
-        &CHAR_PAD_UDF,
+        &CHAR_VALUE_UDF,
+        &CHAR_PADDED_UDF,
+        &CHAR_ORDER_UDF,
         &CHAR_KEY_UDF,
         &CHAR_COMPARE_UDF,
         &VARCHAR_OF_UDF,
         &crate::nested_values::NESTED_TEST_UDF,
-        &crate::nested_values::NESTED_PAD_UDF,
+        &crate::nested_values::NESTED_CHAR_UDF,
     ]
     .into_iter()
     .map(|udf| udf.as_ref().clone())
@@ -429,14 +572,30 @@ pub(crate) fn functions() -> Vec<ScalarUDF> {
 }
 
 /// `expr` as a `char(length)` value (`codelake_char`).
-pub fn pad(expr: Expr, length: u32) -> Expr {
+pub fn as_char(expr: Expr, length: u32) -> Expr {
     Expr::ScalarFunction(ScalarFunction::new_udf(
-        Arc::clone(&CHAR_PAD_UDF),
+        Arc::clone(&CHAR_VALUE_UDF),
         vec![
             expr,
             Expr::Literal(ScalarValue::Int64(Some(i64::from(length))), None),
         ],
     ))
+}
+
+/// `expr` padded to `length` characters (`codelake_char_padded`).
+fn padded_to(expr: Expr, length: u32) -> Expr {
+    Expr::ScalarFunction(ScalarFunction::new_udf(
+        Arc::clone(&CHAR_PADDED_UDF),
+        vec![
+            expr,
+            Expr::Literal(ScalarValue::Int64(Some(i64::from(length))), None),
+        ],
+    ))
+}
+
+/// The key `expr`, a char value, sorts by (`codelake_char_order`).
+fn order(expr: Expr) -> Expr {
+    Expr::ScalarFunction(ScalarFunction::new_udf(Arc::clone(&CHAR_ORDER_UDF), vec![expr]))
 }
 
 fn key(expr: Expr) -> Expr {
@@ -1060,7 +1219,7 @@ fn function_type(name: &str, args: &[Expr], scope: &Scope<'_>, whole: &Expr) -> 
     }
     if matches!(
         name,
-        crate::nested_values::NESTED_PAD | "flatten" | "array_intersect" | "array_union" | "array_except"
+        crate::nested_values::NESTED_CHAR | "flatten" | "array_intersect" | "array_union" | "array_except"
     ) && let Some(array) = function_shape(name, args, scope, whole).and_then(|s| array_text(&s))
     {
         return Some(array);
@@ -1077,8 +1236,14 @@ fn function_type(name: &str, args: &[Expr], scope: &Scope<'_>, whole: &Expr) -> 
                 .map(|n| Text::Varchar(Bound::Known(n))),
             _ => None,
         }),
-        CHAR_PAD => args.get(1).and_then(|n| match n {
+        CHAR_VALUE => args.get(1).and_then(|n| match n {
             Expr::Literal(value, _) => length_argument(Some(value)).ok().map(|n| Text::Char(Some(n))),
+            _ => None,
+        }),
+        CHAR_PADDED => args.get(1).and_then(|n| match n {
+            Expr::Literal(value, _) => length_argument(Some(value))
+                .ok()
+                .map(|n| Text::Varchar(Bound::Known(n))),
             _ => None,
         }),
         crate::coercion::VALUES_CELL
@@ -1412,7 +1577,7 @@ fn element_shape(shape: Option<Shape>) -> Option<Shape> {
     }
 }
 
-/// `shape` with the char lengths of a [`crate::nested_values`] pad spec.
+/// `shape` with the char lengths of a [`crate::nested_values`] char spec.
 fn with_lengths(
     shape: Shape,
     data_type: &DataType,
@@ -1492,7 +1657,7 @@ fn function_shape(name: &str, args: &[Expr], scope: &Scope<'_>, whole: &Expr) ->
         | crate::trino_functions::TRY
         | crate::trino_functions::GUARDED_TRY
         | crate::trino_functions::BARRIER => arg(0),
-        crate::nested_values::NESTED_PAD => {
+        crate::nested_values::NESTED_CHAR => {
             let (_, spec) = literal_text(args.get(1)?)?;
             let data_type = args[0].get_type(scope.schema.as_ref()).ok()?;
             let mut lengths = crate::nested_values::spec_lengths(spec).into_iter();
@@ -1665,17 +1830,17 @@ fn holds_null(expr: Expr, scope: &Scope<'_>) -> Expr {
 }
 
 /// For each value of `data_type` (see [`char_flags`]), the char length it
-/// is padded to so a value of shape `from` has shape `to`.
-fn pad_lengths(data_type: &DataType, from: Option<&Shape>, to: &Shape, out: &mut Vec<Option<u32>>) {
+/// is converted to so a value of shape `from` has shape `to`.
+fn conversion_lengths(data_type: &DataType, from: Option<&Shape>, to: &Shape, out: &mut Vec<Option<u32>>) {
     match (data_type, to) {
         (DataType::Struct(fields), Shape::Row(targets)) => {
             for (k, (f, t)) in fields.iter().zip(targets).enumerate() {
-                pad_lengths(f.data_type(), row_field(from, k), t, out);
+                conversion_lengths(f.data_type(), row_field(from, k), t, out);
             }
         }
         (other, Shape::Array(target)) if crate::nested_values::element(other).is_some() => {
             if let Some(f) = crate::nested_values::element(other) {
-                pad_lengths(f.data_type(), array_element(from), target, out);
+                conversion_lengths(f.data_type(), array_element(from), target, out);
             }
         }
         (other, target) => {
@@ -1706,8 +1871,8 @@ fn unknown_char_length(shape: &Shape) -> bool {
 }
 
 /// `expr` (of shape `from`) as a value of shape `to`: its char values
-/// padded to the common lengths, inside a row or an array written out, or
-/// by [`crate::nested_values`]'s pad.
+/// converted to the common lengths, inside a row or an array written out,
+/// or by [`crate::nested_values`]'s conversion.
 fn conform(expr: Expr, from: Option<&Shape>, to: &Shape, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
     if let Some(kind) = built(&expr)
         && matches!(
@@ -1743,23 +1908,23 @@ fn conform(expr: Expr, from: Option<&Shape>, to: &Shape, scope: &Scope<'_>) -> R
                 if *t == Some(Text::Null) {
                     Transformed::no(expr)
                 } else {
-                    Transformed::yes(pad(expr, *n))
+                    Transformed::yes(as_char(expr, *n))
                 }
             }
             _ => Transformed::no(expr),
         });
     };
     let mut lengths = Vec::new();
-    pad_lengths(&data_type, from, to, &mut lengths);
+    conversion_lengths(&data_type, from, to, &mut lengths);
     if lengths.iter().all(Option::is_none) {
         return Ok(Transformed::no(expr));
     }
     Ok(Transformed::yes(Expr::ScalarFunction(ScalarFunction::new_udf(
-        Arc::clone(&crate::nested_values::NESTED_PAD_UDF),
+        Arc::clone(&crate::nested_values::NESTED_CHAR_UDF),
         vec![
             expr,
             Expr::Literal(
-                ScalarValue::Utf8(Some(crate::nested_values::pad_spec(&lengths))),
+                ScalarValue::Utf8(Some(crate::nested_values::char_spec(&lengths))),
                 None,
             ),
         ],
@@ -1767,7 +1932,7 @@ fn conform(expr: Expr, from: Option<&Shape>, to: &Shape, scope: &Scope<'_>) -> R
 }
 
 /// Rows or arrays output in their common shape: the char values in each
-/// padded to their common length (`CASE … THEN ARRAY[c3] ELSE ARRAY[ch]
+/// converted to their common length (`CASE … THEN ARRAY[c3] ELSE ARRAY[ch]
 /// END` holds `char(5)` values).
 fn unify_nested(exprs: Vec<Expr>, scope: &Scope<'_>, what: &str) -> Result<Transformed<Vec<Expr>>> {
     let shapes: Vec<Option<Shape>> = exprs.iter().map(|e| Some(shape(e, scope))).collect();
@@ -1829,6 +1994,15 @@ fn needs_char_coercion(types: &[Option<Text>]) -> bool {
     !(matches!(first, Text::Char(Some(_))) && chars.all(|t| t == first))
 }
 
+/// Whether values of `types` are char values compared with text or with
+/// each other: one is char, all are text. Equal char values are held alike
+/// (without trailing spaces), but an ordering compares them padded.
+fn holds_char(types: &[Option<Text>]) -> bool {
+    types.iter().flatten().any(|t| t.is_char())
+        && !types.iter().any(Option::is_none)
+        && !types.iter().flatten().any(|t| t.is_container())
+}
+
 /// Whether values of `types` put an array of char values together with
 /// another array: its elements would have to be converted, which this rule
 /// does not do but for arrays written out.
@@ -1871,17 +2045,13 @@ fn text_literal_like(value: &ScalarValue, text: String) -> Expr {
     Expr::Literal(value, None)
 }
 
-/// A text literal compared with a `char(n)` value, padded to `n` so the two
-/// compare as they are; `None` when it does not fit in `n` characters
-/// (trailing spaces aside for an equality).
-fn fitted_literal(expr: &Expr, length: u32, equality: bool) -> Option<Expr> {
+/// A text literal a `char(n)` value is tested for equality with, as a
+/// `char(n)` value holds it (without trailing spaces), so the two compare as
+/// they are; `None` when it does not fit in `n` characters.
+fn fitted_literal(expr: &Expr, length: u32) -> Option<Expr> {
     let (value, text) = literal_text(expr)?;
-    let text = if equality {
-        text.trim_end_matches(' ')
-    } else {
-        text
-    };
-    (characters(text) <= length).then(|| text_literal_like(value, padded(text, length)))
+    let text = unpadded(text);
+    (characters(text) <= length).then(|| text_literal_like(value, text.to_owned()))
 }
 
 /// What a row or array constructor builds from its arguments.
@@ -1937,8 +2107,16 @@ fn compare_built(left: Expr, op: Operator, right: Expr, scope: &Scope<'_>) -> Re
             return Ok(key(e));
         }
         match common(types) {
-            Some(Text::Char(Some(n))) => Ok(pad(e, n)),
+            Some(Text::Char(Some(_))) => Ok(order(e)),
             _ => Err(refusal("an ordering of rows or arrays of char(n) values")),
+        }
+    };
+    // Equal char values are held alike; an ordering compares them padded.
+    let converts = |types: &[Option<Text>]| {
+        if is_equality(op) {
+            needs_char_coercion(types)
+        } else {
+            holds_char(types)
         }
     };
     let arrays = lk == Built::Array && rk == Built::Array;
@@ -1949,7 +2127,7 @@ fn compare_built(left: Expr, op: Operator, right: Expr, scope: &Scope<'_>) -> Re
             .map(|i| infer(&la[*i], scope))
             .chain(rp.iter().map(|i| infer(&ra[*i], scope)))
             .collect();
-        if !needs_char_coercion(&types) {
+        if !converts(&types) {
             return Ok(Transformed::no(rebuild(la, ra)));
         }
         for i in &lp {
@@ -1966,7 +2144,7 @@ fn compare_built(left: Expr, op: Operator, right: Expr, scope: &Scope<'_>) -> Re
     let mut changed = false;
     for (i, j) in lp.into_iter().zip(rp) {
         let types = [infer(&la[i], scope), infer(&ra[j], scope)];
-        if needs_char_coercion(&types) && !types.contains(&Some(Text::Null)) {
+        if converts(&types) && !types.contains(&Some(Text::Null)) {
             la[i] = convert(std::mem::take(&mut la[i]), &types)?;
             ra[j] = convert(std::mem::take(&mut ra[j]), &types)?;
             changed = true;
@@ -2008,7 +2186,7 @@ fn search_array(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result<
         );
         if let Some(Text::Array(Some(n))) = elements
             && needle_type.is_some_and(|t| !t.is_char())
-            && let Some(fitted) = fitted_literal(needle, n, true)
+            && let Some(fitted) = fitted_literal(needle, n)
         {
             let mut args = args;
             args[1] = fitted;
@@ -2112,12 +2290,12 @@ fn compare_parts(
     ))
 }
 
-/// `x` padded to `length` unless it is `NULL` or already a `char(length)`.
-fn pad_to(x: Expr, t: Option<Text>, length: u32) -> Expr {
+/// `x` as a `char(length)` value unless it is `NULL` or already one.
+fn converted_to(x: Expr, t: Option<Text>, length: u32) -> Expr {
     match t {
         Some(Text::Null) => x,
         Some(Text::Char(Some(n))) if n == length => x,
-        _ => pad(x, length),
+        _ => as_char(x, length),
     }
 }
 
@@ -2140,9 +2318,9 @@ fn remove_from_array(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Re
         let elements = elements
             .into_iter()
             .zip(&types)
-            .map(|(e, t)| pad_to(e, *t, n))
+            .map(|(e, t)| converted_to(e, *t, n))
             .collect();
-        let needle = pad_to(needle, needle_type, n);
+        let needle = converted_to(needle, needle_type, n);
         return Ok(Transformed::yes(func.call(vec![inner.call(elements), needle])));
     }
     match (infer(&array, scope), needle_type) {
@@ -2150,8 +2328,8 @@ fn remove_from_array(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Re
             Ok(Transformed::no(func.call(vec![array, needle])))
         }
         (Some(Text::Array(_)), Some(Text::Null)) => Ok(Transformed::no(func.call(vec![array, needle]))),
-        (Some(Text::Array(Some(n))), _) if fitted_literal(&needle, n, true).is_some() => {
-            let fitted = fitted_literal(&needle, n, true).unwrap_or(needle);
+        (Some(Text::Array(Some(n))), _) if fitted_literal(&needle, n).is_some() => {
+            let fitted = fitted_literal(&needle, n).unwrap_or(needle);
             Ok(Transformed::yes(func.call(vec![array, fitted])))
         }
         (Some(Text::Array(_)), _) | (_, Some(Text::Char(_))) => Err(DataFusionError::NotImplemented(
@@ -2180,9 +2358,9 @@ fn look_up(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result<Trans
     match (keys, key) {
         (_, Some(Text::Null)) => Ok(Transformed::no(func.call(args))),
         (Entries::Char(Some(n)), Some(Text::Char(Some(m)))) if n == m => Ok(Transformed::no(func.call(args))),
-        (Entries::Char(Some(n)), _) if fitted_literal(&args[1], n, true).is_some() => {
+        (Entries::Char(Some(n)), _) if fitted_literal(&args[1], n).is_some() => {
             let mut args = args;
-            args[1] = fitted_literal(&args[1], n, true).unwrap_or_default();
+            args[1] = fitted_literal(&args[1], n).unwrap_or_default();
             Ok(Transformed::yes(func.call(args)))
         }
         (Entries::Char(_), _) | (Entries::Other, Some(Text::Char(_))) => {
@@ -2221,9 +2399,9 @@ fn concat_arrays(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result
                 .into_iter()
                 .map(|e| {
                     let t = infer(&e, scope);
-                    let padded = pad_to(e, t, length);
+                    let converted = converted_to(e, t, length);
                     changed |= !matches!(t, Some(Text::Null)) && t != Some(Text::Char(Some(length)));
-                    padded
+                    converted
                 })
                 .collect();
             out.push(inner.call(elements));
@@ -2235,7 +2413,7 @@ fn concat_arrays(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result
         } else {
             let t = infer(&arg, scope);
             changed |= !matches!(t, Some(Text::Null)) && t != Some(Text::Char(Some(length)));
-            out.push(pad_to(arg, t, length));
+            out.push(converted_to(arg, t, length));
         }
     }
     Ok(Transformed::new_transformed(func.call(out), changed))
@@ -2271,37 +2449,44 @@ fn compare(left: Expr, op: Operator, right: Expr, scope: &Scope<'_>) -> Result<T
     {
         return Err(char_array_refusal("a comparison"));
     }
-    if !needs_char_coercion(&types) || types.contains(&Some(Text::Null)) {
+    let equality = is_equality(op);
+    // Two values of one `char(n)` are equal as they are held; they are not
+    // ordered as they are held (`'ab' || chr(9)` sorts below `'ab'`).
+    let converts = if equality {
+        needs_char_coercion(&types)
+    } else {
+        is_ordering(op) && holds_char(&types)
+    };
+    if !converts || types.contains(&Some(Text::Null)) {
         return Ok(Transformed::no(binary(left, op, right)));
     }
-    let equality = is_equality(op);
-    // A literal against a `char(n)` value: pad the literal.
-    if let [Some(Text::Char(Some(n))), _] = types
-        && let Some(fitted) = fitted_literal(&right, n, equality)
+    // A literal tested for equality with a `char(n)` value: the literal as
+    // the char value holds it.
+    if equality
+        && let [Some(Text::Char(Some(n))), _] = types
+        && let Some(fitted) = fitted_literal(&right, n)
     {
         return Ok(Transformed::yes(binary(left, op, fitted)));
     }
-    if let [_, Some(Text::Char(Some(n)))] = types
-        && let Some(fitted) = fitted_literal(&left, n, equality)
+    if equality
+        && let [_, Some(Text::Char(Some(n)))] = types
+        && let Some(fitted) = fitted_literal(&left, n)
     {
         return Ok(Transformed::yes(binary(fitted, op, right)));
     }
     if equality {
         return Ok(Transformed::yes(binary(key(left), op, key(right))));
     }
-    if is_ordering(op) {
-        let zero = Expr::Literal(ScalarValue::Int32(Some(0)), None);
-        return Ok(Transformed::yes(binary(compare_call(left, right), op, zero)));
-    }
-    Ok(Transformed::no(binary(left, op, right)))
+    let zero = Expr::Literal(ScalarValue::Int32(Some(0)), None);
+    Ok(Transformed::yes(binary(compare_call(left, right), op, zero)))
 }
 
 fn binary(left: Expr, op: Operator, right: Expr) -> Expr {
     Expr::BinaryExpr(BinaryExpr::new(Box::new(left), op, Box::new(right)))
 }
 
-/// `exprs`, output in their common type: each padded to its length when
-/// one is char. `what` names the construct in a refusal.
+/// `exprs`, output in their common type: each a value of it when one is
+/// char. `what` names the construct in a refusal.
 fn unify_values(exprs: Vec<Expr>, scope: &Scope<'_>, what: &str) -> Result<Transformed<Vec<Expr>>> {
     if exprs.iter().any(|e| nested_type(e, scope).is_some()) {
         return unify_nested(exprs, scope, what);
@@ -2320,14 +2505,15 @@ fn unify_values(exprs: Vec<Expr>, scope: &Scope<'_>, what: &str) -> Result<Trans
             .map(|(e, t)| match t {
                 Some(Text::Null) => e,
                 Some(Text::Char(Some(n))) if n == length => e,
-                _ => pad(e, length),
+                _ => as_char(e, length),
             })
             .collect(),
     ))
 }
 
-/// `||` / `concat` of a char value: every other text padded to its own
-/// length (`varchar(k)` to `k`).
+/// `||` / `concat` of a char value: every text as it is held, a char value
+/// without trailing spaces, other text with its own (the reference pads
+/// each to its own length, ISS-059). The result is `char(total length)`.
 fn concat_args(args: Vec<Expr>, scope: &Scope<'_>) -> Result<Transformed<Vec<Expr>>> {
     let types: Vec<Option<Text>> = args.iter().map(|a| infer(a, scope)).collect();
     if !types.iter().flatten().any(|t| t.is_char()) {
@@ -2348,21 +2534,7 @@ fn concat_args(args: Vec<Expr>, scope: &Scope<'_>) -> Result<Transformed<Vec<Exp
                 .into(),
         ));
     }
-    let mut changed = false;
-    let args = args
-        .into_iter()
-        .zip(types)
-        .map(|(a, t)| match t {
-            Some(Text::Varchar(Bound::Known(k)))
-                if literal_text(&a).is_none_or(|(_, text)| characters(text) != k) =>
-            {
-                changed = true;
-                pad(a, k)
-            }
-            _ => a,
-        })
-        .collect();
-    Ok(Transformed::new_transformed(args, changed))
+    Ok(Transformed::no(args))
 }
 
 /// Whether `expr` is a constant without a `NULL` anywhere in it.
@@ -2510,7 +2682,7 @@ fn in_list(list: InList, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
             .iter()
             .map(|item| match item {
                 Expr::Literal(value, _) if value.is_null() => Some(item.clone()),
-                other => fitted_literal(other, n, true),
+                other => fitted_literal(other, n),
             })
             .collect();
         if let Some(fitted) = fitted {
@@ -2767,7 +2939,8 @@ fn scalar_function(function: ScalarFunction, scope: &Scope<'_>) -> Result<Transf
     let ScalarFunction { func, args } = function;
     let name = func.name().to_owned();
     match name.as_str() {
-        "coalesce" | "nvl" | "ifnull" | "greatest" | "least" => {
+        "greatest" | "least" => extreme(&func, args, scope),
+        "coalesce" | "nvl" | "ifnull" => {
             Ok(unify_values(args, scope, &name)?.update_data(|args| func.call(args)))
         }
         "nvl2" if args.len() == 3 => {
@@ -2788,7 +2961,7 @@ fn scalar_function(function: ScalarFunction, scope: &Scope<'_>) -> Result<Transf
             let b = args.pop().unwrap_or_default();
             let a = args.pop().unwrap_or_default();
             if let [Some(Text::Char(Some(n))), _] = types
-                && let Some(fitted) = fitted_literal(&b, n, true)
+                && let Some(fitted) = fitted_literal(&b, n)
             {
                 return Ok(Transformed::yes(func.call(vec![a, fitted])));
             }
@@ -2874,7 +3047,7 @@ fn type_of(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result<Trans
         Some(Text::Char(Some(n))) if recorded != Some(Declared::Char(n)) => {
             let mut args = args;
             let value = args.pop().unwrap_or_default();
-            Ok(Transformed::yes(func.call(vec![pad(value, n)])))
+            Ok(Transformed::yes(func.call(vec![as_char(value, n)])))
         }
         Some(Text::Varchar(_)) if matches!(recorded, Some(Declared::Char(_))) => {
             let mut args = args;
@@ -2894,13 +3067,101 @@ fn type_of(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result<Trans
     }
 }
 
-/// `lag`/`lead` with a default: the value and the default share a type.
+/// `greatest`/`least` of char values: the first value no other sorts
+/// after (before), as the reference orders char values (padded), `NULL`
+/// when one is `NULL`; the values in their common type.
+fn extreme(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
+    let unified = unify_values(args, scope, func.name())?;
+    let types: Vec<Option<Text>> = unified.data.iter().map(|a| infer(a, scope)).collect();
+    if unified.data.len() < 2 || !holds_char(&types) || types.contains(&Some(Text::Null)) {
+        return Ok(unified.update_data(|args| func.call(args)));
+    }
+    let args = unified.data;
+    let op = if func.name() == "greatest" {
+        Operator::GtEq
+    } else {
+        Operator::LtEq
+    };
+    let zero = Expr::Literal(ScalarValue::Int32(Some(0)), None);
+    let any_null = args.iter().map(|a| a.clone().is_null()).reduce(Expr::or);
+    let mut whens: Vec<(Box<Expr>, Box<Expr>)> = any_null
+        .into_iter()
+        .map(|test| (Box::new(test), Box::new(Expr::Literal(ScalarValue::Null, None))))
+        .collect();
+    for (i, a) in args.iter().enumerate() {
+        let wins = args
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, b)| binary(compare_call(a.clone(), b.clone()), op, zero.clone()))
+            .reduce(Expr::and);
+        if let Some(wins) = wins {
+            whens.push((Box::new(wins), Box::new(a.clone())));
+        }
+    }
+    Ok(Transformed::yes(Expr::Case(Case::new(None, whens, None))))
+}
+
+/// The keys of an `ORDER BY` (of a query, a window, an aggregate): a char
+/// value sorted by [`order_key`], as the reference orders it (padded).
+fn sort_keys(keys: Vec<SortExpr>, scope: &Scope<'_>) -> Transformed<Vec<SortExpr>> {
+    let mut changed = false;
+    let keys = keys
+        .into_iter()
+        .map(|mut k| {
+            if infer(&k.expr, scope).is_some_and(Text::is_char) {
+                k.expr = order(k.expr);
+                changed = true;
+            }
+            k
+        })
+        .collect();
+    Transformed::new_transformed(keys, changed)
+}
+
+/// `min`/`max` of char values: `min_by`/`max_by` of the value by its
+/// [`order_key`], as the reference orders char values (padded); so is the
+/// char key of `min_by`/`max_by`, and an aggregate's `ORDER BY` by
+/// [`sort_keys`].
+fn aggregate(expr: Expr, scope: &Scope<'_>) -> Transformed<Expr> {
+    let Expr::AggregateFunction(mut aggregate) = expr else {
+        return Transformed::no(expr);
+    };
+    let ordered = sort_keys(std::mem::take(&mut aggregate.params.order_by), scope);
+    let mut changed = ordered.transformed;
+    aggregate.params.order_by = ordered.data;
+    let name = aggregate.func.name();
+    if matches!(name, "min" | "max")
+        && let [value] = aggregate.params.args.as_slice()
+        && infer(value, scope).is_some_and(Text::is_char)
+    {
+        let value = value.clone();
+        aggregate.func = Arc::new(crate::trino_functions::value_by(name == "max"));
+        aggregate.params.args = vec![value.clone(), order(value)];
+        changed = true;
+    } else if matches!(name, "min_by" | "max_by")
+        && let Some(key) = aggregate.params.args.get_mut(1)
+        && infer(key, scope).is_some_and(Text::is_char)
+    {
+        *key = order(std::mem::take(key));
+        changed = true;
+    }
+    Transformed::new_transformed(Expr::AggregateFunction(aggregate), changed)
+}
+
+/// `lag`/`lead` with a default: the value and the default share a type; a
+/// window's `ORDER BY` by [`sort_keys`].
 fn window_function(expr: Expr, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
     let Expr::WindowFunction(mut window) = expr else {
         return Ok(Transformed::no(expr));
     };
+    let ordered = sort_keys(std::mem::take(&mut window.params.order_by), scope);
+    window.params.order_by = ordered.data;
     if !matches!(window.fun.name(), "lag" | "lead") || window.params.args.len() != 3 {
-        return Ok(Transformed::no(Expr::WindowFunction(window)));
+        return Ok(Transformed::new_transformed(
+            Expr::WindowFunction(window),
+            ordered.transformed,
+        ));
     }
     let mut args = std::mem::take(&mut window.params.args);
     let default = args.pop().unwrap_or_default();
@@ -2915,7 +3176,7 @@ fn window_function(expr: Expr, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
     window.params.args = args;
     Ok(Transformed::new_transformed(
         Expr::WindowFunction(window),
-        changed,
+        changed || ordered.transformed,
     ))
 }
 
@@ -2942,7 +3203,7 @@ fn rewrite_one(expr: Expr, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
             high,
         }) => {
             let types = [infer(&expr, scope), infer(&low, scope), infer(&high, scope)];
-            if !needs_char_coercion(&types) {
+            if !holds_char(&types) {
                 return Ok(Transformed::no(Expr::Between(Between::new(
                     expr, negated, low, high,
                 ))));
@@ -2960,8 +3221,39 @@ fn rewrite_one(expr: Expr, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
         Expr::Case(c) => case(c, scope),
         Expr::ScalarFunction(function) => scalar_function(function, scope),
         e @ Expr::WindowFunction(_) => window_function(e, scope),
+        e @ Expr::AggregateFunction(_) => Ok(aggregate(e, scope)),
+        Expr::Like(like) => matched(like, scope),
         other => Ok(Transformed::no(other)),
     }
+}
+
+/// `LIKE` of a char value: the pattern matched against the value padded to
+/// its length, as the reference matches it (`ch LIKE 'ab %'` holds for a
+/// `char(5)` `'ab'`); so is a char pattern.
+fn matched(like: Like, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
+    let Like {
+        negated,
+        expr,
+        pattern,
+        escape_char,
+        case_insensitive,
+    } = like;
+    let mut changed = false;
+    let mut pad = |e: Box<Expr>| -> Result<Box<Expr>> {
+        match infer(&e, scope) {
+            Some(Text::Char(Some(n))) => {
+                changed = true;
+                Ok(Box::new(padded_to(*e, n)))
+            }
+            Some(Text::Char(None)) => Err(refusal("LIKE")),
+            _ => Ok(e),
+        }
+    };
+    let (expr, pattern) = (pad(expr)?, pad(pattern)?);
+    Ok(Transformed::new_transformed(
+        Expr::Like(Like::new(negated, expr, pattern, escape_char, case_insensitive)),
+        changed,
+    ))
 }
 
 /// Every expression of `plan`, names kept.
@@ -3028,7 +3320,7 @@ fn record_types(projection: Projection, scope: &Scope<'_>) -> Result<Transformed
         }
         let value = match wanted {
             Some(Text::Char(Some(n))) if recorded != Some(Declared::Char(n)) => {
-                Some(pad(expr.clone().unalias(), n))
+                Some(as_char(expr.clone().unalias(), n))
             }
             Some(Text::Char(_)) | None => None,
             Some(other) if matches!(recorded, Some(Declared::Char(_))) => Some(match other {
@@ -3062,9 +3354,9 @@ fn record_types(projection: Projection, scope: &Scope<'_>) -> Result<Transformed
     )?)))
 }
 
-/// `plan` with column `i` padded to `lengths[i]` where given (same
+/// `plan` with column `i` a `char(lengths[i])` value where given (same
 /// qualifier and name).
-fn pad_columns(plan: Arc<LogicalPlan>, lengths: &[Option<u32>]) -> Result<Arc<LogicalPlan>> {
+fn converted_columns(plan: Arc<LogicalPlan>, lengths: &[Option<u32>]) -> Result<Arc<LogicalPlan>> {
     if lengths.iter().all(Option::is_none) {
         return Ok(plan);
     }
@@ -3075,7 +3367,7 @@ fn pad_columns(plan: Arc<LogicalPlan>, lengths: &[Option<u32>]) -> Result<Arc<Lo
         .map(|((qualifier, field), length)| {
             let column = Expr::Column(Column::from((qualifier, field)));
             match length {
-                Some(n) => pad(column, *n).alias_qualified(qualifier.cloned(), field.name()),
+                Some(n) => as_char(column, *n).alias_qualified(qualifier.cloned(), field.name()),
                 None => column,
             }
         })
@@ -3085,7 +3377,7 @@ fn pad_columns(plan: Arc<LogicalPlan>, lengths: &[Option<u32>]) -> Result<Arc<Lo
     )?)))
 }
 
-/// The length each input's column `j` is padded to (its common char type),
+/// The length each input's column `j` is converted to (its common char type),
 /// `None` for a column left as it is.
 fn common_lengths(columns: &[Vec<Option<Text>>], what: &str) -> Result<Vec<Option<u32>>> {
     columns
@@ -3105,7 +3397,7 @@ fn common_lengths(columns: &[Vec<Option<Text>>], what: &str) -> Result<Vec<Optio
         .collect()
 }
 
-/// A `UNION` of char values: every input's column padded to the common
+/// A `UNION` of char values: every input's column converted to the common
 /// char type; the char values in rows and arrays too.
 fn union(union: Union, outer: &[&LogicalPlan]) -> Result<Transformed<LogicalPlan>> {
     let width = union.schema.fields().len();
@@ -3149,12 +3441,12 @@ fn union(union: Union, outer: &[&LogicalPlan]) -> Result<Transformed<LogicalPlan
                 .enumerate()
                 .map(|(j, length)| length.filter(|n| columns[j][i] != Some(Text::Char(Some(*n)))))
                 .collect();
-            let padded = pad_columns(input, &own)?;
+            let converted = converted_columns(input, &own)?;
             let targets: Vec<Option<(Shape, Option<Shape>)>> = shapes
                 .iter()
                 .map(|t| t.as_ref().map(|(target, from)| (target.clone(), from[i].clone())))
                 .collect();
-            conform_columns(padded, &targets, outer)
+            conform_columns(converted, &targets, outer)
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Transformed::yes(LogicalPlan::Union(Union {
@@ -3257,7 +3549,7 @@ fn values(values: Values) -> Result<Transformed<LogicalPlan>> {
             row.into_iter()
                 .enumerate()
                 .map(|(j, cell)| match lengths[j] {
-                    Some(n) => pad_cell(cell, n),
+                    Some(n) => converted_cell(cell, n),
                     None => Ok(cell),
                 })
                 .collect::<Result<Vec<_>>>()
@@ -3269,9 +3561,9 @@ fn values(values: Values) -> Result<Transformed<LogicalPlan>> {
     })))
 }
 
-/// A `VALUES` cell padded to `n`, inside its cast and mark, unless it is
+/// A `VALUES` cell as a `char(n)` value, inside its cast and mark, unless it is
 /// `NULL` or already a `char(n)`.
-fn pad_cell(cell: Expr, length: u32) -> Result<Expr> {
+fn converted_cell(cell: Expr, length: u32) -> Result<Expr> {
     let empty = Scope::empty();
     match infer(value_of_cell(&cell), &empty) {
         Some(Text::Null) => return Ok(cell),
@@ -3289,7 +3581,7 @@ fn pad_cell(cell: Expr, length: u32) -> Result<Expr> {
                 Transformed::no(e)
             } else {
                 Transformed::new(
-                    pad(e, length),
+                    as_char(e, length),
                     true,
                     datafusion::common::tree_node::TreeNodeRecursion::Jump,
                 )
@@ -3298,7 +3590,7 @@ fn pad_cell(cell: Expr, length: u32) -> Result<Expr> {
         .data)
 }
 
-/// The char length each column declares: the one it is padded to, or the
+/// The char length each column declares: the one it is converted to, or the
 /// `char(n)` all its values share.
 fn char_lengths(columns: &[Vec<Option<Text>>], lengths: &[Option<u32>]) -> Vec<Option<u32>> {
     columns
@@ -3393,16 +3685,16 @@ fn join(join: Join, outer: &[&LogicalPlan]) -> Result<Transformed<LogicalPlan>> 
         };
         // Below the `DISTINCT` of `INTERSECT`/`EXCEPT`: values equal once
         // converted (`'ab'` and `'ab  '` as char) are one row.
-        let pad_side = |plan: &Arc<LogicalPlan>, lengths: &[Option<u32>]| -> Result<Arc<LogicalPlan>> {
+        let convert_side = |plan: &Arc<LogicalPlan>, lengths: &[Option<u32>]| -> Result<Arc<LogicalPlan>> {
             match plan.as_ref() {
                 LogicalPlan::Distinct(Distinct::All(input)) => Ok(Arc::new(LogicalPlan::Distinct(
-                    Distinct::All(pad_columns(Arc::clone(input), lengths)?),
+                    Distinct::All(converted_columns(Arc::clone(input), lengths)?),
                 ))),
-                _ => pad_columns(Arc::clone(plan), lengths),
+                _ => converted_columns(Arc::clone(plan), lengths),
             }
         };
-        let left = pad_side(&join.left, &side(&join.left, 0))?;
-        let right = pad_side(&join.right, &side(&join.right, 1))?;
+        let left = convert_side(&join.left, &side(&join.left, 0))?;
+        let right = convert_side(&join.right, &side(&join.right, 1))?;
         return Ok(Transformed::yes(LogicalPlan::Join(Join::try_new(
             left,
             right,
@@ -3453,6 +3745,10 @@ fn rewrite_node(plan: LogicalPlan, outer: &[&LogicalPlan]) -> Result<LogicalPlan
     let plan = rewrite_expressions(plan, &scope)?.data;
     match plan {
         LogicalPlan::Values(v) => Ok(values(v)?.data),
+        LogicalPlan::Sort(mut sort) => {
+            sort.expr = sort_keys(sort.expr, &scope).data;
+            Ok(LogicalPlan::Sort(sort))
+        }
         LogicalPlan::Projection(projection) => {
             let projection = match LogicalPlan::Projection(projection).recompute_schema()? {
                 LogicalPlan::Projection(p) => p,
@@ -3576,9 +3872,10 @@ fn is_char_type(data_type: &sql::DataType) -> bool {
 /// On the PostgreSQL wire a statement runs on the session as `DataFusion`
 /// plans it, without the engine's preparation of `char(n)`: a `char(5)`
 /// column would be created as unbounded text (read as `varchar` by every
-/// protocol afterwards) and `CAST('ab' AS char(5))` would answer `'ab'`
-/// unpadded. Both are refused there (`0A000`); a `char(n)` table created
-/// through the Trino protocol reads padded on the wire.
+/// protocol afterwards) and `CAST('ab ' AS char(5))` would keep its
+/// trailing space and compare as text. Both are refused there (`0A000`); a
+/// `char(n)` table created through the Trino protocol reads on the wire as
+/// every protocol reads it (without trailing spaces).
 pub fn refuse_char_types_on_postgres(statement: &sql::Statement) -> Result<()> {
     let refusal = || {
         Err(DataFusionError::NotImplemented(
@@ -3690,8 +3987,61 @@ mod tests {
             .collect()
     }
 
-    /// Each query and the rows Trino 431 answers to it (`typeof` included).
+    /// Each query and the rows Trino 431 answers to it (`typeof` included),
+    /// but for the padding of char values, which the engine neither holds
+    /// nor outputs (ISS-059): a char value without trailing spaces, `length`
+    /// of it, `||`, `substr` and `CAST(… AS varchar)` of it as it is held.
     const CASES: &[(&str, &[&[&str]])] = &[
+        // Char values are held without trailing spaces but ordered padded:
+        // `'a' || chr(9)` (id 9 of `w`) sorts below `'a'` (id 4 of `cht`),
+        // the tab compared with the padding.
+        (
+            "SELECT id FROM (SELECT id, ch FROM cht WHERE id = 4 UNION ALL SELECT id, ch FROM w WHERE id IN (3, 9)) \
+             ORDER BY ch DESC, id",
+            &[&["3"], &["4"], &["9"]],
+        ),
+        (
+            "SELECT max(x) = 'a', min(x) = 'a' || chr(9), max_by(i, x), min_by(i, x) FROM (SELECT id AS i, ch AS x \
+             FROM cht WHERE id = 4 UNION ALL SELECT id, ch FROM w WHERE id = 9)",
+            &[&["true", "true", "4", "9"]],
+        ),
+        (
+            "SELECT greatest(x.ch, y.ch) = 'a', least(x.ch, y.ch) = 'a' || chr(9), greatest(x.ch, y.ch, NULL), \
+             x.ch < y.ch, x.ch > y.ch, x.ch BETWEEN y.ch AND 'b', ROW(x.ch, 1) < ROW(y.ch, 1) FROM cht x, w y \
+             WHERE x.id = 4 AND y.id = 9",
+            &[&["true", "true", "NULL", "false", "true", "true", "false"]],
+        ),
+        (
+            "SELECT array_agg(id ORDER BY ch), array_agg(id ORDER BY ch DESC) FROM (SELECT id, ch FROM cht \
+             UNION ALL SELECT id + 100, ch FROM w WHERE id = 9)",
+            &[&["[109, 4, 1, 2, 3]", "[2, 1, 4, 109, 3]"]],
+        ),
+        (
+            "SELECT id, rank() OVER (ORDER BY ch), lead(id) OVER (ORDER BY ch, id) FROM (SELECT id, ch FROM cht \
+             UNION ALL SELECT id + 100, ch FROM w WHERE id = 9) ORDER BY id",
+            &[
+                &["1", "3", "2"],
+                &["2", "4", "3"],
+                &["3", "5", "NULL"],
+                &["4", "2", "1"],
+                &["109", "1", "4"],
+            ],
+        ),
+        // `LIKE` matches the value padded to its length, as the reference.
+        (
+            "SELECT id, ch LIKE 'ab', ch LIKE 'ab%', ch LIKE '%  ', ch LIKE 'a _%', ch NOT LIKE 'a____' FROM cht \
+             ORDER BY id",
+            &[
+                &["1", "false", "true", "true", "false", "false"],
+                &["2", "false", "false", "true", "false", "true"],
+                &["3", "NULL", "NULL", "NULL", "NULL", "NULL"],
+                &["4", "false", "false", "true", "true", "false"],
+            ],
+        ),
+        (
+            "SELECT id, ch LIKE 'a' || chr(9) || '%' FROM w WHERE id IN (9, 3) ORDER BY id",
+            &[&["3", "false"], &["9", "true"]],
+        ),
         // Rows and arrays written out compare value by value: a NULL field
         // makes `=` NULL (never true), and a constant IN list is looked up as
         // a set (a row holding a NULL is NULL).
@@ -3758,8 +4108,8 @@ mod tests {
              ARRAY[c][1] BETWEEN 'a' AND 'ab', array_max(ARRAY[ch, c]) = 'ab', array_min(ARRAY[ch, c]), \
              typeof(ARRAY[ch, c][1]) FROM cht LEFT JOIN c3 USING (id) ORDER BY id",
             &[
-                &["1", "false", "true", "true", "true", "true", "ab   ", "char(5)"],
-                &["2", "true", "false", "true", "true", "false", "a    ", "char(5)"],
+                &["1", "false", "true", "true", "true", "true", "ab", "char(5)"],
+                &["2", "true", "false", "true", "true", "false", "a", "char(5)"],
                 &["3", "false", "NULL", "NULL", "false", "NULL", "NULL", "char(5)"],
                 &["4", "NULL", "false", "false", "NULL", "NULL", "NULL", "char(5)"],
             ],
@@ -3767,65 +4117,47 @@ mod tests {
         (
             "SELECT id, array_remove(ARRAY[ch, c], 'a'), array_remove(ARRAY[ch], 'abcdefg') FROM cht LEFT JOIN c3 USING (id) ORDER BY id",
             &[
-                &["1", "[ab   , ab   ]", "[ab     ]"],
-                &["2", "[zz   ]", "[zz     ]"],
-                &["3", "[NULL, zz   ]", "[NULL]"],
-                &["4", "[NULL]", "[a      ]"],
+                &["1", "[ab, ab]", "[ab]"],
+                &["2", "[zz]", "[zz]"],
+                &["3", "[NULL, zz]", "[NULL]"],
+                &["4", "[NULL]", "[a]"],
             ],
         ),
         (
             "SELECT id, ARRAY[ch] || ARRAY[s], ARRAY[ch] || s, s || ARRAY[ch] FROM cht JOIN v3 USING (id) ORDER BY id",
             &[
-                &["1", "[ab   , ab   ]", "[ab   , ab   ]", "[ab   , ab   ]"],
-                &["2", "[zz   , a    ]", "[zz   , a    ]", "[a    , zz   ]"],
+                &["1", "[ab, ab]", "[ab, ab]", "[ab, ab]"],
+                &["2", "[zz, a]", "[zz, a]", "[a, zz]"],
             ],
         ),
         (
             "SELECT id, concat(ARRAY[ch], ARRAY[c], ARRAY['x']), ARRAY[ch] || ARRAY[c] || ARRAY['x'], ARRAY[c] || ch, \
              ch || ARRAY[c] FROM cht JOIN c3 USING (id) ORDER BY id",
             &[
-                &[
-                    "1",
-                    "[ab   , ab   , x    ]",
-                    "[ab   , ab   , x    ]",
-                    "[ab   , ab   ]",
-                    "[ab   , ab   ]",
-                ],
-                &[
-                    "2",
-                    "[zz   , a    , x    ]",
-                    "[zz   , a    , x    ]",
-                    "[a    , zz   ]",
-                    "[zz   , a    ]",
-                ],
-                &[
-                    "3",
-                    "[NULL, zz   , x    ]",
-                    "[NULL, zz   , x    ]",
-                    "NULL",
-                    "NULL",
-                ],
+                &["1", "[ab, ab, x]", "[ab, ab, x]", "[ab, ab]", "[ab, ab]"],
+                &["2", "[zz, a, x]", "[zz, a, x]", "[a, zz]", "[zz, a]"],
+                &["3", "[NULL, zz, x]", "[NULL, zz, x]", "NULL", "NULL"],
             ],
         ),
         (
             "SELECT id, coalesce(element_at(ARRAY[c], 1), CAST('x' AS char(7))) FROM c3 ORDER BY id",
-            &[&["1", "ab     "], &["2", "a      "], &["3", "zz     "]],
+            &[&["1", "ab"], &["2", "a"], &["3", "zz"]],
         ),
         (
             "SELECT id, array_sort(ARRAY[ch, 'a'])[1] = 'a', array_distinct(ARRAY[ch, 'ab']), reverse(ARRAY[ch, 'b'])[1] = 'b', \
              slice(ARRAY[ch, 'b'], 1, 1)[1] = 'ab' FROM cht ORDER BY id",
             &[
-                &["1", "true", "[ab   ]", "true", "true"],
-                &["2", "true", "[zz   , ab   ]", "true", "false"],
-                &["3", "true", "[NULL, ab   ]", "true", "NULL"],
-                &["4", "true", "[a    , ab   ]", "true", "false"],
+                &["1", "true", "[ab]", "true", "true"],
+                &["2", "true", "[zz, ab]", "true", "false"],
+                &["3", "true", "[NULL, ab]", "true", "NULL"],
+                &["4", "true", "[a, ab]", "true", "false"],
             ],
         ),
         (
             "SELECT element_at(array_agg(ch ORDER BY id), 1) = 'ab', array_agg(ch ORDER BY id)[4] = 'a', \
              coalesce(element_at(array_agg(ch ORDER BY id), 4), CAST('x' AS char(7))), \
              array_agg(ch ORDER BY id)[4] < 'a' || chr(9), array_agg(ch ORDER BY id)[4] > 'a' || chr(9) FROM cht",
-            &[&["true", "true", "a      ", "false", "true"]],
+            &[&["true", "true", "a", "false", "true"]],
         ),
         (
             "SELECT array_sort(array_agg(ch))[1] = 'a', array_distinct(array_agg(c))[2] = 'a', cardinality(array_agg(ch)), \
@@ -3857,7 +4189,7 @@ mod tests {
         ),
         (
             "SELECT r, count(*) FROM (SELECT min_by(ch, id) AS r FROM cht UNION ALL SELECT 'ab') GROUP BY r",
-            &[&["ab   ", "2"]],
+            &[&["ab", "2"]],
         ),
         (
             "SELECT typeof(min_by(ch, id)), typeof(max_by(ch, id)) FROM cht",
@@ -3876,30 +4208,30 @@ mod tests {
         (
             "SELECT length(v), count(*) FROM (SELECT s AS v FROM vct EXCEPT SELECT ch FROM cht WHERE id = 2) \
              GROUP BY 1 ORDER BY 1",
-            &[&["65536", "3"], &["NULL", "1"]],
+            &[&["1", "1"], &["2", "2"], &["NULL", "1"]],
         ),
         (
             "SELECT length(v), count(*) FROM (SELECT s AS v FROM vct INTERSECT SELECT ch FROM cht) GROUP BY 1 ORDER BY 1",
-            &[&["65536", "2"], &["NULL", "1"]],
+            &[&["1", "1"], &["2", "1"], &["NULL", "1"]],
         ),
         // Multiset operations of char values.
         (
             "SELECT c FROM c3 INTERSECT ALL SELECT ch FROM cht ORDER BY 1",
-            &[&["a    "], &["ab   "], &["zz   "]],
+            &[&["a"], &["ab"], &["zz"]],
         ),
         (
             "SELECT c FROM (SELECT c FROM c3 UNION ALL SELECT c FROM c3) EXCEPT ALL SELECT ch FROM cht ORDER BY 1",
-            &[&["a    "], &["ab   "], &["zz   "]],
+            &[&["a"], &["ab"], &["zz"]],
         ),
         (
             "SELECT length(v), count(*) FROM (SELECT s AS v FROM vct EXCEPT ALL SELECT ch FROM cht WHERE id = 2) \
              GROUP BY 1 ORDER BY 1",
-            &[&["65536", "4"], &["NULL", "1"]],
+            &[&["1", "1"], &["2", "3"], &["NULL", "1"]],
         ),
         (
             "SELECT substr(v, 1, 3), count(*) FROM (SELECT s AS v FROM v3 UNION ALL SELECT s FROM v3 INTERSECT ALL \
              SELECT ch FROM cht) GROUP BY 1 ORDER BY 1",
-            &[&["a  ", "2"], &["ab ", "2"]],
+            &[&["a", "2"], &["ab", "2"]],
         ),
         // Only spaces are padding: a trailing tab or line feed is compared.
         (
@@ -4089,8 +4421,8 @@ mod tests {
              cardinality(array_union(ARRAY[ch], ARRAY[c])), array_except(ARRAY[ch], ARRAY[c]) \
              FROM cht JOIN c3 USING (id) ORDER BY 1",
             &[
-                &["1", "true", "[ab   ]", "1", "[]"],
-                &["2", "false", "[]", "2", "[zz   ]"],
+                &["1", "true", "[ab]", "1", "[]"],
+                &["2", "false", "[]", "2", "[zz]"],
                 &["3", "NULL", "[]", "2", "[NULL]"],
             ],
         ),
@@ -4102,19 +4434,15 @@ mod tests {
             "SELECT id, flatten(ARRAY[ARRAY[ch], ARRAY[c]])[2] || '|', flatten(ARRAY[ARRAY[ch], ARRAY[c]])[2] = 'a' \
              FROM cht JOIN c3 USING (id) ORDER BY id",
             &[
-                &["1", "ab   |", "false"],
-                &["2", "a    |", "true"],
-                &["3", "zz   |", "false"],
+                &["1", "ab|", "false"],
+                &["2", "a|", "true"],
+                &["3", "zz|", "false"],
             ],
         ),
         (
             "SELECT id, coalesce(ARRAY[c], ARRAY[ch])[1] || '|', CASE WHEN id > 1 THEN ARRAY[c] ELSE ARRAY[ch] END[1] || '|' \
              FROM cht JOIN c3 USING (id) ORDER BY id",
-            &[
-                &["1", "ab   |", "ab   |"],
-                &["2", "a    |", "a    |"],
-                &["3", "zz   |", "zz   |"],
-            ],
+            &[&["1", "ab|", "ab|"], &["2", "a|", "a|"], &["3", "zz|", "zz|"]],
         ),
         (
             "SELECT id, coalesce(ROW(c), ROW(ch)) = ROW('ab'), CASE WHEN id > 1 THEN ROW(c) ELSE ROW(ch) END = ROW('a') \
@@ -4140,7 +4468,7 @@ mod tests {
         ),
         (
             "SELECT a[1] || '|' FROM (SELECT ARRAY[c] AS a FROM c3 WHERE id = 2 UNION ALL SELECT ARRAY[ch] FROM cht WHERE id = 4)",
-            &[&["a    |"], &["a    |"]],
+            &[&["a|"], &["a|"]],
         ),
         (
             "SELECT count(*) FROM (SELECT ARRAY[ch] FROM cht UNION SELECT ARRAY['ab'])",
@@ -4152,12 +4480,12 @@ mod tests {
         (
             "SELECT ch FROM (VALUES CAST('ab' AS char(5)), CAST('ab' AS char(5)), CAST('a' AS char(5))) t(ch) \
              INTERSECT ALL SELECT c FROM c3 ORDER BY 1",
-            &[&["a    "], &["ab   "]],
+            &[&["a"], &["ab"]],
         ),
         (
             "SELECT ch FROM (VALUES CAST('ab' AS char(5)), CAST('ab' AS char(5)), CAST('a' AS char(5)), \
              CAST('zz' AS char(5))) t(ch) EXCEPT ALL SELECT c FROM c3 ORDER BY 1",
-            &[&["ab   "]],
+            &[&["ab"]],
         ),
         // The type of a constant (folded before `typeof` runs).
         (
@@ -4180,10 +4508,10 @@ mod tests {
         (
             "SELECT id, ch, length(ch), typeof(ch) FROM cht ORDER BY id",
             &[
-                &["1", "ab   ", "5", "char(5)"],
-                &["2", "zz   ", "5", "char(5)"],
+                &["1", "ab", "2", "char(5)"],
+                &["2", "zz", "2", "char(5)"],
                 &["3", "NULL", "NULL", "char(5)"],
-                &["4", "a    ", "5", "char(5)"],
+                &["4", "a", "1", "char(5)"],
             ],
         ),
         ("SELECT id FROM cht WHERE ch = 'ab' ORDER BY id", &[&["1"]]),
@@ -4250,14 +4578,14 @@ mod tests {
         ),
         (
             "SELECT count(*), max(length(ch)) FROM cht JOIN (SELECT s AS ch FROM vct) w USING (ch)",
-            &[&["3", "65536"]],
+            &[&["3", "2"]],
         ),
         (
             "SELECT typeof(ch), length(ch), CAST(ch AS varchar) FROM cht JOIN (SELECT c AS ch FROM c3) w USING (ch) ORDER BY 3",
             &[
-                &["char(5)", "5", "a    "],
-                &["char(5)", "5", "ab   "],
-                &["char(5)", "5", "zz   "],
+                &["char(5)", "1", "a"],
+                &["char(5)", "2", "ab"],
+                &["char(5)", "2", "zz"],
             ],
         ),
         (
@@ -4294,7 +4622,7 @@ mod tests {
         ),
         (
             "SELECT typeof((SELECT max(ch) FROM cht)), (SELECT min(ch) FROM cht)",
-            &[&["char(5)", "a    "]],
+            &[&["char(5)", "a"]],
         ),
         (
             "SELECT count(*) FROM (SELECT (SELECT CAST('ab' AS char(5))) UNION SELECT 'ab ')",
@@ -4303,10 +4631,10 @@ mod tests {
         (
             "SELECT id, CASE WHEN id = 1 THEN ch ELSE 'ab' END, typeof(CASE WHEN id = 1 THEN ch ELSE 'ab' END) FROM cht ORDER BY id",
             &[
-                &["1", "ab   ", "char(5)"],
-                &["2", "ab   ", "char(5)"],
-                &["3", "ab   ", "char(5)"],
-                &["4", "ab   ", "char(5)"],
+                &["1", "ab", "char(5)"],
+                &["2", "ab", "char(5)"],
+                &["3", "ab", "char(5)"],
+                &["4", "ab", "char(5)"],
             ],
         ),
         (
@@ -4320,10 +4648,10 @@ mod tests {
         (
             "SELECT id, coalesce(ch, 'x'), typeof(coalesce(ch, 'x')) FROM cht ORDER BY id",
             &[
-                &["1", "ab   ", "char(5)"],
-                &["2", "zz   ", "char(5)"],
-                &["3", "x    ", "char(5)"],
-                &["4", "a    ", "char(5)"],
+                &["1", "ab", "char(5)"],
+                &["2", "zz", "char(5)"],
+                &["3", "x", "char(5)"],
+                &["4", "a", "char(5)"],
             ],
         ),
         (
@@ -4333,20 +4661,20 @@ mod tests {
         (
             "SELECT id, nullif(ch, 'ab'), greatest(ch, 'b'), least(ch, 'b') FROM cht ORDER BY id",
             &[
-                &["1", "NULL", "b    ", "ab   "],
-                &["2", "zz   ", "zz   ", "b    "],
+                &["1", "NULL", "b", "ab"],
+                &["2", "zz", "zz", "b"],
                 &["3", "NULL", "NULL", "NULL"],
-                &["4", "a    ", "b    ", "a    "],
+                &["4", "a", "b", "a"],
             ],
         ),
         (
             "SELECT id, CASE WHEN id = 1 THEN ch ELSE c END FROM cht JOIN c3 USING (id) ORDER BY id",
-            &[&["1", "ab   "], &["2", "a    "], &["3", "zz   "]],
+            &[&["1", "ab"], &["2", "a"], &["3", "zz"]],
         ),
         (
             "SELECT id, if(id = 1, ch, 'abcdefg') FROM cht ORDER BY id",
             &[
-                &["1", "ab     "],
+                &["1", "ab"],
                 &["2", "abcdefg"],
                 &["3", "abcdefg"],
                 &["4", "abcdefg"],
@@ -4355,27 +4683,27 @@ mod tests {
         (
             "SELECT id, ch || 'x', typeof(ch || 'x'), ch || c FROM cht JOIN c3 USING (id) ORDER BY id",
             &[
-                &["1", "ab   x", "char(6)", "ab   ab "],
-                &["2", "zz   x", "char(6)", "zz   a  "],
+                &["1", "abx", "char(6)", "abab"],
+                &["2", "zzx", "char(6)", "zza"],
                 &["3", "NULL", "char(6)", "NULL"],
             ],
         ),
         (
             "SELECT id, concat(ch, s) FROM cht JOIN v3 USING (id) ORDER BY id",
-            &[&["1", "ab   ab "], &["2", "zz   a  "]],
+            &[&["1", "abab"], &["2", "zza"]],
         ),
         (
             "SELECT id, upper(ch), typeof(upper(ch)), rtrim(ch), substr(ch, 2) FROM cht ORDER BY id",
             &[
-                &["1", "AB   ", "char(5)", "ab", "b   "],
-                &["2", "ZZ   ", "char(5)", "zz", "z   "],
+                &["1", "AB", "char(5)", "ab", "b"],
+                &["2", "ZZ", "char(5)", "zz", "z"],
                 &["3", "NULL", "char(5)", "NULL", "NULL"],
-                &["4", "A    ", "char(5)", "a", "    "],
+                &["4", "A", "char(5)", "a", ""],
             ],
         ),
         (
             "SELECT CAST(CAST('ab' AS char(5)) AS varchar) = 'ab   '",
-            &[&["true"]],
+            &[&["false"]],
         ),
         (
             "SELECT CAST('ab' AS char(5)) = 'ab ', 'ab ' = CAST('ab' AS char(5)), CAST('ab' AS char(3)) = CAST('ab' AS char(5))",
@@ -4392,9 +4720,9 @@ mod tests {
         (
             "SELECT x, typeof(x) FROM (SELECT ch AS x FROM cht UNION SELECT c FROM c3) ORDER BY 1",
             &[
-                &["a    ", "char(5)"],
-                &["ab   ", "char(5)"],
-                &["zz   ", "char(5)"],
+                &["a", "char(5)"],
+                &["ab", "char(5)"],
+                &["zz", "char(5)"],
                 &["NULL", "char(5)"],
             ],
         ),
@@ -4412,7 +4740,7 @@ mod tests {
         ),
         (
             "SELECT x FROM (SELECT ch AS x FROM cht INTERSECT SELECT c FROM c3) ORDER BY 1",
-            &[&["a    "], &["ab   "], &["zz   "]],
+            &[&["a"], &["ab"], &["zz"]],
         ),
         (
             "SELECT count(*) FROM (SELECT ch FROM cht INTERSECT SELECT s FROM vct)",
@@ -4432,20 +4760,20 @@ mod tests {
         ),
         (
             "SELECT x, typeof(x) FROM (VALUES (CAST('ab' AS char(3))), (CAST('a' AS char(5))), (NULL)) AS t(x) ORDER BY 1",
-            &[&["a    ", "char(5)"], &["ab   ", "char(5)"], &["NULL", "char(5)"]],
+            &[&["a", "char(5)"], &["ab", "char(5)"], &["NULL", "char(5)"]],
         ),
         (
             "SELECT id, max(ch), min(ch) FROM cht GROUP BY id ORDER BY id",
             &[
-                &["1", "ab   ", "ab   "],
-                &["2", "zz   ", "zz   "],
+                &["1", "ab", "ab"],
+                &["2", "zz", "zz"],
                 &["3", "NULL", "NULL"],
-                &["4", "a    ", "a    "],
+                &["4", "a", "a"],
             ],
         ),
         (
             "SELECT ch, count(*) FROM (SELECT ch FROM cht UNION ALL SELECT ch FROM cht) GROUP BY ch ORDER BY 1",
-            &[&["a    ", "2"], &["ab   ", "2"], &["zz   ", "2"], &["NULL", "2"]],
+            &[&["a", "2"], &["ab", "2"], &["zz", "2"], &["NULL", "2"]],
         ),
         (
             "SELECT id FROM (SELECT id, max(ch) AS m FROM cht GROUP BY id) WHERE m = 'ab' ORDER BY 1",
@@ -4466,7 +4794,7 @@ mod tests {
         ),
         (
             "SELECT id, ch FROM cht ORDER BY ch, id",
-            &[&["4", "a    "], &["1", "ab   "], &["2", "zz   "], &["3", "NULL"]],
+            &[&["4", "a"], &["1", "ab"], &["2", "zz"], &["3", "NULL"]],
         ),
         (
             "SELECT id FROM vct WHERE s < ALL (SELECT ch FROM cht) ORDER BY id",
@@ -4542,67 +4870,64 @@ mod tests {
         ),
         (
             "SELECT id, lag(ch, 1, 'x') OVER (ORDER BY id) FROM cht ORDER BY id",
-            &[&["1", "x    "], &["2", "ab   "], &["3", "zz   "], &["4", "NULL"]],
+            &[&["1", "x"], &["2", "ab"], &["3", "zz"], &["4", "NULL"]],
         ),
         (
             "SELECT id, CASE WHEN id = 1 THEN ch END FROM cht ORDER BY id",
-            &[&["1", "ab   "], &["2", "NULL"], &["3", "NULL"], &["4", "NULL"]],
+            &[&["1", "ab"], &["2", "NULL"], &["3", "NULL"], &["4", "NULL"]],
         ),
         (
             "SELECT id, CASE WHEN id = 1 THEN ch ELSE replace(s, 'a', 'bc') END, length(CASE WHEN id = 1 THEN ch ELSE replace(s, 'a', 'bc') END), typeof(CASE WHEN id = 1 THEN ch ELSE replace(s, 'a', 'bc') END) FROM cht JOIN v3 USING (id) ORDER BY id",
-            &[
-                &["1", "ab         ", "11", "char(11)"],
-                &["2", "bc         ", "11", "char(11)"],
-            ],
+            &[&["1", "ab", "2", "char(11)"], &["2", "bc", "2", "char(11)"]],
         ),
         (
             "SELECT id, length(CASE WHEN id = 1 THEN ch ELSE regexp_replace(s, 'a', 'bc') END), typeof(CASE WHEN id = 1 THEN ch ELSE regexp_replace(s, 'a', 'bc') END) FROM cht JOIN v3 USING (id) ORDER BY id",
-            &[&["1", "15", "char(15)"], &["2", "15", "char(15)"]],
+            &[&["1", "2", "char(15)"], &["2", "2", "char(15)"]],
         ),
         (
             "SELECT id, CASE WHEN id = 1 THEN ch ELSE soundex(s) END, typeof(CASE WHEN id = 1 THEN ch ELSE soundex(s) END), length(coalesce(ch, url_encode(s))), typeof(coalesce(ch, url_encode(s))) FROM cht JOIN v3 USING (id) ORDER BY id",
             &[
-                &["1", "ab   ", "char(5)", "36", "char(36)"],
-                &["2", "A000 ", "char(5)", "36", "char(36)"],
+                &["1", "ab", "char(5)", "2", "char(36)"],
+                &["2", "A000", "char(5)", "2", "char(36)"],
             ],
         ),
         (
             "SELECT id, CASE WHEN id = 1 THEN ch ELSE element_at(split(s, ','), 1) END, typeof(CASE WHEN id = 1 THEN ch ELSE element_at(split(s, ','), 1) END) FROM cht JOIN v3 USING (id) ORDER BY id",
-            &[&["1", "ab   ", "char(5)"], &["2", "a    ", "char(5)"]],
+            &[&["1", "ab", "char(5)"], &["2", "a", "char(5)"]],
         ),
         (
             "SELECT id, CASE WHEN id = 1 THEN ch ELSE split(s, ',')[1] END, typeof(CASE WHEN id = 1 THEN ch ELSE split(s, ',')[1] END) FROM cht JOIN v3 USING (id) ORDER BY id",
-            &[&["1", "ab   ", "char(5)"], &["2", "a    ", "char(5)"]],
+            &[&["1", "ab", "char(5)"], &["2", "a", "char(5)"]],
         ),
         (
             "SELECT id, length(coalesce(ch, regexp_extract_all(s, '.')[1])), typeof(coalesce(ch, regexp_extract_all(s, '.')[1])) FROM cht JOIN v3 USING (id) ORDER BY id",
-            &[&["1", "5", "char(5)"], &["2", "5", "char(5)"]],
+            &[&["1", "2", "char(5)"], &["2", "2", "char(5)"]],
         ),
         (
             "SELECT id, CASE WHEN id = 1 THEN ch ELSE to_iso8601(DATE '2020-01-01') END, typeof(CASE WHEN id = 1 THEN ch ELSE to_iso8601(DATE '2020-01-01') END) FROM cht ORDER BY id",
             &[
-                &["1", "ab              ", "char(16)"],
-                &["2", "2020-01-01      ", "char(16)"],
-                &["3", "2020-01-01      ", "char(16)"],
-                &["4", "2020-01-01      ", "char(16)"],
+                &["1", "ab", "char(16)"],
+                &["2", "2020-01-01", "char(16)"],
+                &["3", "2020-01-01", "char(16)"],
+                &["4", "2020-01-01", "char(16)"],
             ],
         ),
         (
             "SELECT id, length(CASE WHEN id = 1 THEN ch ELSE human_readable_seconds(id) END), typeof(CASE WHEN id = 1 THEN ch ELSE human_readable_seconds(id) END) FROM cht ORDER BY id",
             &[
-                &["1", "65536", "char(65536)"],
-                &["2", "65536", "char(65536)"],
-                &["3", "65536", "char(65536)"],
-                &["4", "65536", "char(65536)"],
+                &["1", "2", "char(65536)"],
+                &["2", "9", "char(65536)"],
+                &["3", "9", "char(65536)"],
+                &["4", "9", "char(65536)"],
             ],
         ),
         (
             "SELECT id, length(coalesce(ch, replace(s, 'a', 'bc'))), typeof(coalesce(ch, replace(s, 'a', 'bc'))) FROM cht JOIN vct USING (id) ORDER BY id",
             &[
-                &["1", "65536", "char(65536)"],
-                &["2", "65536", "char(65536)"],
-                &["3", "65536", "char(65536)"],
-                &["4", "65536", "char(65536)"],
+                &["1", "2", "char(65536)"],
+                &["2", "2", "char(65536)"],
+                &["3", "2", "char(65536)"],
+                &["4", "1", "char(65536)"],
             ],
         ),
         (
@@ -4612,21 +4937,21 @@ mod tests {
         (
             "SELECT v, length(v) FROM (SELECT ch AS v FROM cht UNION SELECT replace(s, 'a', 'x') FROM v3) ORDER BY 1",
             &[
-                &["a      ", "7"],
-                &["ab     ", "7"],
-                &["x      ", "7"],
-                &["xb     ", "7"],
-                &["zz     ", "7"],
+                &["a", "1"],
+                &["ab", "2"],
+                &["x", "1"],
+                &["xb", "2"],
+                &["zz", "2"],
                 &["NULL", "NULL"],
             ],
         ),
         (
             "SELECT id, coalesce(ch, regexp_replace(s, 'b', 'yy')), length(coalesce(ch, regexp_replace(s, 'b', 'yy'))) FROM (SELECT id, ch, 'abc' AS s FROM cht) ORDER BY id",
             &[
-                &["1", "ab             ", "15"],
-                &["2", "zz             ", "15"],
-                &["3", "ayyc           ", "15"],
-                &["4", "a              ", "15"],
+                &["1", "ab", "2"],
+                &["2", "zz", "2"],
+                &["3", "ayyc", "4"],
+                &["4", "a", "1"],
             ],
         ),
         (
@@ -4636,7 +4961,7 @@ mod tests {
         (
             "SELECT id, CASE WHEN id = 1 THEN ch ELSE replace(NULL, 'a', 'bc') END, typeof(CASE WHEN id = 1 THEN ch ELSE replace(NULL, 'a', 'bc') END) FROM cht ORDER BY id",
             &[
-                &["1", "ab   ", "char(5)"],
+                &["1", "ab", "char(5)"],
                 &["2", "NULL", "char(5)"],
                 &["3", "NULL", "char(5)"],
                 &["4", "NULL", "char(5)"],
@@ -4682,9 +5007,9 @@ mod tests {
     }
 
     /// Char values stored by the engine itself: an in-memory table, `UPDATE`,
-    /// `CREATE TABLE … AS`, a view.
+    /// `CREATE TABLE … AS`, a view; never padded (ISS-059).
     #[tokio::test]
-    async fn char_values_the_engine_stores_are_padded() {
+    async fn char_values_the_engine_stores_are_not_padded() {
         let dir = tempfile::tempdir().unwrap();
         let engine = engine(dir.path()).await;
         for statement in [
@@ -4701,14 +5026,9 @@ mod tests {
         for (sql, answer) in [
             (
                 "SELECT id, max(ch) FROM cht GROUP BY id ORDER BY id",
-                &[
-                    &["1", "ab   "][..],
-                    &["2", "zz   "],
-                    &["3", "NULL"],
-                    &["4", "b    "],
-                ][..],
+                &[&["1", "ab"][..], &["2", "zz"], &["3", "NULL"], &["4", "b"]][..],
             ),
-            ("SELECT CAST(ch AS varchar) FROM cht WHERE id = 4", &[&["b    "]]),
+            ("SELECT CAST(ch AS varchar) FROM cht WHERE id = 4", &[&["b"]]),
             (
                 "SELECT id, typeof(two), two = 'x', typeof(ch) FROM made WHERE ch = 'ab' ORDER BY id",
                 &[&["1", "char(2)", "true", "char(5)"]],
@@ -4734,8 +5054,8 @@ mod tests {
             (
                 "SELECT * FROM made2 ORDER BY id",
                 &[
-                    &["1", "ab", "b   ", "ab", "NULL", "ab", "ab   "],
-                    &["2", "zz", "z   ", "zz", "a", "zz", "zz   "],
+                    &["1", "ab", "b", "ab", "NULL", "ab", "ab"],
+                    &["2", "zz", "z", "zz", "a", "zz", "zz"],
                 ],
             ),
         ] {
@@ -4785,7 +5105,7 @@ mod tests {
     }
 
     /// `INSERT … SELECT` whose select list repeats a name inserts by
-    /// position (rows of Trino 431).
+    /// position (rows of Trino 431, char values without padding).
     #[tokio::test]
     async fn insert_select_repeating_a_name() {
         let dir = tempfile::tempdir().unwrap();
@@ -4803,13 +5123,13 @@ mod tests {
         assert_eq!(
             rows(&engine, "SELECT id, a, b, c, length(c) FROM ins ORDER BY id").await,
             Ok(expected(&[
-                &["1", "ab", "ab", "ab ", "3"],
-                &["2", "ab  ", "ab", "ab ", "3"],
-                &["3", "cd", "cd", "cd ", "3"],
+                &["1", "ab", "ab", "ab", "2"],
+                &["2", "ab  ", "ab", "ab", "2"],
+                &["3", "cd", "cd", "cd", "2"],
                 &["4", "NULL", "NULL", "NULL", "NULL"],
-                &["5", "a", "a", "a  ", "3"],
-                &["101", "ab   ", "ab", "ab ", "3"],
-                &["104", "a    ", "a ", "a  ", "3"],
+                &["5", "a", "a", "a", "1"],
+                &["101", "ab", "ab", "ab", "2"],
+                &["104", "a", "a", "a", "1"],
             ]))
         );
     }
@@ -4928,5 +5248,36 @@ mod tests {
         assert_eq!(compare_padded("a", "b"), Ordering::Less);
         assert_eq!(padded("ç", 3), "ç  ");
         assert_eq!(padded("abcd", 3), "abcd");
+        assert_eq!(unpadded("a b  "), "a b");
+        assert_eq!(unpadded("a\t"), "a\t");
+        assert_eq!(unpadded("   "), "");
+    }
+
+    /// The order key sorts every pair of texts as [`compare_padded`] does:
+    /// all texts of up to four characters of spaces, a tab (below the
+    /// space), a control character, a letter and one of two bytes.
+    #[test]
+    fn order_key_sorts_as_padded() {
+        let alphabet = [' ', '\t', '\u{1}', 'a', 'é'];
+        let mut texts = vec![String::new()];
+        let mut last = vec![String::new()];
+        for _ in 0..4 {
+            last = last
+                .iter()
+                .flat_map(|t| alphabet.iter().map(move |c| format!("{t}{c}")))
+                .collect();
+            texts.extend(last.iter().cloned());
+        }
+        let keys: Vec<String> = texts.iter().map(|t| order_key(t)).collect();
+        for (a, ka) in texts.iter().zip(&keys) {
+            for (b, kb) in texts.iter().zip(&keys) {
+                assert_eq!(ka.cmp(kb), compare_padded(a, b), "{a:?} {b:?}");
+            }
+        }
+        assert_eq!(order_key("a  "), order_key("a"));
+        assert_eq!(order_key(""), "\u{1}");
+        assert_eq!(order_key("\t"), "\u{0}\u{0}\u{0}\t\u{1}");
+        assert_eq!(order_key("  \t"), "\u{0}\u{0}\u{2}\t\u{1}");
+        assert_eq!(order_key(" a"), "\u{2}\u{7fff}\u{7ffe}a\u{1}");
     }
 }

@@ -26,13 +26,12 @@ use codelake_core::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::{CatalogProvider, SchemaProvider, Session, TableProvider};
-use datafusion::common::{Column, ScalarValue};
+use datafusion::common::Column;
 use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionState;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::functions::expr_fn;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder, TableProviderFilterPushDown, cast};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::sqlparser::dialect::dialect_from_str;
@@ -343,17 +342,11 @@ impl TableProvider for HiveView {
                 } else {
                     cast(column, field.data_type().clone())
                 };
-                // A char(n) column holds its values padded, as Trino shows
-                // them (`codelake_core::char_semantics`): only trailing
-                // spaces are padding, a trailing tab or line feed is text.
+                // A char(n) column holds its values without trailing spaces
+                // (`codelake_core::char_semantics`): only trailing spaces are
+                // padding, a trailing tab or line feed is text.
                 let value = match char_column(field).and_then(|n| u32::try_from(n).ok()) {
-                    Some(length) => codelake_core::char_semantics::pad(
-                        expr_fn::rtrim(vec![
-                            value,
-                            Expr::Literal(ScalarValue::Utf8(Some(" ".into())), None),
-                        ]),
-                        length,
-                    ),
+                    Some(length) => codelake_core::char_semantics::as_char(value, length),
                     None => value,
                 };
                 value.alias(field.name())
