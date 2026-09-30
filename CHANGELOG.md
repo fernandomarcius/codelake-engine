@@ -258,6 +258,14 @@ versioning: [SemVer](https://semver.org/).
     `instr`, `mean`, `covar`, `array_indexof`, `list_position`, `list_indexof`, `list_distinct`,
     `list_except`, `list_intersect`, `list_max`, `list_remove`, `list_sort`, `list_union`); the reference has
     none of them.
+  - `CREATE TABLE AS` of a `UNION ALL` of three or more inputs stored unbounded `varchar` (`string` in the
+    metastore) for text built from literals (`'vendas' AS tabela`, a `CASE` of literals) where the reference
+    stores `varchar(longest)` (`varchar(14)`, `varchar(7)`: four monitoring models, same values). Such a union
+    is planned as a union of unions; one whose inputs agreed kept the type `DataFusion` gave it before the
+    literals were typed, and the union above it dropped the type of every input. A column also took a
+    bounded `varchar(n)` where an input was unbounded; it is unbounded `varchar`, as in the reference.
+    A view of an in-memory catalog lists the `varchar(n)` of its text literals in `information_schema.columns`
+    (it listed `varchar`), as the table created from the same query stores it.
 - `SHOW CREATE TABLE` failed for every table (`COLUMN_NOT_FOUND: No field named definition`) and `SHOW CREATE
   VIEW` was refused. Both answer the statement as the reference engine prints it, one `varchar(n)` row: types
   in SQL syntax, `NOT NULL` where the source refuses nulls, reserved and irregular names quoted, a hive
