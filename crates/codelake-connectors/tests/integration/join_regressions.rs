@@ -127,6 +127,11 @@ pub(crate) struct Trino(ContainerAsync<GenericImage>);
 
 impl Trino {
     pub(crate) async fn start(shared: &Shared, name: &str) -> Self {
+        Self::start_with(shared, name, &[]).await
+    }
+
+    /// [`Trino::start`] with more catalogs: (name, properties file).
+    pub(crate) async fn start_with(shared: &Shared, name: &str, catalogs: &[(&str, String)]) -> Self {
         let properties = format!(
             "connector.name=hive\n\
              hive.metastore=file\n\
@@ -142,7 +147,15 @@ impl Trino {
             .with_user("root")
             .with_container_name(format!("{TRINO_CONTAINER}-{name}-{}", &suffix[..8]))
             .with_mount(shared.mount.clone())
-            .with_copy_to("/etc/trino/catalog/hive.properties", properties.into_bytes())
+            .with_copy_to("/etc/trino/catalog/hive.properties", properties.into_bytes());
+        let container = catalogs
+            .iter()
+            .fold(container, |container, (catalog, properties)| {
+                container.with_copy_to(
+                    format!("/etc/trino/catalog/{catalog}.properties"),
+                    properties.clone().into_bytes(),
+                )
+            })
             .with_startup_timeout(STARTUP_TIMEOUT)
             .start()
             .await

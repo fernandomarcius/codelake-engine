@@ -20,10 +20,10 @@ use tiberius::{AuthMethod, Client, Config};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
-const SA_PASSWORD: &str = "Semi-Join-Only-1";
+pub(crate) const SA_PASSWORD: &str = "Semi-Join-Only-1";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(240);
 
-async fn start_mssql() -> ContainerAsync<MssqlServer> {
+pub(crate) async fn start_mssql() -> ContainerAsync<MssqlServer> {
     MssqlServer::default()
         .with_sa_password(SA_PASSWORD)
         .with_accept_eula()
@@ -45,7 +45,7 @@ async fn client(host: &str, port: u16, database: &str) -> Client<Compat<TcpStrea
     Client::connect(config, tcp.compat_write()).await.unwrap()
 }
 
-async fn exec(host: &str, port: u16, database: &str, batch: &str) {
+pub(crate) async fn exec(host: &str, port: u16, database: &str, batch: &str) {
     let mut c = client(host, port, database).await;
     let done = match c.simple_query(batch).await {
         Ok(stream) => stream.into_results().await.map(|_| ()),
@@ -127,7 +127,7 @@ async fn seed(host: &str, port: u16, rows: u64) {
     .await;
 }
 
-fn sqlserver(host: &str, port: u16) -> Arc<dyn Connector> {
+pub(crate) fn sqlserver(host: &str, port: u16) -> Arc<dyn Connector> {
     Arc::new(SqlServerConnector::new(
         "warehouse".into(),
         SqlServerParams {
