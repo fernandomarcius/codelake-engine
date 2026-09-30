@@ -1,9 +1,10 @@
 # ADR 0015 — `char(n)` semantics instead of refusals
 
-- Status: Accepted
+- Status: Accepted; amended 2026-09-30 (no padding, ISS-059: see
+  [Amendment](#amendment-2026-09-30-no-padding-iss-059))
 - Date: 2026-09-25
 - Related: ADR 0007 (hive catalog), ADR 0008 (function library), ADR 0014,
-  ISS-024, ISS-025
+  ISS-024, ISS-025, ISS-059
 
 ## Context
 
@@ -29,6 +30,10 @@ the owner decided (ISS-024) to implement the semantics.
 `codelake_core::char_semantics`, an analyzer rule before type coercion,
 gives char values Trino 431's semantics (every rule below observed on
 `trinodb/trino:431`):
+
+Rules 1 and 4–8 describe the padding as first decided; the
+[Amendment](#amendment-2026-09-30-no-padding-iss-059) removes it and keeps
+every comparison's answer.
 
 1. **Representation.** Every `char(n)` value is held padded with spaces to
    `n` characters: hive scans (as before), `CAST`/`TRY_CAST … AS char(n)`,
@@ -160,8 +165,9 @@ error naming a way around it):
   or a cast to `char(n)`/`bpchar` (`0A000`): statements there run on the
   session as `DataFusion` plans them, without the engine's preparation, so
   the column would be unbounded text for every protocol and the cast would
-  not pad. A `char(n)` table created through the Trino protocol reads padded
-  on the wire (reported as `text`). `varchar(n)` keeps its length there
+  not pad (since the amendment: would keep trailing spaces and compare as
+  text). A `char(n)` table created through the Trino protocol reads on the
+  wire as on that protocol (reported as `text`). `varchar(n)` keeps its length there
   (`codelake_core::PostgresStatement`): a cast to it is rewritten as the
   engine does, and a `CREATE TABLE` records its `varchar(n)` columns, whose
   `INSERT`s are then checked on both protocols;
@@ -180,6 +186,55 @@ error naming a way around it):
 - `VALUES ((SELECT CAST('ab' AS char(5)))), ('ab ')` fails in Trino 431
   ("Unexpected subquery expression in logical plan"); the engine answers
   what the same `VALUES` answers without the subquery.
+
+## Amendment 2026-09-30: no padding (ISS-059)
+
+Accepted by: Fernando Farias, 2026-09-30. The engine never pads a `char(n)`
+value, whatever its origin: the padding protects no data and takes space
+(`char(65536)` values held 65,536 characters each). The type stays
+`char(n)` (fields, `typeof`, the client's column type, the metastore).
+
+1. **Representation.** Every char value is held without trailing spaces:
+   hive scans (cut to `n`, trailing spaces dropped, also from files other
+   tools wrote), `CAST`/`TRY_CAST … AS char(n)`, `INSERT`/`UPDATE` of a
+   char column, `codelake_char(x, n)` (the conversion to a common char
+   type: `CASE`, `coalesce`, `greatest`, `least`, `lag`/`lead`, arrays,
+   `UNION`/`INTERSECT`/`EXCEPT`/`VALUES`, `USING`, `codelake_nested_char`
+   inside rows and arrays), and the HTTP protocol's output of a char column
+   (it padded to `n`).
+2. **Equality** (`=`, `IN`, joins, `GROUP BY`, `DISTINCT`, set operations)
+   is unchanged: equal char values are held alike; a text literal tested
+   with a `char(n)` value is written without its trailing spaces.
+3. **Ordering** compares as if padded, as the reference: `<`, `BETWEEN`
+   and rows written out with `codelake_char_compare`, also between values
+   of one `char(n)` (held alike, they would sort `'a'` below
+   `'a' || chr(9)`); `ORDER BY` of a query, a window and an aggregate by
+   `codelake_char_order(x)`, a text whose order is the padded one (each
+   character other than a space with the count of spaces before it);
+   `min`/`max` of char values as `min_by`/`max_by` of the value by that
+   key, and the char key of `min_by`/`max_by` so; `greatest`/`least` of
+   char values as a `CASE` of `codelake_char_compare`.
+4. **`LIKE`** matches the value padded to `n` (`codelake_char_padded`),
+   as the reference: `CAST('ab' AS char(5)) LIKE 'ab %'` is true.
+5. **What follows from the value** differs from the reference on purpose:
+   `length` counts the value's characters (`length(CAST('ab' AS char(5)))`
+   is 2, Trino 431: 5), `CAST(… AS varchar)`, `substr` and the functions
+   Trino has no char version of see the value, and `||` concatenates the
+   texts as held (`CAST('ab' AS char(3)) || 'x'` is `'abx'`, Trino 431:
+   `'ab x'`; other text keeps its own trailing spaces). The refusals below
+   stay.
+6. **Not covered** (compared as held, a difference only for a character
+   below the space after a common prefix): an ordering of rows or arrays of
+   char values not written out, `array_sort`/`array_min`/`array_max` of
+   char values, and `min`/`max` of a char value as a window function.
+
+Verification: `char_semantics::tests` (the 100 queries with Trino 431's
+rows without its padding, and ordering, `min`/`max`, `greatest`/`least`,
+windows, `array_agg … ORDER BY` and `LIKE` over `'a' || chr(9)` with
+Trino's rows), `order_key_sorts_as_padded` (every pair of texts of up to
+four characters), `char_matrix`, `char_whitespace` and CH1–CH16/P1–P16
+against Trino 431 with its padding removed from its answers, and the
+differential cases that show the padding, accepted (ISS-059).
 
 ## Consequences
 

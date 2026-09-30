@@ -271,8 +271,9 @@ requires where Trino has no equivalent.
   as in Trino (`INVALID_CAST_ARGUMENT`, only trailing spaces are cut) and reads
   cut values to `n` characters, as Trino's reader. **`char(n)`** is stored as
   declared, written without trailing spaces (as Trino stores it; a longer
-  value fails like Trino's `INSERT`) and read padded to `n` (`'ab   '`,
-  length 5, as Trino shows it). The engine compares, converts and combines
+  value fails like Trino's `INSERT`) and read cut to `n` without trailing
+  spaces (`'ab'`, length 2; Trino shows `'ab   '`, length 5: the engine never
+  pads, ISS-059). The engine compares, converts and combines
   char values as Trino does (`ch = 'ab'` is true), wherever the plan holds
   them (ADR 0015); a filter the scan receives is applied again above it and
   never prunes a file by statistics of a char column.

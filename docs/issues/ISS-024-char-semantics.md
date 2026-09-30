@@ -5,7 +5,14 @@
 - Accepted: Implement padded char(n) semantics and coercion as the reference engine does, and drop refusals the reference engine does not have.
 - Done (front/w1-df54, ADR 0015): every char(n) value is held padded; where char values meet other text both are converted to the reference's common char type (comparisons, `IN`/`ANY`/`ALL`, joins, `CASE`, `coalesce`, set operations, `VALUES`, `USING`, `||`); `TRY_CAST` follows `CAST`. The refusals of W1-4 and DEFECT-W1T-2 are gone. Checked against Trino 431 by `char_semantics::tests` (100 queries) and the integration matrix `char_matrix` (1656 row operations, 384 set operations, joins and subqueries over six origins of the char value): every answer is the reference's rows, or both refuse.
 - Round 5 (verifier of e20fe57): trims of other characters, rows and arrays not written out (compared value by value with `NULL` semantics, char or not), char values inside rows and arrays padded to their common type, `INTERSECT ALL`/`EXCEPT ALL` across Arrow text types, `typeof` of constants, `varchar(n)` on the PostgreSQL wire; the verifier's differential probes s1–s7 answer Trino 431's rows but for `ORDER BY`/`ROWS` ties and statements refused in the probes' setup. Choices applied by recommendation: ISS-052.
+- Amended 2026-09-30 by ISS-059 (Accepted by: Fernando Farias, 2026-09-30): the padding is
+  removed for every origin — a char value is held, returned and written without trailing
+  spaces (hive scans, in-memory tables and views, `CAST`, literals, common char types of
+  `COALESCE`/`CASE`/`UNION`/`USING`, the HTTP protocol's output). The comparisons above keep
+  the reference's answers (ordering and `LIKE` compare as if padded); `length`, `||`, `substr`
+  and `CAST(… AS varchar)` see the value without padding. `char_semantics::tests`,
+  `char_matrix` and `char_whitespace` compare with Trino 431's rows without its padding.
 - Refusals kept: where the reference fails too (`NATURAL JOIN`, `char || <unbounded varchar>`, `char || NULL`); and where the engine cannot derive the reference's common type — char output with text of an unknown length, char values inside arrays that are not written out (ADR 0015).
 - Risk: The rewrites follow the reference type through the plan; a construct they do not know (a function whose result length is not derived) is refused, not guessed. Two answers differ from the reference on purpose, where the reference is wrong (`EXISTS` repeating rows; a scalar subquery in `VALUES`).
 - Revisit when: A new function or plan node carries char values (extend the type rules and the matrix).
-- References: ISS-014, ISS-025, ISS-052, ADR 0015, ADR 0007.
+- References: ISS-014, ISS-025, ISS-052, ISS-059, ADR 0015, ADR 0007.
