@@ -216,25 +216,21 @@ const MAX_SPACES: u32 = (1 << 30) - 1;
 /// space above it (class `\u{2}`, more spaces before it first); trailing
 /// spaces add nothing. A count is two characters of 15 bits each.
 fn order_key(text: &str) -> String {
-    fn count(out: &mut String, value: u32) {
-        for part in [value >> 15, value & 0x7FFF] {
-            // Below the surrogates: always a character.
-            out.push(char::from_u32(part).unwrap_or('\0'));
-        }
-    }
     let mut out = String::with_capacity(text.len() * 4 + 1);
     let mut spaces: u32 = 0;
     for c in text.chars() {
-        if c == ' ' {
-            spaces = spaces.saturating_add(1).min(MAX_SPACES);
-            continue;
-        }
-        if c < ' ' {
-            out.push('\u{0}');
-            count(&mut out, spaces);
-        } else {
-            out.push('\u{2}');
-            count(&mut out, MAX_SPACES - spaces);
+        let (class, count) = match c.cmp(&' ') {
+            Ordering::Equal => {
+                spaces = spaces.saturating_add(1).min(MAX_SPACES);
+                continue;
+            }
+            Ordering::Less => ('\u{0}', spaces),
+            Ordering::Greater => ('\u{2}', MAX_SPACES - spaces),
+        };
+        out.push(class);
+        for part in [count >> 15, count & 0x7FFF] {
+            // Below the surrogates: always a character.
+            out.push(char::from_u32(part).unwrap_or('\0'));
         }
         out.push(c);
         spaces = 0;
@@ -1238,12 +1234,6 @@ fn function_type(name: &str, args: &[Expr], scope: &Scope<'_>, whole: &Expr) -> 
         }),
         CHAR_VALUE => args.get(1).and_then(|n| match n {
             Expr::Literal(value, _) => length_argument(Some(value)).ok().map(|n| Text::Char(Some(n))),
-            _ => None,
-        }),
-        CHAR_PADDED => args.get(1).and_then(|n| match n {
-            Expr::Literal(value, _) => length_argument(Some(value))
-                .ok()
-                .map(|n| Text::Varchar(Bound::Known(n))),
             _ => None,
         }),
         crate::coercion::VALUES_CELL
@@ -2356,8 +2346,10 @@ fn look_up(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result<Trans
     };
     let key = infer(&args[1], scope);
     match (keys, key) {
-        (_, Some(Text::Null)) => Ok(Transformed::no(func.call(args))),
-        (Entries::Char(Some(n)), Some(Text::Char(Some(m)))) if n == m => Ok(Transformed::no(func.call(args))),
+        // Char values of any length are held alike (without trailing spaces).
+        (_, Some(Text::Null)) | (Entries::Char(_), Some(Text::Char(_))) => {
+            Ok(Transformed::no(func.call(args)))
+        }
         (Entries::Char(Some(n)), _) if fitted_literal(&args[1], n).is_some() => {
             let mut args = args;
             args[1] = fitted_literal(&args[1], n).unwrap_or_default();
@@ -2365,9 +2357,9 @@ fn look_up(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result<Trans
         }
         (Entries::Char(_), _) | (Entries::Other, Some(Text::Char(_))) => {
             Err(DataFusionError::NotImplemented(format!(
-                "{}: looking up a map keyed by char(n) values with a key other than a literal or a char(n) value \
-             of the same length, or a map keyed by other values with a char(n) value, is not supported yet; \
-             cast the char values to varchar",
+                "{}: looking up a map keyed by char(n) values with a key other than a literal or a char(n) \
+             value, or a map keyed by other values with a char(n) value, is not supported yet; cast the char \
+             values to varchar",
                 func.name()
             )))
         }
@@ -2390,7 +2382,6 @@ fn concat_arrays(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result
     let Some(length) = length else {
         return Err(char_array_refusal("a concatenation"));
     };
-    let mut changed = false;
     let mut out = Vec::with_capacity(args.len());
     for arg in args {
         if built(&arg) == Some(Built::Array) {
@@ -2399,9 +2390,7 @@ fn concat_arrays(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result
                 .into_iter()
                 .map(|e| {
                     let t = infer(&e, scope);
-                    let converted = converted_to(e, t, length);
-                    changed |= !matches!(t, Some(Text::Null)) && t != Some(Text::Char(Some(length)));
-                    converted
+                    converted_to(e, t, length)
                 })
                 .collect();
             out.push(inner.call(elements));
@@ -2412,11 +2401,10 @@ fn concat_arrays(func: &ScalarUDF, args: Vec<Expr>, scope: &Scope<'_>) -> Result
             out.push(arg);
         } else {
             let t = infer(&arg, scope);
-            changed |= !matches!(t, Some(Text::Null)) && t != Some(Text::Char(Some(length)));
             out.push(converted_to(arg, t, length));
         }
     }
-    Ok(Transformed::new_transformed(func.call(out), changed))
+    Ok(Transformed::yes(func.call(out)))
 }
 
 /// `left op right`, with char semantics (see the module documentation).
@@ -2504,7 +2492,6 @@ fn unify_values(exprs: Vec<Expr>, scope: &Scope<'_>, what: &str) -> Result<Trans
             .zip(types)
             .map(|(e, t)| match t {
                 Some(Text::Null) => e,
-                Some(Text::Char(Some(n))) if n == length => e,
                 _ => as_char(e, length),
             })
             .collect(),
@@ -2678,13 +2665,7 @@ fn in_list(list: InList, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
         return Ok(Transformed::no(Expr::InList(InList::new(expr, list, negated))));
     }
     if let Some(Text::Char(Some(n))) = types[0] {
-        let fitted: Option<Vec<Expr>> = list
-            .iter()
-            .map(|item| match item {
-                Expr::Literal(value, _) if value.is_null() => Some(item.clone()),
-                other => fitted_literal(other, n),
-            })
-            .collect();
+        let fitted: Option<Vec<Expr>> = list.iter().map(|item| fitted_literal(item, n)).collect();
         if let Some(fitted) = fitted {
             return Ok(Transformed::yes(Expr::InList(InList::new(expr, fitted, negated))));
         }
@@ -3166,18 +3147,13 @@ fn window_function(expr: Expr, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
     let mut args = std::mem::take(&mut window.params.args);
     let default = args.pop().unwrap_or_default();
     let value = args.remove(0);
-    let unified = unify_values(vec![value, default], scope, window.fun.name())?;
-    let changed = unified.transformed;
-    let mut pair = unified.data;
+    let mut pair = unify_values(vec![value, default], scope, window.fun.name())?.data;
     let default = pair.pop().unwrap_or_default();
     let value = pair.pop().unwrap_or_default();
     args.insert(0, value);
     args.push(default);
     window.params.args = args;
-    Ok(Transformed::new_transformed(
-        Expr::WindowFunction(window),
-        changed || ordered.transformed,
-    ))
+    Ok(Transformed::yes(Expr::WindowFunction(window)))
 }
 
 /// One expression node (its children done already).
@@ -3240,14 +3216,12 @@ fn matched(like: Like, scope: &Scope<'_>) -> Result<Transformed<Expr>> {
     } = like;
     let mut changed = false;
     let mut pad = |e: Box<Expr>| -> Result<Box<Expr>> {
-        match infer(&e, scope) {
-            Some(Text::Char(Some(n))) => {
-                changed = true;
-                Ok(Box::new(padded_to(*e, n)))
-            }
-            Some(Text::Char(None)) => Err(refusal("LIKE")),
-            _ => Ok(e),
-        }
+        let Some(Text::Char(length)) = infer(&e, scope) else {
+            return Ok(e);
+        };
+        let n = length.ok_or_else(|| refusal("LIKE"))?;
+        changed = true;
+        Ok(Box::new(padded_to(*e, n)))
     };
     let (expr, pattern) = (pad(expr)?, pad(pattern)?);
     Ok(Transformed::new_transformed(
@@ -4012,6 +3986,22 @@ mod tests {
             &[&["true", "true", "NULL", "false", "true", "true", "false"]],
         ),
         (
+            "SELECT ARRAY[x.ch] < ARRAY[y.ch], ARRAY[x.ch] > ARRAY[y.ch], ARRAY[x.ch, 'b'] <= ARRAY[y.ch, 'a'] \
+             FROM cht x, w y WHERE x.id = 4 AND y.id = 9",
+            &[&["false", "true", "false"]],
+        ),
+        (
+            "SELECT greatest(x.ch, y.ch, x.ch) = 'a', least(y.ch, x.ch, y.ch) = 'a' || chr(9) FROM cht x, w y \
+             WHERE x.id = 4 AND y.id = 9",
+            &[&["true", "true"]],
+        ),
+        // A map keyed by `char(5)` values looked up with `char(3)` ones.
+        (
+            "SELECT c3.id, element_at(x.m, c3.c) FROM (SELECT map_agg(ch, id) AS m FROM cht) x CROSS JOIN c3 \
+             ORDER BY 1",
+            &[&["1", "1"], &["2", "4"], &["3", "2"]],
+        ),
+        (
             "SELECT array_agg(id ORDER BY ch), array_agg(id ORDER BY ch DESC) FROM (SELECT id, ch FROM cht \
              UNION ALL SELECT id + 100, ch FROM w WHERE id = 9)",
             &[&["[109, 4, 1, 2, 3]", "[2, 1, 4, 109, 3]"]],
@@ -4026,6 +4016,52 @@ mod tests {
                 &["4", "2", "1"],
                 &["109", "1", "4"],
             ],
+        ),
+        // Types followed through `try` and `nullif` of arrays, and through a column
+        // a projection typed `varchar(n)` (`rtrim` of a char value).
+        (
+            "SELECT id, coalesce(try(ARRAY[c]), ARRAY[ch])[1] || '|' FROM cht JOIN c3 USING (id) ORDER BY id",
+            &[&["1", "ab|"], &["2", "a|"], &["3", "zz|"]],
+        ),
+        (
+            "SELECT id, coalesce(nullif(ARRAY[c], ARRAY['q']), ARRAY[ch])[1] || '|' FROM cht JOIN c3 USING (id) \
+             ORDER BY id",
+            &[&["1", "ab|"], &["2", "a|"], &["3", "zz|"]],
+        ),
+        (
+            "SELECT id, CASE WHEN id = 1 THEN ch ELSE r END || '|', typeof(CASE WHEN id = 1 THEN ch ELSE r END) \
+             FROM (SELECT id, ch, rtrim(ch) AS r FROM cht) ORDER BY id",
+            &[
+                &["1", "ab|", "char(5)"],
+                &["2", "zz|", "char(5)"],
+                &["3", "NULL", "char(5)"],
+                &["4", "a|", "char(5)"],
+            ],
+        ),
+        // The default of `lag` in the value's type, without trailing spaces
+        // (Trino 431: length 5).
+        (
+            "SELECT id, length(lag(ch, 1, 'x  ') OVER (ORDER BY id)) FROM cht ORDER BY id",
+            &[&["1", "1"], &["2", "2"], &["3", "2"], &["4", "NULL"]],
+        ),
+        // A literal with trailing spaces in an `IN` list is compared as char;
+        // text converted to the common char type loses its trailing spaces
+        // (Trino 431: length 5, the padded length).
+        (
+            "SELECT id, ch IN ('ab  ', 'x'), length(coalesce(ch, 'x  ')) FROM cht ORDER BY id",
+            &[
+                &["1", "true", "2"],
+                &["2", "false", "2"],
+                &["3", "NULL", "1"],
+                &["4", "false", "1"],
+            ],
+        ),
+        // A literal removed from an array of char values not written out is
+        // compared as char; a `NULL` answers `NULL`.
+        (
+            "SELECT cardinality(array_remove(array_agg(ch), 'ab ')), cardinality(array_remove(array_agg(ch), NULL)), \
+             cardinality(array_agg(ch)) FROM cht",
+            &[&["3", "NULL", "4"]],
         ),
         // `LIKE` matches the value padded to its length, as the reference.
         (
@@ -5029,6 +5065,18 @@ mod tests {
                 &[&["1", "ab"][..], &["2", "zz"], &["3", "NULL"], &["4", "b"]][..],
             ),
             ("SELECT CAST(ch AS varchar) FROM cht WHERE id = 4", &[&["b"]]),
+            // Text converted to a char type loses its trailing spaces, inside
+            // arrays too (Trino 431: both 5, the padded length).
+            (
+                "SELECT length(a[1]) FROM (SELECT ARRAY[CAST('ab  ' AS varchar(4))] AS a UNION ALL \
+                 SELECT ARRAY[ch] FROM cht WHERE id = 1) ORDER BY 1",
+                &[&["2"], &["2"]],
+            ),
+            (
+                "SELECT length(x) FROM (SELECT CAST('ab  ' AS varchar(4)) AS x UNION ALL \
+                 SELECT ch FROM cht WHERE id = 4) ORDER BY 1",
+                &[&["1"], &["2"]],
+            ),
             (
                 "SELECT id, typeof(two), two = 'x', typeof(ch) FROM made WHERE ch = 'ab' ORDER BY id",
                 &[&["1", "char(2)", "true", "char(5)"]],
@@ -5180,6 +5228,10 @@ mod tests {
                 "removing a char(n) value from an array that is not written out",
             ),
             (
+                "SELECT array_remove(x.a, v3.s) FROM (SELECT array_agg(ch) AS a FROM cht) x CROSS JOIN v3",
+                "or text from an array of char(n) values",
+            ),
+            (
                 "SELECT element_at(x.m, v3.s) FROM (SELECT map_agg(ch, id) AS m FROM cht) x CROSS JOIN v3",
                 "looking up a map keyed by char(n) values",
             ),
@@ -5251,6 +5303,49 @@ mod tests {
         assert_eq!(unpadded("a b  "), "a b");
         assert_eq!(unpadded("a\t"), "a\t");
         assert_eq!(unpadded("   "), "");
+    }
+
+    /// A plan analyzed twice is rewritten once (a view's plan is analyzed
+    /// again in the statement that reads it): the rule leaves its own output
+    /// as it is.
+    #[tokio::test]
+    async fn a_plan_analyzed_twice_is_rewritten_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path()).await;
+        let config = ConfigOptions::default();
+        for sql in [
+            "SELECT id, ch, CASE WHEN id = 1 THEN ch ELSE c END, coalesce(ch, 'x  ') FROM cht JOIN c3 USING (id)",
+            "SELECT ARRAY[ch] || ARRAY[c], ARRAY[c] || ch, array_remove(ARRAY[ch, c], 'a') FROM cht JOIN c3 USING (id)",
+            "SELECT ch FROM cht UNION SELECT c FROM c3 ORDER BY 1",
+            "SELECT id, ch LIKE 'a%', max(ch) OVER (PARTITION BY id ORDER BY ch) FROM cht ORDER BY ch, id",
+            "SELECT max(ch), min_by(id, ch), array_agg(id ORDER BY ch) FROM cht",
+        ] {
+            let plan = engine.sql(sql).await.unwrap().into_unoptimized_plan();
+            let once = CharSemantics.analyze(plan, &config).unwrap();
+            let twice = CharSemantics.analyze(once.clone(), &config).unwrap();
+            assert_eq!(
+                twice.display_indent().to_string(),
+                once.display_indent().to_string(),
+                "{sql}"
+            );
+        }
+    }
+
+    /// The functions the rule plans answer by their names: the text `LIKE`
+    /// matches, the order key, the equality key.
+    #[tokio::test]
+    async fn planned_functions_answer_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path()).await;
+        assert_eq!(
+            rows(
+                &engine,
+                "SELECT codelake_char_padded('ab', 5) || '|', codelake_char_order(' a') < codelake_char_order('a'), \
+                 codelake_char_order('a' || chr(9)) < codelake_char_order('a'), codelake_char_key('ab ') || '|'"
+            )
+            .await,
+            Ok(expected(&[&["ab   |", "true", "true", "ab|"]]))
+        );
     }
 
     /// The order key sorts every pair of texts as [`compare_padded`] does:
