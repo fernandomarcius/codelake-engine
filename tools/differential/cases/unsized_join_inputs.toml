@@ -1,0 +1,60 @@
+# Hash joins with an input the statistics do not size (a federated source reports none;
+# here UNNEST and aggregations above it): the engine builds the right input, the
+# subquery of IN and the right side of a join, as the reference engine does without
+# statistics. The shadow run's reconciliation models held a SQL Server table of 15
+# million rows as the build side and failed with EXCEEDED_LOCAL_MEMORY_LIMIT. The
+# swap must not change rows: every join type, NULL keys on both sides, keys computed
+# by an expression (`lower(…)`), NOT IN (null-aware, kept as written).
+
+oracle = "trino"
+compare = "multiset"
+
+setup_trino = [
+  "CREATE SCHEMA hive.uji",
+  "CREATE TABLE hive.uji.recebidas WITH (format = 'PARQUET') AS SELECT CAST(n AS bigint) AS id, CASE WHEN n % 7 = 0 THEN NULL ELSE concat('REC-', CAST(n % 40 AS varchar)) END AS k, CAST(n % 5 AS integer) AS grupo, CAST(n AS decimal(18,2)) / 4 AS valor FROM UNNEST(sequence(1, 200)) t(n)",
+]
+
+[[case]]
+id = "UJ1"
+sql = "SELECT id, k FROM hive.uji.recebidas WHERE lower(k) IN (SELECT lower(concat('rec-', CAST(n AS varchar))) FROM UNNEST(sequence(1, 60, 3)) u(n))"
+note = "IN over computed keys: the subquery is built"
+
+[[case]]
+id = "UJ2"
+sql = "SELECT r.id, u.n FROM hive.uji.recebidas r JOIN (SELECT n, count(*) AS c FROM UNNEST(sequence(1, 30)) u(n) GROUP BY n) u ON r.id = u.n"
+note = "inner join, an aggregation of unknown size on the right"
+
+[[case]]
+id = "UJ3"
+sql = "SELECT u.n, r.id FROM (SELECT n FROM UNNEST(sequence(190, 230)) u(n)) u LEFT JOIN hive.uji.recebidas r ON r.id = u.n"
+note = "LEFT JOIN, the preserved input unsized: mirrored as a RIGHT JOIN"
+
+[[case]]
+id = "UJ4"
+sql = "SELECT coalesce(r.grupo, -1), count(*), count(r.id), count(u.n), sum(r.valor) FROM hive.uji.recebidas r FULL OUTER JOIN (SELECT CASE WHEN n % 9 = 0 THEN NULL ELSE concat('REC-', CAST(n AS varchar)) END AS k, n FROM UNNEST(sequence(20, 70)) u(n)) u ON lower(r.k) = lower(u.k) GROUP BY 1"
+note = "FULL OUTER JOIN on lowered keys, NULL keys on both sides (the reconciliation's shape)"
+
+[[case]]
+id = "UJ5"
+sql = "SELECT id FROM hive.uji.recebidas r WHERE EXISTS (SELECT 1 FROM UNNEST(sequence(1, 50)) u(n) WHERE u.n = r.id * 2)"
+note = "semi join by EXISTS, computed key"
+
+[[case]]
+id = "UJ6"
+sql = "SELECT id FROM hive.uji.recebidas r WHERE NOT EXISTS (SELECT 1 FROM UNNEST(sequence(1, 150)) u(n) WHERE u.n = r.id)"
+note = "anti join by NOT EXISTS"
+
+[[case]]
+id = "UJ7"
+sql = "SELECT count(*) FROM hive.uji.recebidas WHERE k NOT IN (SELECT CASE WHEN n = 3 THEN NULL ELSE concat('REC-', CAST(n AS varchar)) END FROM UNNEST(sequence(1, 5)) u(n))"
+note = "NOT IN with a NULL in the subquery: nothing (null-aware anti join, kept as written)"
+
+[[case]]
+id = "UJ8"
+sql = "SELECT count(*), sum(valor) FROM hive.uji.recebidas WHERE k NOT IN (SELECT concat('REC-', CAST(n AS varchar)) FROM UNNEST(sequence(1, 5)) u(n))"
+note = "NOT IN without NULLs in the subquery; rows with a NULL key drop out"
+
+[[case]]
+id = "UJ9"
+sql = "SELECT a.n, b.n FROM (SELECT n FROM UNNEST(sequence(1, 20)) u(n)) a JOIN (SELECT n * 2 AS n FROM UNNEST(sequence(1, 20)) u(n)) b ON a.n = b.n"
+note = "both inputs unsized"

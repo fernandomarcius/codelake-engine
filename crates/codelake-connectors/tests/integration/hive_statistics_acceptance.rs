@@ -845,20 +845,29 @@ async fn the_smaller_input_builds_and_a_small_dimension_is_collected_once() {
     let [(join, build)] = hash_joins(&plan).try_into().unwrap();
     assert!(join.contains("mode=CollectLeft"), "{plan}");
     assert!(build.contains("hs/dim/"), "dim must build:\n{plan}");
+    // Without statistics the right input builds (`codelake_core::build_side`):
+    // the dimension here, once per partition.
     let plan = explain(&off, sql).await;
-    let [(_, build)] = hash_joins(&plan).try_into().unwrap();
+    let [(join, build)] = hash_joins(&plan).try_into().unwrap();
     assert!(
-        build.contains("hs/fact/"),
-        "without statistics the written order stays:\n{plan}"
+        join.contains("mode=Partitioned") && build.contains("hs/dim/"),
+        "without statistics the right input builds:\n{plan}"
     );
 
-    // Dimension on the left stays the collected build side.
+    // Dimension on the left stays the collected build side; without
+    // statistics the fact builds, being the right input.
     let sql = "SELECT d.n_name, count(*) FROM hive.hs.dim d JOIN hive.hs.fact f ON f.f_key = d.n_key GROUP BY d.n_name";
     let plan = explain(&with, sql).await;
     let [(join, build)] = hash_joins(&plan).try_into().unwrap();
     assert!(
         join.contains("mode=CollectLeft") && build.contains("hs/dim/"),
         "{plan}"
+    );
+    let plan = explain(&off, sql).await;
+    let [(_, build)] = hash_joins(&plan).try_into().unwrap();
+    assert!(
+        build.contains("hs/fact/"),
+        "without statistics the right input builds:\n{plan}"
     );
 
     // Metastore statistics (fact, 200k rows) against footer statistics (mid,
@@ -883,6 +892,14 @@ async fn the_smaller_input_builds_and_a_small_dimension_is_collected_once() {
             .any(|(j, b)| j.contains("mode=CollectLeft") && b.contains("hs/dim/") && !b.contains("hs/mid/")),
         "the dimension is collected once:\n{plan}"
     );
+    // The same joins with the fact written after the dimension: without
+    // statistics it builds (the right input does), with them it does not.
+    let sql = "SELECT d.n_name, count(*), sum(m.m_key) FROM hive.hs.dim d \
+               JOIN hive.hs.fact f ON f.f_key = d.n_key JOIN hive.hs.mid m ON f.f_id = m.m_fact GROUP BY d.n_name";
+    let plan = explain(&with, sql).await;
+    for (join, build) in hash_joins(&plan) {
+        assert!(!build.contains("hs/fact/"), "fact builds in `{join}`:\n{plan}");
+    }
     let plan = explain(&off, sql).await;
     assert!(
         hash_joins(&plan).iter().any(|(_, b)| b.contains("hs/fact/")),

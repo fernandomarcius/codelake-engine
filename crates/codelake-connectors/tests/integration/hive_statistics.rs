@@ -128,6 +128,10 @@ async fn register_plain(engine: &Engine, warehouse: &Path) {
 const LINEITEM_ORDERS: &str = "SELECT o.o_orderkey, o.o_totalprice, COUNT(*) AS lines, SUM(l.l_linenumber) AS total \
      FROM {c}.tpch.lineitem l JOIN {c}.tpch.orders o ON l.l_orderkey = o.o_orderkey \
      GROUP BY o.o_orderkey, o.o_totalprice ORDER BY o.o_orderkey";
+/// [`LINEITEM_ORDERS`] with `orders` written first.
+const ORDERS_LINEITEM: &str = "SELECT o.o_orderkey, o.o_totalprice, COUNT(*) AS lines, SUM(l.l_linenumber) AS total \
+     FROM {c}.tpch.orders o JOIN {c}.tpch.lineitem l ON l.l_orderkey = o.o_orderkey \
+     GROUP BY o.o_orderkey, o.o_totalprice ORDER BY o.o_orderkey";
 const ORDERS_NATION: &str = "SELECT n.n_name, COUNT(*) AS orders, SUM(o.o_orderkey) AS keys \
      FROM {c}.tpch.orders o JOIN {c}.tpch.nation n ON o.o_nationkey = n.n_nationkey \
      GROUP BY n.n_name ORDER BY n.n_name";
@@ -188,12 +192,23 @@ async fn joins_build_on_the_smaller_input_and_return_the_same_rows() {
         join.contains("mode=Partitioned"),
         "orders (key and price, 51k rows) is above the 1 MiB collect threshold:\n{with}"
     );
-    // Without statistics the planner keeps the written order: lineitem builds.
-    let without = explain(&engine, &on("plain", LINEITEM_ORDERS)).await;
+    // Written the other way, orders still builds.
+    let with = explain(&engine, &on("hive", ORDERS_LINEITEM)).await;
+    let (_, build) = build_side(&with);
+    assert!(build.contains("tpch/orders/"), "orders must build:\n{with}");
+    // Without statistics the right input builds, whichever is written
+    // there (`codelake_core::build_side`): lineitem when it comes last.
+    let without = explain(&engine, &on("plain", ORDERS_LINEITEM)).await;
     let (_, build) = build_side(&without);
     assert!(
         build.contains("tpch/lineitem/"),
         "baseline builds on lineitem:\n{without}"
+    );
+    let without = explain(&engine, &on("plain", LINEITEM_ORDERS)).await;
+    let (_, build) = build_side(&without);
+    assert!(
+        build.contains("tpch/orders/"),
+        "baseline builds on orders:\n{without}"
     );
 
     // A 25-row dimension on the right is collected once, as the build side.
@@ -203,13 +218,15 @@ async fn joins_build_on_the_smaller_input_and_return_the_same_rows() {
     assert!(build.contains("tpch/nation/"), "nation must build:\n{with}");
     let without = explain(&engine, &on("plain", ORDERS_NATION)).await;
     let (join, build) = build_side(&without);
+    // Without statistics it builds too, being the right input, but once
+    // per partition.
     assert!(
-        join.contains("mode=Partitioned") && build.contains("tpch/orders/"),
+        join.contains("mode=Partitioned") && build.contains("tpch/nation/"),
         "{without}"
     );
 
     // Plans differ, rows do not.
-    for sql in [LINEITEM_ORDERS, ORDERS_NATION, FILTERED] {
+    for sql in [LINEITEM_ORDERS, ORDERS_LINEITEM, ORDERS_NATION, FILTERED] {
         let with = run(&engine, &on("hive", sql)).await;
         let without = run(&engine, &on("plain", sql)).await;
         assert_eq!(with, without, "{sql}");

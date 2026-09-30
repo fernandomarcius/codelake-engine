@@ -30,10 +30,11 @@ const BIN: &str = env!("CARGO_BIN_EXE_codelake");
 
 /// Rows enough that a query holds its slot while its client does not read.
 const HOLDS_A_SLOT: &str = "SELECT value FROM generate_series(1, 100000000)";
-/// A join whose build side (2 M rows) stays reserved in the pool while the
-/// probe side (3 G rows) streams: it holds memory until it is stopped.
-const HOLDS_MEMORY: &str = "SELECT count(*) FROM generate_series(1, 2000000) a \
-                            JOIN generate_series(1, 3000000000) b ON a.value = b.value";
+/// A join whose build side (2 M rows; the right input, neither having a
+/// known size) stays reserved in the pool while the probe side (3 G rows)
+/// streams: it holds memory until it is stopped.
+const HOLDS_MEMORY: &str = "SELECT count(*) FROM generate_series(1, 3000000000) b \
+                            JOIN generate_series(1, 2000000) a ON a.value = b.value";
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -623,7 +624,7 @@ assert result.get("rows") == [[1]], result
 # query_max_run_time stops a query.
 try:
     c = cursor("erin", session_properties={"query_max_run_time": "2s"})
-    c.execute("SELECT count(*) FROM generate_series(1, 2000000) a JOIN generate_series(1, 3000000000) b ON a.value = b.value")
+    c.execute("SELECT count(*) FROM generate_series(1, 3000000000) b JOIN generate_series(1, 2000000) a ON a.value = b.value")
     c.fetchall()
     raise AssertionError("EXCEEDED_TIME_LIMIT expected")
 except TrinoQueryError as e:
@@ -2862,8 +2863,8 @@ async fn canceled_fetches_leave_their_cursor_unreadable(server: &Server) {
 
 /// A join that streams rows (2 M, as its probe side advances) while its
 /// build side stays reserved in the pool.
-const STREAMS_WITH_MEMORY: &str = "SELECT a.value FROM generate_series(1, 2000000) a \
-                                   JOIN generate_series(1, 3000000000) b ON a.value = b.value";
+const STREAMS_WITH_MEMORY: &str = "SELECT a.value FROM generate_series(1, 3000000000) b \
+                                   JOIN generate_series(1, 2000000) a ON a.value = b.value";
 
 /// The extended protocol (JDBC, psycopg3, `tokio-postgres`' `query`) sends
 /// rows as they are produced: a client that has read nothing keeps its
