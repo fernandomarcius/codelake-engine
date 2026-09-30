@@ -149,7 +149,8 @@ versioning: [SemVer](https://semver.org/).
   the value differs from Trino 431 on purpose: `length(CAST('ab' AS char(5)))` is 2 (Trino: 5),
   `CAST(CAST('ab' AS char(5)) AS varchar)` is `'ab'` (Trino: `'ab   '`), `CAST('ab' AS char(3)) || 'x'`
   is `'abx'` (Trino: `'ab x'`), `substr` of the value. The differential cases that showed Trino's
-  padding are accepted divergences (ISS-059).
+  padding are accepted divergences (ISS-059). A map keyed by `char(n)` values looked up with a char
+  value of another length is answered (it was refused).
 - **Breaking (ISS-011):** CodeLake names by default. The HTTP protocol's headers are `X-CodeLake-*`
   (`[server.trino] header_prefix`) and the reported version is CodeLake's (`reported_version`); hive
   metastores write `.codelakeSchema`, `.codelakePermissions` and `CodeLake View` markers

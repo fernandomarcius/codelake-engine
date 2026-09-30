@@ -204,7 +204,9 @@ value, whatever its origin: the padding protects no data and takes space
    (it padded to `n`).
 2. **Equality** (`=`, `IN`, joins, `GROUP BY`, `DISTINCT`, set operations)
    is unchanged: equal char values are held alike; a text literal tested
-   with a `char(n)` value is written without its trailing spaces.
+   with a `char(n)` value is written without its trailing spaces. A map
+   keyed by char values is looked up with a char value of any length (it
+   was refused unless the lengths matched).
 3. **Ordering** compares as if padded, as the reference: `<`, `BETWEEN`
    and rows written out with `codelake_char_compare`, also between values
    of one `char(n)` (held alike, they would sort `'a'` below
