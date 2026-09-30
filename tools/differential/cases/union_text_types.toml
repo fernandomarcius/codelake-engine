@@ -1,0 +1,235 @@
+# Types CREATE TABLE AS stores for text built from literals: `'vendas' AS tabela` in
+# each input of a UNION ALL, a CASE of literals, varchar(n) with unbounded varchar. In
+# the reference engine a text literal is varchar(its length) and inputs meet in
+# varchar(longest), or varchar when one is unbounded. The shadow run's monitoring
+# models stored `varchar` (`string` in the metastore) where Trino stored varchar(14)
+# and varchar(7): a union of three inputs whose first two agreed dropped the type.
+# Each engine writes its own table (`<name>_tr`, `<name>_cl`) in the shared
+# metastore; the UT*a cases compare what each engine reports for its own table,
+# UT*b what each reports for the other's. UV*: a view lists the types its rows have,
+# as the table created from it does (dbt's incremental models compare the two and
+# alter the table when they differ).
+
+oracle = "trino"
+compare = "multiset"
+
+setup = [
+  "CREATE SCHEMA {c}.utv",
+  "CREATE VIEW {c}.utv.base_view AS select 1 as id, 'a' as name union all select 2, 'b' union all select 3, 'c'",
+  "CREATE TABLE {c}.utv.events_inc AS select id, name from {c}.utv.base_view",
+  "CREATE VIEW {c}.utv.newer AS select id, name from {c}.utv.base_view where id > (select coalesce(max(id), 0) - 1 from {c}.utv.events_inc)",
+  "CREATE SCHEMA IF NOT EXISTS hive.utx",
+  "CREATE TABLE hive.utx.lit3_{e} WITH (format = 'PARQUET') AS SELECT 'extrato' AS tabela UNION ALL SELECT 'pessoas' UNION ALL SELECT 'vendreclogparc'",
+  "CREATE TABLE hive.utx.lit2_{e} WITH (format = 'PARQUET') AS SELECT 'a' AS t UNION ALL SELECT 'bcd'",
+  "CREATE TABLE hive.utx.case1_{e} WITH (format = 'PARQUET') AS SELECT CASE WHEN x > 1 THEN 'CRITICO' WHEN x > 0 THEN 'ALERTA' ELSE 'OK' END AS status FROM (VALUES 0, 1, 2) t(x)",
+  "CREATE TABLE hive.utx.case3_{e} WITH (format = 'PARQUET') AS SELECT CASE WHEN x > 1 THEN 'CRITICO' ELSE 'OK' END AS status FROM (VALUES 1, 2) t(x) UNION ALL SELECT CASE WHEN x > 1 THEN 'CRITICO' ELSE 'OK' END FROM (VALUES 1) t(x) UNION ALL SELECT CASE WHEN x > 1 THEN 'ALERTA' ELSE 'OK' END FROM (VALUES 3) t(x)",
+  "CREATE TABLE hive.utx.model_{e} WITH (format = 'PARQUET') AS (SELECT 'vendas' AS tabela, 1 AS n, 'OK' AS status UNION ALL SELECT 'contas', 2, 'OK' UNION ALL SELECT 'contasreceber', 3, 'CRITICO')",
+  "CREATE TABLE hive.utx.nest_{e} WITH (format = 'PARQUET') AS SELECT * FROM (SELECT 'ab' AS t UNION ALL SELECT 'cd') UNION ALL SELECT 'efg'",
+  "CREATE TABLE hive.utx.dist_{e} WITH (format = 'PARQUET') AS SELECT 'a' AS t UNION SELECT 'b' UNION SELECT 'ccc'",
+  "CREATE TABLE hive.utx.mix_{e} WITH (format = 'PARQUET') AS SELECT CAST('ab' AS varchar(5)) AS c UNION ALL SELECT CAST('cd' AS varchar(5)) UNION ALL SELECT CAST('abc' AS varchar)",
+  "CREATE TABLE hive.utx.mix2_{e} WITH (format = 'PARQUET') AS SELECT CAST('ab' AS varchar(5)) AS c UNION ALL SELECT CAST('cd' AS varchar(5)) UNION ALL SELECT 'abcdefgh'",
+  "CREATE TABLE hive.utx.coal_{e} WITH (format = 'PARQUET') AS SELECT coalesce(CAST(NULL AS varchar(2)), 'abcd') AS c",
+]
+
+[[case]]
+id = "UT1a"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'lit3_{e}' ORDER BY ordinal_position"
+compare = "ordered"
+note = "three literals, the first two of one length: varchar(14)"
+
+[[case]]
+id = "UT1b"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'lit3_tr' ORDER BY ordinal_position"
+oracle_sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'lit3_cl' ORDER BY ordinal_position"
+compare = "ordered"
+note = "each engine reads the type the other stored"
+
+[[case]]
+id = "UT1c"
+sql = "SELECT * FROM hive.utx.lit3_{e}"
+note = "rows and column types"
+
+[[case]]
+id = "UT2a"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'lit2_{e}' ORDER BY ordinal_position"
+compare = "ordered"
+note = "two literals: varchar(3)"
+
+[[case]]
+id = "UT2b"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'lit2_tr' ORDER BY ordinal_position"
+oracle_sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'lit2_cl' ORDER BY ordinal_position"
+compare = "ordered"
+note = "each engine reads the type the other stored"
+
+[[case]]
+id = "UT2c"
+sql = "SELECT * FROM hive.utx.lit2_{e}"
+note = "rows and column types"
+
+[[case]]
+id = "UT3a"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'case1_{e}' ORDER BY ordinal_position"
+compare = "ordered"
+note = "CASE of literals: varchar(7)"
+
+[[case]]
+id = "UT3b"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'case1_tr' ORDER BY ordinal_position"
+oracle_sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'case1_cl' ORDER BY ordinal_position"
+compare = "ordered"
+note = "each engine reads the type the other stored"
+
+[[case]]
+id = "UT3c"
+sql = "SELECT * FROM hive.utx.case1_{e}"
+note = "rows and column types"
+
+[[case]]
+id = "UT4a"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'case3_{e}' ORDER BY ordinal_position"
+compare = "ordered"
+note = "CASE of literals in three inputs: varchar(7)"
+
+[[case]]
+id = "UT4b"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'case3_tr' ORDER BY ordinal_position"
+oracle_sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'case3_cl' ORDER BY ordinal_position"
+compare = "ordered"
+note = "each engine reads the type the other stored"
+
+[[case]]
+id = "UT4c"
+sql = "SELECT * FROM hive.utx.case3_{e}"
+note = "rows and column types"
+
+[[case]]
+id = "UT5a"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'model_{e}' ORDER BY ordinal_position"
+compare = "ordered"
+note = "a dbt model's shape (`AS ( … )`): varchar(13), varchar(7)"
+
+[[case]]
+id = "UT5b"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'model_tr' ORDER BY ordinal_position"
+oracle_sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'model_cl' ORDER BY ordinal_position"
+compare = "ordered"
+note = "each engine reads the type the other stored"
+
+[[case]]
+id = "UT5c"
+sql = "SELECT * FROM hive.utx.model_{e}"
+note = "rows and column types"
+
+[[case]]
+id = "UT6a"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'nest_{e}' ORDER BY ordinal_position"
+compare = "ordered"
+note = "a union inside a union: varchar(3)"
+
+[[case]]
+id = "UT6b"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'nest_tr' ORDER BY ordinal_position"
+oracle_sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'nest_cl' ORDER BY ordinal_position"
+compare = "ordered"
+note = "each engine reads the type the other stored"
+
+[[case]]
+id = "UT6c"
+sql = "SELECT * FROM hive.utx.nest_{e}"
+note = "rows and column types"
+
+[[case]]
+id = "UT7a"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'dist_{e}' ORDER BY ordinal_position"
+compare = "ordered"
+note = "UNION DISTINCT: varchar(3)"
+
+[[case]]
+id = "UT7b"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'dist_tr' ORDER BY ordinal_position"
+oracle_sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'dist_cl' ORDER BY ordinal_position"
+compare = "ordered"
+note = "each engine reads the type the other stored"
+
+[[case]]
+id = "UT7c"
+sql = "SELECT * FROM hive.utx.dist_{e}"
+note = "rows and column types"
+
+[[case]]
+id = "UT8a"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'mix_{e}' ORDER BY ordinal_position"
+compare = "ordered"
+note = "varchar(5) with unbounded varchar: varchar"
+
+[[case]]
+id = "UT8b"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'mix_tr' ORDER BY ordinal_position"
+oracle_sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'mix_cl' ORDER BY ordinal_position"
+compare = "ordered"
+note = "each engine reads the type the other stored"
+
+[[case]]
+id = "UT8c"
+sql = "SELECT * FROM hive.utx.mix_{e}"
+note = "rows and column types"
+
+[[case]]
+id = "UT9a"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'mix2_{e}' ORDER BY ordinal_position"
+compare = "ordered"
+note = "varchar(5) with a longer literal: varchar(8)"
+
+[[case]]
+id = "UT9b"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'mix2_tr' ORDER BY ordinal_position"
+oracle_sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'mix2_cl' ORDER BY ordinal_position"
+compare = "ordered"
+note = "each engine reads the type the other stored"
+
+[[case]]
+id = "UT9c"
+sql = "SELECT * FROM hive.utx.mix2_{e}"
+note = "rows and column types"
+
+[[case]]
+id = "UT10a"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'coal_{e}' ORDER BY ordinal_position"
+compare = "ordered"
+note = "coalesce: varchar(4)"
+
+[[case]]
+id = "UT10b"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'coal_tr' ORDER BY ordinal_position"
+oracle_sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'utx' AND table_name = 'coal_cl' ORDER BY ordinal_position"
+compare = "ordered"
+note = "each engine reads the type the other stored"
+
+[[case]]
+id = "UT10c"
+sql = "SELECT * FROM hive.utx.coal_{e}"
+note = "rows and column types"
+
+[[case]]
+id = "UV1"
+sql = "SELECT column_name, data_type FROM {c}.information_schema.columns WHERE table_schema = 'utv' AND table_name = 'base_view' ORDER BY ordinal_position"
+compare = "ordered"
+note = "a view of three literals: varchar(1)"
+
+[[case]]
+id = "UV2"
+sql = "SELECT column_name, data_type FROM {c}.information_schema.columns WHERE table_schema = 'utv' AND table_name = 'events_inc' ORDER BY ordinal_position"
+compare = "ordered"
+note = "the table created from it"
+
+[[case]]
+id = "UV3"
+sql = "SELECT column_name, data_type FROM {c}.information_schema.columns WHERE table_schema = 'utv' AND table_name = 'newer' ORDER BY ordinal_position"
+compare = "ordered"
+note = "a view over the view, filtered by a scalar subquery (dbt's incremental relation)"
+
+[[case]]
+id = "UV4"
+sql = "SELECT * FROM {c}.utv.newer"
+note = "rows and column types"

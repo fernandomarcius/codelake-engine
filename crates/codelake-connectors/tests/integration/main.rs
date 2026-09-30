@@ -50,3 +50,5 @@ mod sqlserver_audit;
 mod sqlserver_dynamic_filter;
 #[cfg(all(feature = "sqlserver", feature = "postgres"))]
 mod sqlserver_smoke;
+#[cfg(all(feature = "sqlserver", feature = "hive"))]
+mod sqlserver_union_text_types;
