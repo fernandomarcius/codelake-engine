@@ -67,3 +67,4 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-055](ISS-055-cancel-between-messages-races-a-cursor.md) | A cancel request between messages sometimes cancels the next FETCH | defect | 2026-09-27 | open |
 | [ISS-056](ISS-056-approx-percentile-of-decimal-is-double.md) | `approx_percentile` of a decimal is `double` (Trino 431: `real`) | deliberate divergence | 2026-09-28 | open |
 | [ISS-057](ISS-057-upstream-unparser-decorrelation-workarounds.md) | Upstream unparser and decorrelation defects worked around in the engine | upstream defect | 2026-09-29 | open |
+| [ISS-058](ISS-058-coalesce-of-varchar-and-char-is-not-padded.md) | `COALESCE` of a `varchar` and a SQL Server `char(n)` is not padded to `char(65536)` (Trino 431: padded) | deliberate divergence | 2026-09-30 | open |
