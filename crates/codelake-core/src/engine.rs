@@ -1213,8 +1213,9 @@ impl Engine {
     /// `CREATE VIEW` in `DataFusion`'s in-memory catalogs, as `DataFusion`
     /// does it, but with the column types its query has once analyzed (Trino's
     /// decimal types: `dc * 2` of a `decimal(12,3)` is `decimal(22,3)`, not
-    /// `DataFusion`'s `decimal(33,3)`) and its query as written for
-    /// `information_schema.views`.
+    /// `DataFusion`'s `decimal(33,3)`; the `varchar(n)` of a text literal,
+    /// which a table created from the view stores) and its query as written
+    /// for `information_schema.views`.
     fn create_memory_view(
         ctx: &SessionContext,
         view: &datafusion::logical_expr::CreateView,
@@ -1239,6 +1240,16 @@ impl Engine {
                     column
                 } else {
                     Expr::Cast(Cast::new(Box::new(column), typed.data_type().clone()))
+                };
+                // The type the analyzer declares (a text literal's
+                // `varchar(n)`), which the planned field does not carry yet.
+                let declared = crate::trino_types::declared(typed);
+                let column = if declared == crate::trino_types::declared(field) {
+                    column
+                } else {
+                    let name = declared.map_or_else(String::new, |d| d.name(typed.data_type()));
+                    crate::declared::trino_typed()
+                        .call(vec![column, Expr::Literal(ScalarValue::Utf8(Some(name)), None)])
                 };
                 // Lower case, as the columns of a table (see `lower_case_columns`).
                 column.alias(field.name().to_lowercase())

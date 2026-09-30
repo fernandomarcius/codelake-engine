@@ -1156,12 +1156,34 @@ fn typed_name(declared: Option<Declared>) -> String {
     declared.map_or_else(String::new, |d| d.name(&DataType::Utf8))
 }
 
+/// `field` declaring `declared` (nothing when `None`), its other metadata
+/// kept.
+fn with_declared(field: &Field, declared: Option<Declared>) -> Field {
+    let mut metadata = field.metadata().clone();
+    metadata.remove(crate::trino_types::TRINO_TYPE);
+    if let Some(declared) = declared {
+        metadata.extend(declared.metadata());
+    }
+    field.clone().with_metadata(metadata)
+}
+
 /// Text columns of a `UNION` declare one type in every input (`SELECT 'a'
 /// UNION ALL SELECT 'bcd'` is `varchar(3)`); `DataFusion` would keep the
 /// last input's.
+///
+/// The union's own schema is `DataFusion`'s, computed when the SQL was
+/// planned: before this rule typed its inputs' text literals, so without
+/// their types. Each column declares its inputs' type again, even where
+/// the inputs agree: `a UNION ALL b UNION ALL c` is a union of `a UNION ALL
+/// b` and `c`, and the outer one would see unbounded text in the inner one
+/// and drop the type of every input (`'CRITICO'`/`'OK'` in three inputs
+/// stored as `varchar`, not `varchar(7)`).
 fn unify_union_text(union: Union) -> Result<Transformed<Union>> {
     let columns = union.schema.fields().len();
+    // Per text column: the common type, and whether an input declares
+    // another (it is then cast to it).
     let mut targets: Vec<Option<Option<Declared>>> = Vec::with_capacity(columns);
+    let mut declared: Vec<Option<Option<Declared>>> = Vec::with_capacity(columns);
     for j in 0..columns {
         let fields: Vec<&Field> = union
             .inputs
@@ -1170,15 +1192,35 @@ fn unify_union_text(union: Union) -> Result<Transformed<Union>> {
             .collect();
         if !fields.iter().all(|f| is_text_type(f.data_type())) {
             targets.push(None);
+            declared.push(None);
             continue;
         }
-        let declared: Vec<Option<Declared>> =
-            fields.iter().map(|f| crate::trino_types::declared(f)).collect();
-        let common = common_text(&declared);
-        targets.push(declared.iter().any(|d| *d != common).then_some(common));
+        let own: Vec<Option<Declared>> = fields.iter().map(|f| crate::trino_types::declared(f)).collect();
+        let common = common_text(&own);
+        targets.push(own.iter().any(|d| *d != common).then_some(common));
+        declared.push(Some(common));
     }
+    let fields: Vec<(Option<datafusion::sql::TableReference>, Arc<Field>)> = union
+        .schema
+        .iter()
+        .zip(&declared)
+        .map(|((qualifier, field), declared)| match declared {
+            Some(declared) => (qualifier.cloned(), Arc::new(with_declared(field, *declared))),
+            None => (qualifier.cloned(), Arc::clone(field)),
+        })
+        .collect();
+    let schema = Arc::new(DFSchema::new_with_metadata(
+        fields,
+        union.schema.metadata().clone(),
+    )?);
     if targets.iter().all(Option::is_none) {
-        return Ok(Transformed::no(union));
+        if schema.fields() == union.schema.fields() {
+            return Ok(Transformed::no(union));
+        }
+        return Ok(Transformed::yes(Union {
+            inputs: union.inputs,
+            schema,
+        }));
     }
     let typed = crate::declared::trino_typed();
     let mut inputs = Vec::with_capacity(union.inputs.len());
@@ -1204,24 +1246,7 @@ fn unify_union_text(union: Union) -> Result<Transformed<Union>> {
             datafusion::logical_expr::Projection::try_new(exprs, input)?,
         )));
     }
-    let first = Arc::clone(&inputs[0]);
-    let fields: Vec<(Option<datafusion::sql::TableReference>, Arc<Field>)> = union
-        .schema
-        .iter()
-        .zip(first.schema().fields())
-        .map(|((qualifier, field), typed)| {
-            let metadata = typed.metadata().clone();
-            (
-                qualifier.cloned(),
-                Arc::new(field.as_ref().clone().with_metadata(metadata)),
-            )
-        })
-        .collect();
-    let schema = DFSchema::new_with_metadata(fields, union.schema.metadata().clone())?;
-    Ok(Transformed::yes(Union {
-        inputs,
-        schema: Arc::new(schema),
-    }))
+    Ok(Transformed::yes(Union { inputs, schema }))
 }
 
 fn unify_union(union: Union) -> Result<Transformed<LogicalPlan>> {

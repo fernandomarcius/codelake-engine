@@ -1092,3 +1092,168 @@ async fn relations_show_the_statement_that_creates_them() {
         assert_error(&engine, sql, message).await;
     }
 }
+
+/// Text values of the inputs of a `UNION` meet in `varchar(longest)`, or
+/// unbounded `varchar` when an input is, however many inputs there are and
+/// whether or not the first ones agree: `a UNION ALL b UNION ALL c` is
+/// planned as a union of `a UNION ALL b` and `c`, and a text literal is typed
+/// after the SQL is planned. `CREATE TABLE AS` stores the type.
+#[tokio::test]
+async fn text_types_meet_across_every_input_of_a_union() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    let status = |alert: &str| {
+        format!(
+            "SELECT CASE WHEN x > 1 THEN 'CRITICO' WHEN x > 0 THEN '{alert}' ELSE 'OK' END AS s FROM (VALUES 1) t(x)"
+        )
+    };
+    let three_cases = format!(
+        "{} UNION ALL {} UNION ALL {}",
+        status("ALERTA"),
+        status("ALERTA"),
+        status("AVISO")
+    );
+    assert_same(
+        &engine,
+        &[
+            (
+                "SELECT 'extrato' AS t UNION ALL SELECT 'pessoas' UNION ALL SELECT 'vendreclogparc' ORDER BY 1",
+                answer(&["varchar(14)"], &[&["extrato"], &["pessoas"], &["vendreclogparc"]]),
+            ),
+            (
+                "SELECT 'extrato' AS t, 1 AS n UNION ALL SELECT 'pessoas', 2 UNION ALL SELECT 'vendas', 3 \
+                 UNION ALL SELECT 'vendreclogparc', 4 ORDER BY 2",
+                answer(
+                    &["varchar(14)", "integer"],
+                    &[&["extrato", "1"], &["pessoas", "2"], &["vendas", "3"], &["vendreclogparc", "4"]],
+                ),
+            ),
+            (three_cases.as_str(), answer(&["varchar(7)"], &[&["ALERTA"], &["ALERTA"], &["AVISO"]])),
+            (
+                "SELECT * FROM (SELECT 'ab' AS t UNION ALL SELECT 'cd') UNION ALL SELECT 'efg' ORDER BY 1",
+                answer(&["varchar(3)"], &[&["ab"], &["cd"], &["efg"]]),
+            ),
+            (
+                "SELECT 'a' AS t UNION SELECT 'b' UNION SELECT 'ccc' ORDER BY 1",
+                answer(&["varchar(3)"], &[&["a"], &["b"], &["ccc"]]),
+            ),
+            // Bounded and unbounded: unbounded.
+            (
+                "SELECT CAST('ab' AS varchar(5)) AS c UNION ALL SELECT CAST('cd' AS varchar(5)) \
+                 UNION ALL SELECT CAST('abc' AS varchar) ORDER BY 1",
+                answer(&["varchar"], &[&["ab"], &["abc"], &["cd"]]),
+            ),
+            (
+                "SELECT CAST('abc' AS varchar) AS c UNION ALL SELECT 'x' UNION ALL SELECT 'y' ORDER BY 1",
+                answer(&["varchar"], &[&["abc"], &["x"], &["y"]]),
+            ),
+            (
+                "SELECT CAST('ab' AS varchar(5)) AS c UNION ALL SELECT CAST('cd' AS varchar(5)) \
+                 UNION ALL SELECT 'abcdefgh' ORDER BY 1",
+                answer(&["varchar(8)"], &[&["ab"], &["abcdefgh"], &["cd"]]),
+            ),
+            (
+                "SELECT coalesce(CAST(NULL AS varchar(2)), 'abcd') AS c",
+                answer(&["varchar(4)"], &[&["abcd"]]),
+            ),
+        ],
+    )
+    .await;
+    for statement in [
+        "CREATE SCHEMA datafusion.ut",
+        "CREATE TABLE datafusion.ut.t AS SELECT 'extrato' AS tabela, 'OK' AS status \
+         UNION ALL SELECT 'pessoas', 'OK' UNION ALL SELECT 'vendreclogparc', 'CRITICO'",
+    ] {
+        run(&engine, statement).await;
+    }
+    assert_same(
+        &engine,
+        &[(
+            "SELECT column_name, data_type FROM datafusion.information_schema.columns \
+             WHERE table_schema = 'ut' AND table_name = 't' ORDER BY ordinal_position",
+            answer(
+                &["varchar", "varchar"],
+                &[&["tabela", "varchar(14)"], &["status", "varchar(7)"]],
+            ),
+        )],
+    )
+    .await;
+    // Inputs that agree are read as they are: nothing is cast.
+    run(&engine, "CREATE TABLE datafusion.ut.v (v10 varchar(10))").await;
+    let agreeing = "SELECT v10 FROM datafusion.ut.v UNION ALL SELECT v10 FROM datafusion.ut.v \
+                    UNION ALL SELECT v10 FROM datafusion.ut.v";
+    assert_eq!(run(&engine, agreeing).await.1, Vec::<Vec<String>>::new());
+    let frame = engine.sql(agreeing).await.unwrap();
+    let declared: Vec<String> = frame
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| crate::trino_types::field_display_name(f))
+        .collect();
+    assert_eq!(declared, ["varchar(10)"]);
+    let plan = frame.into_optimized_plan().unwrap().display_indent().to_string();
+    assert!(!plan.contains(crate::declared::TRINO_TYPED), "{plan}");
+}
+
+/// A view of the in-memory catalog lists the types its rows have, those a
+/// table created from the same query stores: dbt compares the two in an
+/// incremental model and alters the table when they differ.
+#[tokio::test]
+async fn a_view_lists_the_text_types_of_its_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    let newer = "select id, name from datafusion.d.base_view \
+                 where id > (select coalesce(max(id), 0) - 1 from datafusion.d.events_inc)";
+    for statement in [
+        "CREATE SCHEMA datafusion.d",
+        "CREATE VIEW datafusion.d.base_view AS \
+         select 1 as id, 'a' as name union all select 2, 'b' union all select 3, 'c'",
+        "CREATE TABLE datafusion.d.events_inc AS select id, name from datafusion.d.base_view",
+        &format!("CREATE VIEW datafusion.d.newer_view AS {newer}"),
+        &format!("CREATE TABLE datafusion.d.newer_table AS {newer}"),
+        "CREATE VIEW datafusion.d.one AS SELECT 'abc' AS t, CASE WHEN true THEN 'x' ELSE 'yz' END AS c",
+        // Bounded and unbounded inputs: unbounded, whatever the first declares.
+        "CREATE VIEW datafusion.d.mixed AS \
+         SELECT CAST('ab' AS varchar(5)) AS c UNION ALL SELECT CAST('abc' AS varchar)",
+        "CREATE TABLE datafusion.d.v (v10 varchar(10))",
+        "CREATE VIEW datafusion.d.kept AS SELECT v10 FROM datafusion.d.v",
+    ] {
+        run(&engine, statement).await;
+    }
+    let columns = |table: &str| {
+        format!(
+            "SELECT column_name, data_type FROM datafusion.information_schema.columns \
+             WHERE table_schema = 'd' AND table_name = '{table}' ORDER BY ordinal_position"
+        )
+    };
+    let text = &["varchar", "varchar"];
+    let id_name: &[&[&str]] = &[&["id", "integer"], &["name", "varchar(1)"]];
+    assert_same(
+        &engine,
+        &[
+            (&columns("base_view"), answer(text, id_name)),
+            (&columns("events_inc"), answer(text, id_name)),
+            (&columns("newer_view"), answer(text, id_name)),
+            (&columns("newer_table"), answer(text, id_name)),
+            (
+                &columns("one"),
+                answer(text, &[&["t", "varchar(3)"], &["c", "varchar(2)"]]),
+            ),
+            (&columns("mixed"), answer(text, &[&["c", "varchar"]])),
+            (&columns("kept"), answer(text, &[&["v10", "varchar(10)"]])),
+            (
+                "SELECT * FROM datafusion.d.newer_view ORDER BY id",
+                answer(&["integer", "varchar(1)"], &[&["3", "c"]]),
+            ),
+            (
+                "SELECT t, c FROM datafusion.d.one",
+                answer(&["varchar(3)", "varchar(2)"], &[&["abc", "x"]]),
+            ),
+            (
+                "SELECT c FROM datafusion.d.mixed ORDER BY 1",
+                answer(&["varchar"], &[&["ab"], &["abc"]]),
+            ),
+        ],
+    )
+    .await;
+}

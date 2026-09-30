@@ -52,3 +52,5 @@ mod sqlserver_dynamic_filter;
 mod sqlserver_join_build_side;
 #[cfg(all(feature = "sqlserver", feature = "postgres"))]
 mod sqlserver_smoke;
+#[cfg(all(feature = "sqlserver", feature = "hive"))]
+mod sqlserver_union_text_types;
