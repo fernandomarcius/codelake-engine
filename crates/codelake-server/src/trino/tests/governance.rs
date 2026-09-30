@@ -83,8 +83,8 @@ async fn timeout_stops_the_query_and_the_pool_returns_to_zero() {
     let first = h
         .submit_as(
             "ana",
-            "SELECT count(*) FROM generate_series(1, 2000000) a \
-             JOIN generate_series(1, 3000000000) b ON a.value = b.value",
+            "SELECT count(*) FROM generate_series(1, 3000000000) b \
+             JOIN generate_series(1, 2000000) a ON a.value = b.value",
             &[("x-trino-session", "query_max_run_time=2s")],
         )
         .await;

@@ -224,6 +224,18 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- Found by the shadow run's nightly validation (2026-09-30):
+  - Two monitoring models failed with `EXCEEDED_LOCAL_MEMORY_LIMIT` under a 4 GiB pool (`HashJoinInput[0..5]`,
+    532 MB each, `can spill: false`) where the reference answers within 8 GB: a SQL Server table of 15
+    million rows filtered by `lower(cast(id AS varchar)) IN (SELECT … FROM hive…)` was the build side of its
+    hash join and held whole. A federated source reports no statistics, and a hash join whose inputs the
+    statistics do not both size built the query's left input. It builds the right one now (the subquery of
+    `IN`, the right side of a join), as the reference does without statistics; an input small enough for
+    one partition is still collected, inputs both sized are still ordered by size, `NOT IN` keeps its sides
+    and `datafusion.optimizer.join_reordering = false` keeps the query's order. Reproduction (15 million
+    rows in SQL Server 2022, a replica of 109 401 rows, a `UNION ALL` of two reconciliations, 6 partitions,
+    4 GiB): failed at a pool peak of 4094 MiB → 321 MiB, same rows; one reconciliation alone: 2886 MiB →
+    166 MiB.
 - Found running the daily receipts reports against the reference engine on the same SQL Server catalogs
   (2026-09-29):
   - **Wrong result**: a grouping federated alone (below a join the engine keeps, as the decorrelated

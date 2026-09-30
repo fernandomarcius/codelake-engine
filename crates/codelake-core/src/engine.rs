@@ -295,7 +295,9 @@ fn trino_literal(value: &ScalarValue) -> String {
 /// the null-aware anti join guard (both must run before `FilterPushdown`; see
 /// [`crate::federation_guard`] and [`crate::join_guard`]), with
 /// aggregates answered from statistics only over exact sources (see
-/// [`crate::statistics_guard`]), hash joins too large for the pool planned as
+/// [`crate::statistics_guard`]), the right input as the build side of a hash
+/// join whose inputs the statistics do not both size, right before
+/// `JoinSelection` ([`crate::build_side`]), hash joins too large for the pool planned as
 /// sort-merge joins right after `EnforceSorting` ([`crate::join_spill`]), the
 /// null-safe join guard right before `FilterPushdown(Post)` (it must see the
 /// build and probe sides `JoinSelection` picked; see [`crate::join_guard`]),
@@ -309,6 +311,7 @@ pub(crate) fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Syn
     let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> =
         vec![Arc::new(FederationFilterGuard), Arc::new(NullAwareAntiJoinGuard)];
     rules.extend(PhysicalOptimizer::new().rules);
+    let rules = crate::build_side::with_build_right_without_sizes(rules);
     let rules = crate::join_spill::with_sort_merge_oversized_joins(rules);
     let rules = crate::join_guard::with_null_safe_join_guard(rules);
     let mut rules = guard_aggregate_statistics(rules);

@@ -3,6 +3,7 @@
 //! the server (see `cargo xtask arch`).
 
 mod batch_schema;
+pub mod build_side;
 pub mod bytes;
 mod casts;
 pub mod catalog;

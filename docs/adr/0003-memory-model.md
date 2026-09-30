@@ -140,6 +140,20 @@
     are nested loop joins, whose spill fallback stays off (ADR 0014).
   - Session property `sort_merge_oversized_joins` (default `true`) turns it
     off per query.
+- Which input a hash join builds, when the statistics cannot say
+  (`codelake_core::build_side`, amended 2026-09-30). `DataFusion` builds the
+  query's left input and `JoinSelection` swaps the inputs only when the
+  statistics size both (bytes, else rows) or one is small enough for one
+  partition. A federated source reports no statistics, so a SQL Server table
+  of 15 million rows filtered by `IN (keys of a Hive replica)` was held whole
+  (six `HashJoinInput` partitions of 532 MB under a 4 GiB pool). A rule right
+  before `JoinSelection` swaps the inputs of a hash join whose inputs the
+  statistics do not both size, so the right input (the subquery of `IN`, the
+  right side of a join) is built, as the reference engine does without
+  statistics and as queries written for it expect; `JoinSelection` then
+  collects a small input and orders sized inputs as before. A null-aware anti
+  join keeps its sides, and `datafusion.optimizer.join_reordering = false`
+  keeps the query's order.
 - Spill goes to a dedicated directory bounded by `memory.spill_limit`; the
   Kubernetes volume has its own `sizeLimit` above that value.
 - When memory and spill are exhausted, the query fails with a resources error;

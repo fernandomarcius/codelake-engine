@@ -1929,10 +1929,12 @@ mod tests {
         context
             .register_table("r", keyed_table(200_000, 'y').await)
             .unwrap();
-        let sql = "SELECT count(*), sum(l.k), sum(length(x.s) + length(l.s)) FROM l JOIN (\
-                   SELECT r.k, g.s FROM (SELECT value AS k, lpad(CAST(value AS VARCHAR), 70, 'z') AS s \
-                                         FROM generate_series(1, 150000)) g \
-                   JOIN r ON g.k = r.k) x ON l.k = x.k";
+        // Inputs of unknown size on the left: each join builds its right
+        // input (`crate::build_side`).
+        let sql = "SELECT count(*), sum(l.k), sum(length(x.s) + length(l.s)) FROM (\
+                   SELECT r.k, g.s FROM r JOIN (SELECT value AS k, lpad(CAST(value AS VARCHAR), 70, 'z') AS s \
+                                                FROM generate_series(1, 150000)) g \
+                   ON g.k = r.k) x JOIN l ON l.k = x.k";
         let frame = engine.sql_with(&options(&engine, "true"), sql).await.unwrap();
         let text = displayable(frame.clone().create_physical_plan().await.unwrap().as_ref())
             .indent(true)
