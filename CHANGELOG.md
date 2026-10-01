@@ -138,6 +138,19 @@ versioning: [SemVer](https://semver.org/).
   fronts' Definition of Done (docs/gates.md).
 
 ### Changed
+- **Breaking (ISS-059):** `char(n)` values are never padded, from any origin: a hive table (and a file
+  another tool wrote with trailing spaces), an in-memory table or view, `CAST`/`TRY_CAST`, a literal,
+  and the common char type of `COALESCE`, `CASE`, `UNION`, `INTERSECT`, `EXCEPT`, `VALUES` and `USING`
+  (`COALESCE(varchar, char(36))` held 65 536 characters per value, as Trino 431). A char value is held,
+  returned on both protocols and written without trailing spaces; its type stays `char(n)`. Comparisons
+  keep Trino 431's answers: equality, `GROUP BY` and joins ignore trailing spaces; `<`, `BETWEEN`,
+  `ORDER BY`, `min`/`max`, `min_by`/`max_by` by a char key and `greatest`/`least` order char values as
+  if padded (`'a' || chr(9)` below `'a'`); `LIKE` matches the value padded to `n`. What follows from
+  the value differs from Trino 431 on purpose: `length(CAST('ab' AS char(5)))` is 2 (Trino: 5),
+  `CAST(CAST('ab' AS char(5)) AS varchar)` is `'ab'` (Trino: `'ab   '`), `CAST('ab' AS char(3)) || 'x'`
+  is `'abx'` (Trino: `'ab x'`), `substr` of the value. The differential cases that showed Trino's
+  padding are accepted divergences (ISS-059). A map keyed by `char(n)` values looked up with a char
+  value of another length is answered (it was refused).
 - **Breaking (ISS-011):** CodeLake names by default. The HTTP protocol's headers are `X-CodeLake-*`
   (`[server.trino] header_prefix`) and the reported version is CodeLake's (`reported_version`); hive
   metastores write `.codelakeSchema`, `.codelakePermissions` and `CodeLake View` markers

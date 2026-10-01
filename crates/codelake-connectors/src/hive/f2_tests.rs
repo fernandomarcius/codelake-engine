@@ -233,7 +233,7 @@ async fn bounded_varchar_is_enforced_on_insert_and_cut_on_read_like_trino() {
 }
 
 #[tokio::test]
-async fn char_columns_read_padded_and_compare_like_trino() {
+async fn char_columns_read_without_padding_and_compare_like_trino() {
     let lake = lake().await;
     lake.ok("CREATE TABLE hive.s.ch (id bigint, ch char(5))").await;
     assert_eq!(lake.columns("ch")[1], ("ch".into(), "char(5)".into()));
@@ -246,14 +246,15 @@ async fn char_columns_read_padded_and_compare_like_trino() {
     );
     lake.ok("INSERT INTO hive.s.ch VALUES (2, 'ab'), (3, 'abcde  '), (4, ''), (5, NULL)")
         .await;
-    // Trino 431 answers exactly these rows (values padded, length 5).
+    // Trino 431 answers these rows with the values padded to 5 characters
+    // (`ab   `, length 5); the engine never pads them (ISS-059).
     assert_eq!(
         lake.ok("SELECT id, CAST(ch AS varchar), length(ch), ch || '|' FROM hive.s.ch ORDER BY id")
             .await,
         rows(&[
-            &["2", "ab   ", "5", "ab   |"],
+            &["2", "ab", "2", "ab|"],
             &["3", "abcde", "5", "abcde|"],
-            &["4", "     ", "5", "     |"],
+            &["4", "", "0", "|"],
             &["5", "NULL", "NULL", "NULL"],
         ])
     );
@@ -280,14 +281,43 @@ async fn char_columns_read_padded_and_compare_like_trino() {
         lake.ok("SELECT id FROM hive.s.ch WHERE ch IS NULL").await,
         rows(&[&["5"]])
     );
-    // What Trino stored, read back padded: values are stored without their
-    // trailing spaces, as Trino stores them.
+    // A file another tool wrote with the padding (and a longer value): read
+    // cut to 5 characters and without trailing spaces, equal to what the
+    // engine wrote.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("ch", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![6, 7, 8])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["ab   ", "abcd efg", "     "])),
+        ],
+    )
+    .unwrap();
+    lake.put_file("ch", "20200101_000000_00000_other", &batch);
+    assert_eq!(
+        lake.ok("SELECT id, ch, length(ch), ch = 'ab' FROM hive.s.ch WHERE id > 5 ORDER BY id")
+            .await,
+        rows(&[
+            &["6", "ab", "2", "true"],
+            &["7", "abcd", "4", "false"],
+            &["8", "", "0", "false"],
+        ])
+    );
+    assert_eq!(
+        lake.ok("SELECT ch, count(*) FROM hive.s.ch WHERE ch IN ('ab', '') GROUP BY ch ORDER BY 1")
+            .await,
+        rows(&[&["", "2"], &["ab", "2"]])
+    );
+    // What Trino stored, read back as it is stored: without trailing spaces.
     lake.ok("CREATE TABLE hive.s.t AS SELECT CAST(1 AS BIGINT) AS id, 'ab' AS ch")
         .await;
     lake.patch("t", |m| m["dataColumns"][1]["type"] = "char(5)".into());
     assert_eq!(
         lake.ok("SELECT id, ch, length(ch) FROM hive.s.t").await,
-        rows(&[&["1", "ab   ", "5"]])
+        rows(&[&["1", "ab", "2"]])
     );
 }
 

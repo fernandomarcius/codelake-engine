@@ -148,8 +148,9 @@ fn fit_varchar(array: &ArrayRef, length: usize) -> Result<ArrayRef> {
     Ok(Arc::new(fitted))
 }
 
-/// Values of a `char(n)` column as Trino stores them: trailing spaces
-/// removed (reads pad them back); a longer value fails like Trino's `INSERT`.
+/// Values of a `char(n)` column as Trino stores them (and the engine holds
+/// them): trailing spaces removed; a longer value fails like Trino's
+/// `INSERT`.
 fn fit_char(array: &ArrayRef, length: usize) -> Result<ArrayRef> {
     let text = cast(array, &DataType::Utf8)?;
     let text = text.as_string::<i32>();
@@ -299,7 +300,8 @@ pub(crate) fn external(err: impl std::error::Error + Send + Sync + 'static) -> D
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reading {
     /// As the table shows them: timestamps rounded half up to the table's
-    /// units, `varchar(n)` values cut, `char(n)` values padded.
+    /// units, `varchar(n)` values cut, `char(n)` values cut and without
+    /// trailing spaces.
     Table,
     /// As they are stored (compaction must not change them).
     Raw,
@@ -624,7 +626,7 @@ impl TableProvider for HiveTable {
 
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Result<Vec<TableProviderFilterPushDown>> {
         // Applied again above the scan: a filter on a char column never
-        // prunes by statistics of the stored (unpadded) text (`types.rs`).
+        // prunes by statistics of the stored text (`types.rs`).
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 

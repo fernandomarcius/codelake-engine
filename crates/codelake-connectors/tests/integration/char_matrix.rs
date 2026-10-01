@@ -1,6 +1,12 @@
 //! `char(n)` semantics against Trino 431: every operation of a matrix, over
 //! every kind of operand and every origin of the char value, answers Trino's
-//! rows (`codelake_core::char_semantics`).
+//! rows (`codelake_core::char_semantics`) without the padding of char values
+//! (ISS-059): Trino's values are compared without trailing spaces (every
+//! column the matrix outputs is a char value, a number or a boolean), its
+//! `x || y` of char values as `rtrim(x, ' ') || y` and its `length(ch)` as
+//! `length(rtrim(ch, ' '))`, the char values as the engine holds them. The
+//! engine's values are compared as they are: one with trailing spaces
+//! differs.
 //!
 //! - operations: comparisons (`=`, `<>`, `<`, `>=`, `IS DISTINCT FROM`,
 //!   `IN`, `BETWEEN`, simple `CASE`), values in a common type (`CASE`,
@@ -82,6 +88,26 @@ const OTHERS: &[(&str, &str, &str)] = &[
 
 /// The other operand, a literal.
 const LITERALS: &[&str] = &["'ab'", "'ab  '", "'a'", "'abcdefg'", "'ab' || chr(9)", "NULL"];
+
+/// Trino's side of an operation of one row, the padding left out: `||`
+/// concatenates the char values without trailing spaces (the engine
+/// concatenates them as it holds them); the original expression is kept in
+/// a `typeof` at the end of the row, so Trino fails where it fails
+/// (`char(65541)`, an untyped `NULL`). `None`: Trino's expression is the
+/// engine's.
+fn unpadded_on_trino(op: &str, other: &str, b: &str) -> Option<(String, String)> {
+    (op == "||").then(|| {
+        let b = if other.starts_with("char") {
+            format!("rtrim({b}, ' ')")
+        } else {
+            b.to_owned()
+        };
+        (
+            format!("rtrim(x.ch, ' ') || {b}"),
+            "typeof(x.ch || {b})".to_owned(),
+        )
+    })
+}
 
 /// Operations of one row: `{a}` the char value, `{b}` the other operand.
 const ROW_OPS: &[(&str, &str)] = &[
@@ -241,12 +267,12 @@ struct Case {
 fn row_cases() -> Vec<Case> {
     let mut out = Vec::new();
     for (origin, codelake, trino) in origins() {
-        let mut add = |columns: Vec<Option<String>>, template: String| {
+        let mut add = |columns: Vec<Option<String>>, template: String, trino_template: String| {
             out.push(Case {
                 origin,
                 columns,
                 codelake: template.replace("{C}", &codelake),
-                trino: template.replace("{C}", &trino),
+                trino: trino_template.replace("{C}", &trino),
             });
         };
         let operands = OTHERS
@@ -289,33 +315,48 @@ fn row_cases() -> Vec<Case> {
                     .iter()
                     .map(|(_, e)| e.replace("{a}", "x.ch").replace("{b}", &b))
                     .collect();
+                let mut trino_exprs = Vec::with_capacity(exprs.len());
+                let mut checks = Vec::new();
+                for ((op, _), e) in group.iter().zip(&exprs) {
+                    match unpadded_on_trino(op, &other, &b) {
+                        Some((expr, check)) => {
+                            trino_exprs.push(expr);
+                            checks.push(check.replace("{b}", &b));
+                        }
+                        None => trino_exprs.push(e.clone()),
+                    }
+                }
+                trino_exprs.extend(checks);
                 let mut columns = vec![None; keys];
                 columns.extend(group.iter().map(|(op, _)| Some(format!("{op} / {other}"))));
                 let order: Vec<String> = (1..=keys).map(|k| k.to_string()).collect();
-                add(
-                    columns,
+                let query = |exprs: &[String]| {
                     format!(
                         "SELECT {ids}, {} FROM {{C}} x{join} ORDER BY {}",
                         exprs.join(", "),
                         order.join(", ")
-                    ),
-                );
+                    )
+                };
+                add(columns, query(&exprs), query(&trino_exprs));
             }
         }
-        add(
-            vec![None, Some("VALUES / literal".into())],
+        let same = |sql: &str| (sql.to_owned(), sql.to_owned());
+        let (values, values_trino) = same(
             "SELECT v, count(*) FROM (SELECT ch AS v FROM {C} x UNION ALL SELECT * FROM (VALUES ('ab '), ('a'))) \
-             GROUP BY v ORDER BY 1"
-                .into(),
+             GROUP BY v ORDER BY 1",
+        );
+        add(vec![None, Some("VALUES / literal".into())], values, values_trino);
+        let (types, types_trino) = same(
+            "SELECT typeof(ch), typeof(max(ch)), typeof(coalesce(ch, 'x')), typeof(ch || 'x') FROM {C} x \
+             GROUP BY ch ORDER BY 1 LIMIT 1",
         );
         add(
             ["typeof", "typeof max", "typeof coalesce", "typeof ||"]
                 .into_iter()
                 .map(|c| Some(c.to_owned()))
                 .collect(),
-            "SELECT typeof(ch), typeof(max(ch)), typeof(coalesce(ch, 'x')), typeof(ch || 'x') FROM {C} x \
-             GROUP BY ch ORDER BY 1 LIMIT 1"
-                .into(),
+            types,
+            types_trino,
         );
     }
     out
@@ -328,11 +369,13 @@ fn set_cases() -> Vec<Case> {
         for (other, relation, column) in OTHERS {
             for (op, template) in SET_OPS {
                 let template = template.replace("{Y}", relation).replace("{y}", column);
+                // The length of the value without its padding.
+                let trino_template = template.replace("length(ch)", "length(rtrim(ch, ' '))");
                 out.push(Case {
                     origin,
                     columns: vec![Some(format!("{op} / {other}"))],
                     codelake: template.replace("{C}", &codelake),
-                    trino: template.replace("{C}", &trino),
+                    trino: trino_template.replace("{C}", &trino),
                 });
             }
         }
@@ -358,6 +401,14 @@ fn column(rows: &Rows, index: usize) -> Vec<Option<&String>> {
     rows.iter().map(|row| row.get(index)).collect()
 }
 
+/// Trino's rows without the padding of char values: every value without
+/// trailing spaces (see the module documentation).
+fn unpadded(rows: &Rows) -> Rows {
+    rows.iter()
+        .map(|row| row.iter().map(|v| v.trim_end_matches(' ').to_owned()).collect())
+        .collect()
+}
+
 /// The outcome of each operation of `case`: the rows of its column (and
 /// the columns that identify them) compared.
 fn outcomes(
@@ -377,6 +428,7 @@ fn outcomes(
         .map(|(i, op)| {
             let result = match (codelake, trino) {
                 (Ok(a), Ok(b)) => {
+                    let b = &unpadded(b);
                     let same = if whole {
                         a == b
                     } else {

@@ -1,6 +1,6 @@
 //! `char(n)` on the PostgreSQL wire: a column or a cast of that type is
 //! refused (`0A000`) on both protocols, where it would create unbounded text
-//! or answer an unpadded value (ADR 0015); the session keeps working.
+//! or a value compared as text (ADR 0015); the session keeps working.
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

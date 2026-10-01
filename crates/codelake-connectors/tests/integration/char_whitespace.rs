@@ -2,7 +2,10 @@
 //! feed, carriage return, vertical tab, form feed, U+001C, U+0085, U+00A0,
 //! U+2003, U+3000), read from a hive table Trino wrote and through views
 //! (written by Trino and by the engine), against Trino 431: only trailing
-//! spaces are padding, every other character is part of the value.
+//! spaces are padding, every other character is part of the value. The
+//! engine never pads (ISS-059): Trino's `CAST(ch AS varchar)` and
+//! `length(ch)` are compared as `rtrim(ch, ' ')` (only spaces) and its
+//! length.
 
 use super::{Rows, Shared, cl_try, note};
 
@@ -32,6 +35,14 @@ const QUERIES: &[&str] = &[
 ];
 
 const RELATIONS: &[&str] = &["hive.s.ws", "hive.s.wsv", "hive.s.ewv"];
+
+/// Trino's side of `sql`, the padding left out (see the module
+/// documentation).
+fn unpadded_on_trino(sql: &str) -> String {
+    sql.replace("CAST(ch AS varchar)", "rtrim(ch, ' ')")
+        .replace("length(ch)", "length(rtrim(ch, ' '))")
+        .replace("to_utf8(v)", "to_utf8(rtrim(v, ' '))")
+}
 
 fn compare(
     wrong: &mut Vec<String>,
@@ -63,7 +74,8 @@ async fn w1t_char_values_ending_in_whitespace_like_trino_431() {
             "SELECT id, to_hex(to_utf8(v)), length(ch) FROM hive.s.wsv2 ORDER BY 1".to_owned(),
         ))
         .collect();
-    let answers = s.trino.sql_batch(&statements).await;
+    let oracle: Vec<String> = statements.iter().map(|q| unpadded_on_trino(q)).collect();
+    let answers = s.trino.sql_batch(&oracle).await;
     for (sql, trino) in statements.iter().zip(answers) {
         let codelake = cl_try(&s.engine, sql).await;
         compare(&mut wrong, sql, &codelake, &trino);

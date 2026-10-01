@@ -13,8 +13,9 @@
 //!   pandas or a Trino catalog at another precision) are rounded half up, as
 //!   Trino reads them; Arrow's cast would cut them;
 //! - `varchar(n)` values longer than `n` are cut to `n` characters, as Trino's
-//!   reader does; `char(n)` values are padded with spaces to `n` characters,
-//!   as Trino shows them.
+//!   reader does; `char(n)` values too, and without trailing spaces (Trino
+//!   shows them padded with spaces to `n` characters; the engine does not,
+//!   `codelake_core::char_semantics`).
 //!
 //! `DataFusion`'s default adapter matches names exactly and casts whatever
 //! Arrow can cast. This one renames the table's columns to the file's
@@ -122,8 +123,8 @@ enum Read {
     Round(TimeUnit, Option<Arc<str>>),
     /// Cut to this many characters.
     Cut(usize),
-    /// A `char(n)`: trailing spaces removed, cut to `n`, padded to `n`.
-    Pad(usize),
+    /// A `char(n)`: cut to `n`, without trailing spaces.
+    Char(usize),
     /// `INT96` instants as the zone's wall-clock time, in this unit (the
     /// stored one, or a finer one).
     Local(ParquetTimeZone, TimeUnit),
@@ -159,21 +160,18 @@ impl fmt::Display for HiveRead {
         match &self.read {
             Read::Round(unit, _) => write!(f, "hive_round({}, {unit:?})", self.child),
             Read::Cut(length) => write!(f, "hive_varchar({}, {length})", self.child),
-            Read::Pad(length) => write!(f, "hive_char({}, {length})", self.child),
+            Read::Char(length) => write!(f, "hive_char({}, {length})", self.child),
             Read::Local(zone, _) => write!(f, "hive_local({}, {zone})", self.child),
             Read::Instant(zone, _) => write!(f, "hive_instant({}, {zone})", self.child),
         }
     }
 }
 
-/// A `char(n)` value as Trino shows it: without its trailing spaces, cut to
-/// `n` characters, then padded with spaces to `n`.
-pub(crate) fn pad_char(value: &str, length: usize) -> String {
-    let trimmed = value.trim_end_matches(' ');
-    let mut padded: String = trimmed.chars().take(length).collect();
-    let count = padded.chars().count();
-    padded.extend(std::iter::repeat_n(' ', length.saturating_sub(count)));
-    padded
+/// A `char(n)` value as the engine holds it: cut to `n` characters, without
+/// trailing spaces.
+pub(crate) fn char_value(value: &str, length: usize) -> String {
+    let cut: String = value.chars().take(length).collect();
+    codelake_core::char_semantics::unpadded(&cut).to_owned()
 }
 
 impl PhysicalExpr for HiveRead {
@@ -182,7 +180,7 @@ impl PhysicalExpr for HiveRead {
         let data_type = match &self.read {
             Read::Round(unit, zone) => DataType::Timestamp(*unit, zone.clone()),
             Read::Local(_, unit) | Read::Instant(_, unit) => DataType::Timestamp(*unit, None),
-            Read::Cut(_) | Read::Pad(_) => DataType::Utf8,
+            Read::Cut(_) | Read::Char(_) => DataType::Utf8,
         };
         Ok(Arc::new(child.as_ref().clone().with_data_type(data_type)))
     }
@@ -207,14 +205,14 @@ impl PhysicalExpr for HiveRead {
                     .collect();
                 Arc::new(cut)
             }
-            Read::Pad(length) => {
+            Read::Char(length) => {
                 let text = cast(&values, &DataType::Utf8)?;
                 let text = text.as_string::<i32>();
-                let padded: StringArray = text
+                let chars: StringArray = text
                     .iter()
-                    .map(|value| value.map(|v| pad_char(v, *length)))
+                    .map(|value| value.map(|v| char_value(v, *length)))
                     .collect();
-                Arc::new(padded)
+                Arc::new(chars)
             }
         };
         Ok(ColumnarValue::Array(read))
@@ -455,7 +453,7 @@ impl PhysicalExprAdapterFactory for HiveColumns {
                 }
                 _ => declared_length(field)
                     .map(Read::Cut)
-                    .or_else(|| char_column(field).map(Read::Pad))
+                    .or_else(|| char_column(field).map(Read::Char))
                     .into_iter()
                     .collect(),
             };
@@ -669,18 +667,21 @@ mod tests {
     }
 
     #[test]
-    fn char_values_read_padded_like_trino() {
-        assert_eq!(pad_char("ab", 5), "ab   ");
-        assert_eq!(pad_char("abcde  ", 5), "abcde");
-        assert_eq!(pad_char("", 2), "  ");
-        assert_eq!(pad_char("abcdef", 3), "abc");
-        assert_eq!(pad_char("ç", 2), "ç ");
+    fn char_values_read_without_padding() {
+        assert_eq!(char_value("ab", 5), "ab");
+        assert_eq!(char_value("ab   ", 5), "ab");
+        assert_eq!(char_value("abcde  ", 5), "abcde");
+        assert_eq!(char_value("  ", 2), "");
+        assert_eq!(char_value("", 2), "");
+        assert_eq!(char_value("abcdef", 3), "abc");
+        assert_eq!(char_value("ab cd", 3), "ab");
+        assert_eq!(char_value("ç ", 2), "ç");
         // Only spaces are padding: a trailing tab, line feed or ideographic
         // space is part of the value (Trino 431 reads 'a' || chr(9) as
         // 'a\t   ' in a char(5) column).
-        assert_eq!(pad_char("a\t", 5), "a\t   ");
-        assert_eq!(pad_char("a\n  ", 3), "a\n ");
-        assert_eq!(pad_char("a\u{3000}", 3), "a\u{3000} ");
+        assert_eq!(char_value("a\t", 5), "a\t");
+        assert_eq!(char_value("a\n  ", 3), "a\n");
+        assert_eq!(char_value("a\u{3000}", 3), "a\u{3000}");
     }
 
     #[test]

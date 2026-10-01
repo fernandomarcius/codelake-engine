@@ -1416,22 +1416,23 @@ impl AggregateUDFImpl for Avg {
     }
 }
 
+/// `max_by` (`max`) or `min_by`.
+pub(crate) fn by(max: bool) -> AggregateUDF {
+    AggregateUDF::from(By {
+        signature: Signature::user_defined(Volatility::Immutable),
+        name: if max { "max_by" } else { "min_by" },
+        max,
+    })
+}
+
 pub(crate) fn udafs() -> Vec<AggregateUDF> {
     let user_defined = || Signature::user_defined(Volatility::Immutable);
     vec![
         AggregateUDF::from(Checksum {
             signature: user_defined(),
         }),
-        AggregateUDF::from(By {
-            signature: user_defined(),
-            name: "max_by",
-            max: true,
-        }),
-        AggregateUDF::from(By {
-            signature: user_defined(),
-            name: "min_by",
-            max: false,
-        }),
+        by(true),
+        by(false),
         AggregateUDF::from(CountIf {
             signature: user_defined(),
         }),
