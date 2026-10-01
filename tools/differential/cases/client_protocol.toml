@@ -1,0 +1,155 @@
+# What a client of the HTTP statement protocol reads besides the rows. The .NET driver
+# (NH.Trino.Data.ADO, used by the Warehouse API) failed with NullReferenceException where
+# the reference engine answers: it follows the first nextUri without reading anything
+# else of the submission's response, and CodeLake answered statements that need no
+# execution (USE, SET SESSION, PREPARE, a kill) and failures found before execution in
+# that response, without a nextUri (the harness refuses such an answer: NO_NEXT_URI).
+# Column names keep the case they are written with (the driver hands them to the API,
+# whose JSON keys are case-sensitive), and a TIME literal has the precision of its digits
+# (the driver cannot read the nine digits of time(9)).
+
+oracle = "trino"
+compare = "multiset"
+
+setup = [
+  "CREATE SCHEMA IF NOT EXISTS {c}.cpt",
+]
+
+# ---------------------------------------------------------------- answered at once
+
+[[case]]
+id = "CP1"
+sql = "USE {c}.cpt"
+
+[[case]]
+id = "CP2"
+sql = "SET SESSION query_max_run_time = '10m'"
+
+[[case]]
+id = "CP3"
+sql = "RESET SESSION query_max_run_time"
+
+[[case]]
+id = "CP4"
+sql = "PREPARE cp_q FROM SELECT ? AS p"
+
+[[case]]
+id = "CP5"
+sql = "SET SESSION no_such_property = '1'"
+note = "INVALID_SESSION_PROPERTY on both, after the first nextUri"
+
+[[case]]
+id = "CP6"
+sql = "DEALLOCATE PREPARE cp_missing"
+note = "NOT_FOUND on both"
+
+[[case]]
+id = "CP7"
+sql = "EXECUTE cp_missing"
+
+[[case]]
+id = "CP8"
+sql = "EXECUTE IMMEDIATE 'SELECT ? AS p' USING 1, 2"
+note = "too many parameters: refused before execution"
+
+[[case]]
+id = "CP9"
+sql = "EXECUTE IMMEDIATE 'SELECT ? AS p' USING 45"
+
+[[case]]
+id = "CP10"
+sql = "CALL system.runtime.kill_query(query_id => '20260101_000000_00000_xxxxx', message => 'x')"
+
+[[case]]
+id = "CP11"
+sql = "USE {c}.cpt_missing"
+
+# ---------------------------------------------------------------- column names
+
+[[case]]
+id = "CN1"
+sql = "SELECT 1 AS FirstDay, 2 AS valorSistemaBase, 3 AS \"Data_Rec\", 4 lastDay"
+
+[[case]]
+id = "CN2"
+sql = "SELECT 1, 'a', x FROM (VALUES 1) t(x)"
+
+[[case]]
+id = "CN3"
+sql = "SELECT X, t.X, T.y, \"x\" FROM (VALUES (1, 2)) t(x, y)"
+
+[[case]]
+id = "CN4"
+sql = "WITH c AS (SELECT 1 AS Foo) SELECT Foo, foo AS Bar FROM c"
+
+[[case]]
+id = "CN5"
+sql = "SELECT 1 AS Abc UNION ALL SELECT 2 AS Xyz"
+
+[[case]]
+id = "CN6"
+sql = "SELECT x AS ValorX FROM (VALUES 2, 1) t(x) ORDER BY ValorX"
+compare = "ordered"
+
+[[case]]
+id = "CN7"
+sql = "SELECT x AS Chave, count(*) AS Total, sum(x) FROM (VALUES 1, 1, 2) t(x) GROUP BY x"
+
+[[case]]
+id = "CN8"
+sql = "SELECT x AS Primeiro, *, y AS Ultimo FROM (VALUES (1, 2)) t(x, y)"
+
+[[case]]
+id = "CN9"
+sql = "SELECT FirstDay AS Dia, FirstDay FROM (SELECT 1 AS FirstDay) s"
+
+[[case]]
+id = "CN10"
+sql = "SELECT 1 AS \"Ação\", 2 AS \"Espaço Livre\""
+
+[[case]]
+id = "CN11"
+sql = "SELECT * FROM (SELECT 1 AS FirstDay, 2 AS b) s"
+expect = "NOME"
+known = "ISS-018 choice 3: a * expands to the engine's folded names"
+
+[[case]]
+id = "CN12"
+sql = "SELECT * FROM (VALUES 1) t(MinhaCol)"
+expect = "NOME"
+known = "ISS-018 choice 3: a * expands to the engine's folded names"
+
+# ---------------------------------------------------------------- time literals
+
+[[case]]
+id = "CT1"
+sql = "SELECT TIME '12:34:56' AS a, TIME '12:34' AS b, TIME '12:34:56.789' AS c, TIME '12:34:56.123456' AS d, TIME '12:34:56.123456789' AS e"
+
+[[case]]
+id = "CT2"
+sql = "SELECT TIME '12:34:56.7' AS a"
+
+[[case]]
+id = "CT3"
+sql = "SELECT TIME '12:34:56.1234' AS a"
+
+[[case]]
+id = "CT5"
+sql = "SELECT TIME '12:34:56.789' < TIME '12:34:57' AS a, TIME '12:34:56.789' = TIME '12:34:56.789000' AS b, TIME '12:34:56' = TIME '12:34:56.000000001' AS c"
+
+[[case]]
+id = "CT6"
+sql = "SELECT hour(TIME '12:34:56.789') AS h, minute(TIME '12:34:56.789') AS m, second(TIME '12:34:56.789') AS s, millisecond(TIME '12:34:56.789') AS ms"
+
+[[case]]
+id = "CT7"
+sql = "SELECT CAST(TIME '12:34:56.789' AS varchar) AS a, CAST(TIME '12:34:56' AS varchar) AS b"
+
+[[case]]
+id = "CT8"
+sql = "SELECT t FROM (VALUES TIME '12:00:00.250', TIME '08:30:00.125') v(t) ORDER BY t"
+compare = "ordered"
+
+[[case]]
+id = "CT9"
+sql = "SELECT date_diff('millisecond', TIME '12:00:00', TIME '12:00:01.500') AS a"

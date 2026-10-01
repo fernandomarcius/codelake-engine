@@ -8,14 +8,16 @@ Outcomes (the report and docs/differential.md use these names):
   ERRO    both refused, with different errors (Trino errorName / SQLSTATE)
   ORDEM   same multiset of rows, different order, where the case asks for order
   TIPO    same rows, different column types
+  NOME    same rows and types, different column names (case counts)
   TRAVA   CodeLake gave no answer in time (the connection is dropped)
 """
 
 import json
 
-OUTCOMES = ("OK", "WRONG", "RECUSA", "EXTRA", "ERRO", "ORDEM", "TIPO", "TRAVA")
+OUTCOMES = ("OK", "WRONG", "RECUSA", "EXTRA", "ERRO", "ORDEM", "TIPO", "NOME", "TRAVA")
 # Worst first: a session's outcome is its worst step.
-SEVERITY = {"WRONG": 0, "TRAVA": 1, "EXTRA": 2, "RECUSA": 3, "ERRO": 4, "ORDEM": 5, "TIPO": 6, "OK": 7}
+SEVERITY = {"WRONG": 0, "TRAVA": 1, "EXTRA": 2, "RECUSA": 3, "ERRO": 4, "ORDEM": 5, "TIPO": 6, "NOME": 7,
+            "OK": 8}
 
 
 def canonical(value):
@@ -68,6 +70,9 @@ def classify(oracle, codelake, ordered=False, compare_types=True):
             return "ORDEM"
     if compare_types and "types" in oracle and "types" in codelake and oracle["types"] != codelake["types"]:
         return "TIPO"
+    # The header is compared with the types: names as the client reads them.
+    if compare_types and "names" in oracle and "names" in codelake and oracle["names"] != codelake["names"]:
+        return "NOME"
     return "OK"
 
 

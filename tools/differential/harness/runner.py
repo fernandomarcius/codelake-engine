@@ -42,6 +42,8 @@ def short(result, limit=1200):
         out["rows_total"] = len(result["rows"])
     if "types" in result:
         out["types"] = result["types"]
+    if "names" in result:
+        out["names"] = result["names"]
     return out
 
 
