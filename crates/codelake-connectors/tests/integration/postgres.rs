@@ -404,3 +404,458 @@ async fn zoned_timestamp_literals_reach_postgresql_as_instants() {
     let sql = "SELECT max(at) FROM erp.public.t WHERE at < TIMESTAMP '2026-09-14 06:00:00.000001'";
     assert_eq!(rows(&engine, sql).await, [["2026-09-14T06:00:00Z"]]);
 }
+
+async fn client(host: &str, port: u16, user: &str, password: &str) -> tokio_postgres::Client {
+    let dsn = format!("host={host} port={port} user={user} password={password} dbname=postgres");
+    let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    client
+}
+
+fn connector_as(host: &str, port: u16, user: &str, password: &str) -> PostgresConnector {
+    PostgresConnector::new(
+        "erp".into(),
+        PostgresParams {
+            host: host.into(),
+            port,
+            database: "postgres".into(),
+            user: user.into(),
+            password: SecretString::from(password.to_owned()),
+            sslmode: "disable".into(),
+        },
+    )
+}
+
+/// One relation of each kind a query reads, the hub's views among them, all
+/// over the same rows; and objects that are not relations.
+const RELATIONS: &str = "
+    CREATE SCHEMA cat;
+    CREATE TABLE cat.base_t (id INT NOT NULL, label TEXT, ts TIMESTAMPTZ);
+    INSERT INTO cat.base_t VALUES (1, 'a', '2026-09-01 12:00:00+00'), (2, 'b', NULL);
+    CREATE VIEW cat.a_view AS SELECT * FROM cat.base_t;
+    CREATE MATERIALIZED VIEW cat.a_matview AS SELECT * FROM cat.base_t;
+    CREATE TABLE cat.a_part (id INT, label TEXT, ts TIMESTAMPTZ) PARTITION BY RANGE (id);
+    CREATE TABLE cat.a_part_1 PARTITION OF cat.a_part FOR VALUES FROM (0) TO (100);
+    INSERT INTO cat.a_part SELECT * FROM cat.base_t;
+    CREATE TABLE cat.empty_part (id INT, label TEXT) PARTITION BY RANGE (id);
+    CREATE EXTENSION postgres_fdw;
+    CREATE SERVER loopback FOREIGN DATA WRAPPER postgres_fdw OPTIONS (dbname 'postgres');
+    CREATE USER MAPPING FOR PUBLIC SERVER loopback OPTIONS (user 'postgres', password 'postgres');
+    CREATE FOREIGN TABLE cat.a_foreign (id INT, label TEXT, ts TIMESTAMPTZ)
+        SERVER loopback OPTIONS (schema_name 'cat', table_name 'base_t');
+    CREATE SEQUENCE cat.a_seq;
+    CREATE INDEX a_idx ON cat.base_t (id);
+    CREATE TYPE cat.pair AS (x INT, y TEXT);
+    CREATE TABLE cat.no_grant (id INT);
+    CREATE SCHEMA hidden;
+    CREATE TABLE hidden.h (id INT);
+    CREATE ROLE limited LOGIN PASSWORD 'limited';
+    GRANT USAGE ON SCHEMA cat TO limited;
+    GRANT SELECT ON cat.base_t, cat.a_view TO limited;";
+
+#[tokio::test]
+async fn views_materialized_views_foreign_and_partitioned_tables_are_relations() {
+    let container = Postgres::default().with_tag("17-alpine").start().await.unwrap();
+    let host = common::host();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    client(&host, port, "postgres", "postgres")
+        .await
+        .batch_execute(RELATIONS)
+        .await
+        .unwrap();
+
+    let spill = tempfile::tempdir().unwrap();
+    let mut engine = common::engine(spill.path());
+    common::attach(&mut engine, Arc::new(connector(&host, port))).await;
+
+    // Every relation kind, partitions too; not sequences, indexes nor types.
+    let tables = common::query(
+        &engine,
+        "SELECT table_name, table_type FROM erp.information_schema.tables \
+         WHERE table_schema = 'cat' ORDER BY table_name",
+    )
+    .await;
+    let names: Vec<&str> = tables
+        .lines()
+        .filter_map(|l| l.strip_prefix("| "))
+        .filter_map(|l| l.split(' ').next())
+        .filter(|n| *n != "table_name")
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "a_foreign",
+            "a_matview",
+            "a_part",
+            "a_part_1",
+            "a_view",
+            "base_t",
+            "empty_part",
+            "no_grant"
+        ],
+        "{tables}"
+    );
+    assert!(
+        !tables.contains("VIEW |"),
+        "listed as tables, as the reference engine does:\n{tables}"
+    );
+
+    for relation in ["base_t", "a_view", "a_matview", "a_part", "a_part_1", "a_foreign"] {
+        let rows = common::query(
+            &engine,
+            &format!("SELECT id, label, ts FROM erp.cat.{relation} ORDER BY id"),
+        )
+        .await;
+        assert!(
+            rows.contains("| 1  | a     | 2026-09-01T12:00:00Z |") && rows.contains("| 2  | b     |"),
+            "{relation}:\n{rows}"
+        );
+    }
+    // Columns come from the catalog, not from a row: an empty partitioned
+    // table has them.
+    let columns = common::query(
+        &engine,
+        "SELECT column_name, data_type FROM erp.information_schema.columns \
+         WHERE table_schema = 'cat' AND table_name IN ('empty_part', 'a_foreign') \
+         ORDER BY table_name, ordinal_position",
+    )
+    .await;
+    for line in [
+        "| id          | integer                     |",
+        "| label       | varchar                     |",
+        "| ts          | timestamp(9) with time zone |",
+    ] {
+        assert!(columns.contains(line), "{line}:\n{columns}");
+    }
+    assert_eq!(columns.matches("| id ").count(), 2, "{columns}");
+    let empty = common::query(&engine, "SELECT count(*) AS n FROM erp.cat.empty_part").await;
+    assert!(empty.contains("| 0 |"), "{empty}");
+
+    // The source's system schemas: pg_catalog is listed, without relations;
+    // its relations and the source's information_schema are not readable.
+    let schemas = common::query(
+        &engine,
+        "SELECT schema_name FROM erp.information_schema.schemata ORDER BY schema_name",
+    )
+    .await;
+    for schema in ["cat", "hidden", "information_schema", "pg_catalog", "public"] {
+        assert!(schemas.contains(&format!("| {schema}")), "{schema}:\n{schemas}");
+    }
+    assert!(!schemas.contains("pg_toast"), "{schemas}");
+    for missing in [
+        "erp.pg_catalog.pg_class",
+        "erp.cat.a_seq",
+        "erp.cat.a_idx",
+        "erp.cat.pair",
+    ] {
+        let err = engine
+            .context()
+            .sql(&format!("SELECT * FROM {missing}"))
+            .await
+            .expect_err(missing);
+        assert!(err.to_string().contains("not found"), "{missing}: {err}");
+    }
+}
+
+/// Like the reference engine, the listing does not depend on privileges:
+/// what the user may not read is listed and fails at the source when read.
+#[tokio::test]
+async fn relations_the_user_may_not_read_are_listed_and_fail_at_the_source() {
+    let container = Postgres::default().with_tag("17-alpine").start().await.unwrap();
+    let host = common::host();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    client(&host, port, "postgres", "postgres")
+        .await
+        .batch_execute(RELATIONS)
+        .await
+        .unwrap();
+
+    let spill = tempfile::tempdir().unwrap();
+    let mut engine = common::engine(spill.path());
+    common::attach(
+        &mut engine,
+        Arc::new(connector_as(&host, port, "limited", "limited")),
+    )
+    .await;
+    let tables = common::query(
+        &engine,
+        "SELECT table_schema, table_name FROM erp.information_schema.tables \
+         WHERE table_schema IN ('cat', 'hidden') ORDER BY 1, 2",
+    )
+    .await;
+    assert!(tables.contains("| cat          | no_grant"), "{tables}");
+    assert!(tables.contains("| hidden       | h "), "{tables}");
+    let granted = common::query(&engine, "SELECT label FROM erp.cat.a_view WHERE id = 2").await;
+    assert!(granted.contains("| b "), "{granted}");
+    for denied in ["erp.cat.no_grant", "erp.hidden.h"] {
+        let err = engine
+            .context()
+            .sql(&format!("SELECT * FROM {denied}"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .expect_err(denied);
+        assert!(err.to_string().contains("permission denied"), "{denied}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn relations_created_after_boot_are_found_without_a_restart() {
+    let container = Postgres::default().with_tag("17-alpine").start().await.unwrap();
+    let host = common::host();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let admin = client(&host, port, "postgres", "postgres").await;
+    admin
+        .batch_execute("CREATE TABLE public.t (id INT); INSERT INTO t VALUES (1), (2);")
+        .await
+        .unwrap();
+
+    let spill = tempfile::tempdir().unwrap();
+    let mut engine = common::engine(spill.path());
+    common::attach(&mut engine, Arc::new(connector(&host, port))).await;
+
+    // A view created after boot is read by name at once, in any case.
+    admin
+        .batch_execute("CREATE VIEW public.late_view AS SELECT id * 10 AS v FROM t;")
+        .await
+        .unwrap();
+    let rows = common::query(&engine, "SELECT sum(v) AS s FROM erp.public.LATE_VIEW").await;
+    assert!(rows.contains("| 30 |"), "{rows}");
+    let listed = common::query(
+        &engine,
+        "SELECT count(*) AS n FROM erp.information_schema.tables WHERE table_name = 'late_view'",
+    )
+    .await;
+    assert!(listed.contains("| 1 |"), "{listed}");
+
+    // Relations and schemas created after boot are listed once the listing
+    // is older than its time to live; a schema then resolves.
+    admin
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW public.late_mat AS SELECT 7 AS v;
+             CREATE SCHEMA late; CREATE TABLE late.t2 (x INT); INSERT INTO late.t2 VALUES (5);",
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let tables = common::query(
+        &engine,
+        "SELECT table_schema, table_name FROM erp.information_schema.tables \
+         WHERE table_schema IN ('public', 'late') ORDER BY 1, 2",
+    )
+    .await;
+    for line in [
+        "| late         | t2 ",
+        "| public       | late_mat ",
+        "| public       | t ",
+    ] {
+        assert!(tables.contains(line), "{line}:\n{tables}");
+    }
+    let rows = common::query(&engine, "SELECT x FROM erp.late.t2").await;
+    assert!(rows.contains("| 5 |"), "{rows}");
+
+    // Dropped at the source: no longer listed once read again.
+    admin.batch_execute("DROP VIEW public.late_view;").await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let listed = common::query(
+        &engine,
+        "SELECT count(*) AS n FROM erp.information_schema.tables WHERE table_name = 'late_view'",
+    )
+    .await;
+    assert!(listed.contains("| 0 |"), "{listed}");
+}
+
+const ARRAYS: &str = "
+    CREATE TYPE mood AS ENUM ('ok', 'bad');
+    CREATE TABLE arrays (
+      id INT,
+      a_date DATE[], a_ts TIMESTAMP[], a_ts3 TIMESTAMP(3)[], a_tstz TIMESTAMPTZ[], a_time TIME[],
+      a_num2 NUMERIC(10,2)[], a_text TEXT[], a_varchar VARCHAR[], a_varchar10 VARCHAR(10)[],
+      a_char CHAR(3)[], a_ichar \"char\"[], a_name NAME[], a_i2 SMALLINT[], a_i4 INT[], a_i8 BIGINT[],
+      a_f4 REAL[], a_f8 DOUBLE PRECISION[], a_bool BOOLEAN[], a_uuid UUID[], a_json JSON[],
+      a_jsonb JSONB[], a_money MONEY[], a_mood mood[], a_2d INT[][],
+      a_num NUMERIC[], a_bytea BYTEA[], a_interval INTERVAL[], a_inet INET[], a_oid OID[]
+    );
+    INSERT INTO arrays VALUES (1,
+      ARRAY[DATE '2026-09-01', NULL, DATE '2026-09-30'], ARRAY[TIMESTAMP '2026-09-01 10:11:12.123456'],
+      ARRAY[TIMESTAMP '2026-09-01 10:11:12.123'], ARRAY[TIMESTAMPTZ '2026-09-01 10:11:12.5+00'],
+      ARRAY[TIME '10:11:12'], ARRAY[1.5, NULL, -2.25]::NUMERIC(10,2)[], ARRAY['a', NULL, 'c'],
+      ARRAY['v']::VARCHAR[], ARRAY['v10']::VARCHAR(10)[], ARRAY['ab']::CHAR(3)[], ARRAY['x']::\"char\"[],
+      ARRAY['n']::NAME[], ARRAY[1, 2]::SMALLINT[], ARRAY[1, NULL, 3], ARRAY[9223372036854775807, -1],
+      ARRAY[1.5]::REAL[], ARRAY[2.5, 'NaN', '-Infinity']::FLOAT8[], ARRAY[true, NULL],
+      ARRAY['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID], ARRAY['{\"a\":1}'::JSON],
+      ARRAY['{\"a\": 1}'::JSONB], ARRAY[1.5::MONEY], ARRAY['ok'::mood], ARRAY[[1, 2], [3, 4]],
+      ARRAY[1.5], ARRAY['\\x01'::BYTEA], ARRAY[INTERVAL '1 day'], ARRAY['10.0.0.1'::INET], ARRAY[1::OID]),
+      (2, NULL, '{}', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+       NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    CREATE VIEW arrays_view AS SELECT * FROM arrays;";
+
+async fn assert_contains(engine: &codelake_core::Engine, sql: &str, values: &[&str]) {
+    let rows = common::query(engine, sql).await;
+    for value in values {
+        assert!(rows.contains(value), "{value}:\n{rows}");
+    }
+}
+
+/// The columns of `ARRAYS` read, with their types (the others are left out).
+const ARRAY_COLUMNS: [(&str, &str); 24] = [
+    ("id", "integer"),
+    ("a_date", "array(date)"),
+    ("a_ts", "array(timestamp(9))"),
+    ("a_ts3", "array(timestamp(9))"),
+    ("a_tstz", "array(timestamp(9) with time zone)"),
+    ("a_time", "array(time(9))"),
+    ("a_num2", "array(decimal(10,2))"),
+    ("a_text", "array(varchar)"),
+    ("a_varchar", "array(varchar)"),
+    ("a_varchar10", "array(varchar)"),
+    ("a_char", "array(varchar)"),
+    ("a_ichar", "array(varchar)"),
+    ("a_name", "array(varchar)"),
+    ("a_i2", "array(smallint)"),
+    ("a_i4", "array(integer)"),
+    ("a_i8", "array(bigint)"),
+    ("a_f4", "array(real)"),
+    ("a_f8", "array(double)"),
+    ("a_bool", "array(boolean)"),
+    ("a_uuid", "array(varchar)"),
+    ("a_json", "array(varchar)"),
+    ("a_jsonb", "array(varchar)"),
+    ("a_money", "array(varchar)"),
+    ("a_mood", "array(varchar)"),
+];
+
+/// Arrays as the reference engine maps them (`array-mapping=AS_ARRAY`): the
+/// types it maps are lists, the others are left out.
+#[tokio::test]
+async fn arrays_of_the_types_the_reference_engine_maps_are_read() {
+    let container = Postgres::default().with_tag("17-alpine").start().await.unwrap();
+    let host = common::host();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    client(&host, port, "postgres", "postgres")
+        .await
+        .batch_execute(ARRAYS)
+        .await
+        .unwrap();
+
+    let spill = tempfile::tempdir().unwrap();
+    let mut engine = common::engine(spill.path());
+    common::attach(&mut engine, Arc::new(connector(&host, port))).await;
+
+    for relation in ["arrays", "arrays_view"] {
+        let columns = common::query(
+            &engine,
+            &format!(
+                "SELECT column_name, data_type FROM erp.information_schema.columns \
+                 WHERE table_name = '{relation}' ORDER BY ordinal_position"
+            ),
+        )
+        .await;
+        let found: Vec<(String, String)> = columns
+            .lines()
+            .skip(3)
+            .filter_map(|l| {
+                let cells: Vec<&str> = l.split('|').map(str::trim).collect();
+                (cells.len() == 4).then(|| (cells[1].to_owned(), cells[2].to_owned()))
+            })
+            .collect();
+        let mut want: Vec<(String, String)> = ARRAY_COLUMNS
+            .iter()
+            .map(|(c, t)| ((*c).to_owned(), (*t).to_owned()))
+            .collect();
+        // Declared dimensions: a view keeps none, read as one.
+        want.push((
+            "a_2d".to_owned(),
+            if relation == "arrays" {
+                "array(array(integer))"
+            } else {
+                "array(integer)"
+            }
+            .to_owned(),
+        ));
+        assert_eq!(found, want, "{relation}:\n{columns}");
+    }
+
+    assert_contains(
+        &engine,
+        "SELECT a_date, a_ts, a_ts3, a_tstz, a_time, a_num2, a_text, a_varchar, a_varchar10, a_char, \
+         a_ichar, a_name FROM erp.public.arrays ORDER BY id",
+        &[
+            "[2026-09-01, , 2026-09-30]",
+            "[2026-09-01T10:11:12.123456]",
+            "[2026-09-01T10:11:12.123]",
+            "[2026-09-01T10:11:12.500Z]",
+            "[10:11:12]",
+            "[1.50, , -2.25]",
+            "[a, , c]",
+            "[v]",
+            "[v10]",
+            "[ab]",
+            "[x]",
+            "[n]",
+        ],
+    )
+    .await;
+    assert_contains(
+        &engine,
+        "SELECT a_i2, a_i4, a_i8, a_f4, a_f8, a_bool, a_uuid, a_json, a_jsonb, a_money, a_mood, a_ts AS empty \
+         FROM erp.public.arrays_view ORDER BY id",
+        &[
+        "[1, 2]",
+        "[1, , 3]",
+        "[9223372036854775807, -1]",
+        "[1.5]",
+        "[2.5, NaN, -inf]",
+        "[true, ]",
+        "[a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11]",
+        "[{\"a\":1}]",
+        "[{\"a\": 1}]",
+        "[$1.50]",
+        "[ok]",
+        "| [] ",
+        ],
+    )
+    .await;
+    let grid = common::query(&engine, "SELECT a_2d FROM erp.public.arrays WHERE id = 1").await;
+    assert!(grid.contains("[[1, 2], [3, 4]]"), "{grid}");
+    // An array next to other columns, filtered and projected at the source.
+    let filtered = common::query(
+        &engine,
+        "SELECT id, a_date FROM erp.public.arrays_view WHERE a_date IS NOT NULL",
+    )
+    .await;
+    assert!(
+        filtered.contains("| 1  | [2026-09-01, , 2026-09-30] |") && !filtered.contains("| 2 "),
+        "{filtered}"
+    );
+}
+
+/// Each connection opens a plain session: no statement the server refuses,
+/// so its log has no `ERROR` from the engine.
+#[tokio::test]
+async fn sessions_leave_no_error_in_the_server_log() {
+    let container = Postgres::default().with_tag("17-alpine").start().await.unwrap();
+    let host = common::host();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    seed(&host, port).await;
+
+    let spill = tempfile::tempdir().unwrap();
+    let mut engine = common::engine(spill.path());
+    common::attach(&mut engine, Arc::new(connector(&host, port))).await;
+    // Several connections of the pool at once.
+    let queries = (0..4).map(|_| {
+        common::query(
+            &engine,
+            "SELECT c.name, o.total FROM erp.public.customers c JOIN erp.public.orders o ON o.customer_id = c.id",
+        )
+    });
+    for rows in futures::future::join_all(queries).await {
+        assert!(rows.contains("Ana"), "{rows}");
+    }
+    let log = String::from_utf8_lossy(&container.stderr_to_vec().await.unwrap()).into_owned();
+    assert!(log.contains("database system is ready"), "{log}");
+    assert!(!log.contains("ERROR"), "{log}");
+}

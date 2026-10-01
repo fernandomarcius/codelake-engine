@@ -17,6 +17,11 @@ postgres = [
   "dep:datafusion-table-providers-postgres",
   "datafusion-table-providers-postgres/federation",
   "dep:datafusion-federation",
+  "dep:bb8",
+  "dep:bb8-postgres",
+  "dep:postgres-native-tls",
+  "dep:native-tls",
+  "dep:futures",
 ]
 mysql = [
   "dep:datafusion-table-providers-common",
@@ -41,6 +46,9 @@ datafusion-table-providers-mysql = { workspace = true, optional = true }
 datafusion-table-providers-mongodb = { workspace = true, optional = true }
 tiberius = { workspace = true, optional = true }
 bb8 = { workspace = true, optional = true }
+bb8-postgres = { workspace = true, optional = true }
+postgres-native-tls = { workspace = true, optional = true }
+native-tls = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true, features = ["compat"] }
 futures = { workspace = true, optional = true }
 datafusion-federation = { workspace = true, optional = true }

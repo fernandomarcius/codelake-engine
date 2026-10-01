@@ -44,8 +44,8 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 use datafusion_federation::sql::{
     LogicalOptimizer, RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
 };
+use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers_common::sql::sql_provider_datafusion::SqlTable;
-use datafusion_table_providers_postgres::DynPostgresConnectionPool;
 
 /// Which plan nodes PostgreSQL may evaluate.
 #[derive(Debug, Default)]
@@ -523,8 +523,8 @@ impl<E: SQLExecutor + 'static> SQLExecutor for PostgresExecutor<E> {
 
 /// The remote table `reference` as a federated provider whose sub-plans go
 /// through [`PostgresPolicy`].
-pub(crate) async fn table_provider(
-    pool: &Arc<DynPostgresConnectionPool>,
+pub(crate) async fn table_provider<T: 'static, P: 'static>(
+    pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
     reference: TableReference,
 ) -> Result<Arc<dyn TableProvider>> {
     let table = SqlTable::new("postgres", pool, reference.clone())
