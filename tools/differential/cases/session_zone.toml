@@ -1,0 +1,67 @@
+# The session time zone the client sends (X-Trino-Time-Zone, to both engines):
+# `now()`, `current_timestamp`, `current_timestamp(p)` and `from_unixtime` are
+# `timestamp with time zone` values in it. CodeLake typed them in UTC, the
+# engine's zone, whatever the client sent: the same instant, shown at another
+# hour (`hour(now())` 12 where Trino answers 9 in America/Sao_Paulo).
+# The current instant differs between the engines, so the cases compare what
+# follows from the zone (types, the zone shown, local hours, differences),
+# never the instant itself.
+
+oracle = "trino"
+time_zone = "America/Sao_Paulo"
+
+[[case]]
+id = "Z1-types"
+sql = "SELECT typeof(now()), typeof(current_timestamp), typeof(current_timestamp(6)), typeof(current_timestamp(0)), typeof(localtimestamp(6)), typeof(localtimestamp)"
+
+[[case]]
+id = "Z2-zone-shown"
+sql = "SELECT CAST(now() AS varchar) LIKE '% America/Sao_Paulo', CAST(current_timestamp AS varchar) LIKE '%.___ America/Sao_Paulo', CAST(current_timestamp(6) AS varchar) LIKE '%.______ America/Sao_Paulo', CAST(current_timestamp(0) AS varchar) LIKE '%:__ America/Sao_Paulo'"
+
+[[case]]
+id = "Z3-local-hour"
+sql = "SELECT hour(now()) = hour(localtimestamp), hour(current_timestamp(6)) = hour(localtimestamp), day(now()) = day(localtimestamp)"
+
+[[case]]
+id = "Z4-cast-to-timestamp"
+sql = "SELECT date_diff('second', CAST(now() AS timestamp), localtimestamp) BETWEEN -2 AND 2, CAST(now() AS date) = current_date, typeof(CAST(now() AS timestamp))"
+
+[[case]]
+id = "Z5-at-time-zone"
+sql = "SELECT now() AT TIME ZONE 'UTC' = now(), CAST(now() AT TIME ZONE 'UTC' AS varchar) LIKE '% UTC', date_diff('hour', CAST(now() AT TIME ZONE 'UTC' AS timestamp), CAST(now() AS timestamp)), date_diff('hour', CAST(now() AT TIME ZONE 'Asia/Tokyo' AS timestamp), CAST(now() AS timestamp))"
+
+[[case]]
+id = "Z6-compared-with-literals"
+sql = "SELECT now() > TIMESTAMP '2026-01-01 00:00:00', now() > TIMESTAMP '2026-01-01 00:00:00 America/Sao_Paulo', now() < TIMESTAMP '2100-01-01 00:00:00 UTC', current_timestamp(6) > TIMESTAMP '2026-01-01 00:00:00.000000 Asia/Tokyo'"
+
+[[case]]
+id = "Z7-from-unixtime"
+sql = "SELECT from_unixtime(0), CAST(from_unixtime(0) AS varchar), hour(from_unixtime(0)), CAST(from_unixtime(0) AS timestamp)"
+
+[[case]]
+id = "Z8-union-typed-while-planning"
+sql = "SELECT typeof(x), CAST(x AS varchar) LIKE '% America/Sao_Paulo' FROM (SELECT now() AS x UNION ALL SELECT current_timestamp)"
+
+[[case]]
+id = "Z9-another-zone"
+sql = "SELECT CAST(now() AS varchar) LIKE '% Asia/Tokyo', date_diff('hour', CAST(now() AT TIME ZONE 'UTC' AS timestamp), CAST(now() AS timestamp)), from_unixtime(0)"
+time_zone = "Asia/Tokyo"
+
+[[case]]
+id = "Z10-offset-zone"
+sql = "SELECT CAST(now() AS varchar) LIKE '% -03:00', from_unixtime(0), current_timezone()"
+time_zone = "-03:00"
+
+[[case]]
+id = "Z11-current-time-type"
+sql = "SELECT typeof(current_time)"
+expect = "WRONG"
+known = "ISS-032"
+note = "time(3) with time zone in Trino 431; the engine has no time with time zone type and answers time(9) (its local wall time is the session's)"
+
+[[case]]
+id = "Z12-union-timestamp-precision"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.123' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00')"
+expect = "WRONG"
+known = "ISS-032"
+note = "found here, not about the zone: a UNION of timestamp(3) and timestamp(0) is timestamp(0) and loses the fraction (Trino 431: timestamp(3))"

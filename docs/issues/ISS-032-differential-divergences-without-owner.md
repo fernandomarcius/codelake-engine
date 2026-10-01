@@ -36,7 +36,15 @@
      `EXPRESSION_NOT_AGGREGATE`.
   6. **Precedence of `IS [NOT] DISTINCT FROM` against `=`**: `true IS DISTINCT FROM b = false`
      and `x = 0 IS NOT DISTINCT FROM true` answer rows where Trino fails with a syntax error.
-- Risk: items 1 and 4 are wrong or unpadded rows; the others are refusals or wrong error
+  7. **`current_time`** (`session_zone.toml` `Z11-current-time-type`, found 2026-10-01): Trino
+     431 answers a `time(3) with time zone` (`09:41:10.612-03:00`); the engine has no
+     `time with time zone` type and answers a `time(9)` (the session's local wall time), which
+     `hour()` refuses.
+  8. **`UNION` of timestamps of different precisions** (`session_zone.toml`
+     `Z12-union-timestamp-precision`, found 2026-10-01): `timestamp(3)` with `timestamp(0)` is
+     typed `timestamp(0)` and the fraction is lost (Trino 431: `timestamp(3)`), with or
+     without a zone.
+- Risk: items 1, 4 and 8 are wrong or unpadded rows; the others are refusals or wrong error
   codes.
 - Revisit when: a front takes an item: it fixes it, drops `known = "ISS-032"` from the cases it
   turns `OK` (the gate fails until it does) and updates this list.
