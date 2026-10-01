@@ -1,0 +1,104 @@
+description = """
+Relations of a PostgreSQL catalog (`pg`, the same database for both engines; the reference
+engine with `postgresql.array-mapping=AS_ARRAY`): views, materialized views, foreign and
+partitioned tables and their partitions, and arrays of the types the reference engine maps
+(ISS-060). Before the fix only base and partitioned tables existed for CodeLake
+(`TABLE_NOT_FOUND`) and an array of dates refused the whole relation (`unsupported data type:
+_date`). Objects created after CodeLake started are covered by the connector's integration
+tests (setup_postgres runs before it starts).
+"""
+oracle = "trino"
+
+setup_postgres = [
+    "CREATE TABLE source.pc_base_t (id INT NOT NULL, label TEXT, d DATE, amount NUMERIC(10,2))",
+  "INSERT INTO source.pc_base_t VALUES (1, 'a', DATE '2026-09-01', 1.50), (2, 'b', NULL, NULL)",
+  "CREATE VIEW source.pc_a_view AS SELECT * FROM source.pc_base_t",
+  "CREATE MATERIALIZED VIEW source.pc_a_matview AS SELECT * FROM source.pc_base_t",
+  "CREATE TABLE source.pc_a_part (id INT, label TEXT, d DATE, amount NUMERIC(10,2)) PARTITION BY RANGE (id)",
+  "CREATE TABLE source.pc_a_part_1 PARTITION OF source.pc_a_part FOR VALUES FROM (0) TO (100)",
+  "INSERT INTO source.pc_a_part SELECT * FROM source.pc_base_t",
+  "CREATE TABLE source.pc_empty_part (id INT, label TEXT) PARTITION BY RANGE (id)",
+  "CREATE EXTENSION IF NOT EXISTS postgres_fdw",
+  "CREATE SERVER pc_loopback FOREIGN DATA WRAPPER postgres_fdw OPTIONS (dbname 'postgres')",
+  "CREATE USER MAPPING FOR PUBLIC SERVER pc_loopback OPTIONS (user 'postgres', password_required 'false')",
+  "CREATE FOREIGN TABLE source.pc_a_foreign (id INT, label TEXT, d DATE, amount NUMERIC(10,2)) SERVER pc_loopback OPTIONS (schema_name 'source', table_name 'pc_base_t')",
+  "CREATE SEQUENCE source.pc_a_seq",
+  "CREATE TYPE source.pc_mood AS ENUM ('ok', 'bad')",
+  """CREATE TABLE source.pc_arrays (
+       id INT, a_date DATE[], a_num2 NUMERIC(10,2)[], a_text TEXT[], a_varchar VARCHAR[],
+       a_name NAME[], a_i2 SMALLINT[], a_i4 INT[], a_i8 BIGINT[], a_f4 REAL[], a_f8 DOUBLE PRECISION[],
+       a_bool BOOLEAN[], a_money MONEY[], a_mood source.pc_mood[], a_2d INT[][],
+       a_num NUMERIC[], a_bytea BYTEA[], a_interval INTERVAL[], a_inet INET[])""",
+  """INSERT INTO source.pc_arrays VALUES
+       (1, ARRAY[DATE '2026-09-01', NULL, DATE '2026-09-30'], ARRAY[1.5, 2.25]::NUMERIC(10,2)[],
+        ARRAY['a', NULL, 'c'], ARRAY['v']::VARCHAR[], ARRAY['n']::NAME[], ARRAY[1, 2]::SMALLINT[],
+        ARRAY[1, NULL, 3], ARRAY[10000000000], ARRAY[1.5]::REAL[], ARRAY[2.5]::FLOAT8[], ARRAY[true, false],
+        ARRAY[1.5::MONEY], ARRAY['ok'::source.pc_mood], ARRAY[[1, 2], [3, 4]],
+        ARRAY[1.5], ARRAY['\\x01'::BYTEA], ARRAY[INTERVAL '1 day'], ARRAY['10.0.0.1'::INET]),
+       (2, '{}', NULL, '{}', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)""",
+  "CREATE VIEW source.pc_arrays_view AS SELECT * FROM source.pc_arrays",
+  "GRANT SELECT ON ALL TABLES IN SCHEMA source TO source",
+]
+
+[[case]]
+id = "PC1"
+sql = "SELECT table_name, table_type FROM pg.information_schema.tables WHERE table_schema = 'source' AND table_name LIKE 'pc%'"
+note = "every relation kind, partitions included, as BASE TABLE; not sequences nor types"
+
+[[case]]
+id = "PC2"
+sql = "SELECT * FROM pg.source.pc_a_view"
+
+[[case]]
+id = "PC3"
+sql = "SELECT * FROM pg.source.pc_a_matview"
+
+[[case]]
+id = "PC4"
+sql = "SELECT * FROM pg.source.pc_a_foreign"
+
+[[case]]
+id = "PC5"
+sql = "SELECT * FROM pg.source.pc_a_part"
+
+[[case]]
+id = "PC6"
+sql = "SELECT * FROM pg.source.pc_a_part_1"
+
+[[case]]
+id = "PC7"
+sql = "SELECT count(*), max(label) FROM pg.source.pc_empty_part"
+
+[[case]]
+id = "PC8"
+sql = "SELECT table_name, column_name, ordinal_position, data_type FROM pg.information_schema.columns WHERE table_schema = 'source' AND table_name IN ('pc_a_foreign', 'pc_empty_part', 'pc_a_view')"
+
+[[case]]
+id = "PC9"
+sql = "SELECT v.label, f.amount FROM pg.source.pc_a_view v JOIN pg.source.pc_a_foreign f ON f.id = v.id"
+
+[[case]]
+id = "PC10"
+sql = "SELECT * FROM pg.pg_catalog.pg_class"
+note = "the source's system relations are not listed"
+
+[[case]]
+id = "PC11"
+sql = "SELECT * FROM pg.source.pc_a_seq"
+
+[[case]]
+id = "PC12"
+sql = "SELECT count(*) FROM pg.information_schema.schemata WHERE schema_name IN ('source', 'pg_catalog', 'public', 'information_schema')"
+
+[[case]]
+id = "PC13"
+sql = "SELECT column_name, data_type FROM pg.information_schema.columns WHERE table_schema = 'source' AND table_name = 'pc_arrays'"
+note = "numeric[] without precision, bytea[], interval[] and inet[] are left out"
+
+[[case]]
+id = "PC14"
+sql = "SELECT * FROM pg.source.pc_arrays"
+
+[[case]]
+id = "PC15"
+sql = "SELECT id, a_date, a_text FROM pg.source.pc_arrays_view WHERE a_i4 IS NOT NULL OR id = 2"
