@@ -270,6 +270,12 @@ versioning: [SemVer](https://semver.org/).
   production views) are read: their columns resolve by any spelling, as a table's do (ISS-018). A view over
   such a view (`ob.descr_obr`) failed with `COLUMN_NOT_FOUND`. A view whose columns differ only by case is
   refused with an error naming both.
+- `codelake hive migrate-names`: hidden directories inside a schema (a backup copy `.bkp_<date>…` of a
+  table) are skipped like hidden schemas; one with an empty metadata file refused the whole plan. Column
+  statistics keep every digit (`13591.293610249173` became `…171`: JSON numbers are now parsed exactly,
+  which also fixes every other metadata rewrite). `--apply` checks that each directory it changes can be
+  written before changing anything, and a write that fails halfway removes what the run wrote. A
+  partitioned table refuses the plan with a clear message (its partition metadata is not migrated).
 - Found by the shadow run on production routines (2026-10-01):
   - **Wrong result**: a `UNION ALL` (or `UNION`) of three or more inputs mixing a decimal and a `double`
     answered `decimal(35,15)` where the reference answers `double` (the go/no-go report model stored

@@ -147,8 +147,15 @@ codelake hive migrate-names --config codelake.toml --source hive \
 The command rewrites every schema, table and view metadata file under the
 new name with its checksum (writer version, version and view parameters,
 view markers), removes the old one, and renames the permissions
-directories; data files are not touched. It refuses the whole plan, changing
-nothing, when a new name exists or a file does not parse. The reference
+directories; data files are not touched, and numbers (column statistics)
+keep every digit. Hidden directories (a name starting with `.`, such as a
+backup copy `.bkp_<date>` of a table) are not schemas or tables and keep
+their names. It refuses the whole plan, changing nothing, when a new name
+exists, a file does not parse, a table is partitioned (partition metadata
+is not migrated; CodeLake does not read partitioned tables yet) or a
+directory the plan changes cannot be written (checked by creating and
+removing a probe file in each before anything changes). A write that fails
+during `--apply` removes the files the run already wrote. The reference
 engine cannot read the warehouse afterwards.
 
 ## 4. Side by side

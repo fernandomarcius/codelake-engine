@@ -9,9 +9,16 @@
 //! checksum are removed; a table's permissions directory is renamed. Data
 //! files are not touched.
 //!
+//! Hidden directories (a name starting with `.`) are not schemas or tables,
+//! as the warehouse's listing skips them: a backup copy of a table
+//! (`.bkp_<date>`) keeps its old names.
+//!
 //! The whole plan is computed first; it is refused, with nothing changed,
-//! when a new name already exists or a metadata file does not parse. Without
-//! `apply` only the plan is returned.
+//! when a new name already exists, a metadata file does not parse, a table
+//! has partitions (their metadata files are not migrated: the engine does
+//! not read partitioned tables) or a directory the plan changes cannot be
+//! written. Numbers are rewritten exactly as they were read (statistics keep
+//! every digit). Without `apply` only the plan is returned.
 
 use std::path::{Path, PathBuf};
 
@@ -38,6 +45,13 @@ pub enum MigrateError {
     Exists(PathBuf),
     #[error("{0} is not valid metadata JSON ({1}): nothing changed")]
     Json(PathBuf, serde_json::Error),
+    #[error(
+        "{0} is a partitioned table: its partition metadata is not migrated, so the plan is \
+         refused (nothing changed)"
+    )]
+    Partitioned(PathBuf),
+    #[error("{0} cannot be written ({1}): nothing changed")]
+    NotWritable(PathBuf, std::io::Error),
     #[error("old and new names are the same: nothing to do")]
     Same,
 }
@@ -89,8 +103,8 @@ pub fn migrate_names(
         if name.starts_with('.') {
             continue;
         }
-        for (_, table_dir, table_is_dir) in entries(&path)? {
-            if !table_is_dir {
+        for (table, table_dir, table_is_dir) in entries(&path)? {
+            if !table_is_dir || table.starts_with('.') {
                 continue;
             }
             let metadata = table_dir.join(&old.metadata_file);
@@ -120,6 +134,13 @@ pub fn migrate_names(
             let bytes = std::fs::read(from).map_err(io(from))?;
             let mut json: Value =
                 serde_json::from_slice(&bytes).map_err(|e| MigrateError::Json(from.clone(), e))?;
+            if json
+                .get("partitionColumns")
+                .and_then(Value::as_array)
+                .is_some_and(|columns| !columns.is_empty())
+            {
+                return Err(MigrateError::Partitioned(from.clone()));
+            }
             rewrite_markers(&mut json, old, new);
             let bytes = serde_json::to_vec_pretty(&json).map_err(|e| MigrateError::Json(from.clone(), e))?;
             rewritten.push(bytes);
@@ -128,14 +149,36 @@ pub fn migrate_names(
     if !apply {
         return Ok(steps);
     }
-    let mut contents = rewritten.into_iter();
+    // Every directory the plan writes to, before writing anything.
+    let mut dirs: Vec<&Path> = steps
+        .iter()
+        .filter_map(|step| {
+            let (Step::Rewrite { from, .. } | Step::Rename { from, .. }) = step;
+            from.parent()
+        })
+        .collect();
+    dirs.sort_unstable();
+    dirs.dedup();
+    for dir in dirs {
+        check_writable(dir)?;
+    }
+    // New files and checksums first: an interrupted run leaves the old
+    // metadata readable under the old names. A write that fails removes the
+    // ones already written, so the warehouse is left as it was.
+    let mut written: Vec<&Path> = Vec::new();
+    for (step, bytes) in steps.iter().filter_map(rewrite_target).zip(&rewritten) {
+        if let Err(err) = write_with_crc(step, bytes) {
+            for path in written.into_iter().chain([step]) {
+                let _ = std::fs::remove_file(path);
+                let _ = std::fs::remove_file(sibling(path, &crc_name(&file_name(path))));
+            }
+            return Err(err);
+        }
+        written.push(step);
+    }
     for step in &steps {
         match step {
-            Step::Rewrite { from, to } => {
-                let bytes = contents.next().unwrap_or_default();
-                // New file and checksum first: an interrupted run leaves the
-                // old metadata readable under the old names.
-                write_with_crc(to, &bytes)?;
+            Step::Rewrite { from, .. } => {
                 let old_crc = sibling(from, &crc_name(&file_name(from)));
                 std::fs::remove_file(from).map_err(io(from))?;
                 if old_crc.exists() {
@@ -146,6 +189,26 @@ pub fn migrate_names(
         }
     }
     Ok(steps)
+}
+
+fn rewrite_target(step: &Step) -> Option<&Path> {
+    match step {
+        Step::Rewrite { to, .. } => Some(to),
+        Step::Rename { .. } => None,
+    }
+}
+
+/// Whether files can be created and removed in `dir`: a probe file is
+/// created there and removed (permissions alone do not tell a read-only
+/// mount or an immutable directory).
+fn check_writable(dir: &Path) -> Result<(), MigrateError> {
+    let probe = dir.join(format!(".codelake-migrate-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|e| MigrateError::NotWritable(dir.to_path_buf(), e))?;
+    std::fs::remove_file(&probe).map_err(|e| MigrateError::NotWritable(dir.to_path_buf(), e))
 }
 
 fn file_name(path: &Path) -> String {
@@ -274,6 +337,189 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, MigrateError::Exists(_)), "{err}");
         assert!(dir.path().join(".pilot.trinoSchema").exists(), "nothing changed");
+    }
+
+    fn fixture_copy() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/trino431/warehouse");
+        copy_dir(&fixture, dir.path());
+        dir
+    }
+
+    /// Every file under `dir` with its bytes.
+    fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = std::collections::BTreeMap::new();
+        for (_, path, is_dir) in entries(dir).unwrap() {
+            if is_dir {
+                files.extend(snapshot(&path));
+            } else {
+                files.insert(path.clone(), std::fs::read(&path).unwrap());
+            }
+        }
+        files
+    }
+
+    /// Statistics as Trino 431 wrote them after `ANALYZE`: a double whose
+    /// shortest form has 17 digits, exponents, an integer past 2^53.
+    const STATISTICS: &str = r#""columnStatistics" : {
+    "x" : {
+      "doubleStatistics" : {
+        "min" : 0.1,
+        "max" : 1.23456789E7
+      }
+    },
+    "b" : {
+      "integerStatistics" : {
+        "min" : 2,
+        "max" : 9007199254740993
+      }
+    },
+    "d" : {
+      "doubleStatistics" : {
+        "min" : 1.0E-7,
+        "max" : 13591.293610249173
+      }
+    }
+  }
+}
+"#;
+
+    #[test]
+    fn numbers_keep_every_digit_there_and_back() {
+        let dir = fixture_copy();
+        let file = dir.path().join("pilot/t1/.trinoSchema");
+        let text = std::fs::read_to_string(&file).unwrap();
+        let start = text.find("\"columnStatistics\"").unwrap();
+        std::fs::write(&file, format!("{}{STATISTICS}", &text[..start])).unwrap();
+        let (trino, codelake) = (crate::hive::reference_names(), MetastoreNames::default());
+        let migrated = dir.path().join("pilot/t1/.codelakeSchema");
+        let mut passes = Vec::new();
+        for _ in 0..2 {
+            migrate_names(dir.path(), &trino, &codelake, true).unwrap();
+            passes.push(std::fs::read(&migrated).unwrap());
+            migrate_names(dir.path(), &codelake, &trino, true).unwrap();
+            passes.push(std::fs::read(&file).unwrap());
+        }
+        // Each value is the number Trino wrote (`13591.293610249173` was read
+        // as `…171`).
+        let json: Value = serde_json::from_slice(&passes[0]).unwrap();
+        let statistics = &json["columnStatistics"];
+        for (column, kind, bound, written) in [
+            ("d", "doubleStatistics", "max", "13591.293610249173"),
+            ("d", "doubleStatistics", "min", "1.0E-7"),
+            ("x", "doubleStatistics", "min", "0.1"),
+            ("x", "doubleStatistics", "max", "1.23456789E7"),
+        ] {
+            let value = statistics[column][kind][bound].as_f64().unwrap();
+            assert_eq!(
+                value.to_bits(),
+                written.parse::<f64>().unwrap().to_bits(),
+                "{column}.{bound}: {value}"
+            );
+        }
+        assert_eq!(
+            statistics["b"]["integerStatistics"]["max"].as_u64(),
+            Some(9_007_199_254_740_993)
+        );
+        let migrated_text = String::from_utf8(passes[0].clone()).unwrap();
+        assert!(migrated_text.contains("13591.293610249173"), "{migrated_text}");
+        // There and back, twice: the same bytes under each name.
+        assert_eq!(passes[0], passes[2], "new names");
+        assert_eq!(passes[1], passes[3], "old names");
+    }
+
+    /// Production held `erp_raw_b1/.bkp_20260909_…__dbt_tmp`: a hidden copy
+    /// of a table, with an empty metadata file, refused the whole plan.
+    #[test]
+    fn hidden_directories_in_a_schema_are_not_tables() {
+        let dir = fixture_copy();
+        let hidden = dir.path().join("pilot/.bkp_20260909__dbt_tmp");
+        std::fs::create_dir_all(hidden.join(".trinoPermissions")).unwrap();
+        std::fs::write(hidden.join(".trinoSchema"), b"").unwrap();
+        let (old, new) = (crate::hive::reference_names(), MetastoreNames::default());
+        let plan = migrate_names(dir.path(), &old, &new, true).unwrap();
+        assert!(
+            plan.iter().all(|step| {
+                let (Step::Rewrite { from, .. } | Step::Rename { from, .. }) = step;
+                !from.starts_with(&hidden)
+            }),
+            "{plan:?}"
+        );
+        assert_eq!(plan.len(), 5, "{plan:?}");
+        assert!(hidden.join(".trinoSchema").is_file(), "left as it was");
+        assert!(hidden.join(".trinoPermissions").is_dir(), "left as it was");
+    }
+
+    #[test]
+    fn partitioned_tables_refuse_the_whole_plan() {
+        let dir = fixture_copy();
+        let file = dir.path().join("pilot/t1/.trinoSchema");
+        let text = std::fs::read_to_string(&file).unwrap().replace(
+            "\"partitionColumns\" : [ ]",
+            r#""partitionColumns" : [ { "name" : "p", "type" : "string", "properties" : { } } ]"#,
+        );
+        std::fs::write(&file, text).unwrap();
+        let before = snapshot(dir.path());
+        let err = migrate_names(
+            dir.path(),
+            &crate::hive::reference_names(),
+            &MetastoreNames::default(),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, MigrateError::Partitioned(path) if *path == file),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("partition metadata is not migrated"),
+            "{err}"
+        );
+        assert_eq!(snapshot(dir.path()), before, "nothing changed");
+    }
+
+    /// A write that fails halfway (here the third new checksum, whose name a
+    /// directory takes) removes what the run wrote: the warehouse is left as
+    /// it was, readable under the old names.
+    #[test]
+    fn a_write_that_fails_halfway_changes_nothing() {
+        let dir = fixture_copy();
+        std::fs::create_dir(dir.path().join("pilot/v1/..codelakeSchema.crc")).unwrap();
+        let before = snapshot(dir.path());
+        let err = migrate_names(
+            dir.path(),
+            &crate::hive::reference_names(),
+            &MetastoreNames::default(),
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MigrateError::Io(..)), "{err}");
+        assert_eq!(snapshot(dir.path()), before, "nothing changed");
+        assert!(dir.path().join("pilot/v1/..codelakeSchema.crc").is_dir());
+    }
+
+    #[test]
+    fn writable_directories_keep_no_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        check_writable(dir.path()).unwrap();
+        assert!(snapshot(dir.path()).is_empty());
+        let missing = dir.path().join("missing");
+        let err = check_writable(&missing).unwrap_err();
+        assert!(
+            matches!(&err, MigrateError::NotWritable(path, _) if *path == missing),
+            "{err}"
+        );
+        assert!(err.to_string().contains("cannot be written"), "{err}");
+    }
+
+    /// A directory nobody can write into, not even root (the tests run as
+    /// root in the toolbelt): the plan is refused before any file changes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_directory_that_cannot_be_written_is_refused() {
+        let err = check_writable(Path::new("/proc")).unwrap_err();
+        assert!(matches!(err, MigrateError::NotWritable(..)), "{err}");
     }
 
     fn copy_dir(from: &Path, to: &Path) {
