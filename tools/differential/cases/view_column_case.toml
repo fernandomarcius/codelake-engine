@@ -1,0 +1,65 @@
+# Views the reference engine stored with a capital letter in a column name (ISS-018).
+# Trino 431 stores a view's columns as its query spelled them (`Descr_obr`) and resolves
+# any spelling of them, quoted or not. Production: `analytics.obras_latest` stores
+# `Descr_obr`, `analytics.vw_recebidas_comissoes_base1` reads `ob.descr_obr`; CodeLake
+# refused it (COLUMN_NOT_FOUND). The header of `SELECT *` (the stored spelling on Trino,
+# the folded name on CodeLake) is not compared by the gate.
+
+oracle = "trino"
+setup_trino = [
+  "CREATE SCHEMA hive.vcase",
+  "CREATE TABLE hive.vcase.obras (codigo integer, descr varchar) WITH (format = 'PARQUET')",
+  "INSERT INTO hive.vcase.obras VALUES (1, 'um'), (2, 'dois'), (3, NULL)",
+  "CREATE VIEW hive.vcase.obras_latest AS SELECT codigo AS Cod_obr, descr AS Descr_obr FROM hive.vcase.obras",
+  "CREATE VIEW hive.vcase.base1 AS SELECT ob.descr_obr, ob.COD_OBR AS cod FROM hive.vcase.obras_latest ob",
+  "CREATE VIEW hive.vcase.quoted AS SELECT \"Descr_obr\" AS \"Nome\", \"COD_OBR\" AS \"Cod\" FROM hive.vcase.obras_latest",
+  "CREATE VIEW hive.vcase.dup AS SELECT 1 AS a, 2 AS A",
+]
+
+[[case]]
+id = "VC1"
+sql = "SELECT * FROM hive.vcase.obras_latest"
+note = "a view whose stored columns are Cod_obr, Descr_obr"
+
+[[case]]
+id = "VC2"
+sql = "SELECT descr_obr, \"Descr_obr\", \"DESCR_OBR\", COD_OBR FROM hive.vcase.obras_latest"
+note = "every spelling, quoted or not, resolves to the stored column"
+
+[[case]]
+id = "VC2b"
+sql = "SELECT \"descr_obr\", Descr_obr AS d FROM hive.vcase.obras_latest"
+note = "the folded form quoted, the stored spelling unquoted"
+
+[[case]]
+id = "VC3"
+sql = "SELECT * FROM hive.vcase.base1"
+note = "the production shape: a view over the view, reading ob.descr_obr and ob.COD_OBR"
+
+[[case]]
+id = "VC4"
+sql = "SELECT cod, nome FROM hive.vcase.base1 b JOIN hive.vcase.quoted q ON b.cod = q.\"cod\""
+note = "a join of two views over the view, through aliases and quoted stored names"
+
+[[case]]
+id = "VC5"
+sql = "SELECT Cod_obr FROM hive.vcase.obras_latest WHERE DESCR_OBR = 'dois' OR descr_obr IS NULL"
+note = "a filter on the view's columns"
+
+[[case]]
+id = "VC6"
+sql = "SELECT descr_obr, count(*) FROM hive.vcase.obras_latest GROUP BY Descr_obr"
+note = "an aggregation grouped by another spelling"
+
+[[case]]
+id = "VC7"
+sql = "SELECT table_name, column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'vcase' AND table_name IN ('obras_latest', 'base1', 'quoted') ORDER BY table_name, ordinal_position"
+compare = "ordered"
+note = "both list the folded names"
+
+[[case]]
+id = "VC8"
+sql = "SELECT a FROM hive.vcase.dup"
+expect = "ERRO"
+accepted = "ISS-018"
+note = "columns that differ only by case: Trino 431 refuses the reference as ambiguous, CodeLake refuses the view naming both"

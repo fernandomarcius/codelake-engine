@@ -266,6 +266,10 @@ versioning: [SemVer](https://semver.org/).
     `CAST('…+00' AS TIMESTAMP WITH TIME ZONE)`.
   - Kept local as well: floats in comparisons, grouping and ordering (`NaN`, `-0`), `avg`, `sum` of
     `bigint` or floats, decimal arithmetic, `CASE`, `LIKE` and every other function.
+- Hive views another engine stored with a capital letter in a column name (`Descr_obr`; 40 of the 84
+  production views) are read: their columns resolve by any spelling, as a table's do (ISS-018). A view over
+  such a view (`ob.descr_obr`) failed with `COLUMN_NOT_FOUND`. A view whose columns differ only by case is
+  refused with an error naming both.
 - Found by the shadow run on production routines (2026-10-01):
   - **Wrong result**: a `UNION ALL` (or `UNION`) of three or more inputs mixing a decimal and a `double`
     answered `decimal(35,15)` where the reference answers `double` (the go/no-go report model stored
