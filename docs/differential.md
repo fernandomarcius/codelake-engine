@@ -20,8 +20,15 @@ it ends (also on failure):
 | Engine | Image | Reached as |
 |---|---|---|
 | Trino 431 (oracle) | `trinodb/trino:431`, `hive` catalog on a file metastore | HTTP statement protocol |
-| PostgreSQL 17 (oracle) | `postgres:17-alpine` | PostgreSQL wire |
+| PostgreSQL 17 (oracle and source) | `postgres:17-alpine` | PostgreSQL wire; as a source, the `pg` catalog of both engines |
 | CodeLake under test | the toolbelt image + the binary just built, `tools/differential/stack/codelake.toml` | Trino protocol (`[server.trino]`) and PostgreSQL wire |
+
+When a case file needs PostgreSQL, both engines also read it as a source, through a catalog
+named `pg` (Trino's `postgresql` connector, CodeLake's `postgres` connector) connected as the
+role `source`, whose sessions run in `America/Sao_Paulo` (`stack/postgres-source.sql`). Such a
+file creates its tables in the `source` schema with `setup_postgres` and compares CodeLake with
+Trino reading the same rows (`postgres_pushdown.toml`). Every file's `setup_postgres` runs
+before CodeLake starts: CodeLake lists a source's tables once, when it starts.
 
 Trino and CodeLake share one warehouse volume, so a case can read with one engine
 files the other wrote (`setup_trino` writes, CodeLake reads). Timings: about 1 min to

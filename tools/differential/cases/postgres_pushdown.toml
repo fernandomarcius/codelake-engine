@@ -1,0 +1,96 @@
+description = """A PostgreSQL table read through both engines' `pg` catalog: what CodeLake
+sends to PostgreSQL must not change the answer. The text column sorts by an ICU
+collation (pt-BR) and the sessions run in America/Sao_Paulo (stack/postgres-source.sql),
+where PostgreSQL disagrees with Trino on ordering and on zoneless timestamps; the
+engine's own functions (count_if, arrays_overlap, subscripts, FILTER) do not exist
+there under those names."""
+oracle = "trino"
+setup_postgres = [
+  """CREATE TABLE source.pdt (id integer, s text COLLATE "pt-BR-x-icu", ops integer[], ok boolean,
+                             at timestamptz, d date, n numeric(12, 2))""",
+  """INSERT INTO source.pdt VALUES
+       (1, 'b', '{18}', true, '2026-09-14 00:30:00+00', '2026-09-01', 10.50),
+       (2, 'B', '{6,18}', false, '2026-09-13 23:30:00+00', '2026-09-02', 1.25),
+       (3, 'a', '{88}', false, '2026-09-14 02:59:00+00', '2026-09-03', NULL),
+       (4, 'A', NULL, NULL, '2026-09-14 03:00:00+00', '2026-09-04', 3.00),
+       (5, 'é', '{89,6}', true, NULL, NULL, 7.75),
+       (6, 'e', '{6}', true, '2026-09-15 00:00:00+00', '2026-09-05', 0.10),
+       (7, '_x', '{13}', false, '2026-09-14 01:00:00+00', '2026-09-06', 2.00),
+       (8, 'Z', '{169}', false, '2026-09-14 06:00:00+00', '2026-09-07', 5.55),
+       (9, 'Ábaco', '{18,88}', NULL, '2026-09-14 05:59:00+00', '2026-09-08', 9.99),
+       (10, 'ação', '{88}', false, '2026-09-16 00:00:00+00', '2026-09-09', 4.40),
+       (11, NULL, '{18}', false, NULL, NULL, 6.00)""",
+  "GRANT SELECT ON source.pdt TO source",
+]
+
+[[case]]
+id = "PD1"
+sql = "SELECT s FROM pg.source.pdt ORDER BY s"
+compare = "ordered"
+note = "code point order; PostgreSQL's pt-BR order starts _x, a, A"
+
+[[case]]
+id = "PD2"
+sql = "SELECT s FROM pg.source.pdt ORDER BY s DESC LIMIT 3"
+compare = "ordered"
+
+[[case]]
+id = "PD3"
+sql = "SELECT min(s), max(s) FROM pg.source.pdt"
+
+[[case]]
+id = "PD4"
+sql = "SELECT count(*) FROM pg.source.pdt WHERE s < 'a'"
+
+[[case]]
+id = "PD5"
+sql = "SELECT id FROM pg.source.pdt WHERE s BETWEEN 'a' AND 'b'"
+
+[[case]]
+id = "PD6"
+sql = "SELECT id FROM pg.source.pdt WHERE s = 'ação' OR s IN ('Z', 'e')"
+
+[[case]]
+id = "PD7"
+sql = "SELECT DISTINCT s FROM pg.source.pdt"
+note = "was sent as SELECT t.s FROM (…) AS derived_projection GROUP BY t.s: missing FROM-clause entry"
+
+[[case]]
+id = "PD8"
+sql = "SELECT s, count(*), sum(id) FROM pg.source.pdt GROUP BY s"
+
+[[case]]
+id = "PD9"
+sql = "SELECT count_if(ok), count_if(s IS NULL) FROM pg.source.pdt"
+
+[[case]]
+id = "PD10"
+sql = "SELECT id FROM pg.source.pdt WHERE arrays_overlap(ops, ARRAY[6, 13]) AND id > 2"
+
+[[case]]
+id = "PD11"
+sql = "SELECT count(*) FILTER (WHERE id > 5), count(*) FILTER (WHERE s = 'a') FROM pg.source.pdt"
+
+[[case]]
+id = "PD12"
+sql = "SELECT id FROM pg.source.pdt WHERE ops[1] = 18"
+
+[[case]]
+id = "PD13"
+sql = "SELECT id FROM pg.source.pdt WHERE at >= TIMESTAMP '2026-09-14 00:00:00' AND at < TIMESTAMP '2026-09-14 03:00:00'"
+note = "a zoneless literal is an instant in the session zone (UTC): sent as such, not read in America/Sao_Paulo"
+
+[[case]]
+id = "PD14"
+sql = "SELECT d, count(*), sum(n) FROM pg.source.pdt WHERE d >= DATE '2026-09-05' GROUP BY d ORDER BY d"
+compare = "ordered"
+
+[[case]]
+id = "PD15"
+sql = "SELECT a.id, b.id FROM pg.source.pdt a JOIN pg.source.pdt b ON a.s = b.s AND a.id < b.id + 1 ORDER BY a.id"
+compare = "ordered"
+
+[[case]]
+id = "PD16"
+sql = "SELECT id, s FROM pg.source.pdt ORDER BY s NULLS FIRST, id OFFSET 2 LIMIT 4"
+compare = "ordered"

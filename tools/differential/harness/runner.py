@@ -116,13 +116,8 @@ def run_setup(engines, suite):
         check("trino", sql, engines.trino.query(for_trino(sql), "memory"))
     for sql in suite.setup_codelake:
         check("codelake", sql, engines.codelake.query(for_codelake(sql), "datafusion"))
-    if suite.setup_postgres:
-        pg = engines.postgres()
-        try:
-            for sql in suite.setup_postgres:
-                check("postgres", sql, pg.query(sql))
-        finally:
-            pg.close()
+    # setup_postgres runs before CodeLake starts (stack.Stack), which lists a
+    # source's tables once, at start.
     return errors
 
 
@@ -190,9 +185,9 @@ def judge(case, outcome, divergent, got):
     return None
 
 
-def run(suites, engines, log, binary=None):
+def run(suites, engines, log, binary=None, setup_errors=()):
     started = time.time()
-    results, setup_errors = [], []
+    results, setup_errors = [], list(setup_errors)
     for suite in suites:
         log(f"suite {suite.name}: {len(suite.cases)} cases")
         setup_errors += run_setup(engines, suite)

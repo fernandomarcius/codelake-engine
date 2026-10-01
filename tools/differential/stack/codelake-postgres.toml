@@ -1,0 +1,13 @@
+
+# The PostgreSQL the stack starts, read as Trino 431 reads it (pg.properties):
+# appended only when a case file needs PostgreSQL. Trust authentication: the
+# password is not checked.
+[[source]]
+name = "pg"
+kind = "postgres"
+host = "postgres"
+port = 5432
+database = "postgres"
+user = "source"
+password_env = "CODELAKE_DIFF_PG_PASSWORD"
+sslmode = "disable"
