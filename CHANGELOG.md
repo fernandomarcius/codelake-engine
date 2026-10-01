@@ -260,6 +260,22 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- PostgreSQL, found by the shadow run of the Warehouse boletos panel (2026-10-01; its 28 queries failed;
+  ISS-060):
+  - Views, materialized views and foreign tables did not exist (`TABLE_NOT_FOUND`): relations were listed from
+    `pg_tables`. They are listed from `pg_class` as the reference lists them (tables, partitioned tables and
+    their partitions, views, materialized views, foreign tables; `pg_catalog` listed without relations; not
+    filtered by privilege: what the user may not read fails at the source). Columns are read from the catalog
+    for every kind (a foreign or partitioned table was typed from its first row, an empty one had none).
+  - A relation created after boot needed a restart. A name the listing lacks is looked up at the source when
+    a query names it; `information_schema` and `system.jdbc` read the listing again once it is older than one
+    second.
+  - An array of dates refused its whole relation (`unsupported data type: _date`). Arrays follow the
+    reference's `array-mapping=AS_ARRAY`: `date`, `time`, `timestamp`, `timestamptz`, `numeric(p,s)`, text
+    types, `uuid`, `json`, `jsonb`, `money`, enums, numbers and booleans, nested per declared dimension;
+    arrays of other types are left out of the relation, as the reference leaves them.
+  - Every connection ran `SET json_serialization_enable` (a Redshift parameter), one `ERROR` in the server's
+    log per connection. The connector opens plain sessions.
 - PostgreSQL sources get a pushdown policy, as SQL Server has: only what PostgreSQL evaluates exactly like
   the engine is sent to it. Found on a dashboard reading PostgreSQL views (2026-10-01):
   - `count_if`, `arrays_overlap`, array subscripts and `count(*) FILTER (WHERE …)` were sent as written
