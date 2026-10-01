@@ -22,6 +22,8 @@ pub mod mysql;
 mod params;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "postgres")]
+mod postgres_pushdown;
 #[cfg(feature = "sqlserver")]
 pub mod sqlserver;
 
