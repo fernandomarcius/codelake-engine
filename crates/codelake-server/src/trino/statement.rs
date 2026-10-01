@@ -1154,6 +1154,13 @@ fn control_headers(
             )]
         }
         Control::ResetSession { name } => vec![(names.clear_session.clone(), name.clone())],
+        Control::SetTimeZone { zone: Some(zone) } => vec![(
+            names.set_session.clone(),
+            format!("{}={}", session::TIME_ZONE_ID, session::percent_encode(zone)),
+        )],
+        Control::SetTimeZone { zone: None } => {
+            vec![(names.clear_session.clone(), session::TIME_ZONE_ID.to_owned())]
+        }
     }
 }
 
