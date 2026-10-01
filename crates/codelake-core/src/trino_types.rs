@@ -59,8 +59,8 @@ impl Declared {
             (Self::Varchar(_) | Self::Char(_), DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) => {
                 true
             }
-            (Self::Timestamp(p), DataType::Timestamp(unit, _)) => p <= digits(*unit),
-            (Self::Time(p), DataType::Time32(unit) | DataType::Time64(unit)) => p <= digits(*unit),
+            (Self::Timestamp(p), DataType::Timestamp(unit, _))
+            | (Self::Time(p), DataType::Time32(unit) | DataType::Time64(unit)) => p <= digits(*unit),
             _ => false,
         }
     }

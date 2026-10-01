@@ -304,11 +304,10 @@ impl ScalarUDFImpl for TrinoTyped {
             });
         let array = value.to_array(args.number_rows)?;
         let result: ArrayRef = match declared {
-            None => array,
+            // A literal's `time(p)` has its digits: nothing to round.
+            None | Some(Declared::Time(_)) => array,
             Some(Declared::Timestamp(p)) if self.lenient => rounded_timestamps_or_null(&array, p)?,
             Some(Declared::Timestamp(p)) => rounded_timestamps(&array, p)?,
-            // A literal's digits: nothing to round.
-            Some(Declared::Time(_)) => array,
             Some(declared @ (Declared::Varchar(n) | Declared::Char(n))) => {
                 let mut out = Vec::with_capacity(array.len());
                 for text in texts(&array)? {
