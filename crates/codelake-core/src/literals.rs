@@ -23,7 +23,7 @@
 //! common type for two time units, not even in `VALUES`); the precision is
 //! recorded with `codelake_trino_type` (see [`crate::declared`]), which the
 //! client protocol shows. An expression over it (`CASE`, a `VALUES` row) is
-//! `time(9)` again.
+//! `time(9)` again (ISS-061).
 //!
 //! Numbers take their types from the function library's literal rewrite
 //! (`crate::trino_functions`: `1.5` is `decimal(2,1)`, `1e5` a `double`).

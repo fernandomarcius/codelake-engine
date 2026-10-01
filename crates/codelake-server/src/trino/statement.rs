@@ -482,9 +482,8 @@ impl Exec {
             } else {
                 deadline.min(tokio::time::Instant::now() + FILL_WAIT)
             };
-            let event = match tokio::time::timeout_at(until, self.events.recv()).await {
-                Ok(event) => event,
-                Err(_) => break,
+            let Ok(event) = tokio::time::timeout_at(until, self.events.recv()).await else {
+                break;
             };
             let Some(event) = event else {
                 // The task ended without a final event: canceled or panicked.
@@ -1007,7 +1006,6 @@ fn start(
     sender: mpsc::Sender<Event>,
 ) -> Result<(), QueryError> {
     let session = session?;
-    let names = EngineNames(&state.engine);
     let bound;
     let sql = match prepared::command(sql)? {
         Some(Command::Prepare { name, sql: statement }) => {
@@ -1057,21 +1055,7 @@ fn start(
         }
         None => sql,
     };
-    // Killing a query answers at once, without a slot: it works on a full node.
-    if let Some(request) = governance::kill_request_sql(sql) {
-        request
-            .and_then(|request| state.engine.governance().kill(&request, &session.user))
-            .map_err(|error| QueryError::from_kill(&error))?;
-        answered(query, exec, "CALL", Vec::new());
-        return Ok(());
-    }
-    if let Some(control) = session::control(sql, &session, state.engine.session_properties(), &names)? {
-        answered(
-            query,
-            exec,
-            control.update_type(),
-            control_headers(&control, &session, &state.headers),
-        );
+    if answered_at_once(state, query, exec, sql, &session)? {
         return Ok(());
     }
     exec.shape = shape(sql);
@@ -1094,7 +1078,7 @@ fn start(
     };
     let governance = state.engine.governance();
     let limits = governance.session_limits(&session.properties);
-    // Refused here, the client gets the failure in this response.
+    // Refused here, the client reads the failure on the first page.
     let ticket = governance
         .enter(query.record())
         .map_err(|e| QueryError::from_governance(&e))?;
@@ -1117,6 +1101,36 @@ fn start(
         (ticket, limits),
     ));
     Ok(())
+}
+
+/// Answers a kill or a session-control statement at once; `false` for any
+/// other statement.
+fn answered_at_once(
+    state: &TrinoState,
+    query: &TrinoQuery,
+    exec: &mut Exec,
+    sql: &str,
+    session: &ClientSession,
+) -> Result<bool, QueryError> {
+    // Killing a query answers at once, without a slot: it works on a full node.
+    if let Some(request) = governance::kill_request_sql(sql) {
+        request
+            .and_then(|request| state.engine.governance().kill(&request, &session.user))
+            .map_err(|error| QueryError::from_kill(&error))?;
+        answered(query, exec, "CALL", Vec::new());
+        return Ok(true);
+    }
+    let names = EngineNames(&state.engine);
+    let Some(control) = session::control(sql, session, state.engine.session_properties(), &names)? else {
+        return Ok(false);
+    };
+    answered(
+        query,
+        exec,
+        control.update_type(),
+        control_headers(&control, session, &state.headers),
+    );
+    Ok(true)
 }
 
 fn control_headers(
