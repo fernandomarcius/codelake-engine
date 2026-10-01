@@ -95,7 +95,7 @@ pub(crate) fn is_java_whitespace(c: char) -> bool {
 }
 
 /// Java's simple (one code point) case mapping.
-fn simple_lower(c: char) -> char {
+pub(crate) fn simple_lower(c: char) -> char {
     if c == '\u{130}' {
         return 'i';
     }
@@ -106,7 +106,7 @@ fn simple_lower(c: char) -> char {
     }
 }
 
-fn simple_upper(c: char) -> char {
+pub(crate) fn simple_upper(c: char) -> char {
     let mut mapped = c.to_uppercase();
     match (mapped.next(), mapped.next()) {
         (Some(single), None) => single,

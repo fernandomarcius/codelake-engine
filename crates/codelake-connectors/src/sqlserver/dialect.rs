@@ -7,11 +7,11 @@
 //!
 //! | Kept local | Why |
 //! |---|---|
-//! | comparisons, `GROUP BY`, `MIN/MAX`, `DISTINCT`, joins on text | collations are usually case-insensitive and ignore trailing spaces |
+//! | comparisons, `GROUP BY`, `MIN/MAX`, `DISTINCT`, joins on text | collations are usually case-insensitive and ignore trailing spaces (text `=`/`IN` and `lower`/`upper` of a column compared with literals reach SQL Server as a superset the engine narrows) |
 //! | `AVG` | T-SQL `AVG(int)` truncates to `int` |
 //! | `SUM` of `int`/`smallint` | T-SQL sums in `int` and overflows at 2^31 |
 //! | decimal `/` and `%` | T-SQL and `DataFusion` use different result scales |
-//! | `ORDER BY` | SQL Server sorts NULLs first |
+//! | `ORDER BY`, except the first rows by columns of the types [`exactly_ordered`] names with NULLs where SQL Server puts them (`TOP n … ORDER BY`, sorted again in the engine) | SQL Server sorts NULLs first; collations order text |
 //! | binary, boolean and non-ASCII text literals | no faithful T-SQL rendering in the unparser |
 //! | temporal literals, except compared with a `date`, `smalldatetime` or `datetime2(0..6)` column (the other temporal columns get whole-second bounds as a superset) | the engine shows `datetime` at the millisecond (ISS-054) and truncates `datetime2(7)` to the microsecond |
 //! | functions, `CASE`, `LIKE`, casts other than numeric widening | semantics differ or are unverified |
@@ -22,13 +22,16 @@ use std::sync::Arc;
 use codelake_core::federation_policy::PushdownPolicy;
 use codelake_core::functions::{
     EXACT_CAST, VARBINARY_LITERAL, as_binary_literal, as_superset_filter, binary_literal_expr, decode_hex,
+    has_case_preimage_beyond_ascii,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, ExprSchema, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::expr::{AggregateFunction, Alias};
-use datafusion::logical_expr::{Aggregate, BinaryExpr, Expr, ExprSchemable, JoinType, LogicalPlan, Operator};
+use datafusion::logical_expr::{
+    Aggregate, BinaryExpr, Expr, ExprSchemable, JoinType, Like, LogicalPlan, Operator, Sort, lit,
+};
 use datafusion::sql::sqlparser::ast::{
     self, Expr as SqlExpr, Ident, LimitClause, ObjectName, ObjectNamePart, Query, SetExpr, Statement, Top,
     TopQuantity, VisitMut, VisitorMut,
@@ -215,6 +218,15 @@ fn sql_type_of(expr: &Expr, schema: &DFSchema) -> Option<String> {
     field.metadata().get(super::SQL_TYPE).cloned()
 }
 
+/// Collation of a text column (field metadata written by the catalog).
+fn collation_of(expr: &Expr, schema: &DFSchema) -> Option<String> {
+    let Expr::Column(column) = expr else {
+        return None;
+    };
+    let field = schema.field_from_column(column).ok()?;
+    field.metadata().get(super::SQL_COLLATION).cloned()
+}
+
 /// Byte width of a fixed-length binary operand: a `binary(n)` column or a
 /// binary literal. `None` for `varbinary` and anything else.
 fn binary_width(expr: &Expr, schema: &DFSchema) -> Option<usize> {
@@ -359,6 +371,26 @@ fn without_identity_casts<'a>(mut expr: &'a Expr, schema: &DFSchema) -> &'a Expr
         expr = cast.expr.as_ref();
     }
     expr
+}
+
+/// A column SQL Server orders as the engine orders it, value for value
+/// (ties included): integers, decimals, the temporal types
+/// [`exact_temporal_column`] names, and `datetime` (its 1/300 s steps are
+/// each a millisecond of their own in the engine, ISS-054). Not text
+/// (collations), floats (`-0.0` and `0.0` are one value there), binary,
+/// `bit`, `datetime2(7)` (the engine truncates it), `time` or
+/// `datetimeoffset`.
+fn exactly_ordered(data_type: &DataType, sql_type: Option<&str>) -> bool {
+    let Some(sql_type) = sql_type else {
+        return false;
+    };
+    match data_type {
+        DataType::Decimal128(..) => true,
+        DataType::Date32 | DataType::Timestamp(_, None) => {
+            exact_temporal_column(sql_type) || sql_type == "datetime"
+        }
+        other => other.is_integer(),
+    }
 }
 
 /// Single value usable as a grouping key or `DISTINCT`/`MIN`/`MAX` operand.
@@ -515,12 +547,124 @@ fn superset_text_column(expr: &Expr, schema: &DFSchema) -> bool {
         })
 }
 
+fn ascii_literal(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Literal(
+            ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)),
+            _,
+        ) if s.is_ascii() => Some(s),
+        _ => None,
+    }
+}
+
 fn ascii_text(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Literal(ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)), _)
-            if s.is_ascii()
-    )
+    ascii_literal(expr).is_some()
+}
+
+/// A collation that pairs the ASCII letters by case as the engine does
+/// (`A`-`Z` with `a`-`z`): the Latin ones. A Turkish or Azeri collation
+/// pairs `I` with `ı` and `i` with `İ`, so there `LOWER('I')` is `ı` and
+/// `'I' = 'i'` is false even when it ignores case.
+fn latin_collation(name: &str) -> bool {
+    name.starts_with("Latin1_General_") || name.starts_with("SQL_Latin1_General_")
+}
+
+/// `lower(column)` or `upper(column)` of a text column of a Latin collation.
+struct CaseCall<'a> {
+    call: &'a Expr,
+    column: &'a Expr,
+    upper: bool,
+    ignores_case: bool,
+}
+
+impl<'a> CaseCall<'a> {
+    fn of(expr: &'a Expr, schema: &DFSchema) -> Option<Self> {
+        let Expr::ScalarFunction(function) = expr else {
+            return None;
+        };
+        let upper = match function.name() {
+            "lower" => false,
+            "upper" => true,
+            _ => return None,
+        };
+        let [column] = function.args.as_slice() else {
+            return None;
+        };
+        let collation = collation_of(column, schema)?;
+        (superset_text_column(column, schema) && latin_collation(&collation)).then(|| Self {
+            call: expr,
+            column,
+            upper,
+            ignores_case: collation.split('_').any(|part| part == "CI"),
+        })
+    }
+
+    /// A predicate SQL Server keeps at least the rows of `call = literal`
+    /// (ASCII) with. Each character of such a row is one the engine maps to
+    /// the literal's: an ASCII letter of either case or, for a few letters, a
+    /// character beyond ASCII (`İ` for `i`). A collation that ignores case
+    /// compares the column itself, any other `LOWER`/`UPPER` of it (which
+    /// map the ASCII letters as the engine); a position whose letter has
+    /// such another character is left to `%` in a `LIKE` (as is any `%`,
+    /// `_` or `[` of the literal there).
+    fn equal_to(&self, literal: &str) -> Expr {
+        let compared = if self.ignores_case {
+            self.column.clone()
+        } else {
+            self.call.clone()
+        };
+        let open = |c: char| has_case_preimage_beyond_ascii(c, self.upper);
+        if !literal.chars().any(open) {
+            return compared.eq(lit(literal));
+        }
+        let mut pattern = String::with_capacity(literal.len());
+        for c in literal.chars() {
+            let c = if open(c) || matches!(c, '%' | '_' | '[') {
+                '%'
+            } else {
+                c
+            };
+            if !(c == '%' && pattern.ends_with('%')) {
+                pattern.push(c);
+            }
+        }
+        compared.like(lit(pattern))
+    }
+}
+
+/// `lower(column) = 'abc'` (either side) or `upper(column) IN ('A', 'B')`
+/// as a superset SQL Server evaluates (see [`CaseCall::equal_to`]).
+fn case_superset(term: &Expr, schema: &DFSchema) -> Option<Expr> {
+    match term {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Eq,
+            right,
+        }) => {
+            let (call, literal) = match (CaseCall::of(left, schema), CaseCall::of(right, schema)) {
+                (Some(call), None) => (call, right),
+                (None, Some(call)) => (call, left),
+                _ => return None,
+            };
+            Some(call.equal_to(ascii_literal(literal)?))
+        }
+        Expr::InList(list) if !list.negated => {
+            let call = CaseCall::of(&list.expr, schema)?;
+            let terms = list
+                .list
+                .iter()
+                .map(|e| ascii_literal(e).map(|literal| call.equal_to(literal)))
+                .collect::<Option<Vec<_>>>()?;
+            terms.into_iter().reduce(Expr::or)
+        }
+        _ => None,
+    }
+}
+
+/// What a superset compares with ASCII literals: a text column, or the
+/// `lower`/`upper` of one of a Latin collation.
+fn superset_text_operand(expr: &Expr, schema: &DFSchema) -> bool {
+    superset_text_column(expr, schema) || CaseCall::of(expr, schema).is_some()
 }
 
 /// A plain temporal column of a type SQL Server compares with a whole-second
@@ -552,13 +696,14 @@ fn source_superset(expr: &Expr, schema: &DFSchema) -> bool {
 }
 
 /// A superset filter [`SqlServerPolicy::superset_of`] produces: text equality
-/// or `IN` against ASCII literals, and whole-second bounds on a temporal
-/// column (`>=` a lower one, `<` an upper one), combined with `AND`/`OR`
-/// (with exact predicates too). SQL Server keeps at least the rows the
-/// engine keeps (its collations ignore case and trailing spaces, and match
-/// whenever the bytes match; a value the engine shows at or past a whole
-/// second is at or past it in SQL Server); the engine applies the exact
-/// predicate above.
+/// or `IN` against ASCII literals (of a column, or of its `lower`/`upper`
+/// under a Latin collation), `LIKE` of such an operand with an ASCII pattern
+/// holding no `_` or `[`, and whole-second bounds on a temporal column (`>=`
+/// a lower one, `<` an upper one), combined with `AND`/`OR` (with exact
+/// predicates too). SQL Server keeps at least the rows the engine keeps (its
+/// collations ignore case and trailing spaces, and match whenever the bytes
+/// match; a value the engine shows at or past a whole second is at or past
+/// it in SQL Server); the engine applies the exact predicate above.
 fn superset_shape(expr: &Expr, schema: &DFSchema) -> bool {
     match expr {
         Expr::BinaryExpr(BinaryExpr {
@@ -571,8 +716,8 @@ fn superset_shape(expr: &Expr, schema: &DFSchema) -> bool {
             op: Operator::Eq,
             right,
         }) => {
-            (superset_text_column(left, schema) && ascii_text(right))
-                || (superset_text_column(right, schema) && ascii_text(left))
+            (superset_text_operand(left, schema) && ascii_text(right))
+                || (superset_text_operand(right, schema) && ascii_text(left))
         }
         Expr::BinaryExpr(BinaryExpr {
             left,
@@ -580,7 +725,21 @@ fn superset_shape(expr: &Expr, schema: &DFSchema) -> bool {
             right,
         }) => superset_temporal_column(left, schema) && whole_second_literal(right),
         Expr::InList(list) => {
-            !list.negated && superset_text_column(&list.expr, schema) && list.list.iter().all(ascii_text)
+            !list.negated && superset_text_operand(&list.expr, schema) && list.list.iter().all(ascii_text)
+        }
+        Expr::Like(Like {
+            negated: false,
+            expr,
+            pattern,
+            escape_char: None,
+            case_insensitive: false,
+        }) => {
+            // A collation of another language may read letters together
+            // (`cs` is one in Hungarian): only Latin ones match `a%` with `ab`.
+            let latin = CaseCall::of(expr, schema).is_some()
+                || (superset_text_column(expr, schema)
+                    && collation_of(expr, schema).is_some_and(|c| latin_collation(&c)));
+            latin && ascii_literal(pattern).is_some_and(|p| !p.contains(['_', '[']))
         }
         _ => false,
     }
@@ -714,6 +873,9 @@ impl SqlServerPolicy {
                 (None, None) => None,
             },
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                if let Some(superset) = case_superset(term, schema) {
+                    return Some(superset);
+                }
                 if let (Some(column), Some(days)) = (date_of_column(left, schema), date_literal(right)) {
                     return date_bounds(column, *op, days, schema);
                 }
@@ -752,6 +914,13 @@ impl SqlServerPolicy {
                     )?),
                 )
             }
+            Expr::InList(_) => {
+                case_superset(term, schema).or_else(|| source_superset(term, schema).then(|| term.clone()))
+            }
+            // A `LIKE` of the query has the engine's meaning (`[` is a
+            // character, `_` one code point): only one of these supersets
+            // reaches SQL Server.
+            Expr::Like(_) => None,
             other => source_superset(other, schema).then(|| other.clone()),
         }
     }
@@ -853,6 +1022,26 @@ impl PushdownPolicy for SqlServerPolicy {
 
     fn superset(&self, term: &Expr, schema: &DFSchema) -> Option<Expr> {
         Self::superset_of(term, schema)
+    }
+
+    /// Keys that are plain columns [`exactly_ordered`], each with its NULLs
+    /// where SQL Server puts them (first ascending, last descending) or
+    /// with none.
+    fn first_rows(&self, sort: &Sort) -> bool {
+        let schema = sort.input.schema();
+        sort.expr.iter().all(|key| {
+            let Expr::Column(column) = &key.expr else {
+                return false;
+            };
+            let Ok(field) = schema.field_from_column(column) else {
+                return false;
+            };
+            (!field.is_nullable() || key.nulls_first == key.asc)
+                && exactly_ordered(
+                    field.data_type(),
+                    field.metadata().get(super::SQL_TYPE).map(String::as_str),
+                )
+        })
     }
 
     /// Adapts a subtree about to be unparsed:
@@ -1514,6 +1703,206 @@ mod tests {
         fn superset(term: &Expr) -> Option<Expr> {
             let plan = scan().build().unwrap();
             SqlServerPolicy.superset(term, plan.schema())
+        }
+
+        fn collated(name: &str, sql: &str, collation: &str) -> Field {
+            Field::new(name, DataType::Utf8, true).with_metadata(std::collections::HashMap::from([
+                (super::super::super::SQL_TYPE.to_owned(), sql.to_owned()),
+                (
+                    super::super::super::SQL_COLLATION.to_owned(),
+                    collation.to_owned(),
+                ),
+            ]))
+        }
+
+        fn texts() -> LogicalPlanBuilder {
+            let schema = Schema::new(vec![
+                collated("ci", "varchar(20)", "SQL_Latin1_General_CP1_CI_AS"),
+                collated("ci_n", "nvarchar(20)", "Latin1_General_100_CI_AS_SC_UTF8"),
+                collated("cs", "varchar(20)", "Latin1_General_CS_AS"),
+                collated("bin", "nvarchar(20)", "Latin1_General_100_BIN2"),
+                collated("tr", "nvarchar(20)", "Turkish_CI_AS"),
+                collated("memo", "text", "SQL_Latin1_General_CP1_CI_AS"),
+                typed("bare", DataType::Utf8, "varchar(20)"),
+                Field::new("n", DataType::Int64, true),
+            ]);
+            table_scan(Some("t"), &schema, None).unwrap()
+        }
+
+        fn text_superset(term: &Expr) -> Option<Expr> {
+            let plan = texts().build().unwrap();
+            SqlServerPolicy.superset(term, plan.schema())
+        }
+
+        /// `lower`/`upper` of a column compared with ASCII literals: under a
+        /// Latin collation that ignores case, the column itself; under
+        /// another Latin one, the call (`LOWER` maps ASCII as the engine).
+        /// A letter another character also becomes (`İ` → `i`) is `%` in a
+        /// `LIKE`, and so are `%`, `_` and `[` then.
+        #[test]
+        fn lower_and_upper_of_a_latin_column_are_sent_as_a_superset() {
+            use datafusion::functions::expr_fn::{lower, upper};
+            let s = text_superset;
+            assert_eq!(
+                s(&lower(col("ci")).eq(lit("pagas"))),
+                Some(col("ci").eq(lit("pagas")))
+            );
+            assert_eq!(
+                s(&lit("pagas").eq(lower(col("ci")))),
+                Some(col("ci").eq(lit("pagas")))
+            );
+            assert_eq!(
+                s(&lower(col("ci")).eq(lit("a_b%c"))),
+                Some(col("ci").eq(lit("a_b%c")))
+            );
+            assert_eq!(
+                s(&lower(col("ci_n")).eq(lit("recebidas"))),
+                Some(col("ci_n").like(lit("receb%das")))
+            );
+            assert_eq!(
+                s(&upper(col("ci")).eq(lit("STRASSE"))),
+                Some(col("ci").like(lit("%TRA%E")))
+            );
+            assert_eq!(
+                s(&lower(col("ci")).eq(lit("k_i%t[x"))),
+                Some(col("ci").like(lit("%t%x")))
+            );
+            assert_eq!(
+                s(&lower(col("cs")).eq(lit("pagas"))),
+                Some(lower(col("cs")).eq(lit("pagas")))
+            );
+            assert_eq!(
+                s(&upper(col("bin")).in_list(vec![lit("PAGAS"), lit("SIM")], false)),
+                Some(
+                    upper(col("bin"))
+                        .like(lit("PAGA%"))
+                        .or(upper(col("bin")).like(lit("%M")))
+                )
+            );
+            assert_eq!(
+                s(&lower(col("ci")).eq(lit("pagas")).and(col("n").gt(lit(1_i64)))),
+                Some(col("ci").eq(lit("pagas")).and(col("n").gt(lit(1_i64))))
+            );
+            for kept in [
+                lower(col("tr")).eq(lit("pagas")),
+                lower(col("memo")).eq(lit("pagas")),
+                lower(col("bare")).eq(lit("pagas")),
+                lower(col("ci")).eq(lit("ação")),
+                lower(col("ci")).not_eq(lit("pagas")),
+                lower(col("ci")).in_list(vec![lit("pagas")], true),
+                lower(col("ci")).eq(col("cs")),
+                lower(col("ci")).like(lit("pa%")),
+                col("ci").like(lit("pa%")),
+                datafusion::functions::expr_fn::trim(vec![col("ci")]).eq(lit("pagas")),
+            ] {
+                assert_eq!(s(&kept), None, "{kept}");
+            }
+            let filter = |e: Expr| texts().filter(e).unwrap();
+            assert!(
+                !pushable(filter(lower(col("ci")).eq(lit("pagas")))),
+                "never as the exact filter"
+            );
+            for marked in [
+                lower(col("ci_n")).eq(lit("recebidas")),
+                upper(col("bin")).in_list(vec![lit("PAGAS"), lit("SIM")], false),
+            ] {
+                let sent = s(&marked).unwrap();
+                assert!(
+                    pushable(filter(codelake_core::functions::superset_filter(sent))),
+                    "{marked}"
+                );
+            }
+            // A `LIKE` with `_` or `[`, or of a column of another collation,
+            // is no superset this policy sends.
+            for refused in [
+                col("ci").like(lit("a_c")),
+                col("ci").like(lit("[a]c")),
+                col("tr").like(lit("a%")),
+                lower(col("tr")).eq(lit("a")),
+            ] {
+                assert!(
+                    !pushable(filter(codelake_core::functions::superset_filter(refused.clone()))),
+                    "{refused}"
+                );
+            }
+        }
+
+        /// The first rows of a sort reach SQL Server by plain columns it
+        /// orders as the engine (NULLs included: first ascending, last
+        /// descending, or a column without them).
+        #[test]
+        fn first_rows_by_columns_ordered_as_the_engine() {
+            use datafusion::arrow::datatypes::TimeUnit;
+            let nonnull =
+                |name: &str, data_type: DataType, sql: &str| typed(name, data_type, sql).with_nullable(false);
+            let schema = Schema::new(vec![
+                nonnull("id", DataType::Int64, "bigint"),
+                typed("small", DataType::Int32, "int"),
+                typed("amount", DataType::Decimal128(18, 2), "decimal(18,2)"),
+                typed("valor", DataType::Decimal128(19, 4), "money"),
+                typed("day", DataType::Date32, "date"),
+                typed("dt", DataType::Timestamp(TimeUnit::Microsecond, None), "datetime"),
+                typed(
+                    "loaded",
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    "datetime2(3)",
+                ),
+                typed(
+                    "minute",
+                    DataType::Timestamp(TimeUnit::Second, None),
+                    "smalldatetime",
+                ),
+                typed(
+                    "dt2",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    "datetime2(7)",
+                ),
+                typed("ratio", DataType::Float64, "float"),
+                typed("code", DataType::Utf8, "varchar(5)"),
+                typed("flag", DataType::Boolean, "bit"),
+                typed("lsn", DataType::Binary, "binary(10)"),
+                typed("at", DataType::Time64(TimeUnit::Microsecond), "time(6)"),
+                Field::new("computed", DataType::Int64, false),
+            ]);
+            let first = |keys: Vec<datafusion::logical_expr::SortExpr>| {
+                let plan = table_scan(Some("t"), &schema, None)
+                    .unwrap()
+                    .sort(keys)
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                let LogicalPlan::Sort(sort) = plan else {
+                    unreachable!("a sort")
+                };
+                SqlServerPolicy.first_rows(&sort)
+            };
+            assert!(
+                first(vec![col("id").sort(true, false), col("id").sort(false, true)]),
+                "no NULLs"
+            );
+            assert!(first(vec![col("small").sort(false, false)]));
+            assert!(first(vec![col("small").sort(true, true)]));
+            assert!(
+                !first(vec![col("small").sort(true, false)]),
+                "SQL Server puts NULLs first"
+            );
+            assert!(!first(vec![col("small").sort(false, true)]));
+            assert!(first(vec![
+                col("amount").sort(false, false),
+                col("valor").sort(true, true),
+                col("day").sort(false, false),
+                col("dt").sort(false, false),
+                col("loaded").sort(false, false),
+                col("minute").sort(false, false),
+            ]));
+            for unordered in ["dt2", "ratio", "code", "flag", "lsn", "at", "computed"] {
+                assert!(!first(vec![col(unordered).sort(false, false)]), "{unordered}");
+            }
+            assert!(!first(vec![(col("id") + lit(1_i64)).sort(false, false)]));
+            assert!(!first(vec![
+                col("id").sort(false, false),
+                col("ratio").sort(false, false)
+            ]));
         }
 
         #[test]

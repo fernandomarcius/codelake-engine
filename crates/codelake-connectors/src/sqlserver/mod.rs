@@ -41,13 +41,17 @@ const LIST_TABLES: &str = "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHE
      AND TABLE_TYPE IN ('BASE TABLE', 'VIEW')";
 
 const LIST_COLUMNS: &str = "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, \
-     CHARACTER_MAXIMUM_LENGTH, DATETIME_PRECISION \
+     CHARACTER_MAXIMUM_LENGTH, DATETIME_PRECISION, COLLATION_NAME \
      FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = @P1 AND TABLE_NAME = @P2 \
      ORDER BY ORDINAL_POSITION";
 
 /// Field metadata key holding the column's SQL Server type, e.g. `binary(10)`
 /// or `datetime2(7)`. The pushdown policy relies on it.
 pub(crate) const SQL_TYPE: &str = "sqlserver.type";
+
+/// Field metadata key holding the collation of a text column, e.g.
+/// `SQL_Latin1_General_CP1_CI_AS`. The pushdown policy relies on it.
+pub(crate) const SQL_COLLATION: &str = "sqlserver.collation";
 
 /// SQL Server type as written in DDL, from `INFORMATION_SCHEMA.COLUMNS`.
 fn sql_type(data_type: &str, max_length: Option<i32>, datetime_precision: Option<i16>) -> String {
@@ -271,6 +275,7 @@ impl SqlServerResolver {
             let nullable = row.get::<&str, _>(4) != Some("NO");
             let max_length: Option<i32> = row.get(5);
             let datetime_precision: Option<i16> = row.get(6);
+            let collation: Option<&str> = row.get(7);
             if !safe_name(column) {
                 tracing::warn!(source = %self.source, %schema, %table, %column, "name contains `]`; column not exposed");
                 continue;
@@ -288,6 +293,9 @@ impl SqlServerResolver {
             )]);
             if let Some(declared) = declared_text(data_type, max_length) {
                 metadata.insert(codelake_core::trino_types::TRINO_TYPE.to_owned(), declared);
+            }
+            if let Some(collation) = collation {
+                metadata.insert(SQL_COLLATION.to_owned(), collation.to_owned());
             }
             let field = Field::new(column.to_lowercase(), arrow, nullable).with_metadata(metadata);
             real_names.insert(column.to_lowercase(), column.to_owned());

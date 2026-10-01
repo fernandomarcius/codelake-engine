@@ -39,6 +39,32 @@ pub fn superset_filter(predicate: Expr) -> Expr {
     UDF.call(vec![predicate])
 }
 
+/// Whether a character beyond ASCII becomes `c`, an ASCII character, under
+/// the engine's `lower` (`upper` when `upper`): `İ` and the Kelvin sign
+/// become `i` and `k`, `ı` and `ſ` become `I` and `S`. Where the engine's
+/// `lower(x)` holds such a `c`, `x` may hold that other character, which a
+/// source folding case its own way need not map to `c`.
+pub fn has_case_preimage_beyond_ascii(c: char, upper: bool) -> bool {
+    static ASCII_IMAGES: std::sync::LazyLock<[[bool; 128]; 2]> = std::sync::LazyLock::new(|| {
+        let mut images = [[false; 128]; 2];
+        for c in '\u{80}'..=char::MAX {
+            for (table, upper) in images.iter_mut().zip([false, true]) {
+                if let Ok(byte) = u8::try_from(crate::trino_functions::case_of(c, upper))
+                    && let Some(seen) = table.get_mut(usize::from(byte))
+                {
+                    *seen = true;
+                }
+            }
+        }
+        images
+    });
+    u8::try_from(c)
+        .ok()
+        .and_then(|byte| ASCII_IMAGES[usize::from(upper)].get(usize::from(byte)))
+        .copied()
+        .unwrap_or(false)
+}
+
 /// The predicate inside [`superset_filter`], if `expr` is one.
 pub fn as_superset_filter(expr: &Expr) -> Option<&Expr> {
     let Expr::ScalarFunction(function) = expr else {
@@ -190,6 +216,26 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::AsArray;
     use datafusion::prelude::SessionContext;
+
+    /// The ASCII letters a character beyond ASCII also becomes under the
+    /// engine's `lower` and `upper` (Java's one-code-point mappings):
+    /// `İ`→`i`, Kelvin sign→`k`; `ı`→`I`, `ſ`→`S`.
+    #[test]
+    fn ascii_letters_other_characters_case_map_to() {
+        let open = |upper| {
+            (0_u8..128)
+                .map(char::from)
+                .filter(|c| has_case_preimage_beyond_ascii(*c, upper))
+                .collect::<String>()
+        };
+        assert_eq!(open(false), "ik");
+        assert_eq!(open(true), "IS");
+        assert!(
+            !has_case_preimage_beyond_ascii('\u{130}', false),
+            "only ASCII characters"
+        );
+        assert!(!has_case_preimage_beyond_ascii('\u{212A}', true));
+    }
 
     #[test]
     fn hex_round_trip() {
