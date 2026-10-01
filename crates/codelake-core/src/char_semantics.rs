@@ -943,7 +943,7 @@ fn typed_as(args: &[Expr], scope: &Scope<'_>) -> Option<Text> {
     match Declared::parse(name)? {
         Declared::Char(n) => Some(Text::Char(Some(n))),
         Declared::Varchar(k) => Some(Text::Varchar(Bound::Known(k))),
-        Declared::Timestamp(_) => None,
+        Declared::Timestamp(_) | Declared::Time(_) => None,
     }
 }
 

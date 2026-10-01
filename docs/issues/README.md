@@ -69,3 +69,4 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-057](ISS-057-upstream-unparser-decorrelation-workarounds.md) | Upstream unparser and decorrelation defects worked around in the engine | upstream defect | 2026-09-29 | open |
 | [ISS-058](ISS-058-coalesce-of-varchar-and-char-is-not-padded.md) | `COALESCE` of a `varchar` and a SQL Server `char(n)` is not padded to `char(65536)` (Trino 431: padded); extended to every origin by ISS-059 | deliberate divergence | 2026-09-30 | open |
 | [ISS-059](ISS-059-char-values-are-never-padded.md) | `char(n)` values are never padded, from any origin (Trino 431: padded to `n`); comparisons as the reference | deliberate divergence | 2026-09-30 | open |
+| [ISS-061](ISS-061-time-precision-lost-through-expressions.md) | A `TIME` literal's `time(p)` is lost through `VALUES`, `CASE` and other expressions (`time(9)` again) | known defect | 2026-10-01 | open |

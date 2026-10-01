@@ -257,6 +257,9 @@ pub(crate) fn field_type(field: &Field, encoding: Encoding) -> Result<(String, V
             };
             (name, signature(raw, &[long_arg(i64::from(p))]))
         }
+        Some(Declared::Time(p)) if encoding.parametric_datetime => {
+            (format!("time({p})"), signature("time", &[long_arg(i64::from(p))]))
+        }
         _ => trino_type(field.data_type(), encoding)?,
     })
 }
@@ -462,6 +465,22 @@ fn timestamp_value_digits(
     }))
 }
 
+/// Nanoseconds of the day of row `row` of a time array.
+fn time_nanos(array: &ArrayRef, row: usize) -> i128 {
+    match array.data_type() {
+        DataType::Time32(TimeUnit::Second) => {
+            i128::from(array.as_primitive::<Time32SecondType>().value(row)) * 1_000_000_000
+        }
+        DataType::Time32(_) => {
+            i128::from(array.as_primitive::<Time32MillisecondType>().value(row)) * 1_000_000
+        }
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            i128::from(array.as_primitive::<Time64NanosecondType>().value(row))
+        }
+        _ => i128::from(array.as_primitive::<Time64MicrosecondType>().value(row)) * 1_000,
+    }
+}
+
 fn time_value(nanos_of_day: i128, unit: TimeUnit, encoding: Encoding) -> Value {
     let digits = encoding.digits(precision(unit));
     let rounded = round_nanos(nanos_of_day, digits).rem_euclid(NANOS_PER_DAY);
@@ -485,7 +504,8 @@ fn values(list: &ArrayRef, encoding: Encoding) -> Result<Value> {
 }
 
 /// [`value`] of a column declaring a narrower Trino type: a `timestamp(p)`
-/// shows `p` fraction digits, a `char(n)` its value without trailing spaces.
+/// or `time(p)` shows `p` fraction digits, a `char(n)` its value without
+/// trailing spaces.
 pub(crate) fn declared_value(
     array: &ArrayRef,
     row: usize,
@@ -504,6 +524,11 @@ pub(crate) fn declared_value(
                 3
             };
             timestamp_value_digits(array, row, *unit, zone.as_deref(), digits)
+        }
+        (Some(Declared::Time(p)), DataType::Time32(_) | DataType::Time64(_)) => {
+            let digits = encoding.digits(u32::from(p));
+            let rounded = round_nanos(time_nanos(array, row), digits).rem_euclid(NANOS_PER_DAY);
+            Ok(json!(time_text(rounded, digits)))
         }
         // Never padded (Trino pads to `n` characters, ISS-059).
         (Some(Declared::Char(_)), _) => match value(array, row, encoding)? {
@@ -572,22 +597,8 @@ pub(crate) fn value(array: &ArrayRef, row: usize, encoding: Encoding) -> Result<
             json!(date_text(millis.div_euclid(MILLIS_PER_DAY)))
         }
         DataType::Timestamp(unit, zone) => timestamp_value(array, row, *unit, zone.as_deref(), encoding)?,
-        DataType::Time32(unit) => {
-            let (raw, factor) = match unit {
-                TimeUnit::Second => (array.as_primitive::<Time32SecondType>().value(row), 1_000_000_000),
-                _ => (
-                    array.as_primitive::<Time32MillisecondType>().value(row),
-                    1_000_000,
-                ),
-            };
-            time_value(i128::from(raw) * factor, *unit, encoding)
-        }
-        DataType::Time64(unit) => {
-            let nanos = match unit {
-                TimeUnit::Nanosecond => i128::from(array.as_primitive::<Time64NanosecondType>().value(row)),
-                _ => i128::from(array.as_primitive::<Time64MicrosecondType>().value(row)) * 1_000,
-            };
-            time_value(nanos, *unit, encoding)
+        DataType::Time32(unit) | DataType::Time64(unit) => {
+            time_value(time_nanos(array, row), *unit, encoding)
         }
         DataType::Interval(IntervalUnit::YearMonth) => json!(year_to_month_text(
             array.as_primitive::<IntervalYearMonthType>().value(row)

@@ -26,6 +26,14 @@ impl Harness {
         self.call(Method::POST, "/v1/statement", &all, sql).await.body
     }
 
+    /// The first page of a statement: where a refusal at submission is.
+    async fn first_page_as(&self, user: &str, sql: &str) -> Value {
+        let submitted = self.submit_as(user, sql, &[]).await;
+        assert_eq!(submitted["stats"]["state"], "QUEUED", "{submitted}");
+        let next = path_of(submitted["nextUri"].as_str().unwrap());
+        self.call(Method::GET, &next, &[], "").await.body
+    }
+
     async fn cancel(&self, submitted: &Value) {
         let next = path_of(submitted["nextUri"].as_str().unwrap());
         let _ = self.call(Method::DELETE, &next, &[], "").await;
@@ -172,7 +180,7 @@ async fn queued_queries_run_when_a_slot_frees() {
     h.load_becomes((0, 0)).await;
 }
 
-/// A full queue refuses at once, in the submission's own response.
+/// A full queue refuses at once, on the statement's first page.
 #[tokio::test]
 async fn a_full_queue_refuses_with_query_queue_full() {
     let h = governed(&GovernanceConfig {
@@ -182,7 +190,7 @@ async fn a_full_queue_refuses_with_query_queue_full() {
     });
     let holder = h.submit_as("ana", HOLDS_A_SLOT, &[]).await;
     h.load_becomes((1, 0)).await;
-    let refused = h.submit_as("bob", "SELECT 1", &[]).await;
+    let refused = h.first_page_as("bob", "SELECT 1").await;
     assert!(refused.get("nextUri").is_none(), "{refused}");
     assert_eq!(refused["error"]["errorName"], "QUERY_QUEUE_FULL", "{refused}");
     assert_eq!(refused["error"]["errorType"], "INSUFFICIENT_RESOURCES");
@@ -206,7 +214,7 @@ async fn per_user_limit_refuses_that_user_only() {
     });
     let holder = h.submit_as("alice", HOLDS_A_SLOT, &[]).await;
     h.load_becomes((1, 0)).await;
-    let refused = h.submit_as("alice", "SELECT 1", &[]).await;
+    let refused = h.first_page_as("alice", "SELECT 1").await;
     assert_eq!(refused["error"]["errorName"], "QUERY_QUEUE_FULL", "{refused}");
     assert_eq!(
         refused["error"]["message"],
@@ -295,7 +303,7 @@ async fn resource_group_limits_its_members() {
     });
     let holder = h.submit_as("dbt", HOLDS_A_SLOT, &[]).await;
     h.load_becomes((1, 0)).await;
-    let refused = h.submit_as("dbt", "SELECT 1", &[]).await;
+    let refused = h.first_page_as("dbt", "SELECT 1").await;
     assert_eq!(
         refused["error"]["message"], "Too many queued queries for resource group etl (limit 0)",
         "{refused}"
@@ -335,7 +343,7 @@ async fn session_statements_do_not_queue() {
     let holder = h.submit_as("ana", HOLDS_A_SLOT, &[]).await;
     h.load_becomes((1, 0)).await;
     let set = h
-        .submit_as("ana", "SET SESSION query_max_run_time = '1h'", &[])
+        .first_page_as("ana", "SET SESSION query_max_run_time = '1h'")
         .await;
     assert_eq!(set["stats"]["state"], "FINISHED", "{set}");
     h.cancel(&holder).await;

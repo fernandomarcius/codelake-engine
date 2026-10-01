@@ -2,7 +2,7 @@
 PostgreSQL wire protocol (simple and extended query), standard library only.
 
 Every call returns a result dict and never raises for a query error:
-  {"rows": [[...]], "types": [...]}          an answer
+  {"rows": [[...]], "types": [...], "names": [...]}   an answer
   {"error": "<code>", "message": "..."}      a refusal (Trino errorName or SQLSTATE)
   {"error": "HANG", "message": "..."}        no answer within the timeout
 """
@@ -49,6 +49,10 @@ class Trino:
         if st != 200:
             return {"error": f"HTTP{st}", "message": body[:400]}
         page = json.loads(body)
+        if not page.get("nextUri"):
+            # The reference engine answers every submission with a nextUri, and a client
+            # may follow it without reading the rest (the .NET driver does).
+            return {"error": "NO_NEXT_URI", "message": body[:400]}
         cols, rows = None, []
         started = time.time()
         while True:
@@ -71,7 +75,7 @@ class Trino:
                 return {"error": f"HTTP{st}", "message": body[:400]}
             page = json.loads(body)
         cols = cols or []
-        return {"types": [c["type"] for c in cols], "rows": rows}
+        return {"types": [c["type"] for c in cols], "names": [c["name"] for c in cols], "rows": rows}
 
     def ready(self):
         try:

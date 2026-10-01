@@ -216,7 +216,7 @@ fn view_declared(trino: &str) -> Option<Declared> {
     Declared::parse(trino).filter(|d| match d {
         Declared::Varchar(_) => true,
         Declared::Timestamp(p) => ![0, 3, 6, 9].contains(p),
-        Declared::Char(_) => false,
+        Declared::Char(_) | Declared::Time(_) => false,
     })
 }
 

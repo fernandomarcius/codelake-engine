@@ -1447,7 +1447,10 @@ async fn queue_limit_rejects_with_query_queue_full() {
     let base = server.base();
     let a = post(&base, PARKED, &[]).await.json();
     let _b = post(&base, PARKED, &[]).await.json();
-    let full = post(&base, "SELECT 1", &[]).await.json();
+    // Accepted like any statement; the refusal is on the first page.
+    let submitted = post(&base, "SELECT 1", &[]).await.json();
+    assert_eq!(submitted["stats"]["state"], "QUEUED", "{submitted}");
+    let full = get(submitted["nextUri"].as_str().unwrap()).await.json();
     assert!(full.get("nextUri").is_none(), "{full}");
     assert_eq!(full["error"]["errorName"], "QUERY_QUEUE_FULL", "{full}");
     assert_eq!(full["error"]["errorCode"], 131_074);

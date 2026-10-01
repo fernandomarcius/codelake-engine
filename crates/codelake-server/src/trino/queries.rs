@@ -177,12 +177,14 @@ impl<E: Release> Registry<E> {
     }
 
     /// Indexes a query, forgetting completed ones the engine's registry no
-    /// longer lists; refuses it beyond `max_active` unfinished queries.
+    /// longer lists; refuses an unfinished one beyond `max_active` unfinished
+    /// queries. A query that failed before running takes no slot: it is
+    /// indexed only so that its client can read the failure.
     pub(crate) fn insert(&self, query: Arc<Query<E>>) -> Result<(), QueryError> {
         let mut map = self.map();
         self.trim(&mut map);
         let active = map.values().filter(|q| !q.is_done()).count();
-        if active >= self.limits.max_active {
+        if !query.is_done() && active >= self.limits.max_active {
             return Err(QueryError::new(
                 Code::QueryQueueFull,
                 format!("Too many queued queries (limit {})", self.limits.max_active),
@@ -285,8 +287,14 @@ mod tests {
         let records = records(10);
         let registry = registry(&records, 1);
         registry.insert(query(&records)).unwrap();
-        let err = registry.insert(query(&records)).unwrap_err();
+        let refused = query(&records);
+        let err = registry.insert(Arc::clone(&refused)).unwrap_err();
         assert_eq!(err.name(), "QUERY_QUEUE_FULL");
+        // Failed, it is indexed for its client to read why, beyond the limit.
+        refused.fail(&err);
+        registry.insert(Arc::clone(&refused)).unwrap();
+        assert!(registry.get(&refused.id).is_some());
+        assert!(registry.insert(query(&records)).is_err(), "still full");
     }
 
     #[test]

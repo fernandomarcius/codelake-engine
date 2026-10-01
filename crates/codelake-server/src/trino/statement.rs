@@ -3,7 +3,10 @@
 //! Each query runs in its own task that plans it and pushes record batches into
 //! a small bounded channel, so execution moves ahead of the client by at most a
 //! few batches, like Trino's output buffer. `GET nextUri` drains the channel
-//! into a page of about 1 MiB of JSON. Pages are numbered by the token in the
+//! into a page of about the size the client asks for (`targetResultSize`, 1 MiB
+//! of JSON by default, 128 MiB at most): once it has rows, it keeps taking the
+//! batches that follow each other closely and sends the page when the size is
+//! reached or execution pauses. Pages are numbered by the token in the
 //! URI; asking again for the current token returns the same page (a client
 //! retry after a lost response), an older token is gone (`410`) and a later one
 //! unknown (`404`).
@@ -28,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -53,7 +56,7 @@ use datafusion::sql::sqlparser::tokenizer::Token;
 use futures::StreamExt;
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::sync::mpsc::{self, error::TryRecvError};
+use tokio::sync::mpsc;
 
 use super::errors::{Code, Everything, Namespace, QueryError};
 use super::prepared::{self, Command};
@@ -62,10 +65,17 @@ use super::rewrite;
 use super::session::{self, ClientSession, Control, SessionError};
 use super::types::{self, Column, Encoding};
 
-/// JSON per page; Trino's default target result size is 1 MB.
+/// JSON per page when the client asks for no size; Trino's default target
+/// result size is 1 MB.
 const PAGE_TARGET_BYTES: usize = 1 << 20;
+/// Largest page a client may ask for (as the reference engine).
+const MAX_PAGE_TARGET_BYTES: usize = 128 << 20;
 /// Longest a `GET nextUri` waits for rows before answering with none.
 const MAX_WAIT: Duration = Duration::from_secs(1);
+/// Once a page has rows, how long it waits for the next batch before it is
+/// sent short: execution that produces small batches back to back fills the
+/// page, one that pauses does not hold the rows it has.
+const FILL_WAIT: Duration = Duration::from_millis(10);
 /// Batches produced ahead of the client.
 const BUFFERED_BATCHES: usize = 2;
 
@@ -311,6 +321,8 @@ pub(crate) struct Exec {
     columns: Option<Arc<Vec<Column>>>,
     /// The Trino type each result column declares beyond its Arrow type.
     declared: Vec<Option<codelake_core::trino_types::Declared>>,
+    /// The output items as the statement writes them: the case of the names.
+    written: Vec<rewrite::Written>,
     count: Option<u64>,
     pending: Option<(Buffered, usize)>,
     finished: bool,
@@ -319,6 +331,9 @@ pub(crate) struct Exec {
     /// The rows of the page being built, then the body in `last`.
     memory: MemoryReservation,
     warnings: Vec<Value>,
+    /// The final page of a statement answered without execution (session
+    /// control, prepared statements, a kill), sent on the first `nextUri`.
+    answer: Option<Page>,
 }
 
 impl Release for Exec {
@@ -330,6 +345,7 @@ impl Release for Exec {
         self.pending = None;
         self.finished = true;
         self.last = None;
+        self.answer = None;
         self.memory.free();
     }
 }
@@ -348,6 +364,7 @@ impl Exec {
             encoding,
             columns: None,
             declared: Vec::new(),
+            written: Vec::new(),
             count: None,
             pending: None,
             finished: false,
@@ -355,6 +372,7 @@ impl Exec {
             last: None,
             memory: MemoryConsumer::new(format!("Trino page {id}")).register(pool),
             warnings,
+            answer: None,
         }
     }
 
@@ -366,6 +384,7 @@ impl Exec {
         query: &TrinoQuery,
         rows: &mut Vec<Vec<Value>>,
         bytes: &mut usize,
+        target: usize,
     ) -> Result<(), QueryError> {
         let Some((buffered, mut offset)) = self.pending.take() else {
             return Ok(());
@@ -373,7 +392,7 @@ impl Exec {
         let start = offset;
         let batch = &buffered.batch;
         let mut refused = None;
-        while offset < batch.num_rows() && *bytes < PAGE_TARGET_BYTES {
+        while offset < batch.num_rows() && *bytes < target {
             let row = batch
                 .columns()
                 .iter()
@@ -399,7 +418,7 @@ impl Exec {
             Some(error) if rows.is_empty() => Err(QueryError::from(&error)),
             // Sent short: the next page starts at the refused row.
             Some(_) => {
-                *bytes = PAGE_TARGET_BYTES;
+                *bytes = target;
                 Ok(())
             }
             None => Ok(()),
@@ -410,7 +429,12 @@ impl Exec {
         match event {
             Event::Started(schema) => {
                 if self.shape == Shape::Rows {
-                    self.columns = Some(Arc::new(types::columns(&schema, self.encoding)?));
+                    let mut columns = types::columns(&schema, self.encoding)?;
+                    rewrite::restore_written(
+                        columns.iter_mut().map(|c| &mut c.name).collect(),
+                        &self.written,
+                    );
+                    self.columns = Some(Arc::new(columns));
                     self.declared = schema
                         .fields()
                         .iter()
@@ -432,34 +456,34 @@ impl Exec {
         Ok(())
     }
 
-    /// Produces the next page: rows, a final result, or an error.
-    async fn page(&mut self, query: &TrinoQuery) -> Page {
+    /// Produces the next page, of about `target` bytes of rows: rows, a
+    /// final result, or an error.
+    async fn page(&mut self, query: &TrinoQuery, target: usize) -> Page {
         if let Some(error) = query.error() {
             self.release();
             return Page::failed(error);
+        }
+        if let Some(answer) = self.answer.take() {
+            return answer;
         }
         let deadline = tokio::time::Instant::now() + MAX_WAIT;
         let mut rows = Vec::new();
         let mut bytes = 0;
         loop {
-            if let Err(error) = self.take_rows(query, &mut rows, &mut bytes) {
+            if let Err(error) = self.take_rows(query, &mut rows, &mut bytes, target) {
                 return self.fail(query, &error);
             }
-            if bytes >= PAGE_TARGET_BYTES || self.pending.is_some() || self.finished {
+            if bytes >= target || self.pending.is_some() || self.finished {
                 break;
             }
-            // Wait for the first rows; once some are in hand, only take what is ready.
-            let event = if rows.is_empty() {
-                match tokio::time::timeout_at(deadline, self.events.recv()).await {
-                    Ok(event) => event,
-                    Err(_) => break,
-                }
+            // Wait for the first rows; once some are in hand, only briefly for more.
+            let until = if rows.is_empty() {
+                deadline
             } else {
-                match self.events.try_recv() {
-                    Ok(event) => Some(event),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => None,
-                }
+                deadline.min(tokio::time::Instant::now() + FILL_WAIT)
+            };
+            let Ok(event) = tokio::time::timeout_at(until, self.events.recv()).await else {
+                break;
             };
             let Some(event) = event else {
                 // The task ended without a final event: canceled or panicked.
@@ -566,6 +590,8 @@ struct Page {
     done: bool,
     update_type: Option<&'static str>,
     update_count: Option<u64>,
+    /// Response headers: what a session-control statement changes.
+    headers: Vec<(HeaderName, String)>,
 }
 
 impl Page {
@@ -732,7 +758,18 @@ impl TrinoState {
         next_token: Option<u64>,
         warnings: &[Value],
     ) -> Bytes {
-        let info = query.snapshot();
+        Self::body_as(query, base, page, next_token, warnings, &query.snapshot())
+    }
+
+    /// [`Self::body`] with the given statistics.
+    fn body_as(
+        query: &TrinoQuery,
+        base: &str,
+        page: &Page,
+        next_token: Option<u64>,
+        warnings: &[Value],
+        info: &Info,
+    ) -> Bytes {
         let results = QueryResults {
             id: &query.id,
             info_uri: format!("{base}/ui/query.html?{}", query.id),
@@ -740,7 +777,7 @@ impl TrinoState {
                 .map(|t| format!("{base}/v1/statement/executing/{}/{}/{t}", query.id, query.slug)),
             columns: page.columns.as_deref().map(Vec::as_slice),
             data: page.data.as_deref(),
-            stats: stats(&info),
+            stats: stats(info),
             error: page.error.as_ref(),
             warnings,
             update_type: page.update_type,
@@ -793,6 +830,29 @@ fn body_limit(max_chars: usize) -> usize {
     max_chars.saturating_mul(4).saturating_add(64 * 1024)
 }
 
+/// The answer to every accepted submission, whatever becomes of the
+/// statement: `QUEUED` with the first `nextUri`, where the outcome is (rows,
+/// a failure, or the page of a statement answered at once), as the reference
+/// engine answers. Clients rely on it: one (.NET) follows `nextUri` without
+/// reading anything else of this response.
+fn accepted(query: &TrinoQuery, base: &str) -> Response {
+    let mut info = query.snapshot();
+    info.state = QueryState::Queued;
+    json_response(
+        TrinoState::body_as(query, base, &Page::default(), Some(1), &[], &info),
+        &[],
+    )
+}
+
+/// Fails a query that has not run, keeping it reachable for its first page.
+fn fail_indexed(state: &TrinoState, query: &Arc<TrinoQuery>, error: &QueryError) {
+    query.fail(error);
+    // A full index refused it unfinished; failed, it takes no slot.
+    if state.queries.get(&query.id).is_none() {
+        let _ = state.queries.insert(Arc::clone(query));
+    }
+}
+
 /// Registers a query that failed before running and answers with its failure.
 fn refuse(
     state: &TrinoState,
@@ -811,11 +871,8 @@ fn refuse(
     let query = Arc::new(Query::new(record, exec));
     // A full registry reports its own error instead.
     let error = state.queries.insert(Arc::clone(&query)).err().unwrap_or(error);
-    query.fail(&error);
-    json_response(
-        TrinoState::body(&query, base, &Page::failed(error), None, &[]),
-        &[],
-    )
+    fail_indexed(state, &query, &error);
+    accepted(&query, base)
 }
 
 /// Warnings for the session properties this engine accepts and ignores.
@@ -901,52 +958,45 @@ async fn submit(State(state): State<Arc<TrinoState>>, request: Request) -> Respo
     let exec = Exec::new(receiver, encoding, warnings, &state.pool(), record.id());
     let query = Arc::new(Query::new(record, exec));
     if let Err(error) = state.queries.insert(Arc::clone(&query)) {
-        query.fail(&error);
-        return json_response(
-            TrinoState::body(&query, &base, &Page::failed(error), None, &[]),
-            &[],
-        );
+        fail_indexed(&state, &query, &error);
+        return accepted(&query, &base);
     }
 
     // Nobody else can reach the query before this response: the lock is free.
     let mut exec = query.exec.lock().await;
     let started = start(&state, &query, &mut exec, sql, session, sender);
     drop(exec);
-    match started {
-        Ok((page, headers, next)) => {
-            json_response(TrinoState::body(&query, &base, &page, next, &[]), &headers)
-        }
-        Err(error) => {
-            query.fail(&error);
-            json_response(
-                TrinoState::body(&query, &base, &Page::failed(error), None, &[]),
-                &[],
-            )
-        }
+    if let Err(error) = started {
+        query.fail(&error);
     }
+    accepted(&query, &base)
 }
 
-type Started = (Page, Vec<(HeaderName, String)>, Option<u64>);
-
-/// A statement answered at once, without execution.
-fn answered(query: &TrinoQuery, update_type: &'static str, headers: Vec<(HeaderName, String)>) -> Started {
+/// A statement answered at once, without execution: done now, its page (and
+/// the headers that change the client's session) sent on the first `nextUri`.
+fn answered(
+    query: &TrinoQuery,
+    exec: &mut Exec,
+    update_type: &'static str,
+    headers: Vec<(HeaderName, String)>,
+) {
     query.set_state(QueryState::Running);
     query.finish();
-    let page = Page {
+    exec.answer = Some(Page {
         columns: Some(Arc::new(Vec::new())),
         done: true,
         update_type: Some(update_type),
+        headers,
         ..Page::default()
-    };
-    (page, headers, None)
+    });
 }
 
 fn not_found_prepared(name: &str) -> QueryError {
     QueryError::new(Code::NotFound, format!("Prepared statement not found: {name}"))
 }
 
-/// Session-control and prepared-statement commands answer at once; anything
-/// else starts executing and the client follows `nextUri`.
+/// Session-control and prepared-statement commands are answered at once;
+/// anything else starts executing.
 fn start(
     state: &TrinoState,
     query: &Arc<TrinoQuery>,
@@ -954,9 +1004,8 @@ fn start(
     sql: &str,
     session: Result<ClientSession, QueryError>,
     sender: mpsc::Sender<Event>,
-) -> Result<Started, QueryError> {
+) -> Result<(), QueryError> {
     let session = session?;
-    let names = EngineNames(&state.engine);
     let bound;
     let sql = match prepared::command(sql)? {
         Some(Command::Prepare { name, sql: statement }) => {
@@ -968,22 +1017,26 @@ fn start(
                 session::percent_encode(&name),
                 session::percent_encode(&statement)
             );
-            return Ok(answered(
+            answered(
                 query,
+                exec,
                 "PREPARE",
                 vec![(state.headers.added_prepare.clone(), added)],
-            ));
+            );
+            return Ok(());
         }
         Some(Command::Deallocate { name }) => {
             if !session.prepared.contains_key(&name) {
                 return Err(not_found_prepared(&name));
             }
             let removed = session::percent_encode(&name);
-            return Ok(answered(
+            answered(
                 query,
+                exec,
                 "DEALLOCATE",
                 vec![(state.headers.deallocated_prepare.clone(), removed)],
-            ));
+            );
+            return Ok(());
         }
         Some(Command::Execute { name, parameters }) => {
             let statement = session
@@ -1002,19 +1055,8 @@ fn start(
         }
         None => sql,
     };
-    // Killing a query answers at once, without a slot: it works on a full node.
-    if let Some(request) = governance::kill_request_sql(sql) {
-        request
-            .and_then(|request| state.engine.governance().kill(&request, &session.user))
-            .map_err(|error| QueryError::from_kill(&error))?;
-        return Ok(answered(query, "CALL", Vec::new()));
-    }
-    if let Some(control) = session::control(sql, &session, state.engine.session_properties(), &names)? {
-        return Ok(answered(
-            query,
-            control.update_type(),
-            control_headers(&control, &session, &state.headers),
-        ));
+    if answered_at_once(state, query, exec, sql, &session)? {
+        return Ok(());
     }
     exec.shape = shape(sql);
     let work = if let Some(filter) = show_session_filter(sql)? {
@@ -1028,6 +1070,7 @@ fn start(
     } else if let Some((table, like)) = describe_target(sql) {
         Work::Describe(table, like)
     } else {
+        exec.written = rewrite::written_names(sql);
         Work::Sql {
             planned: rewrite::name_unnamed_columns(sql),
             sql: sql.to_owned(),
@@ -1035,7 +1078,7 @@ fn start(
     };
     let governance = state.engine.governance();
     let limits = governance.session_limits(&session.properties);
-    // Refused here, the client gets the failure in this response.
+    // Refused here, the client reads the failure on the first page.
     let ticket = governance
         .enter(query.record())
         .map_err(|e| QueryError::from_governance(&e))?;
@@ -1057,7 +1100,37 @@ fn start(
         sender,
         (ticket, limits),
     ));
-    Ok((Page::default(), Vec::new(), Some(1)))
+    Ok(())
+}
+
+/// Answers a kill or a session-control statement at once; `false` for any
+/// other statement.
+fn answered_at_once(
+    state: &TrinoState,
+    query: &TrinoQuery,
+    exec: &mut Exec,
+    sql: &str,
+    session: &ClientSession,
+) -> Result<bool, QueryError> {
+    // Killing a query answers at once, without a slot: it works on a full node.
+    if let Some(request) = governance::kill_request_sql(sql) {
+        request
+            .and_then(|request| state.engine.governance().kill(&request, &session.user))
+            .map_err(|error| QueryError::from_kill(&error))?;
+        answered(query, exec, "CALL", Vec::new());
+        return Ok(true);
+    }
+    let names = EngineNames(&state.engine);
+    let Some(control) = session::control(sql, session, state.engine.session_properties(), &names)? else {
+        return Ok(false);
+    };
+    answered(
+        query,
+        exec,
+        control.update_type(),
+        control_headers(&control, session, &state.headers),
+    );
+    Ok(true)
 }
 
 fn control_headers(
@@ -1352,6 +1425,7 @@ fn find(state: &TrinoState, id: &str, slug: &str) -> Option<Arc<TrinoQuery>> {
 async fn fetch(
     State(state): State<Arc<TrinoState>>,
     Path((id, slug, token)): Path<(String, String, u64)>,
+    RawQuery(parameters): RawQuery,
     headers: HeaderMap,
 ) -> Response {
     let Some(query) = find(&state, &id, &slug) else {
@@ -1359,7 +1433,53 @@ async fn fetch(
     };
     query.heartbeat();
     let base = state.base_uri(&headers);
-    fetch_page(&query, &base, token).await
+    fetch_page(&query, &base, token, page_target(parameters.as_deref())).await
+}
+
+/// The page size a client asks for (`?targetResultSize=5MB`), up to
+/// [`MAX_PAGE_TARGET_BYTES`] and at least one row; [`PAGE_TARGET_BYTES`]
+/// when it asks for none or for a size that cannot be read.
+fn page_target(parameters: Option<&str>) -> usize {
+    parameters
+        .into_iter()
+        .flat_map(|text| text.split('&'))
+        .find_map(|pair| pair.strip_prefix("targetResultSize="))
+        .and_then(data_size)
+        .map_or(PAGE_TARGET_BYTES, |bytes| bytes.clamp(1, MAX_PAGE_TARGET_BYTES))
+}
+
+/// A data size as the reference engine writes it: a number, possibly with a
+/// fraction, then `B`, `kB`, `MB`, `GB`, `TB` or `PB` (powers of 1024).
+fn data_size(text: &str) -> Option<usize> {
+    let split = text.find(|c: char| c.is_ascii_alphabetic())?;
+    let (number, unit) = text.split_at(split);
+    let shift = match unit {
+        "B" => 0,
+        "kB" => 10,
+        "MB" => 20,
+        "GB" => 30,
+        "TB" => 40,
+        "PB" => 50,
+        _ => return None,
+    };
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    let (whole, fraction) = match number.split_once('.') {
+        Some((whole, fraction)) if digits(fraction) => (whole, fraction),
+        Some(_) => return None,
+        None => (number, "0"),
+    };
+    if !digits(whole) {
+        return None;
+    }
+    let scale = 10_u128.checked_pow(u32::try_from(fraction.len()).ok()?)?;
+    let scaled = whole
+        .parse::<u128>()
+        .ok()?
+        .checked_mul(scale)?
+        .checked_add(fraction.parse().ok()?)?;
+    // Past the ceiling anyway: saturate instead of failing.
+    let bytes = scaled.checked_mul(1 << shift).map_or(u128::MAX, |b| b / scale);
+    Some(usize::try_from(bytes).unwrap_or(usize::MAX))
 }
 
 /// Counts a page request while it lives, also when the client goes away
@@ -1379,7 +1499,7 @@ impl Drop for Fetching<'_> {
     }
 }
 
-async fn fetch_page(query: &TrinoQuery, base: &str, token: u64) -> Response {
+async fn fetch_page(query: &TrinoQuery, base: &str, token: u64, target: usize) -> Response {
     // Declared before the `exec` guard, so dropped after it: the last request
     // out of a canceled query can then release what the cancel left.
     let _fetching = Fetching::new(query);
@@ -1395,7 +1515,7 @@ async fn fetch_page(query: &TrinoQuery, base: &str, token: u64) -> Response {
     if token < exec.next_token {
         return (StatusCode::GONE, "Invalid token").into_response();
     }
-    let page = exec.page(query).await;
+    let mut page = exec.page(query, target).await;
     let failed = query.error().is_some();
     if failed {
         // Failed while this page was built: no buffered batch is needed anymore.
@@ -1403,6 +1523,7 @@ async fn fetch_page(query: &TrinoQuery, base: &str, token: u64) -> Response {
     }
     let next = (!page.done).then_some(token + 1);
     let body = TrinoState::body(query, base, &page, next, &exec.warnings);
+    let headers = std::mem::take(&mut page.headers);
     drop(page);
     if page_is_final(next, failed) {
         // The query finished: nothing is kept for it, not even this page.
@@ -1417,7 +1538,7 @@ async fn fetch_page(query: &TrinoQuery, base: &str, token: u64) -> Response {
         exec.memory.resize(body.len());
     }
     exec.next_token = token + 1;
-    json_response(body, &[])
+    json_response(body, &headers)
 }
 
 /// The last page of a query that finished (not failed).
@@ -1551,6 +1672,38 @@ mod tests {
         assert!(!like("a_c").matches("ac"));
         assert!(!like("query").matches("query_max_run_time"));
         assert!(like("%a%b%").matches("xxaxxbxx"));
+    }
+
+    #[test]
+    fn pages_have_the_size_clients_ask_for() {
+        let asked = |value: &str| page_target(Some(&format!("targetResultSize={value}")));
+        assert_eq!(page_target(None), PAGE_TARGET_BYTES);
+        assert_eq!(page_target(Some("maxWait=1s")), PAGE_TARGET_BYTES);
+        assert_eq!(asked("5MB"), 5 << 20);
+        assert_eq!(page_target(Some("maxWait=1s&targetResultSize=1.5kB")), 1536);
+        assert_eq!(asked("200B"), 200);
+        assert_eq!(asked("0.25MB"), 1 << 18);
+        assert_eq!(asked("2GB"), MAX_PAGE_TARGET_BYTES, "within the ceiling");
+        assert_eq!(asked("128MB"), MAX_PAGE_TARGET_BYTES);
+        assert_eq!(
+            asked("100000000000000000000000000000000000PB"),
+            MAX_PAGE_TARGET_BYTES
+        );
+        assert_eq!(asked("0B"), 1, "at least one row a page");
+        for unreadable in [
+            "5mb", "5 MB", "MB", "5", "1.MB", ".5MB", "-1MB", "5MiB", "1.2.3MB", "1e3B",
+        ] {
+            assert_eq!(asked(unreadable), PAGE_TARGET_BYTES, "{unreadable}");
+        }
+        for (text, bytes) in [
+            ("3B", 3),
+            ("3kB", 3 << 10),
+            ("3GB", 3 << 30),
+            ("3TB", 3 << 40),
+            ("3PB", 3 << 50),
+        ] {
+            assert_eq!(data_size(text), Some(bytes), "{text}");
+        }
     }
 
     #[test]

@@ -286,6 +286,22 @@ versioning: [SemVer](https://semver.org/).
   which also fixes every other metadata rewrite). `--apply` checks that each directory it changes can be
   written before changing anything, and a write that fails halfway removes what the run wrote. A
   partitioned table refuses the plan with a clear message (its partition metadata is not migrated).
+- Found running the Warehouse API's .NET driver (`NH.Trino.Data.ADO` 2025.11.15.6) against the HTTP statement
+  protocol (2026-10-01):
+  - Every submission is answered `QUEUED` with the first `nextUri`, as the reference engine answers;
+    statements answered at once (`USE`, `SET`/`RESET SESSION`, `PREPARE`, `DEALLOCATE`, a kill) and failures
+    found before execution (a bad session property, parameters that do not bind, a full queue, a text over
+    the limit) come on that page, with their `X-Trino-Set-*`/`Added-Prepare` headers. They came in the
+    submission's own answer, without `nextUri`, and the driver failed with `NullReferenceException`.
+  - Result columns keep the case they are written with: `SELECT 1 AS FirstDay` and `SELECT X FROM t` name
+    them `FirstDay` and `X`, quoted or not (they were `firstday`, `x`); the names a `*` expands to are still
+    folded (ISS-018).
+  - A page takes the size the client asks for (`targetResultSize`, up to 128 MB; 1 MB by default) and, once
+    it has rows, keeps taking the batches that follow closely: execution producing small batches (a cross
+    join of `UNNEST`s) sent two batches a page. 300 000 rows over a link of 8 ms: 5 001 requests, 57.5 s →
+    4 requests (the driver asks for 5 MB), 0.53 s (reference engine: 0.83 s).
+  - A `TIME` literal is `time(p)` for its fraction digits (`TIME '12:34:56.789'` is `time(3)`), as in the
+    reference engine; it was `time(9)`, whose nine digits the driver cannot read.
 - Found by the shadow run on production routines (2026-10-01):
   - **Wrong result**: a `UNION ALL` (or `UNION`) of three or more inputs mixing a decimal and a `double`
     answered `decimal(35,15)` where the reference answers `double` (the go/no-go report model stored

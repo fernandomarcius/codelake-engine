@@ -57,6 +57,13 @@ class Classify(unittest.TestCase):
         self.assertEqual(classify(ans([["a"]], ["varchar"]), ans([["a"]], ["varchar(1)"])), "TIPO")
         self.assertEqual(classify(ans([["a"]], ["varchar"]), ans([["a"]], ["varchar(1)"]), compare_types=False), "OK")
 
+    def test_names_compared_with_the_types(self):
+        want = dict(ans([[1]], ["integer"]), names=["FirstDay"])
+        self.assertEqual(classify(want, dict(ans([[1]], ["integer"]), names=["firstday"])), "NOME")
+        self.assertEqual(classify(want, dict(ans([[1]], ["integer"]), names=["FirstDay"])), "OK")
+        self.assertEqual(classify(want, dict(ans([[1]], ["bigint"]), names=["firstday"])), "TIPO")
+        self.assertEqual(classify(want, dict(ans([[1]], ["integer"]), names=["x"]), compare_types=False), "OK")
+
     def test_worst_step_wins(self):
         self.assertEqual(worst(["OK", "ORDEM", "WRONG", "RECUSA"]), "WRONG")
         self.assertEqual(worst([]), "OK")

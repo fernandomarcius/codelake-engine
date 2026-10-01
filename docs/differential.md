@@ -38,18 +38,23 @@ start Trino, then a few seconds per case file.
 
 | Outcome | Meaning |
 |---|---|
-| `OK` | same rows (and, for a Trino oracle over HTTP, the same column types), or the same error |
+| `OK` | same rows (and, for a Trino oracle over HTTP, the same column types and names), or the same error |
 | `WRONG` | both answered, the rows differ as a multiset: a **wrong result** |
 | `RECUSA` | the oracle answered, CodeLake refused |
 | `EXTRA` | CodeLake answered, the oracle refused |
 | `ERRO` | both refused, with different errors (Trino `errorName`, SQLSTATE) |
 | `ORDEM` | same rows in another order, where the case asks for order |
 | `TIPO` | same rows, other column types |
+| `NOME` | same rows and types, other column names (case counts: a client may read `FirstDay`, not `firstday`) |
 | `TRAVA` | CodeLake did not answer in time (15 s on the PostgreSQL wire, 280 s over HTTP) |
 
 Values are compared exactly as the client decodes them: `-0.0` is not `0.0`, `1`
 is not `1.0` nor `true`. Over the PostgreSQL wire against Trino, Trino's values are
 first printed as PostgreSQL text (`t`/`f`, `1.5`, `-0`).
+
+Over HTTP the harness reads answers as the strictest client does: a submission
+answered without a `nextUri` is refused (`NO_NEXT_URI`), since the reference engine
+always gives one and the .NET driver follows it without reading anything else.
 
 ## Expectations: nothing divergent passes silently
 
@@ -111,7 +116,7 @@ Other case keys:
 | `oracle_sql` | trino oracle | the SQL Trino runs when it differs (inlined parameters) |
 | `rows_json = '[[1, null]]'` | value oracle | the expected rows (JSON: TOML has no null) |
 | `codelake_session = "k=v"` | trino protocol | `X-Trino-Session` sent to CodeLake only; the `/*CLSESSION k=v*/ SQL` prefix does the same |
-| `types = false` | trino oracle | do not compare column types |
+| `types = false` | trino oracle | do not compare column types nor names |
 | `compare` | any | as at file level |
 
 `{e}` in SQL becomes `tr` for Trino and `cl` for CodeLake (one table per writer).

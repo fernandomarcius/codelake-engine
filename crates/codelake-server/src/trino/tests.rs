@@ -139,7 +139,45 @@ impl Harness {
     async fn run(&self, sql: &str, headers: &[(&str, &str)]) -> Outcome {
         let first = self.submit(sql, headers).await;
         assert_eq!(first.status, StatusCode::OK, "{sql}");
+        assert_accepted(&first.body, sql);
         Outcome::from(self.follow(first).await)
+    }
+
+    /// The first page of a statement: where one answered at once (or refused
+    /// before running) has its outcome and headers.
+    async fn answer(&self, sql: &str, headers: &[(&str, &str)]) -> Reply {
+        let first = self.submit(sql, headers).await;
+        assert_eq!(first.status, StatusCode::OK, "{sql}");
+        assert_accepted(&first.body, sql);
+        let next = path_of(first.body["nextUri"].as_str().unwrap());
+        self.call(Method::GET, &next, &[], "").await
+    }
+
+    /// Follows `nextUri` asking for pages of `target` (`targetResultSize`).
+    async fn run_sized(&self, sql: &str, target: &str) -> Outcome {
+        let mut pages = vec![self.submit(sql, &[]).await.body];
+        while let Some(next) = pages.last().unwrap()["nextUri"].as_str().map(path_of) {
+            let reply = self
+                .call(Method::GET, &format!("{next}?targetResultSize={target}"), &[], "")
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{next}");
+            pages.push(reply.body);
+            assert!(pages.len() < 100_000, "no end");
+        }
+        Outcome::from(pages)
+    }
+}
+
+/// Every submission is answered alike, whatever becomes of it: `QUEUED`, the
+/// first `nextUri`, and nothing a client would have to read.
+fn assert_accepted(body: &Value, sql: &str) {
+    assert_eq!(body["stats"]["state"], "QUEUED", "{sql}: {body}");
+    assert!(
+        body["nextUri"].as_str().is_some_and(|uri| uri.ends_with("/1")),
+        "{sql}: {body}"
+    );
+    for key in ["columns", "data", "error", "updateType", "updateCount"] {
+        assert!(body.get(key).is_none(), "{sql}: {key} in {body}");
     }
 }
 
@@ -260,7 +298,9 @@ async fn large_results_are_paged_and_complete() {
 #[tokio::test]
 async fn repeating_a_token_returns_the_same_page_and_old_tokens_are_gone() {
     let h = harness();
-    let first = h.submit("SELECT value FROM generate_series(1, 50000)", &[]).await;
+    let first = h
+        .submit("SELECT value FROM generate_series(1, 500000)", &[])
+        .await;
     let one = path_of(first.body["nextUri"].as_str().unwrap());
     let a = h.call(Method::GET, &one, &[], "").await;
     let b = h.call(Method::GET, &one, &[], "").await;
@@ -378,17 +418,38 @@ async fn kill_by_id_requires_the_owner() {
 #[tokio::test]
 async fn session_statements_answer_with_headers() {
     let h = harness();
-    let use_ = h.submit("USE datafusion.public", &[]).await;
+    let submitted = h.submit("USE datafusion.public", &[]).await;
+    assert!(submitted.headers.get("x-trino-set-schema").is_none());
+    let use_ = h
+        .call(
+            Method::GET,
+            &path_of(submitted.body["nextUri"].as_str().unwrap()),
+            &[],
+            "",
+        )
+        .await;
     assert_eq!(use_.body["updateType"], "USE");
+    assert_eq!(use_.body["stats"]["state"], "FINISHED");
+    assert_eq!(use_.body["columns"], serde_json::json!([]));
     assert_eq!(use_.headers["x-trino-set-catalog"], "datafusion");
     assert_eq!(use_.headers["x-trino-set-schema"], "public");
     assert!(use_.body.get("nextUri").is_none());
+    // The final page is not kept: asking again finds the token gone.
+    let again = h
+        .call(
+            Method::GET,
+            &path_of(submitted.body["nextUri"].as_str().unwrap()),
+            &[],
+            "",
+        )
+        .await;
+    assert_eq!(again.status, StatusCode::GONE);
 
-    let set = h.submit("SET SESSION query_max_run_time = '2h'", &[]).await;
+    let set = h.answer("SET SESSION query_max_run_time = '2h'", &[]).await;
     assert_eq!(set.body["updateType"], "SET SESSION");
     assert_eq!(set.headers["x-trino-set-session"], "query_max_run_time=2h");
 
-    let reset = h.submit("RESET SESSION query_max_run_time", &[]).await;
+    let reset = h.answer("RESET SESSION query_max_run_time", &[]).await;
     assert_eq!(reset.headers["x-trino-clear-session"], "query_max_run_time");
 
     let bad = h.run("SET SESSION no_such_thing = 1", &[]).await;
@@ -507,8 +568,9 @@ async fn active_query_limit_refuses_with_queue_full() {
     let first = h
         .submit("SELECT count(*) FROM generate_series(1, 5000000000)", &[])
         .await;
-    let second = h.submit("SELECT 1", &[]).await;
+    let second = h.answer("SELECT 1", &[]).await;
     assert_eq!(second.body["error"]["errorName"], "QUERY_QUEUE_FULL");
+    assert_eq!(second.body["stats"]["state"], "FAILED");
     let next = path_of(first.body["nextUri"].as_str().unwrap());
     let _ = h.call(Method::DELETE, &next, &[], "").await;
 }
@@ -663,7 +725,7 @@ async fn show_session_filters_and_formats_defaults() {
 #[tokio::test]
 async fn prepared_statements_travel_in_headers() {
     let h = harness();
-    let prepare = h.submit("PREPARE st1 FROM SELECT ? + 1 AS y, ? AS s", &[]).await;
+    let prepare = h.answer("PREPARE st1 FROM SELECT ? + 1 AS y, ? AS s", &[]).await;
     assert_eq!(prepare.body["updateType"], "PREPARE");
     let added = prepare.headers["x-trino-added-prepare"]
         .to_str()
@@ -691,7 +753,7 @@ async fn prepared_statements_travel_in_headers() {
         .await;
     assert_eq!(wrong_count.error_name(), Some("INVALID_PARAMETER_USAGE"));
     let deallocated = h
-        .submit(
+        .answer(
             "DEALLOCATE PREPARE st1",
             &[("x-trino-prepared-statement", added.as_str())],
         )
@@ -760,6 +822,157 @@ async fn submit_cost_does_not_grow_with_history_text() {
     assert!(
         loaded < baseline * 4 + Duration::from_millis(2),
         "POST SELECT 1 went from {baseline:?} to {loaded:?}"
+    );
+}
+
+/// A statement answered at once, or refused before it runs, has its outcome on
+/// the first page, never in the submission's answer (the .NET driver reads
+/// only `nextUri` there): a kill, a bad session header, an unknown prepared
+/// statement, parameters that do not bind, an unknown session property.
+#[tokio::test]
+async fn outcomes_known_at_submission_come_on_the_first_page() {
+    let h = harness();
+    let kill = h
+        .answer(
+            "CALL system.runtime.kill_query(query_id => '20260101_000000_00000_xxxxx', message => 'x')",
+            &[],
+        )
+        .await;
+    assert_eq!(kill.body["error"]["errorName"], "NOT_FOUND", "{}", kill.body);
+    for (sql, headers, error) in [
+        (
+            "SELECT 1",
+            vec![("x-trino-session", "no_such_thing=1")],
+            "INVALID_SESSION_PROPERTY",
+        ),
+        ("DEALLOCATE PREPARE nope", vec![], "NOT_FOUND"),
+        (
+            "EXECUTE IMMEDIATE 'SELECT ?' USING 1, 2",
+            vec![],
+            "INVALID_PARAMETER_USAGE",
+        ),
+        (
+            "SET SESSION no_such_thing = '1'",
+            vec![],
+            "INVALID_SESSION_PROPERTY",
+        ),
+    ] {
+        let page = h.answer(sql, &headers).await;
+        assert_eq!(page.body["error"]["errorName"], error, "{sql}: {}", page.body);
+        assert_eq!(page.body["stats"]["state"], "FAILED", "{sql}");
+        assert!(page.body.get("nextUri").is_none(), "{sql}");
+    }
+    let killed = h
+        .submit("SELECT count(*) FROM generate_series(1, 5000000000)", &[])
+        .await;
+    let id = killed.body["id"].as_str().unwrap().to_owned();
+    let call = h
+        .answer(
+            &format!("CALL system.runtime.kill_query(query_id => '{id}', message => 'stop')"),
+            &[],
+        )
+        .await;
+    assert_eq!(call.body["updateType"], "CALL", "{}", call.body);
+    assert_eq!(call.body["stats"]["state"], "FINISHED");
+    let after = h.follow(killed).await;
+    assert!(
+        after.last().unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stop"),
+        "{:?}",
+        after.last()
+    );
+}
+
+/// A text over the limit is accepted too; its first page has the refusal.
+#[tokio::test]
+async fn refusals_before_running_are_read_like_any_failure() {
+    let h = harness_with(Limits {
+        max_query_length: 10,
+        ..limits()
+    });
+    let submitted = h.submit("SELECT 1 + 1 + 1", &[]).await;
+    assert_accepted(&submitted.body, "too long");
+    let next = path_of(submitted.body["nextUri"].as_str().unwrap());
+    let long = h.call(Method::GET, &next, &[], "").await;
+    assert_eq!(long.body["error"]["errorName"], "QUERY_TEXT_TOO_LARGE");
+    assert_eq!(long.body["stats"]["state"], "FAILED");
+}
+
+/// Execution that produces small batches back to back fills the page: a page
+/// used to take only the batches already waiting (two), and 300 000 rows of
+/// a cross join of `UNNEST`s cost thousands of round trips.
+#[tokio::test]
+async fn small_batches_fill_the_page() {
+    let execution = ExecutionConfig {
+        batch_size: 16,
+        ..ExecutionConfig::default()
+    };
+    let h = harness_config(limits(), ByteSize::mib(256), &execution);
+    let out = h.run("SELECT value FROM generate_series(1, 50000)", &[]).await;
+    assert_eq!(out.rows.len(), 50_000);
+    // About 8 bytes a row: 1 MiB holds them all.
+    assert_eq!(out.pages_with_data, 1);
+}
+
+/// `targetResultSize` sets the size of each page, up to a ceiling.
+#[tokio::test]
+async fn pages_have_the_size_the_client_asks_for() {
+    let h = harness();
+    let sql = "SELECT value FROM generate_series(1, 20000)";
+    let small = h.run_sized(sql, "16kB").await;
+    assert_eq!(small.rows.len(), 20_000);
+    // 8 bytes a row: 2 048 rows in 16 kB.
+    assert_eq!(small.pages_with_data, 10, "{}", small.pages_with_data);
+    let large = h.run_sized(sql, "5MB").await;
+    assert_eq!(large.rows.len(), 20_000);
+    assert_eq!(large.pages_with_data, 1);
+    for (index, row) in small.rows.iter().enumerate() {
+        assert_eq!(row[0].as_i64().unwrap(), i64::try_from(index).unwrap() + 1);
+    }
+}
+
+/// Names keep the case they are written with (observed on the reference engine).
+#[tokio::test]
+async fn column_names_keep_their_written_case() {
+    let h = harness();
+    let out = h
+        .run(
+            "SELECT 1 AS FirstDay, x, Y AS \"Data_Rec\", t.Z, 2, valorSistema \
+             FROM (VALUES (1, 2, 3, 4)) t(x, y, z, valorsistema)",
+            &[],
+        )
+        .await;
+    let names: Vec<&str> = out.columns.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(out.state(), "FINISHED", "{}", out.last["error"]["message"]);
+    assert_eq!(names, ["FirstDay", "x", "Data_Rec", "Z", "_col4", "valorSistema"]);
+    // `DESCRIBE` and `SHOW` are not queries: their headers are their own.
+    let described = h.run("SHOW SESSION LIKE 'query_max_run%'", &[]).await;
+    assert_eq!(described.columns[0].0, "Name");
+}
+
+/// A `TIME` literal has the precision of its digits (the reference engine); the .NET
+/// driver cannot read the nine digits of `time(9)`.
+#[tokio::test]
+async fn time_literals_take_the_precision_of_their_digits() {
+    let h = harness();
+    let out = h
+        .run(
+            "SELECT TIME '12:34:56.789' AS a, TIME '12:34' AS b, TIME '12:34:56.123456' AS c, \
+             TIME '12:34:56.789' < TIME '12:34:56.789001' AS d",
+            &[("x-trino-client-capabilities", "PARAMETRIC_DATETIME")],
+        )
+        .await;
+    assert_eq!(out.state(), "FINISHED", "{}", out.last["error"]["message"]);
+    let types: Vec<&str> = out.columns.iter().map(|(_, t)| t.as_str()).collect();
+    assert_eq!(types, ["time(3)", "time(0)", "time(6)", "boolean"]);
+    assert_eq!(
+        out.rows[0],
+        serde_json::json!(["12:34:56.789", "12:34:00", "12:34:56.123456", true])
+            .as_array()
+            .unwrap()
+            .clone()
     );
 }
 
