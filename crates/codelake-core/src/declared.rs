@@ -1,6 +1,6 @@
-//! Trino types narrower than their Arrow type: `varchar(n)`, `char(n)` and
-//! `timestamp(p)` with `p` other than 0, 3, 6 or 9 (see
-//! [`crate::trino_types::Declared`]).
+//! Trino types narrower than their Arrow type: `varchar(n)`, `char(n)`,
+//! `timestamp(p)` with `p` other than 0, 3, 6 or 9, and the `time(p)` of a
+//! `TIME` literal (see [`crate::trino_types::Declared`], `crate::literals`).
 //!
 //! `DataFusion` reads `VARCHAR(5)` and `CHAR(3)` as unbounded text and has no
 //! `TIMESTAMP(1)`. Trino 431:
@@ -139,6 +139,10 @@ fn result_type(declared: Option<Declared>, input: &DataType) -> Result<DataType>
         }
         (Some(Declared::Timestamp(p)), other) => {
             return plan_err!("{TRINO_TYPED}: timestamp({p}) of {other}");
+        }
+        (Some(Declared::Time(_)), time @ (DataType::Time32(_) | DataType::Time64(_))) => time.clone(),
+        (Some(Declared::Time(p)), other) => {
+            return plan_err!("{TRINO_TYPED}: time({p}) of {other}");
         }
     })
 }
@@ -303,6 +307,8 @@ impl ScalarUDFImpl for TrinoTyped {
             None => array,
             Some(Declared::Timestamp(p)) if self.lenient => rounded_timestamps_or_null(&array, p)?,
             Some(Declared::Timestamp(p)) => rounded_timestamps(&array, p)?,
+            // A literal's digits: nothing to round.
+            Some(Declared::Time(_)) => array,
             Some(declared @ (Declared::Varchar(n) | Declared::Char(n))) => {
                 let mut out = Vec::with_capacity(array.len());
                 for text in texts(&array)? {
@@ -429,6 +435,7 @@ fn typed_call(function: &str, expr: sql::Expr, declared: Declared) -> sql::Expr 
         Declared::Varchar(n) => format!("varchar({n})"),
         Declared::Char(n) => format!("char({n})"),
         Declared::Timestamp(p) => format!("timestamp({p})"),
+        Declared::Time(p) => format!("time({p})"),
     };
     let arg = |e: sql::Expr| FunctionArg::Unnamed(FunctionArgExpr::Expr(e));
     sql::Expr::Function(Function {

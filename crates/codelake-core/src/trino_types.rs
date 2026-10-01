@@ -28,6 +28,9 @@ pub enum Declared {
     /// `timestamp(p)` or `timestamp(p) with time zone` (the zone is in the
     /// Arrow type): values rounded to `p` fraction digits.
     Timestamp(u8),
+    /// `time(p)`: a `TIME` literal with `p` fraction digits, carried by an
+    /// Arrow time of a finer unit (`crate::literals`).
+    Time(u8),
 }
 
 /// Longest `varchar(n)` Trino accepts.
@@ -45,6 +48,7 @@ impl Declared {
             "varchar" if argument <= MAX_VARCHAR => Some(Self::Varchar(argument)),
             "char" if (1..=65_536).contains(&argument) => Some(Self::Char(argument)),
             "timestamp" if argument <= 12 => Some(Self::Timestamp(u8::try_from(argument).ok()?)),
+            "time" if argument <= 12 => Some(Self::Time(u8::try_from(argument).ok()?)),
             _ => None,
         }
     }
@@ -56,6 +60,7 @@ impl Declared {
                 true
             }
             (Self::Timestamp(p), DataType::Timestamp(unit, _)) => p <= digits(*unit),
+            (Self::Time(p), DataType::Time32(unit) | DataType::Time64(unit)) => p <= digits(*unit),
             _ => false,
         }
     }
@@ -69,6 +74,7 @@ impl Declared {
                 format!("timestamp({p}) with time zone")
             }
             Self::Timestamp(p) => format!("timestamp({p})"),
+            Self::Time(p) => format!("time({p})"),
         }
     }
 
@@ -78,6 +84,7 @@ impl Declared {
             Self::Varchar(n) => format!("varchar({n})"),
             Self::Char(n) => format!("char({n})"),
             Self::Timestamp(p) => format!("timestamp({p})"),
+            Self::Time(p) => format!("time({p})"),
         };
         HashMap::from([(TRINO_TYPE.to_owned(), text)])
     }

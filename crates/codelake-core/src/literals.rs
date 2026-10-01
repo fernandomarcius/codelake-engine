@@ -17,6 +17,14 @@
 //! 8) is recorded with `codelake_trino_type` (see [`crate::declared`]).
 //! Anything this does not recognise is left to `DataFusion`.
 //!
+//! A `TIME 'HH:MM[:SS[.f…]]'` literal is likewise a `time(p)`, `p` its
+//! fractional digits (`DataFusion`: always `time(9)`). Its Arrow type stays
+//! nanoseconds, so it meets any other time as before (`DataFusion` has no
+//! common type for two time units, not even in `VALUES`); the precision is
+//! recorded with `codelake_trino_type` (see [`crate::declared`]), which the
+//! client protocol shows. An expression over it (`CASE`, a `VALUES` row) is
+//! `time(9)` again.
+//!
 //! Numbers take their types from the function library's literal rewrite
 //! (`crate::trino_functions`: `1.5` is `decimal(2,1)`, `1e5` a `double`).
 
@@ -192,8 +200,8 @@ impl ZonedTimestamp {
     }
 }
 
-/// Rewrites every `TIMESTAMP '…'` literal of `statement` (see the module
-/// documentation).
+/// Rewrites every `TIMESTAMP '…'` and `TIME '…'` literal of `statement`
+/// (see the module documentation).
 pub(crate) fn rewrite_zoned_timestamps(statement: &mut DFStatement) {
     let DFStatement::Statement(inner) = statement else {
         return;
@@ -208,9 +216,53 @@ pub(crate) fn rewrite_zoned_timestamps(statement: &mut DFStatement) {
             && let Some(zoned) = parse(&text)
         {
             *expr = zoned.to_expr();
+        } else if let Expr::TypedString(TypedString {
+            data_type: DataType::Time(None, TimezoneInfo::None),
+            value,
+            ..
+        }) = expr
+            && let Some(text) = value.clone().into_string()
+            && let Some(time) = time_literal(&text)
+        {
+            *expr = time;
         }
         ControlFlow::<()>::Continue(())
     });
+}
+
+/// `TIME '<text>'` as a nanosecond time declaring the precision of its
+/// fractional digits; `None` for a text that is not `HH:MM[:SS[.f…]]` (a
+/// zone, for one), left to the planner.
+fn time_literal(text: &str) -> Option<Expr> {
+    let (clock, precision) = parse_time(text.trim())?;
+    let value = named_cast(
+        "arrow_cast",
+        Expr::value(Value::SingleQuotedString(clock)),
+        "Time64(Nanosecond)".to_owned(),
+    );
+    if precision == 9 {
+        return Some(value);
+    }
+    let arg = |e: Expr| FunctionArg::Unnamed(FunctionArgExpr::Expr(e));
+    Some(Expr::Function(Function {
+        name: ObjectName::from(vec![Ident::new(crate::declared::TRINO_TYPED)]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![
+                arg(value),
+                arg(Expr::value(Value::SingleQuotedString(format!(
+                    "time({precision})"
+                )))),
+            ],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    }))
 }
 
 /// `TIMESTAMP` without precision is `timestamp(3)` in Trino.
@@ -389,6 +441,29 @@ mod tests {
             statement.to_string(),
             "SELECT arrow_cast('2026-01-01 10:00:00.123', 'Timestamp(Millisecond, None)'), \
              codelake_trino_type(arrow_cast('1969-12-31 23:59:59.5', 'Timestamp(Millisecond, None)'), 'timestamp(1)')"
+        );
+    }
+
+    /// The reference engine: `TIME '12:34:56.789'` is `time(3)`, `TIME '12:34'` is
+    /// `time(0)`; a zone is not this literal's.
+    #[test]
+    fn a_time_literal_takes_its_digits() {
+        let mut statement = datafusion::sql::parser::DFParser::parse_sql(
+            "SELECT TIME '12:34', TIME '12:34:56.789', TIME '12:34:56.7', TIME ' 12:34:56.1234 ', \
+             TIME '12:34:56.123456789', TIME '12:34:56+03:00', TIME 'noon', TIME '12:34:56.'",
+        )
+        .unwrap()
+        .pop_front()
+        .unwrap();
+        rewrite_zoned_timestamps(&mut statement);
+        assert_eq!(
+            statement.to_string(),
+            "SELECT codelake_trino_type(arrow_cast('12:34:00', 'Time64(Nanosecond)'), 'time(0)'), \
+             codelake_trino_type(arrow_cast('12:34:56.789', 'Time64(Nanosecond)'), 'time(3)'), \
+             codelake_trino_type(arrow_cast('12:34:56.7', 'Time64(Nanosecond)'), 'time(1)'), \
+             codelake_trino_type(arrow_cast('12:34:56.1234', 'Time64(Nanosecond)'), 'time(4)'), \
+             arrow_cast('12:34:56.123456789', 'Time64(Nanosecond)'), \
+             TIME '12:34:56+03:00', TIME 'noon', TIME '12:34:56.'"
         );
     }
 

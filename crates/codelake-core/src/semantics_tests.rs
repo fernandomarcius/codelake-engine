@@ -911,6 +911,46 @@ async fn timestamps_of_different_precisions_compare_at_the_finer_one() {
     .await;
 }
 
+/// A `TIME` literal is `time(p)` for its digits (it was always `time(9)`),
+/// as in the reference engine; its values stay nanoseconds, so literals of
+/// different digits still meet, compared exactly.
+#[tokio::test]
+async fn time_literals_take_their_digits_and_still_meet() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    assert_same(
+        &engine,
+        &[
+            (
+                "SELECT TIME '12:34:56.789', TIME '12:34', TIME '12:34:56.123456', TIME '12:34:56.123456789'",
+                answer(
+                    &["time(3)", "time(0)", "time(6)", "time(9)"],
+                    &[&["12:34:56.789", "12:34:00", "12:34:56.123456", "12:34:56.123456789"]],
+                ),
+            ),
+            (
+                "SELECT TIME '12:34:56.789' < TIME '12:34:56.789001', TIME '12:34:56.789' = TIME '12:34:56.789000', \
+                 TIME '12:34:56' = TIME '12:34:56.000000001', TIME '12:34:56.5' > TIME '12:34:56'",
+                answer(
+                    &["boolean", "boolean", "boolean", "boolean"],
+                    &[&["true", "true", "false", "true"]],
+                ),
+            ),
+            (
+                "SELECT k FROM (VALUES (1, TIME '08:00:00.250'), (2, TIME '09:00:00')) t(k, t) \
+                 WHERE t IN (TIME '08:00:00.250000', TIME '10:00:00')",
+                answer(&["integer"], &[&["1"]]),
+            ),
+            (
+                "SELECT k FROM (VALUES (1, TIME '08:00:00.250'), (2, TIME '09:00:00')) t(k, t) \
+                 WHERE t BETWEEN TIME '08:00:00.250001' AND TIME '09:00:00.000000001'",
+                answer(&["integer"], &[&["2"]]),
+            ),
+        ],
+    )
+    .await;
+}
+
 /// A window ordered by a `varbinary` key without a frame (the default
 /// `RANGE … CURRENT ROW`, peers included) plans as in Trino 431.
 #[tokio::test]
