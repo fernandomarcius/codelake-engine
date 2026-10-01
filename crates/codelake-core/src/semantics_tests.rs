@@ -1195,6 +1195,112 @@ async fn text_types_meet_across_every_input_of_a_union() {
     assert!(!plan.contains(crate::declared::TRINO_TYPED), "{plan}");
 }
 
+/// A decimal and a double meet in `double` (with a `real`, in `real`) however
+/// many inputs a union has: `a UNION ALL b UNION ALL c` is planned as a union
+/// of `a UNION ALL b` and `c`, and the outer one kept the decimal
+/// `DataFusion` gave it (`decimal(35,15)`) once the inner one was a double.
+/// The elements of an array meet in the same type. `CREATE TABLE AS` stores
+/// it. Types and values observed on Trino 431.
+#[tokio::test]
+async fn numbers_meet_in_one_type_across_every_input_of_a_union() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    let third = "CAST(1 AS DOUBLE) / 3";
+    let report = "WITH cdc AS (SELECT 'cdc' AS sensor, max(CAST(s AS bigint) / 3600.0) AS pior_valor \
+         FROM (VALUES 7200, 5401) t(s)), \
+         pull AS (SELECT 'pull' AS sensor, max(CAST(s AS DOUBLE)) AS pior_valor FROM (VALUES 3, 7) t(s)), \
+         recon AS (SELECT 'recon' AS sensor, max(CAST(a AS DOUBLE) + CAST(b AS DOUBLE) / 3) AS pior_valor \
+         FROM (VALUES (1, 2)) t(a, b)) \
+         SELECT * FROM cdc UNION ALL SELECT * FROM pull UNION ALL SELECT * FROM recon";
+    assert_same(
+        &engine,
+        &[
+            (
+                &format!("{report} ORDER BY 1"),
+                answer(
+                    &["varchar(5)", "double"],
+                    &[
+                        &["cdc", "2.0"],
+                        &["pull", "7.0"],
+                        &["recon", "1.6666666666666665"],
+                    ],
+                ),
+            ),
+            (
+                &format!(
+                    "SELECT CAST(1.5 AS decimal(21,1)) AS x UNION ALL SELECT {third} \
+                     UNION ALL SELECT CAST(2 AS DOUBLE) ORDER BY 1"
+                ),
+                answer(&["double"], &[&["0.3333333333333333"], &["1.5"], &["2.0"]]),
+            ),
+            (
+                &format!(
+                    "SELECT {third} AS x UNION ALL SELECT CAST(1.5 AS decimal(21,1)) \
+                     UNION ALL SELECT CAST(2.25 AS decimal(5,2)) ORDER BY 1"
+                ),
+                answer(&["double"], &[&["0.3333333333333333"], &["1.5"], &["2.25"]]),
+            ),
+            (
+                &format!(
+                    "SELECT CAST(1.5 AS decimal(21,1)) AS x UNION SELECT {third} \
+                     UNION SELECT CAST(1.5 AS DOUBLE) ORDER BY 1"
+                ),
+                answer(&["double"], &[&["0.3333333333333333"], &["1.5"]]),
+            ),
+            (
+                "SELECT CAST(1.5 AS decimal(21,1)) AS x INTERSECT SELECT CAST(1.5 AS DOUBLE) \
+                 INTERSECT SELECT CAST(1.5 AS DOUBLE)",
+                answer(&["double"], &[&["1.5"]]),
+            ),
+            (
+                "SELECT CAST(1.5 AS decimal(21,1)) AS x UNION ALL SELECT CAST(0.25 AS REAL) \
+                 UNION ALL SELECT CAST(0.5 AS REAL) ORDER BY 1",
+                answer(&["real"], &[&["0.25"], &["0.5"], &["1.5"]]),
+            ),
+            (
+                "SELECT CAST(1.5 AS decimal(3,1)) AS x UNION ALL SELECT CAST(2 AS bigint) \
+                 UNION ALL SELECT CAST(3 AS bigint) ORDER BY 1",
+                answer(&["decimal(20,1)"], &[&["1.5"], &["2.0"], &["3.0"]]),
+            ),
+            (
+                "SELECT CAST(1 AS integer) AS x UNION ALL SELECT CAST(2 AS bigint) \
+                 UNION ALL SELECT CAST(3 AS bigint) ORDER BY 1",
+                answer(&["bigint"], &[&["1"], &["2"], &["3"]]),
+            ),
+            (
+                &format!(
+                    "SELECT ARRAY[CAST(1.5 AS decimal(21,1)), {third}], \
+                     ARRAY[CAST(1.5 AS decimal(21,1)), CAST(2 AS bigint)], \
+                     ARRAY[CAST(1.5 AS decimal(3,1)), CAST(0.25 AS REAL)]"
+                ),
+                answer(
+                    &["array(double)", "array(decimal(21,1))", "array(real)"],
+                    &[&["[1.5, 0.3333333333333333]", "[1.5, 2.0]", "[1.5, 0.25]"]],
+                ),
+            ),
+        ],
+    )
+    .await;
+    for statement in [
+        "CREATE SCHEMA datafusion.numt".to_owned(),
+        format!("CREATE TABLE datafusion.numt.report AS {report}"),
+    ] {
+        run(&engine, &statement).await;
+    }
+    assert_same(
+        &engine,
+        &[(
+            "SELECT column_name, data_type FROM datafusion.information_schema.columns \
+             WHERE table_schema = 'numt' AND table_name = 'report' ORDER BY ordinal_position",
+            answer(
+                &["varchar", "varchar"],
+                &[&["sensor", "varchar(5)"], &["pior_valor", "double"]],
+            ),
+        )],
+    )
+    .await;
+}
+
 /// A view of the in-memory catalog lists the types its rows have, those a
 /// table created from the same query stores: dbt compares the two in an
 /// incremental model and alters the table when they differ.

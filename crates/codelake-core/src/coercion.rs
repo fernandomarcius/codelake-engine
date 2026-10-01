@@ -2,8 +2,9 @@
 //!
 //! Where values of different types meet — the rows of `VALUES`, the inputs
 //! of `UNION`, the branches of `CASE`, the arguments of `coalesce`,
-//! `nullif`, `greatest` and `least`, an `IN` list, `BETWEEN` and a comparison
-//! — Trino 431 converts every value to one common type. For numbers:
+//! `nullif`, `greatest` and `least`, the elements of an array, an `IN` list,
+//! `BETWEEN` and a comparison — Trino 431 converts every value to one common
+//! type. For numbers:
 //!
 //! - `tinyint < smallint < integer < bigint`: the wider integer;
 //! - a decimal with an integer: a decimal, the integer counting as
@@ -621,6 +622,14 @@ fn is_decimal(data_type: &DataType) -> bool {
     )
 }
 
+/// A number Trino has: not an unsigned integer, nor a decimal above 38
+/// digits.
+fn is_number(data_type: &DataType) -> bool {
+    integer_rank(data_type).is_some()
+        || is_float(data_type)
+        || (is_decimal(data_type) && as_decimal(data_type).is_some())
+}
+
 /// Trino's common type of two numbers (see the module documentation), or
 /// `None` when one is not a number Trino has (unsigned integers, decimals
 /// above 38 digits).
@@ -631,9 +640,7 @@ fn common_number(a: &DataType, b: &DataType) -> Option<DataType> {
     if let (Some(ra), Some(rb)) = (integer_rank(a), integer_rank(b)) {
         return Some(if ra >= rb { a.clone() } else { b.clone() });
     }
-    let known =
-        |t: &DataType| integer_rank(t).is_some() || is_float(t) || (is_decimal(t) && as_decimal(t).is_some());
-    if !known(a) || !known(b) {
+    if !is_number(a) || !is_number(b) {
         return None;
     }
     if is_float(a) || is_float(b) {
@@ -762,9 +769,12 @@ fn is_comparison(op: datafusion::logical_expr::Operator) -> bool {
     )
 }
 
-/// Functions whose arguments share one type.
+/// Functions whose arguments share one type (`make_array`: `ARRAY[…]`).
 fn unifies_arguments(name: &str) -> bool {
-    matches!(name, "coalesce" | "greatest" | "least" | "nvl" | "ifnull")
+    matches!(
+        name,
+        "coalesce" | "greatest" | "least" | "nvl" | "ifnull" | "make_array"
+    )
 }
 
 /// `nullif(a, b)`: compared in the common type, typed as `a`.
@@ -1259,6 +1269,16 @@ fn unify_union(union: Union) -> Result<Transformed<LogicalPlan>> {
     ))
 }
 
+/// The number type every input of a union has, when the union declares
+/// another. The union's schema is `DataFusion`'s, computed when the SQL was
+/// planned: `a UNION ALL b UNION ALL c` is a union of `a UNION ALL b` and
+/// `c`, and the outer one keeps the type `DataFusion` gave `decimal UNION ALL
+/// double` (`decimal(35,15)`) after this rule cast the inner one's inputs to
+/// `double`; type coercion would then cast every input back to that decimal.
+fn agreed_number(types: &[DataType], declared: &DataType) -> Option<DataType> {
+    only_type(types).filter(|t| t != declared && is_number(t))
+}
+
 fn unify_union_numbers(union: Union) -> Result<Transformed<LogicalPlan>> {
     let columns = union.schema.fields().len();
     let mut targets: Vec<Option<DataType>> = Vec::with_capacity(columns);
@@ -1268,7 +1288,9 @@ fn unify_union_numbers(union: Union) -> Result<Transformed<LogicalPlan>> {
             .iter()
             .map(|input| input.schema().field(j).data_type().clone())
             .collect();
-        targets.push(common_numeric_type(&types));
+        targets.push(
+            common_numeric_type(&types).or_else(|| agreed_number(&types, union.schema.field(j).data_type())),
+        );
     }
     if targets.iter().all(Option::is_none) {
         return Ok(Transformed::no(LogicalPlan::Union(union)));
@@ -1564,5 +1586,17 @@ mod tests {
         assert_eq!(c(DataType::Utf8, Int64), None);
         assert_eq!(common_numeric_type(&[Int32, Int32]), None);
         assert_eq!(common_numeric_type(&[DataType::Null, Int32]), Some(Int32));
+    }
+
+    #[test]
+    fn a_union_declares_the_number_its_inputs_agree_on() {
+        use DataType::{Decimal128 as D, Float64, Int64, Utf8, Utf8View};
+        assert_eq!(agreed_number(&[Float64, Float64], &D(35, 15)), Some(Float64));
+        assert_eq!(agreed_number(&[D(20, 1), D(20, 1)], &D(21, 1)), Some(D(20, 1)));
+        assert_eq!(agreed_number(&[DataType::Null, Int64], &D(20, 0)), Some(Int64));
+        assert_eq!(agreed_number(&[Float64, Float64], &Float64), None);
+        assert_eq!(agreed_number(&[Float64, D(2, 1)], &D(35, 15)), None);
+        assert_eq!(agreed_number(&[Utf8, Utf8], &Utf8View), None);
+        assert_eq!(agreed_number(&[DataType::UInt64, DataType::UInt64], &Int64), None);
     }
 }

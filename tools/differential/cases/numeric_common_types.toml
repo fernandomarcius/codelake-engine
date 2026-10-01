@@ -1,0 +1,154 @@
+# Common type of numbers where values meet: a decimal with a double is a double, with a
+# real a real, with an integer a decimal whose integer part holds the integer's digits.
+# The shadow run's go/no-go report model stored `pior_valor` (a UNION ALL of a decimal
+# `max(bigint / 3600.0)` and two `max(CAST(… AS DOUBLE))`) as decimal(36,15) where the
+# reference stored double: the union of three inputs kept the type the SQL planner gave
+# it after the first two inputs met in double. Each engine writes its own table
+# (`<name>_tr`, `<name>_cl`) in the shared metastore; NT*a compare the type each engine
+# stores, NT*b what each reports for the other's table.
+
+oracle = "trino"
+compare = "multiset"
+
+setup = [
+  "CREATE SCHEMA IF NOT EXISTS hive.numt",
+  "CREATE TABLE hive.numt.report_{e} WITH (format = 'PARQUET') AS WITH cdc AS (SELECT 'cdc' AS sensor, max(CAST(s AS bigint) / 3600.0) AS pior_valor FROM (VALUES 7200, 5401) t(s)), pull AS (SELECT 'pull' AS sensor, max(CAST(s AS DOUBLE)) AS pior_valor FROM (VALUES 3, 7) t(s)), recon AS (SELECT 'recon' AS sensor, max(CAST(a AS DOUBLE) + CAST(b AS DOUBLE) / 3) AS pior_valor FROM (VALUES (1, 2)) t(a, b)) SELECT * FROM cdc UNION ALL SELECT * FROM pull UNION ALL SELECT * FROM recon",
+  "CREATE TABLE hive.numt.two_{e} WITH (format = 'PARQUET') AS SELECT CAST(1.5 AS decimal(21,1)) AS x UNION ALL SELECT CAST(1 AS DOUBLE) / 3",
+  "CREATE TABLE hive.numt.int3_{e} WITH (format = 'PARQUET') AS SELECT CAST(1.5 AS decimal(3,1)) AS x UNION ALL SELECT CAST(2 AS bigint) UNION ALL SELECT CAST(3 AS bigint)",
+]
+
+[[case]]
+id = "NT1a"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'numt' AND table_name = 'report_{e}' ORDER BY ordinal_position"
+compare = "ordered"
+note = "the shadow run's model: a decimal and two doubles in three inputs store double"
+
+[[case]]
+id = "NT1b"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'numt' AND table_name = 'report_tr' ORDER BY ordinal_position"
+oracle_sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'numt' AND table_name = 'report_cl' ORDER BY ordinal_position"
+compare = "ordered"
+note = "each engine reads the type the other stored"
+
+[[case]]
+id = "NT1c"
+sql = "SELECT * FROM hive.numt.report_{e}"
+note = "rows and column types: 5401 / 3600.0 is 1.5 as decimal(21,1), then a double; 2 + 2/3 a double"
+
+[[case]]
+id = "NT2a"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'numt' AND table_name = 'two_{e}' ORDER BY ordinal_position"
+compare = "ordered"
+note = "a decimal and a double in two inputs: double"
+
+[[case]]
+id = "NT2b"
+sql = "SELECT * FROM hive.numt.two_{e}"
+note = "1/3 as a double, not decimal(35,15)"
+
+[[case]]
+id = "NT3a"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'numt' AND table_name = 'int3_{e}' ORDER BY ordinal_position"
+compare = "ordered"
+note = "decimal(3,1) with two bigints: decimal(20,1), a bigint counting as decimal(19,0)"
+
+[[case]]
+id = "NT3b"
+sql = "SELECT * FROM hive.numt.int3_{e}"
+
+[[case]]
+id = "NT4"
+sql = "SELECT x FROM (SELECT CAST(1.5 AS decimal(21,1)) AS x UNION ALL SELECT CAST(1 AS DOUBLE) / 3 UNION ALL SELECT CAST(2 AS DOUBLE))"
+note = "three inputs, the decimal first"
+
+[[case]]
+id = "NT5"
+sql = "SELECT x FROM (SELECT CAST(1 AS DOUBLE) / 3 AS x UNION ALL SELECT CAST(1.5 AS decimal(21,1)) UNION ALL SELECT CAST(2.25 AS decimal(5,2)))"
+note = "three inputs, the double first"
+
+[[case]]
+id = "NT6"
+sql = "SELECT x FROM (SELECT CAST(1.5 AS decimal(21,1)) AS x UNION ALL SELECT CAST(2.25 AS decimal(5,2)) UNION ALL SELECT CAST(1 AS DOUBLE) / 3 UNION ALL SELECT CAST(4 AS integer))"
+note = "four inputs, the double third"
+
+[[case]]
+id = "NT7"
+sql = "SELECT x FROM (SELECT CAST(1.5 AS decimal(21,1)) AS x UNION SELECT CAST(1 AS DOUBLE) / 3 UNION SELECT CAST(1.5 AS DOUBLE))"
+note = "UNION (distinct) of three inputs: 1.5 once"
+
+[[case]]
+id = "NT8"
+sql = "SELECT x FROM (SELECT CAST(1.5 AS decimal(21,1)) AS x INTERSECT SELECT CAST(1.5 AS DOUBLE))"
+
+[[case]]
+id = "NT9"
+sql = "SELECT x FROM (SELECT CAST(1.5 AS decimal(21,1)) AS x EXCEPT SELECT CAST(1 AS DOUBLE) / 3)"
+
+[[case]]
+id = "NT10"
+sql = "SELECT x FROM (SELECT CAST(1.5 AS decimal(21,1)) AS x INTERSECT SELECT CAST(1.5 AS DOUBLE) INTERSECT SELECT CAST(1.5 AS DOUBLE))"
+note = "three inputs of INTERSECT"
+
+[[case]]
+id = "NT11"
+sql = "SELECT CASE WHEN x = 1 THEN CAST(1.5 AS decimal(21,1)) WHEN x = 2 THEN CAST(1 AS DOUBLE) / 3 ELSE CAST(2 AS DOUBLE) END FROM (VALUES 1, 2, 3) t(x)"
+
+[[case]]
+id = "NT12"
+sql = "SELECT coalesce(CAST(NULL AS decimal(21,1)), CAST(1 AS DOUBLE) / 3), coalesce(CAST(1.5 AS decimal(21,1)), CAST(1 AS DOUBLE) / 3)"
+
+[[case]]
+id = "NT13"
+sql = "SELECT if(x = 1, CAST(1.5 AS decimal(21,1)), CAST(1 AS DOUBLE) / 3) FROM (VALUES 1, 2) t(x)"
+
+[[case]]
+id = "NT14"
+sql = "SELECT nullif(CAST(1.5 AS decimal(21,1)), CAST(1.5 AS DOUBLE)), nullif(CAST(1.5 AS decimal(21,1)), CAST(2 AS DOUBLE)), nullif(CAST(1 AS DOUBLE) / 3, CAST(1.5 AS decimal(21,1)))"
+note = "compared in double, typed as the first argument"
+
+[[case]]
+id = "NT15"
+sql = "SELECT x FROM (VALUES (CAST(1.5 AS decimal(21,1))), (CAST(1 AS DOUBLE) / 3), (CAST(2 AS DOUBLE))) t(x)"
+
+[[case]]
+id = "NT16"
+sql = "SELECT CAST(1.5 AS decimal(21,1)) IN (CAST(1 AS DOUBLE) / 3, CAST(1.5 AS DOUBLE)), CAST(0.1 AS decimal(2,1)) IN (CAST(0.1 AS REAL)), CAST(0.1 AS decimal(2,1)) = CAST(0.1 AS REAL)"
+note = "compared in the floating point type: 0.1 as real equals 0.1 as real"
+
+[[case]]
+id = "NT17"
+sql = "SELECT greatest(CAST(1.5 AS decimal(21,1)), CAST(1 AS DOUBLE) / 3), least(CAST(1.5 AS decimal(21,1)), CAST(1 AS DOUBLE) / 3)"
+
+[[case]]
+id = "NT18"
+sql = "SELECT ARRAY[CAST(1.5 AS decimal(21,1)), CAST(1 AS DOUBLE) / 3]"
+note = "array elements meet in double"
+
+[[case]]
+id = "NT19"
+sql = "SELECT ARRAY[CAST(1.5 AS decimal(21,1)), CAST(2 AS bigint)], ARRAY[CAST(1.5 AS decimal(3,1)), CAST(0.25 AS REAL)]"
+note = "array elements: decimal with bigint, decimal with real"
+
+[[case]]
+id = "NT20"
+sql = "SELECT x FROM (SELECT CAST(1.5 AS decimal(21,1)) AS x UNION ALL SELECT CAST(0.25 AS REAL) UNION ALL SELECT CAST(0.5 AS REAL))"
+note = "a decimal with reals: real"
+
+[[case]]
+id = "NT21"
+sql = "SELECT CASE WHEN x = 1 THEN CAST(1.5 AS decimal(3,1)) ELSE CAST(0.25 AS REAL) END FROM (VALUES 1, 2) t(x)"
+
+[[case]]
+id = "NT22"
+sql = "SELECT x FROM (SELECT CAST(1 AS integer) AS x UNION ALL SELECT CAST(2 AS bigint) UNION ALL SELECT CAST(3 AS bigint))"
+note = "integers in three inputs: bigint"
+
+[[case]]
+id = "NT23"
+sql = "SELECT x FROM (SELECT CAST(1.5 AS decimal(21,1)) AS x UNION ALL SELECT CAST(2 AS integer) UNION ALL SELECT CAST(3 AS integer))"
+note = "decimal(21,1) with two integers: decimal(21,1)"
+
+[[case]]
+id = "NT24"
+sql = "SELECT max(CAST(s AS bigint) / 3600.0), CAST(5401 AS bigint) / 3600.0 FROM (VALUES 7200, 5401) t(s)"
+note = "the decimal input of the shadow run's union alone: bigint / decimal(5,1)"

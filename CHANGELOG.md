@@ -242,6 +242,16 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- Found by the shadow run on production routines (2026-10-01):
+  - **Wrong result**: a `UNION ALL` (or `UNION`) of three or more inputs mixing a decimal and a `double`
+    answered `decimal(35,15)` where the reference answers `double` (the go/no-go report model stored
+    `pior_valor`, a `max(bigint / 3600.0)` and two `max(CAST(… AS DOUBLE))`, as `decimal(36,15)`, values
+    rounded to 15 digits). Such a union is planned as a union of unions; the outer one kept the decimal the
+    SQL planner gave it after the inner one's inputs met in `double`, and every input was cast back to it.
+    The outer union now takes the number type its inputs agree on (`real` likewise, where a decimal meets
+    a `real`).
+  - The elements of an array meet in the same common type: `ARRAY[decimal, double]` is `array(double)`,
+    `ARRAY[decimal, real]` is `array(real)` (both were a decimal).
 - Found by the shadow run's nightly validation (2026-09-30):
   - Two monitoring models failed with `EXCEEDED_LOCAL_MEMORY_LIMIT` under a 4 GiB pool (`HashJoinInput[0..5]`,
     532 MB each, `can spill: false`) where the reference answers within 8 GB: a SQL Server table of 15
