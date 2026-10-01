@@ -26,7 +26,8 @@ async fn rt1_use_of_missing_schema_fails_like_trino() {
     let reply = h.submit("USE nocat.nope", &[]).await;
     let out = Outcome::from(h.follow(reply).await);
     assert_eq!(out.state(), "FAILED", "{}", out.last);
-    let reply = h.submit("USE datafusion.nope", &[]).await;
+    let reply = h.answer("USE datafusion.nope", &[]).await;
+    assert_eq!(reply.body["stats"]["state"], "FAILED", "{}", reply.body);
     assert!(
         reply.headers.get("x-trino-set-schema").is_none(),
         "session switched to a missing schema: {:?}",
@@ -41,7 +42,7 @@ async fn rt_pass_use_of_non_ascii_schema_sets_the_header() {
     let h = harness();
     let created = h.run("CREATE SCHEMA datafusion.\"ação\"", &[]).await;
     assert_eq!(created.state(), "FINISHED", "{}", created.last);
-    let reply = h.submit("USE datafusion.\"ação\"", &[]).await;
+    let reply = h.answer("USE datafusion.\"ação\"", &[]).await;
     assert_eq!(reply.body["updateType"], "USE");
     assert!(reply.body.get("error").is_none());
     assert!(
@@ -58,7 +59,7 @@ async fn rt_pass_set_session_values_cannot_inject_headers() {
     let h = harness();
     for value in ["'1h\r\nX-Evil: 1'", "'a,b=c'", "'ação'"] {
         let reply = h
-            .submit(&format!("SET SESSION query_max_run_time = {value}"), &[])
+            .answer(&format!("SET SESSION query_max_run_time = {value}"), &[])
             .await;
         // Invalid durations are refused; nothing may leak into headers.
         assert!(reply.headers.get("x-evil").is_none());
