@@ -19,6 +19,8 @@ setup_trino = [
 [[case]]
 id = "VC1"
 sql = "SELECT * FROM hive.vcase.obras_latest"
+expect = "NOME"
+known = "ISS-018 choice 3: a * expands to the folded names (Trino 431: Cod_obr, Descr_obr)"
 note = "a view whose stored columns are Cod_obr, Descr_obr"
 
 [[case]]
