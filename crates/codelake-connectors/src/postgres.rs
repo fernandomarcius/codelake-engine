@@ -7,11 +7,11 @@ use async_trait::async_trait;
 use codelake_core::catalog::{FederatedCatalog, TableResolver};
 use codelake_core::{Connector, ConnectorError};
 use datafusion::catalog::{CatalogProvider, TableProvider};
-use datafusion::error::{DataFusionError, Result as DfResult};
+use datafusion::error::Result as DfResult;
 use datafusion::sql::TableReference;
 use datafusion_table_providers_common::common::DatabaseCatalogProvider;
 use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
-use datafusion_table_providers_postgres::PostgresTableFactory;
+use datafusion_table_providers_postgres::DynPostgresConnectionPool;
 use datafusion_table_providers_postgres::pool::PostgresConnectionPool;
 use secrecy::SecretString;
 use tokio::sync::OnceCell;
@@ -70,7 +70,7 @@ impl PostgresConnector {
     }
 }
 
-struct PostgresResolver(PostgresTableFactory);
+struct PostgresResolver(Arc<DynPostgresConnectionPool>);
 
 impl fmt::Debug for PostgresResolver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -81,11 +81,9 @@ impl fmt::Debug for PostgresResolver {
 #[async_trait]
 impl TableResolver for PostgresResolver {
     async fn resolve(&self, schema: &str, table: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
-        self.0
-            .table_provider(TableReference::partial(schema, table))
+        crate::postgres_pushdown::table_provider(&self.0, TableReference::partial(schema, table))
             .await
             .map(Some)
-            .map_err(DataFusionError::External)
     }
 }
 
@@ -107,7 +105,7 @@ impl Connector for PostgresConnector {
                 source_name: self.name.clone(),
                 cause,
             })?;
-        let resolver = PostgresResolver(PostgresTableFactory::new(pool));
+        let resolver = PostgresResolver(pool);
         Ok(Arc::new(FederatedCatalog::new(
             Arc::new(listing),
             Arc::new(resolver),

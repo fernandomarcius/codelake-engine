@@ -16,6 +16,7 @@ postgres = [
   "dep:datafusion-table-providers-common",
   "dep:datafusion-table-providers-postgres",
   "datafusion-table-providers-postgres/federation",
+  "dep:datafusion-federation",
 ]
 mysql = [
   "dep:datafusion-table-providers-common",

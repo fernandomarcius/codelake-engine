@@ -49,11 +49,12 @@ def main():
         return 2
     need = set().union(*(s.needs() for s in suites)) if suites else {"codelake"}
     try:
-        with stack.Stack(need, args.binary, log=log) as st:
+        postgres_setup = [(s.name, sql) for s in suites for sql in s.setup_postgres]
+        with stack.Stack(need, args.binary, log=log, postgres_setup=postgres_setup) as st:
             engines = runner.Engines(st.endpoints)
             try:
                 engines.wait(log, alive=st.codelake_alive)
-                rep = runner.run(suites, engines, log, binary=args.binary)
+                rep = runner.run(suites, engines, log, binary=args.binary, setup_errors=st.setup_errors)
             except BaseException:
                 log("CodeLake log tail:\n" + st.codelake_logs())
                 raise

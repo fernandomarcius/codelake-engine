@@ -250,6 +250,22 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- PostgreSQL sources get a pushdown policy, as SQL Server has: only what PostgreSQL evaluates exactly like
+  the engine is sent to it. Found on a dashboard reading PostgreSQL views (2026-10-01):
+  - `count_if`, `arrays_overlap`, array subscripts and `count(*) FILTER (WHERE …)` were sent as written
+    and failed ("function count_if(boolean) does not exist"); the engine's functions now run in the engine,
+    and the other terms of the same filter are still sent.
+  - `SELECT DISTINCT c` was sent as `SELECT t.c FROM (…) AS derived_projection GROUP BY t.c` ("missing
+    FROM-clause entry for table").
+  - **Wrong result**: `ORDER BY`, `<`/`>`/`BETWEEN` and `min`/`max` on text were sent and followed the
+    column's collation (`pt-BR-x-icu`: `_x, a, A, Ábaco, b, B`); they run in the engine, by code point
+    (`A, B, _x, a, b, Ábaco`). Text equality, `IN`, `GROUP BY`, `DISTINCT` and join keys are still sent.
+  - **Wrong result**: a `TIMESTAMP '…'` literal compared with a `timestamp with time zone` column was sent
+    as `CAST('…+00:00' AS TIMESTAMP)`, which drops the offset and reads the text in PostgreSQL's
+    `TimeZone` (a database in `America/Sao_Paulo` shifted the window by three hours); it is sent as
+    `CAST('…+00' AS TIMESTAMP WITH TIME ZONE)`.
+  - Kept local as well: floats in comparisons, grouping and ordering (`NaN`, `-0`), `avg`, `sum` of
+    `bigint` or floats, decimal arithmetic, `CASE`, `LIKE` and every other function.
 - Found by the shadow run on production routines (2026-10-01):
   - **Wrong result**: a `UNION ALL` (or `UNION`) of three or more inputs mixing a decimal and a `double`
     answered `decimal(35,15)` where the reference answers `double` (the go/no-go report model stored

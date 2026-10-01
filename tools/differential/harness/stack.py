@@ -4,7 +4,9 @@ removes every one of them, the network and the warehouse volume on exit.
 
 Nothing is published on the host: the harness container joins a private
 network with Trino 431, PostgreSQL 17 and CodeLake (the binary built by the gate,
-copied into a container of the toolbelt image).
+copied into a container of the toolbelt image). When PostgreSQL runs, both engines
+also read it as a source, through a catalog named `pg` (stack/pg.properties,
+stack/codelake-postgres.toml, stack/postgres-source.sql).
 """
 
 import http.client
@@ -17,6 +19,8 @@ import tarfile
 import tempfile
 import time
 import urllib.parse
+
+from .clients import Pg, PgError
 
 TRINO_IMAGE = "trinodb/trino:431"
 POSTGRES_IMAGE = "postgres:17-alpine"
@@ -123,8 +127,11 @@ class Docker:
 class Stack:
     """Context manager: the engines, reachable by name from this container."""
 
-    def __init__(self, need, binary, log=print):
+    def __init__(self, need, binary, log=print, postgres_setup=()):
+        """postgres_setup: (suite, sql) pairs run on PostgreSQL before CodeLake
+        starts, which reads its sources' table listing once, at start."""
         self.need, self.binary, self.log = need, binary, log
+        self.postgres_setup, self.setup_errors = list(postgres_setup), []
         self.docker = Docker()
         self.tag = "codelake-diff-" + secrets.token_hex(4)
         self.containers, self.network, self.volume, self.joined = [], None, None, None
@@ -184,24 +191,62 @@ class Stack:
             with open(os.path.join(STACK, name), "rb") as f:
                 return f.read()
 
+        source = "postgres" in self.need
+        if source:
+            p = self._run("postgres", POSTGRES_IMAGE, "postgres", env=["POSTGRES_HOST_AUTH_METHOD=trust"])
+            self.docker.copy_in(p, "/docker-entrypoint-initdb.d",
+                                {"source.sql": (read("postgres-source.sql"), 0o644)})
+            self.docker.call("POST", f"/containers/{p}/start")
+            self.endpoints["postgres"] = ("postgres", 5432)
         if "trino" in self.need:
             t = self._run("trino", TRINO_IMAGE, "trino", binds=[f"{self.volume}:/wh"])
             self.docker.copy_in(t, "/etc/trino", {"jvm.config": (read("jvm.config"), 0o644)})
-            self.docker.copy_in(t, "/etc/trino/catalog", {"hive.properties": (read("hive.properties"), 0o644)})
+            catalogs = {"hive.properties": (read("hive.properties"), 0o644)}
+            if source:
+                catalogs["pg.properties"] = (read("pg.properties"), 0o644)
+            self.docker.copy_in(t, "/etc/trino/catalog", catalogs)
             self.docker.call("POST", f"/containers/{t}/start")
             self.endpoints["trino"] = "http://trino:8080"
-        if "postgres" in self.need:
-            p = self._run("postgres", POSTGRES_IMAGE, "postgres", env=["POSTGRES_HOST_AUTH_METHOD=trust"])
-            self.docker.call("POST", f"/containers/{p}/start")
-            self.endpoints["postgres"] = ("postgres", 5432)
+        config = read("codelake.toml")
+        if source:
+            # CodeLake attaches its sources when it starts: PostgreSQL must be up.
+            self._wait_postgres()
+            self._setup_postgres()
+            config += read("codelake-postgres.toml")
         c = self._run("codelake", own_image, "codelake", binds=[f"{self.volume}:/wh"], user="1000:1000",
-                      entrypoint=["/opt/codelake/codelake"], cmd=["serve", "--config", "/opt/codelake/codelake.toml"])
+                      entrypoint=["/opt/codelake/codelake"], cmd=["serve", "--config", "/opt/codelake/codelake.toml"],
+                      env=["CODELAKE_DIFF_PG_PASSWORD=unused"] if source else None)
         self.docker.copy_in(c, "/opt", {"codelake/codelake": (self.binary, 0o755),
-                                        "codelake/codelake.toml": (read("codelake.toml"), 0o644)})
+                                        "codelake/codelake.toml": (config, 0o644)})
         self.codelake = c
         self.docker.call("POST", f"/containers/{c}/start")
         self.endpoints["codelake_trino"] = "http://codelake:8081"
         self.endpoints["codelake_pg"] = ("codelake", 5432)
+
+    def _wait_postgres(self, timeout=120):
+        """Until PostgreSQL accepts TCP connections as `source`: its entrypoint
+        runs the init scripts on a server that listens on a socket only."""
+        deadline = time.time() + timeout
+        while True:
+            try:
+                Pg("postgres", 5432, "source", "postgres").close()
+                return
+            except (OSError, PgError):
+                if time.time() > deadline:
+                    raise DockerError(f"postgres did not accept connections in {timeout}s") from None
+                time.sleep(1)
+
+    def _setup_postgres(self):
+        pg = Pg("postgres", 5432, "postgres", "postgres")
+        try:
+            for suite, sql in self.postgres_setup:
+                result = pg.query(sql)
+                if "error" in result:
+                    self.setup_errors.append({"suite": suite, "engine": "postgres", "sql": sql,
+                                              "result": {"error": result["error"],
+                                                         "message": result.get("message", "")[:400]}})
+        finally:
+            pg.close()
 
     def codelake_alive(self):
         running, code = self.docker.running(self.codelake)
