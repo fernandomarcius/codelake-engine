@@ -309,9 +309,10 @@ pub struct ExecutionConfig {
     /// Seconds allowed for connecting to every source at startup.
     #[serde(default = "default_startup_timeout_secs")]
     pub source_startup_timeout_secs: u64,
-    /// Distinct join keys a hash join's dynamic filter lists (a federated
-    /// source receives them as an `IN` list); past it, or past
-    /// `dynamic_filter_max_key_bytes`, only their min/max remain.
+    /// Distinct join keys a hash join's dynamic filter lists, per partition
+    /// of the join; past it, or past `dynamic_filter_max_key_bytes`, only
+    /// their min/max remain. A federated source receives the lists as an
+    /// `IN` only while those of every partition hold this many keys together.
     #[serde(default = "default_dynamic_filter_max_keys")]
     pub dynamic_filter_max_keys: usize,
     /// Size of those keys per build partition.

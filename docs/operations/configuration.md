@@ -52,7 +52,7 @@ Tuning, in order of preference:
 | `batch_size` | 8192 | rows per batch (1 to 1 048 576) |
 | `target_partitions` | CPUs | parallelism per query and runtime workers |
 | `source_startup_timeout_secs` | 60 | time to attach every source at startup |
-| `dynamic_filter_max_keys` | 150 | distinct build keys a hash join's dynamic filter lists; a federated source receives them as an `IN` list, and past this (or `dynamic_filter_max_key_bytes`) only their min/max |
+| `dynamic_filter_max_keys` | 150 | distinct build keys a hash join's dynamic filter lists per partition, past this (or `dynamic_filter_max_key_bytes`) only their min/max; a federated source receives the lists as an `IN` only while every partition's hold this many keys together |
 | `dynamic_filter_max_key_bytes` | 128KiB | size of those keys per build partition |
 
 ## Catalogs: `[[source]]`
