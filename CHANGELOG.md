@@ -6,6 +6,16 @@ versioning: [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Performance
+- SQL Server: `lower(column)`/`upper(column)` compared with ASCII literals (`=`, `IN`) reach SQL Server as a
+  filter that keeps at least the engine's rows (the column under a case-insensitive Latin collation, its
+  `LOWER`/`UPPER` under another Latin one; `%` in a `LIKE` where a character beyond ASCII also maps to the
+  letter, as `İ` to `i`); the engine narrows them. The monitoring screen's `WHERE lower(tabela) =
+  'recebidas' ORDER BY started_at DESC LIMIT 100` read the whole table: 2.1 million rows in SQL Server
+  2022, 0.717 s → 0.047 s (p50 of 7); `upper(tabela) IN ('RECEBIDAS', 'PAGAS')` 0.487 s → 0.050 s.
+- SQL Server: `ORDER BY … LIMIT n [OFFSET m]` over a sub-plan it evaluates exactly asks it for its first
+  `m + n` rows (`TOP … ORDER BY`), by plain columns of integer, decimal, `date`, `smalldatetime`,
+  `datetime2(0..6)` or `datetime` type with NULLs where it puts them; the engine sorts them again.
+  `ORDER BY started_at DESC LIMIT 100` over the same table: 0.455 s → 0.186 s.
 - Freed memory is returned to the system within a second while the memory pool is below an eighth of its
   limit, and at once above it (it was always at once). TPC-H SF10 on 16 vCPU: 2.6x faster and 65% less
   CPU (sum of p50 51.6 s → 19.8 s, CPU 507 s → 177 s; Trino 431: 24.4 s, 243 s). The memory ceiling holds.
