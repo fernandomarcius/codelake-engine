@@ -543,6 +543,37 @@ async fn local_keys_and_time_windows_reach_sql_server() {
         format!("{sent:?}"),
     );
 
+    // A partitioned join lists its keys per partition; the source gets the
+    // lists while they hold the limit together, else nothing for text keys
+    // (no text bounds): a source compares each row with every key.
+    run(
+        &engine,
+        "CREATE TABLE hive.pilot.textos AS SELECT CONCAT('F-', CAST(n AS varchar)) AS chave FROM UNNEST(sequence(1, 40)) t(n)",
+    )
+    .await;
+    let join = "SELECT count(*), min(c.id), max(c.id) FROM warehouse.dbo.chaves c JOIN hive.pilot.textos t ON c.chave = t.chave";
+    for (keys, sent_keys) in [(40, true), (39, false)] {
+        let engine = attached(spill.path(), warehouse.path(), &host, port, keys).await;
+        for setting in [
+            "SET datafusion.execution.target_partitions = 16",
+            "SET datafusion.optimizer.hash_join_single_partition_threshold = 0",
+            "SET datafusion.optimizer.hash_join_single_partition_threshold_rows = 0",
+        ] {
+            engine.context().sql(setting).await.unwrap();
+        }
+        let (rows, sent) = traced(&engine, &host, port, "chaves", join).await;
+        checks.check(
+            &format!("40 text keys in 16 partitions, limit {keys}: rows"),
+            rows == ["40 | 101 | 140"],
+            format!("{rows:?}"),
+        );
+        checks.check(
+            &format!("40 text keys in 16 partitions, limit {keys}: IN lists sent: {sent_keys}"),
+            sent_any(&sent, &["[chave] IN ("]) == sent_keys,
+            format!("{sent:?}"),
+        );
+    }
+
     // Past the IN-list limit, integer keys go as their min/max.
     let few = attached(spill.path(), warehouse.path(), &host, port, 10).await;
     let (rows, sent) = traced(
