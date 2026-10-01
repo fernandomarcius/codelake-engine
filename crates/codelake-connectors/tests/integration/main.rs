@@ -47,6 +47,8 @@ mod sqlserver_acceptance;
 #[cfg(all(feature = "sqlserver", feature = "postgres"))]
 mod sqlserver_audit;
 #[cfg(all(feature = "sqlserver", feature = "hive"))]
+mod sqlserver_case_functions;
+#[cfg(all(feature = "sqlserver", feature = "hive"))]
 mod sqlserver_column_pruning;
 #[cfg(all(feature = "sqlserver", feature = "hive"))]
 mod sqlserver_dynamic_filter;

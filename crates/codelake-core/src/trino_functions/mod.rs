@@ -140,6 +140,15 @@ pub fn is_trino_function(name: &str) -> bool {
     NAMES.contains(name)
 }
 
+/// The engine's `lower` (`upper` when `upper`) of one character.
+pub(crate) fn case_of(c: char, upper: bool) -> char {
+    if upper {
+        string::simple_upper(c)
+    } else {
+        string::simple_lower(c)
+    }
+}
+
 /// Session defaults Trino semantics rely on: the session zone is UTC unless
 /// configured (`timestamp with time zone` needs a zone), and `ORDER BY`
 /// without `NULLS FIRST|LAST` puts NULLs last in both directions (queries,

@@ -22,7 +22,10 @@ use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{Column, DFSchema};
 use datafusion::error::Result;
 use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
-use datafusion::logical_expr::{Expr, Extension, Filter, LogicalPlan, Projection, SubqueryAlias, TableScan};
+use datafusion::logical_expr::{
+    Expr, Extension, FetchType, Filter, LogicalPlan, LogicalPlanBuilder, Projection, SkipType, Sort,
+    SubqueryAlias, TableScan,
+};
 use datafusion::optimizer::optimizer::ApplyOrder;
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 use datafusion_federation::{FederatedPlanNode, FederationPlanner};
@@ -45,6 +48,16 @@ pub trait PushdownPolicy: Send + Sync + Debug {
     /// runs in the engine, which keeps the result exact.
     fn superset(&self, _term: &Expr, _schema: &DFSchema) -> Option<Expr> {
         None
+    }
+
+    /// Whether the source may return only the first rows of `sort` (as
+    /// many as a `LIMIT` above it keeps), ordered by its keys: the rows it
+    /// picks must be rows the engine's order could pick (its order agrees
+    /// on the keys, NULLs included). Asked only when everything below the
+    /// sort reaches the source exactly; the engine sorts what comes back
+    /// again.
+    fn first_rows(&self, _sort: &Sort) -> bool {
+        false
     }
 }
 
@@ -188,6 +201,9 @@ fn split(
     if fully_pushable(&plan, policy) {
         return federate_prepared(plan, policy, planner);
     }
+    if let Some(first) = first_rows(&plan, policy, planner)? {
+        return Ok(first);
+    }
     if let LogicalPlan::TableScan(scan) = plan {
         return lift_scan_filters(scan, policy, planner);
     }
@@ -201,6 +217,59 @@ fn split(
     // Runs in the engine: its arithmetic is checked again (see `crate::overflow`).
     let local = without_local_supersets(with_new_inputs(&plan, children)?)?;
     crate::overflow::check_local_node(local)
+}
+
+/// `ORDER BY … LIMIT n [OFFSET m]` over a sub-plan the source evaluates
+/// exactly: the source sends its first `m + n` rows (`SELECT TOP … ORDER
+/// BY`), not all of them, and the engine sorts them again before skipping
+/// and keeping its own. Not over a superset filter: the engine would drop
+/// some of the source's first rows and miss the ones after them.
+fn first_rows(
+    plan: &LogicalPlan,
+    policy: &dyn PushdownPolicy,
+    planner: &Arc<dyn FederationPlanner>,
+) -> Result<Option<LogicalPlan>> {
+    let LogicalPlan::Limit(limit) = plan else {
+        return Ok(None);
+    };
+    // Projections of plain columns may sit between them (`SELECT a … ORDER BY b`).
+    let mut between = Vec::new();
+    let mut node = limit.input.as_ref();
+    while let LogicalPlan::Projection(projection) = node
+        && projection.expr.iter().all(|e| matches!(e, Expr::Column(_)))
+    {
+        between.push(node);
+        node = projection.input.as_ref();
+    }
+    let LogicalPlan::Sort(sort) = node else {
+        return Ok(None);
+    };
+    let (Ok(SkipType::Literal(skip)), Ok(FetchType::Literal(Some(fetch)))) =
+        (limit.get_skip_type(), limit.get_fetch_type())
+    else {
+        return Ok(None);
+    };
+    let Some(rows) = skip.checked_add(fetch).filter(|n| *n > 0) else {
+        return Ok(None);
+    };
+    // Exact: a superset filter is only made below a term the policy
+    // rejects, which then stays above it, out of this sub-plan.
+    if !fully_pushable(&sort.input, policy) || !policy.first_rows(sort) {
+        return Ok(None);
+    }
+    let first = LogicalPlanBuilder::from(Arc::clone(&sort.input))
+        .sort(sort.expr.clone())?
+        .limit(0, Some(rows))?
+        .build()?;
+    let mut local = LogicalPlan::Sort(Sort {
+        expr: sort.expr.clone(),
+        input: Arc::new(federate_prepared(first, policy, planner)?),
+        fetch: sort.fetch,
+    });
+    for node in between.into_iter().rev() {
+        local = with_new_inputs(node, vec![local])?;
+    }
+    with_new_inputs(plan, vec![local]).map(Some)
 }
 
 /// A superset filter only serves a source: in the engine it repeats an exact
@@ -881,6 +950,106 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(ids.values(), &[1, 2]);
+    }
+
+    /// `CaseInsensitiveSource` that also returns the first rows of a sort
+    /// by plain columns.
+    #[derive(Debug)]
+    struct FirstRowsSource;
+
+    impl PushdownPolicy for FirstRowsSource {
+        fn node_is_pushable(&self, plan: &LogicalPlan) -> bool {
+            CaseInsensitiveSource.node_is_pushable(plan)
+        }
+
+        fn superset(&self, term: &Expr, schema: &DFSchema) -> Option<Expr> {
+            CaseInsensitiveSource.superset(term, schema)
+        }
+
+        fn first_rows(&self, sort: &Sort) -> bool {
+            sort.expr.iter().all(|key| matches!(key.expr, Expr::Column(_)))
+        }
+    }
+
+    /// `ORDER BY … LIMIT n` asks the source for its first `n` rows only
+    /// when everything below reaches it exactly; the engine sorts them
+    /// again (the fake source ignores its SQL and returns every row).
+    #[tokio::test]
+    async fn the_source_returns_the_first_rows_of_an_exact_sub_plan() {
+        for (sql, first, expected) in [
+            (
+                "SELECT customer_id FROM contracts ORDER BY customer_id DESC LIMIT 2",
+                true,
+                vec![3, 2],
+            ),
+            (
+                "SELECT customer_id FROM contracts WHERE customer_id >= 2 ORDER BY customer_id DESC LIMIT 1",
+                true,
+                vec![3],
+            ),
+            // The engine drops rows of a superset: the source's first two
+            // could all be dropped.
+            (
+                "SELECT customer_id FROM contracts WHERE status = 'active' ORDER BY customer_id DESC LIMIT 2",
+                false,
+                vec![2, 1],
+            ),
+            // The policy refuses the key, or something below the sort stays local.
+            (
+                "SELECT customer_id FROM contracts ORDER BY customer_id + 1 DESC LIMIT 2",
+                false,
+                vec![3, 2],
+            ),
+            (
+                "SELECT max(customer_id) AS m FROM contracts GROUP BY status ORDER BY m DESC LIMIT 1",
+                false,
+                vec![3],
+            ),
+            (
+                "SELECT customer_id FROM contracts ORDER BY customer_id DESC",
+                false,
+                vec![3, 2, 1],
+            ),
+            (
+                "SELECT customer_id FROM contracts WHERE customer_id >= 2 ORDER BY status LIMIT 1",
+                true,
+                vec![3],
+            ),
+            // The source's first `offset + limit`, skipped in the engine.
+            (
+                "SELECT customer_id FROM contracts ORDER BY customer_id DESC LIMIT 1 OFFSET 1",
+                true,
+                vec![2],
+            ),
+        ] {
+            let ctx = crate::testing::federated_session();
+            let (table, sent) = remote_table_recording(
+                "crm",
+                "contracts",
+                vec![
+                    ("customer_id", int64(&[1, 2, 3])),
+                    ("status", strings(&["active", "active", "ACTIVE"])),
+                ],
+                Some(Arc::new(FirstRowsSource)),
+            );
+            ctx.register_table("contracts", table).unwrap();
+            let batches = rows(&ctx, sql).await.unwrap();
+            let ids: Vec<i64> = batches
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            assert_eq!(ids, expected, "{sql}");
+            let sent = sent.lock().unwrap().join("\n");
+            assert_eq!(sent.contains("LIMIT"), first, "{sql}: {sent}");
+            assert_eq!(sent.contains("ORDER BY"), first, "{sql}: {sent}");
+        }
     }
 
     #[tokio::test]

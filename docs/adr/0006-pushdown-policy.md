@@ -83,6 +83,24 @@ dynamic filter, so the whole remote table would be read on every run.
    whole-second bounds (`>=` the second at or before it, `<` the first
    second past what it keeps), a superset of what the engine keeps.
 
+10. `lower(column)`/`upper(column)` compared with ASCII literals (`=`, `IN`)
+    reach SQL Server as a superset when the column's collation (read from
+    `INFORMATION_SCHEMA.COLUMNS`) is a Latin one: the column itself under a
+    case-insensitive collation, `LOWER`/`UPPER` of it otherwise (both pair
+    `A`-`Z` with `a`-`z` as the engine; a Turkish or Azeri collation does
+    not, and gets nothing). A letter a character beyond ASCII also becomes
+    under the engine's case mapping (`İ` → `i`, Kelvin sign → `k`, `ı` →
+    `I`, `ſ` → `S`) is `%` in a `LIKE`. `<>` and `NOT IN` are not supersets
+    and stay local.
+11. `ORDER BY … LIMIT n [OFFSET m]` over a sub-plan the source evaluates
+    exactly (no superset below it) asks the source for its first `m + n`
+    rows (`PushdownPolicy::first_rows`, `TOP … ORDER BY` in T-SQL); the
+    engine sorts them again. SQL Server: keys that are plain columns of
+    integer, decimal, `date`, `smalldatetime`, `datetime2(0..6)` or
+    `datetime` type (ordered value for value as the engine orders them), each
+    with its NULLs where SQL Server puts them (first ascending, last
+    descending) or without NULLs.
+
 ## Consequences
 
 - Correctness first: some operators Trino pushes down run locally here, moving
