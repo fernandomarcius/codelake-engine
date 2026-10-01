@@ -186,6 +186,29 @@ fn view_field(name: &str, trino: &str) -> Field {
     }
 }
 
+/// The fields of a view's columns, by their folded names. Another engine
+/// stores a view's columns as its query spelled them (`Descr_obr`) and
+/// resolves them without regard to case; the engine sees every column of
+/// this catalog by its folded name, as a table's (ISS-018). Two stored names
+/// that fold to one would make every reference to them ambiguous: refused,
+/// never a guess.
+fn view_fields(view: &str, columns: &[TrinoViewColumn]) -> Result<Vec<Field>> {
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for column in columns {
+        if let Some(other) = seen.insert(hive_name(&column.name), &column.name) {
+            return Err(DataFusionError::Plan(format!(
+                "view {view} has columns `{other}` and `{}`, which differ only by case: \
+                 column names are case-insensitive, so the view cannot be read",
+                column.name
+            )));
+        }
+    }
+    Ok(columns
+        .iter()
+        .map(|c| view_field(&hive_name(&c.name), &c.trino_type))
+        .collect())
+}
+
 /// The type a view column declares beyond its Arrow type: `varchar(n)`, and
 /// a timestamp precision no Arrow unit has (`timestamp(1)`); `char(n)` is a
 /// table's char column (see `view_field`).
@@ -457,11 +480,7 @@ impl HiveCatalog {
                 .as_deref()
                 .ok_or_else(|| DataFusionError::Plan(format!("view {schema}.{table} has no definition")))?;
             let definition = TrinoView::decode(text, &self.metastore.names().view_marker)?;
-            let fields: Vec<Field> = definition
-                .columns
-                .iter()
-                .map(|c| view_field(&c.name, &c.trino_type))
-                .collect();
+            let fields = view_fields(&format!("{schema}.{table}"), &definition.columns)?;
             return Ok(Some(Arc::new(HiveView {
                 name: format!("{schema}.{table}"),
                 definition,

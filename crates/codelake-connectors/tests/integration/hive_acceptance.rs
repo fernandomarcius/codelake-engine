@@ -1078,6 +1078,85 @@ async fn trino_view_with_unqualified_names_reads_in_codelake() {
     );
 }
 
+/// Trino 431 stores a view's columns as its query spelled them (`Descr_obr`)
+/// and resolves any spelling of them, quoted or not; another view reads them
+/// in lower case. 40 of the 84 production views store a capital letter.
+#[tokio::test]
+async fn trino_views_with_mixed_case_columns_read_in_codelake() {
+    let shared = shared().await;
+    let spill = tempfile::tempdir().unwrap();
+    let trino = Trino::start(&shared).await;
+    for sql in [
+        "CREATE SCHEMA hive.vc",
+        "CREATE TABLE hive.vc.obras (codigo integer, descr varchar) WITH (format = 'PARQUET')",
+        "INSERT INTO hive.vc.obras VALUES (1, 'um'), (2, 'dois')",
+        "CREATE VIEW hive.vc.obras_latest AS SELECT codigo AS Cod_obr, descr AS Descr_obr FROM hive.vc.obras",
+        "CREATE VIEW hive.vc.base1 AS SELECT ob.descr_obr, ob.COD_OBR AS cod FROM hive.vc.obras_latest ob",
+        "CREATE VIEW hive.vc.quoted AS SELECT \"Descr_obr\" AS \"Nome\" FROM hive.vc.obras_latest WHERE \"COD_OBR\" = 2",
+    ] {
+        trino.sql(sql).await;
+    }
+    let engine = codelake(&shared.warehouse(), spill.path()).await;
+    for (label, sql, want) in [
+        (
+            "4c. SELECT * of a view with mixed-case columns",
+            "SELECT * FROM hive.vc.obras_latest ORDER BY 1",
+            strings(&[&["1", "um"], &["2", "dois"]]),
+        ),
+        (
+            "4c. every spelling of a mixed-case view column",
+            "SELECT \"Descr_obr\", descr_obr, \"DESCR_OBR\", Cod_obr \
+             FROM hive.vc.obras_latest ORDER BY cod_obr",
+            strings(&[&["um", "um", "um", "1"], &["dois", "dois", "dois", "2"]]),
+        ),
+        (
+            "4c. the stored spelling's folded form, quoted",
+            "SELECT \"descr_obr\" FROM hive.vc.obras_latest ORDER BY \"COD_OBR\"",
+            strings(&[&["um"], &["dois"]]),
+        ),
+        (
+            "4c. a filter on a mixed-case view column",
+            "SELECT cod_obr FROM hive.vc.obras_latest WHERE descr_obr = 'dois'",
+            strings(&[&["2"]]),
+        ),
+        (
+            "4c. a view over the view, in lower case",
+            "SELECT descr_obr, cod FROM hive.vc.base1 ORDER BY cod",
+            strings(&[&["um", "1"], &["dois", "2"]]),
+        ),
+        (
+            "4c. a view over the view, quoted spellings",
+            "SELECT nome FROM hive.vc.quoted",
+            strings(&[&["dois"]]),
+        ),
+        (
+            "4c. a join of both views through aliases",
+            "SELECT b.cod, o.Descr_obr FROM hive.vc.base1 b \
+             JOIN hive.vc.obras_latest o ON b.cod = o.COD_obr ORDER BY 1",
+            strings(&[&["1", "um"], &["2", "dois"]]),
+        ),
+        (
+            "4c. information_schema lists the folded names",
+            "SELECT table_name, column_name FROM hive.information_schema.columns \
+             WHERE table_schema = 'vc' AND table_name IN ('obras_latest', 'quoted') \
+             ORDER BY 1, ordinal_position",
+            strings(&[
+                &["obras_latest", "cod_obr"],
+                &["obras_latest", "descr_obr"],
+                &["quoted", "nome"],
+            ]),
+        ),
+    ] {
+        let by_trino = trino.sql(sql).await;
+        assert_rows(&format!("{label} (Trino)"), &by_trino, &want);
+        assert_rows(label, &cl(&engine, sql).await, &want);
+    }
+    // DESCRIBE shows the folded names, as Trino's does.
+    let described = cl(&engine, "DESCRIBE hive.vc.obras_latest").await;
+    let names: Vec<&str> = described.iter().map(|row| row[0].as_str()).collect();
+    assert_eq!(names, ["cod_obr", "descr_obr"], "{described:?}");
+}
+
 // ---------------------------------------------------------------------------
 // 5. SQL Server 2022 loads CodeLake Parquet with OPENROWSET.
 // ---------------------------------------------------------------------------

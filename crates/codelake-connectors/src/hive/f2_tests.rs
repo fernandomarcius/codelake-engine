@@ -790,6 +790,80 @@ async fn views_with_quoted_mixed_case_columns_read_back() {
     assert_eq!(definition["columns"][0]["name"], "mixedcol");
 }
 
+/// Trino 431 stores a view's columns as its query spelled them and resolves
+/// them without regard to case (`analytics.obras_latest` stores `Descr_obr`,
+/// `vw_recebidas_comissoes_base1` reads `ob.descr_obr`). Every answer below
+/// is what Trino 431 returned for the same views.
+#[tokio::test]
+async fn views_another_engine_stored_with_capitals_resolve_any_spelling() {
+    let lake = lake().await;
+    lake.ok("CREATE TABLE hive.s.obras AS SELECT * FROM (VALUES (1, 'um'), (2, 'dois')) AS t(codigo, descr)")
+        .await;
+    trino_view(
+        &lake,
+        "obras_latest",
+        "SELECT codigo AS Cod_obr, descr AS Descr_obr FROM hive.s.obras",
+        &serde_json::json!([
+            {"name": "Cod_obr", "type": "integer"},
+            {"name": "Descr_obr", "type": "varchar"}
+        ]),
+    );
+    trino_view(
+        &lake,
+        "base1",
+        "SELECT ob.descr_obr, ob.COD_OBR AS cod FROM hive.s.obras_latest ob",
+        &serde_json::json!([
+            {"name": "descr_obr", "type": "varchar"},
+            {"name": "cod", "type": "integer"}
+        ]),
+    );
+    assert_eq!(
+        lake.ok("SELECT * FROM hive.s.obras_latest ORDER BY 1").await,
+        rows(&[&["1", "um"], &["2", "dois"]])
+    );
+    assert_eq!(
+        lake.ok(
+            "SELECT \"Descr_obr\", descr_obr, \"DESCR_OBR\", COD_obr FROM hive.s.obras_latest \
+             WHERE \"Descr_obr\" = 'dois'"
+        )
+        .await,
+        rows(&[&["dois", "dois", "dois", "2"]])
+    );
+    assert_eq!(
+        lake.ok("SELECT descr_obr, cod FROM hive.s.base1 ORDER BY cod")
+            .await,
+        rows(&[&["um", "1"], &["dois", "2"]])
+    );
+    assert_eq!(
+        lake.ok("SELECT b.cod, o.Descr_obr FROM hive.s.base1 b \
+             JOIN hive.s.obras_latest o ON b.cod = o.cod_obr ORDER BY 1")
+            .await,
+        rows(&[&["1", "um"], &["2", "dois"]])
+    );
+    assert_eq!(
+        lake.ok("SELECT column_name FROM hive.information_schema.columns \
+             WHERE table_schema = 's' AND table_name = 'obras_latest' ORDER BY ordinal_position")
+            .await,
+        rows(&[&["cod_obr"], &["descr_obr"]])
+    );
+    // Trino 431 creates a view whose columns differ only by case, and then
+    // refuses every reference to them as ambiguous.
+    trino_view(
+        &lake,
+        "dup",
+        "SELECT 1 AS a, 2 AS A",
+        &serde_json::json!([
+            {"name": "a", "type": "integer"},
+            {"name": "A", "type": "integer"}
+        ]),
+    );
+    let err = lake.err("SELECT * FROM hive.s.dup").await;
+    assert!(
+        err.contains("view s.dup has columns `a` and `A`, which differ only by case"),
+        "{err}"
+    );
+}
+
 /// A view's plan is built in a state rebuilt from the query's
 /// (`codelake_core::rebuild_state`), which registers the functions again in
 /// hash order: a built-in the engine replaced could take its name back in
