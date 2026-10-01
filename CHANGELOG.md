@@ -45,6 +45,14 @@ versioning: [SemVer](https://semver.org/).
   reconciliation (eleven scans of SQL Server, each under `SELECT *, ROW_NUMBER() OVER (…)`) asked eight of
   them for every column, 380 s against Trino 431's 197 s. Reproduction (SQL Server 2022, 70 columns, three
   tables of 5 million rows and four of 500 000): 211–213 s → 38–39 s, Trino 431 36–55 s; same rows.
+- A partitioned hash join's dynamic filter reaches a federated scan as `IN` lists only while the lists of
+  every partition hold `execution.dynamic_filter_max_keys` keys together; past it, only the rest of the filter
+  (the bounds) is sent. Each partition listed up to that many, so the source got up to that many times the
+  partitions. Found by the shadow run (2026-10-01): once a hash join without sizes built its right input,
+  the Warehouse Comissões screen (a 5.8-million-row SQL Server view joined with three small views) sent the
+  view the 432 keys of one of them, which kept nearly every row, and SQL Server compared each row with every
+  key: 157–178 s against 21–25 s before and Trino 431's 29–48 s. Now 26–33 s, same rows; the build sides
+  stay the small views (1 MB of hash tables instead of 1.5 GB).
 
 ### Added
 - Distributed execution (M4, ADR 0011), behind the `distributed` feature: a `[distributed]` coordinator

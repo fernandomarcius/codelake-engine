@@ -121,10 +121,11 @@ impl FederationFilterBarrier {
         }
     }
 
-    /// The input, narrowed by the dynamic filters complete by now. Narrowing
-    /// is only an optimization: a plan it cannot build keeps the input.
-    fn narrowed_input(&self) -> Arc<dyn ExecutionPlan> {
-        match crate::federated_dynamic_filters::narrowed(&self.input, &self.dynamic_filters) {
+    /// The input, narrowed by the dynamic filters complete by now, each
+    /// listing at most `max_keys` keys. Narrowing is only an optimization: a
+    /// plan it cannot build keeps the input.
+    fn narrowed_input(&self, max_keys: usize) -> Arc<dyn ExecutionPlan> {
+        match crate::federated_dynamic_filters::narrowed(&self.input, &self.dynamic_filters, max_keys) {
             Ok(Some(narrowed)) => narrowed,
             _ => Arc::clone(&self.input),
         }
@@ -237,8 +238,13 @@ impl ExecutionPlan for FederationFilterBarrier {
             let this = self.with_dynamic_filters(self.dynamic_filters.clone());
             let schema = self.schema();
             let started = span.clone();
+            let max_keys = context
+                .session_config()
+                .options()
+                .optimizer
+                .hash_join_inlist_pushdown_max_distinct_values;
             let stream = futures::stream::once(async move {
-                let input = this.narrowed_input();
+                let input = this.narrowed_input(max_keys);
                 started.in_scope(|| input.execute(partition, context))
             })
             .try_flatten();

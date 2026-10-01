@@ -21,6 +21,13 @@
 //! filter, which sends what the source evaluates exactly or offers a superset
 //! for (text `IN` under a case-insensitive collation, whole-second bounds on
 //! a `datetime`) and drops the rest. A source without a policy gets nothing.
+//!
+//! A partitioned join lists up to that many keys per partition, and the
+//! source receives the lists of every partition. Past the limit together
+//! ([`within_key_limit`]), only the rest of the filter is sent (the bounds):
+//! a source compares each row with every key of an `IN` it cannot seek, and
+//! a list of a few hundred keys that keeps nearly every row made a scan of 6
+//! million rows of a SQL Server view six times slower.
 
 use std::sync::Arc;
 
@@ -207,18 +214,58 @@ fn typed_like(value: Expr, other: &Expr, schema: &DFSchema) -> Option<Expr> {
     (back == *scalar).then(|| Expr::Literal(cast, metadata.clone()))
 }
 
+/// `predicate` (a [`superset_of`] a join's dynamic filter) without its `IN`
+/// lists when they hold more than `max_keys` keys together; `None` when
+/// nothing remains (every row).
+pub(crate) fn within_key_limit(predicate: Expr, max_keys: usize) -> Option<Expr> {
+    if listed_keys(&predicate) <= max_keys {
+        return Some(predicate);
+    }
+    without_lists(predicate)
+}
+
+/// Keys of the `IN` lists of `expr`, through `AND` and `OR`.
+fn listed_keys(expr: &Expr) -> usize {
+    match expr {
+        Expr::InList(list) => list.list.len(),
+        Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
+            listed_keys(&binary.left) + listed_keys(&binary.right)
+        }
+        _ => 0,
+    }
+}
+
+/// `expr` with every `IN` list taken as true: below `AND` and `OR` only, so
+/// it keeps at least the same rows.
+fn without_lists(expr: Expr) -> Option<Expr> {
+    match expr {
+        Expr::InList(_) => None,
+        Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+            match (without_lists(*binary.left), without_lists(*binary.right)) {
+                (Some(l), Some(r)) => Some(l.and(r)),
+                (one, None) | (None, one) => one,
+            }
+        }
+        Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
+            Some(or(without_lists(*binary.left)?, without_lists(*binary.right)?))
+        }
+        other => Some(other),
+    }
+}
+
 /// `input` with the federated scan below it (through single-child wrappers)
-/// narrowed by `filters`; `None` when nothing changes.
+/// narrowed by `filters`, each listing at most `max_keys` keys
+/// ([`within_key_limit`]); `None` when nothing changes.
 pub(crate) fn narrowed(
     input: &Arc<dyn ExecutionPlan>,
     filters: &[Arc<dyn PhysicalExpr>],
+    max_keys: usize,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     if let Some(remote) = input.downcast_ref::<VirtualExecutionPlan>() {
-        let predicate = conjunction(
-            filters
-                .iter()
-                .filter_map(|filter| superset_of(filter, remote.plan().schema())),
-        );
+        let predicate =
+            conjunction(filters.iter().filter_map(|filter| {
+                within_key_limit(superset_of(filter, remote.plan().schema())?, max_keys)
+            }));
         let Some(predicate) = predicate else {
             return Ok(None);
         };
@@ -228,7 +275,7 @@ pub(crate) fn narrowed(
     let [child] = children.as_slice() else {
         return Ok(None);
     };
-    match narrowed(child, filters)? {
+    match narrowed(child, filters, max_keys)? {
         Some(child) => Ok(Some(Arc::clone(input).with_new_children(vec![child])?)),
         None => Ok(None),
     }
@@ -482,6 +529,38 @@ mod tests {
         assert!(sql.contains(">= 2") && sql.contains("<= 3"), "{sql}");
         assert!(!sql.contains(" IN "), "{sql}");
         assert_eq!(rows, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn the_keys_of_every_partition_count_together_against_the_limit() {
+        let ctx = session();
+        for statement in [
+            "SET datafusion.execution.target_partitions = 4",
+            "SET datafusion.optimizer.hash_join_single_partition_threshold = 0",
+            "SET datafusion.optimizer.hash_join_single_partition_threshold_rows = 0",
+            "SET datafusion.optimizer.hash_join_inlist_pushdown_max_distinct_values = 7",
+        ] {
+            ctx.sql(statement).await.unwrap().collect().await.unwrap();
+        }
+        local(&ctx, "wanted", &[1, 2, 3, 4, 5, 6, 7, 8], &["x"; 8]);
+        let statements = contracts(&ctx, Some(Arc::new(TextInAsSuperset)));
+        // A partitioned join that builds `wanted`, up to 7 keys per partition
+        // (they fall in two).
+        let sql = "SELECT k.customer_id FROM contracts k JOIN wanted w ON k.customer_id = w.id";
+        let plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
+        let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 5);
+        let shown = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(shown.contains("IN (SET)"), "partitions list their keys: {shown}");
+        // 8 keys together: the source gets the bounds of each partition.
+        let sent = sent(&statements);
+        assert!(!sent.contains(" IN ("), "{sent}");
+        assert!(sent.contains(">= ") && sent.contains("<= "), "{sent}");
     }
 
     #[tokio::test]
@@ -890,6 +969,41 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(superset_of(&unknown, &schema), None);
+    }
+
+    #[test]
+    fn past_the_key_limit_together_the_lists_are_dropped() {
+        let keys = |values: &[i64]| column("a").in_list(values.iter().map(|v| lit(*v)).collect(), false);
+        let bounds = |lo: i64, hi: i64| column("a").gt_eq(lit(lo)).and(column("a").lt_eq(lit(hi)));
+        // The filter of a partitioned join: bounds and keys per partition.
+        let two = or(
+            bounds(1, 2).and(keys(&[1, 2])),
+            bounds(5, 9).and(keys(&[5, 7, 9])),
+        );
+        assert_eq!(within_key_limit(two.clone(), 5), Some(two.clone()), "5 keys");
+        assert_eq!(
+            within_key_limit(two, 4),
+            Some(or(bounds(1, 2), bounds(5, 9))),
+            "the keys of both partitions count"
+        );
+        // An AND keeps its other side, on either side of the list.
+        assert_eq!(
+            within_key_limit(keys(&[1, 2]).and(bounds(1, 2)), 1),
+            Some(bounds(1, 2))
+        );
+        // A list alone, or an OR with a branch reduced to it, keeps every row.
+        assert_eq!(within_key_limit(keys(&[1, 2]), 1), None);
+        assert_eq!(within_key_limit(or(keys(&[1, 2]), bounds(5, 9)), 1), None);
+        assert_eq!(within_key_limit(or(bounds(5, 9), keys(&[1, 2])), 1), None);
+        // Anything else stays.
+        let null = column("a").is_null();
+        assert_eq!(within_key_limit(null.clone(), 0), Some(null.clone()));
+        assert_eq!(
+            within_key_limit(null.clone().or(keys(&[1])).and(keys(&[2])), 1),
+            None,
+            "an OR of a list is every row"
+        );
+        assert_eq!(within_key_limit(null.clone().and(keys(&[1, 2])), 1), Some(null));
     }
 
     #[test]
