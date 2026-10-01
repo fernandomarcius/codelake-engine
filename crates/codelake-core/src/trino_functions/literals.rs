@@ -79,11 +79,17 @@ fn typed(number: &str) -> Option<Expr> {
 }
 
 /// Functions that read numeric literal arguments when planned
-/// (`from_unixtime(t, hours, minutes)` takes its zone from them), and the
-/// engine's own `arrow_cast`, which Trino does not have: it builds an exact
-/// Arrow type from the engine's reading of its argument
-/// (`arrow_cast(18446744073709551615, 'UInt64')`).
-const LITERAL_ARGUMENTS: [&str; 2] = ["from_unixtime", "arrow_cast"];
+/// (`from_unixtime(t, hours, minutes)` takes its zone from them,
+/// `current_timestamp(6)` its precision), and the engine's own `arrow_cast`,
+/// which Trino does not have: it builds an exact Arrow type from the
+/// engine's reading of its argument (`arrow_cast(18446744073709551615,
+/// 'UInt64')`).
+const LITERAL_ARGUMENTS: [&str; 4] = [
+    "from_unixtime",
+    "arrow_cast",
+    "current_timestamp",
+    "localtimestamp",
+];
 
 #[derive(Debug, Default)]
 struct LiteralTyper {

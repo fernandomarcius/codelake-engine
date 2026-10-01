@@ -243,7 +243,7 @@ impl FunctionRewrite for TrinoRewrites {
         "trino_functions"
     }
 
-    fn rewrite(&self, expr: Expr, schema: &DFSchema, _config: &ConfigOptions) -> Result<Transformed<Expr>> {
+    fn rewrite(&self, expr: Expr, schema: &DFSchema, config: &ConfigOptions) -> Result<Transformed<Expr>> {
         if let Expr::BinaryExpr(binary) = &expr
             && matches!(binary.op, Operator::Plus | Operator::Minus)
             && let Ok(DataType::Date32) = binary.left.get_type(schema)
@@ -306,11 +306,46 @@ impl FunctionRewrite for TrinoRewrites {
                 divisor.clone(),
             )));
         }
-        match self.by_name.get(function.name()) {
+        // Updated for the session (its time zone), as the session's own
+        // functions are: the one registered with the library has the engine's.
+        let trino = self.by_name.get(function.name()).map(|trino| {
+            trino
+                .inner()
+                .with_updated_config(config)
+                .map_or_else(|| Arc::clone(trino), Arc::new)
+        });
+        match trino {
             Some(trino) if function.func.as_ref() != trino.as_ref() => Ok(Transformed::yes(
-                Expr::ScalarFunction(ScalarFunction::new_udf(Arc::clone(trino), function.args)),
+                Expr::ScalarFunction(ScalarFunction::new_udf(trino, function.args)),
             )),
             _ => Ok(Transformed::no(Expr::ScalarFunction(function))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A call is swapped for the library's function of its name, updated
+    /// for the session's configuration (its time zone), unless it already
+    /// is that function: the instance registered with the library has the
+    /// engine's zone.
+    #[test]
+    fn calls_get_the_library_function_updated_for_the_session() {
+        let engine_zone = Arc::new(super::super::datetime::current_timestamp());
+        let rewrites = TrinoRewrites::new(vec![Arc::clone(&engine_zone)]);
+        let mut config = ConfigOptions::default();
+        config.execution.time_zone = Some("America/Sao_Paulo".to_owned());
+        let session_zone = Arc::new(engine_zone.inner().with_updated_config(&config).unwrap());
+        assert_ne!(session_zone, engine_zone);
+        let call = |f: &Arc<ScalarUDF>| Expr::ScalarFunction(ScalarFunction::new_udf(Arc::clone(f), vec![]));
+        let schema = DFSchema::empty();
+        let stale = rewrites.rewrite(call(&engine_zone), &schema, &config).unwrap();
+        assert!(stale.transformed);
+        assert_eq!(stale.data, call(&session_zone));
+        let current = rewrites.rewrite(call(&session_zone), &schema, &config).unwrap();
+        assert!(!current.transformed);
+        assert_eq!(current.data, call(&session_zone));
     }
 }
