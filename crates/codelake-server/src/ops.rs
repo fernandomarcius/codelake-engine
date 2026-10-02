@@ -150,6 +150,12 @@ async fn metrics_endpoint(State(state): State<Arc<OpsState>>) -> impl IntoRespon
     metrics::gauge!("codelake_memory_reserved_bytes").set(memory.reserved_bytes as f64);
     metrics::gauge!("codelake_spill_used_bytes").set(memory.spill_used_bytes as f64);
     metrics::gauge!("codelake_spill_limit_bytes").set(memory.spill_limit_bytes as f64);
+    if let Some(open) = crate::net::limits::open_descriptors() {
+        metrics::gauge!("codelake_open_files").set(open as f64);
+    }
+    if let Some(soft) = crate::net::limits::current_soft() {
+        metrics::gauge!("codelake_open_files_limit").set(soft as f64);
+    }
     for source in state.sources().await {
         metrics::gauge!("codelake_source_up", "source" => source.name, "kind" => source.kind)
             .set(if source.up { 1.0 } else { 0.0 });
@@ -240,5 +246,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("codelake_memory_limit_bytes"), "{body}");
         assert!(body.contains("codelake_spill_limit_bytes"), "{body}");
+        assert!(body.contains("codelake_open_files "), "{body}");
+        assert!(body.contains("codelake_open_files_limit "), "{body}");
     }
 }

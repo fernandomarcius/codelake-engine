@@ -51,6 +51,7 @@ fn follow_memory_pressure(scarce: bool) {
 
 mod hooks;
 mod import;
+mod net;
 mod ops;
 mod pg;
 mod serve;

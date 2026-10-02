@@ -177,7 +177,7 @@ async fn sigkill_during_or_replace_leaves_the_old_or_the_new_table() {
 }
 
 /// One statement over the Trino HTTP protocol: column names and rows.
-async fn http(port: u16, sql: &str) -> (Vec<String>, Vec<serde_json::Value>, Option<String>) {
+pub(super) async fn http(port: u16, sql: &str) -> (Vec<String>, Vec<serde_json::Value>, Option<String>) {
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{port}");
     let mut page: serde_json::Value = serde_json::from_str(
