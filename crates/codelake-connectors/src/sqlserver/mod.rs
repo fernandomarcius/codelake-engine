@@ -70,12 +70,19 @@ fn sql_type(data_type: &str, max_length: Option<i32>, datetime_precision: Option
     }
 }
 
-/// The bounded text type a column shows in results and keeps through
-/// `CREATE TABLE AS`, as the reference maps SQL Server: `varchar(n)` and
-/// `nvarchar(n)` are `varchar(n)`; `(max)`, `text` and `ntext` are unbounded.
-fn declared_text(data_type: &str, max_length: Option<i32>) -> Option<String> {
+/// The type a column shows in results beyond its Arrow type, as the
+/// reference maps SQL Server: `varchar(n)` and `nvarchar(n)` are
+/// `varchar(n)` (kept through `CREATE TABLE AS`; `(max)`, `text` and
+/// `ntext` are unbounded); `time(p)` is `time(p)` (7 without `p`), carried in
+/// nanoseconds: it was `time(9)`, nine digits a client may refuse.
+fn declared_text(
+    data_type: &str,
+    max_length: Option<i32>,
+    datetime_precision: Option<i16>,
+) -> Option<String> {
     match (data_type.to_ascii_lowercase().as_str(), max_length) {
         ("varchar" | "nvarchar", Some(n)) if n > 0 => Some(format!("varchar({n})")),
+        ("time", _) => Some(format!("time({})", datetime_precision.unwrap_or(7).clamp(0, 7))),
         _ => None,
     }
 }
@@ -291,7 +298,7 @@ impl SqlServerResolver {
                 SQL_TYPE.to_owned(),
                 sql_type(data_type, max_length, datetime_precision),
             )]);
-            if let Some(declared) = declared_text(data_type, max_length) {
+            if let Some(declared) = declared_text(data_type, max_length, datetime_precision) {
                 metadata.insert(codelake_core::trino_types::TRINO_TYPE.to_owned(), declared);
             }
             if let Some(collation) = collation {
@@ -404,19 +411,32 @@ mod tests {
 
     #[test]
     fn bounded_text_declares_its_length() {
-        assert_eq!(declared_text("varchar", Some(20)).as_deref(), Some("varchar(20)"));
         assert_eq!(
-            declared_text("NVARCHAR", Some(50)).as_deref(),
+            declared_text("varchar", Some(20), None).as_deref(),
+            Some("varchar(20)")
+        );
+        assert_eq!(
+            declared_text("NVARCHAR", Some(50), None).as_deref(),
             Some("varchar(50)")
         );
-        assert_eq!(declared_text("varchar", Some(-1)), None, "varchar(max)");
-        assert_eq!(declared_text("ntext", Some(1_073_741_823)), None);
+        assert_eq!(declared_text("varchar", Some(-1), None), None, "varchar(max)");
+        assert_eq!(declared_text("ntext", Some(1_073_741_823), None), None);
         assert_eq!(
-            declared_text("char", Some(3)),
+            declared_text("char", Some(3), None),
             None,
             "char(n) keeps its own semantics"
         );
-        assert_eq!(declared_text("int", None), None);
+        assert_eq!(declared_text("int", None, None), None);
+        assert_eq!(declared_text("datetime2", None, Some(7)), None);
+    }
+
+    #[test]
+    fn times_declare_their_precision() {
+        assert_eq!(declared_text("time", None, Some(3)).as_deref(), Some("time(3)"));
+        assert_eq!(declared_text("TIME", None, Some(0)).as_deref(), Some("time(0)"));
+        assert_eq!(declared_text("time", None, None).as_deref(), Some("time(7)"));
+        assert_eq!(declared_text("time", None, Some(9)).as_deref(), Some("time(7)"));
+        assert_eq!(declared_text("time", None, Some(-1)).as_deref(), Some("time(0)"));
     }
 
     use super::*;
