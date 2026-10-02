@@ -1,0 +1,291 @@
+# Common type of timestamps, dates and times where they meet. In the reference engine
+# timestamp(3) with timestamp(0) is timestamp(3): the highest precision, the fraction kept.
+# CodeLake typed a UNION of TIMESTAMP '... 10:00:00.123' and TIMESTAMP '... 10:00:00' as
+# timestamp(0) and dropped the fraction (the SQL planner takes the coarser Arrow unit), with or
+# without a time zone, in two or more inputs, over memory tables, hive Parquet tables and VALUES;
+# INTERSECT and EXCEPT of such inputs failed. A precision no Arrow unit has (timestamp(1),
+# timestamp(7), time(3) on a nanosecond time) is declared on the result column, which the client
+# reads: those cases select the column itself (typeof() and CAST(... AS varchar) of a
+# timestamp(1) answer for its Arrow unit, ADR 0008).
+# Each engine writes its own hive tables (`<name>_tr`, `<name>_cl`); TC*a compare the type each
+# stores, TC*b what each reads from the other's table.
+
+oracle = "trino"
+compare = "multiset"
+time_zone = "America/Sao_Paulo"
+
+setup = [
+  "CREATE SCHEMA {c}.tsp",
+  "CREATE TABLE {c}.tsp.cols AS SELECT CAST(TIMESTAMP '2026-01-01 10:00:00' AS timestamp(0)) AS s0, CAST(TIMESTAMP '2026-01-01 10:00:00.1' AS timestamp(1)) AS s1, CAST(TIMESTAMP '2026-01-01 10:00:00.123' AS timestamp(3)) AS s3, CAST(TIMESTAMP '2026-01-01 10:00:00.123456' AS timestamp(6)) AS s6",
+  "CREATE SCHEMA IF NOT EXISTS hive.tsp",
+  "CREATE TABLE hive.tsp.h_{e} WITH (format = 'PARQUET') AS SELECT CAST(TIMESTAMP '2026-01-01 10:00:00.123' AS timestamp(3)) AS t",
+  "CREATE TABLE hive.tsp.two_{e} WITH (format = 'PARQUET') AS SELECT CAST(TIMESTAMP '2026-01-01 10:00:00.123' AS timestamp(3)) AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00'",
+  "CREATE TABLE hive.tsp.three_{e} WITH (format = 'PARQUET') AS SELECT TIMESTAMP '2026-01-01 10:00:00' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 11:00:00' UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.123'",
+]
+
+# ---------------------------------------------------------------- UNION of literals
+
+[[case]]
+id = "TU1"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.123' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00')"
+note = "the defect: timestamp(3) with timestamp(0) is timestamp(3), the fraction kept (was timestamp(0), .123 lost)"
+
+[[case]]
+id = "TU2"
+sql = "SELECT x FROM (SELECT TIMESTAMP '2026-01-01 10:00:00' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.123')"
+note = "the coarser input first; the client reads timestamp(3)"
+
+[[case]]
+id = "TU3"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.123' UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.123456')"
+note = "three inputs, three precisions: timestamp(6)"
+
+[[case]]
+id = "TU4"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 11:00:00' UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.123')"
+note = "a union of unions: the first two agree on timestamp(0), the third is timestamp(3)"
+
+[[case]]
+id = "TU5"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.123' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00' UNION ALL SELECT TIMESTAMP '2026-01-01 11:00:00')"
+note = "a union of unions whose inner union agrees with the third input, the outer one typed timestamp(0) when planned"
+
+[[case]]
+id = "TU6"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.000' AS x UNION SELECT TIMESTAMP '2026-01-01 10:00:00' UNION SELECT TIMESTAMP '2026-01-01 10:00:00.123')"
+note = "UNION (distinct): .000 and :00 are one row, .123 another (was one row)"
+
+[[case]]
+id = "TU7"
+sql = "SELECT x FROM (SELECT TIMESTAMP '2026-01-01 10:00:00' AS x UNION ALL SELECT CAST(NULL AS timestamp(3)) UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.5')"
+note = "a typed NULL input counts: timestamp(3)"
+
+[[case]]
+id = "TU8"
+sql = "SELECT x FROM (SELECT TIMESTAMP '2026-01-01 10:00:00' AS x UNION ALL SELECT NULL UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.5')"
+note = "an untyped NULL does not: timestamp(1)"
+
+[[case]]
+id = "TU9"
+sql = "SELECT x FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.1' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.12')"
+note = "precisions no Arrow unit has: timestamp(2), declared on the column"
+
+[[case]]
+id = "TU10"
+sql = "SELECT x FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.1' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00')"
+note = "timestamp(1) with timestamp(0): timestamp(1)"
+
+[[case]]
+id = "TU11"
+sql = "SELECT x FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.1234567' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.123')"
+note = "timestamp(7) with timestamp(3): timestamp(7)"
+
+[[case]]
+id = "TU12"
+sql = "SELECT x FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.123' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.1')"
+note = "timestamp(3) with timestamp(1): timestamp(3); the timestamp(1) input's declaration must not round the other"
+
+[[case]]
+id = "TU13"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT DATE '2026-01-01' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.123')"
+note = "a date with timestamp(3): timestamp(3) (was timestamp(9))"
+
+[[case]]
+id = "TU14"
+sql = "SELECT x FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.123' AS x UNION ALL SELECT DATE '2026-01-02' UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.1234')"
+note = "timestamp(3), a date and timestamp(4) in three inputs: timestamp(4)"
+
+# ---------------------------------------------------------------- with time zone
+
+[[case]]
+id = "TZ1"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.123 America/Sao_Paulo' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00 America/Sao_Paulo')"
+note = "timestamp(3) with time zone with timestamp(0) with time zone (was timestamp(0) with time zone)"
+
+[[case]]
+id = "TZ2"
+sql = "SELECT x FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.123 America/Sao_Paulo' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00 America/Sao_Paulo')"
+note = "the type the client reads"
+
+[[case]]
+id = "TZ3"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00 America/Sao_Paulo' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 11:00:00 America/Sao_Paulo' UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.123456 America/Sao_Paulo')"
+note = "three inputs: timestamp(6) with time zone"
+
+[[case]]
+id = "TZ4"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.123' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00 America/Sao_Paulo')"
+note = "without and with a time zone: timestamp(3) with time zone, the first the local time in the session zone"
+
+[[case]]
+id = "TZ5"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.123 UTC' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00 America/Sao_Paulo')"
+expect = "WRONG"
+accepted = "ADR 0008"
+note = "type and instants agree; the reference keeps each value's zone, Arrow has one zone per column (both shown in UTC)"
+
+# ---------------------------------------------------------------- columns
+
+[[case]]
+id = "TC1"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT s0 AS x FROM {c}.tsp.cols UNION ALL SELECT s3 FROM {c}.tsp.cols)"
+note = "memory table columns: timestamp(0) with timestamp(3)"
+
+[[case]]
+id = "TC2"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT s0 AS x FROM {c}.tsp.cols UNION ALL SELECT s0 FROM {c}.tsp.cols UNION ALL SELECT s6 FROM {c}.tsp.cols)"
+note = "three inputs, the first two agreeing: timestamp(6)"
+
+[[case]]
+id = "TC3"
+sql = "SELECT x FROM (SELECT s0 AS x FROM {c}.tsp.cols UNION ALL SELECT s1 FROM {c}.tsp.cols)"
+note = "a timestamp(1) column with a timestamp(0) one: timestamp(1)"
+
+[[case]]
+id = "TC4"
+sql = "SELECT count(*), count(DISTINCT x) FROM (SELECT s0 AS x FROM {c}.tsp.cols UNION SELECT s3 FROM {c}.tsp.cols UNION SELECT s6 FROM {c}.tsp.cols UNION SELECT CAST(s0 AS timestamp(6)) FROM {c}.tsp.cols)"
+note = "UNION (distinct) of four inputs: three rows"
+
+[[case]]
+id = "TC5"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT t AS x FROM hive.tsp.h_{e} UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00')"
+note = "a hive Parquet timestamp(3) column with a timestamp(0) literal"
+
+[[case]]
+id = "TC6"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00' AS x UNION ALL SELECT t FROM hive.tsp.h_{e})"
+note = "the literal first"
+
+[[case]]
+id = "TC7a"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'tsp' AND table_name = 'two_{e}' ORDER BY ordinal_position"
+compare = "ordered"
+note = "CREATE TABLE AS of the union stores timestamp(3) (the engine refused it: timestamp(0) in a MILLISECONDS catalog)"
+
+[[case]]
+id = "TC7b"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'tsp' AND table_name = 'two_tr' ORDER BY ordinal_position"
+oracle_sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'tsp' AND table_name = 'two_cl' ORDER BY ordinal_position"
+compare = "ordered"
+note = "each engine reads the type the other stored"
+
+[[case]]
+id = "TC7c"
+sql = "SELECT CAST(x AS varchar) FROM hive.tsp.two_{e}"
+note = "the fraction stored"
+
+[[case]]
+id = "TC8a"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'tsp' AND table_name = 'three_{e}' ORDER BY ordinal_position"
+compare = "ordered"
+note = "three inputs, the first two timestamp(0)"
+
+[[case]]
+id = "TC8b"
+sql = "SELECT CAST(x AS varchar) FROM hive.tsp.three_{e}"
+
+# ---------------------------------------------------------------- VALUES, CASE, coalesce, IN
+
+[[case]]
+id = "TV1"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (VALUES TIMESTAMP '2026-01-01 10:00:00.123', TIMESTAMP '2026-01-01 10:00:00') t(x)"
+note = "VALUES: timestamp(3) (was timestamp(0))"
+
+[[case]]
+id = "TV2"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (VALUES TIMESTAMP '2026-01-01 10:00:00', TIMESTAMP '2026-01-01 10:00:00.123') t(x)"
+note = "the coarser row first"
+
+[[case]]
+id = "TV3"
+sql = "SELECT x FROM (VALUES TIMESTAMP '2026-01-01 10:00:00.1', TIMESTAMP '2026-01-01 10:00:00.12') t(x)"
+note = "VALUES of timestamp(1) and timestamp(2): timestamp(2)"
+
+[[case]]
+id = "TV4"
+sql = "SELECT typeof(y), CAST(y AS varchar) FROM (SELECT CASE WHEN b THEN TIMESTAMP '2026-01-01 10:00:00' ELSE TIMESTAMP '2026-01-01 10:00:00.123' END AS y FROM (VALUES true, false) t(b))"
+note = "CASE: timestamp(3)"
+
+[[case]]
+id = "TV5"
+sql = "SELECT y FROM (SELECT CASE WHEN b THEN TIMESTAMP '2026-01-01 10:00:00.1' ELSE TIMESTAMP '2026-01-01 10:00:00.12' END AS y FROM (VALUES true, false) t(b))"
+note = "CASE of timestamp(1) and timestamp(2): timestamp(2)"
+
+[[case]]
+id = "TV6"
+sql = "SELECT typeof(y), CAST(y AS varchar) FROM (SELECT CASE WHEN b THEN DATE '2026-01-01' ELSE TIMESTAMP '2026-01-01 10:00:00.123' END AS y FROM (VALUES true, false) t(b))"
+note = "CASE of a date and timestamp(3): timestamp(3) (was timestamp(9))"
+
+[[case]]
+id = "TV7"
+sql = "SELECT typeof(y), CAST(y AS varchar) FROM (SELECT coalesce(CAST(NULL AS timestamp(0)), TIMESTAMP '2026-01-01 10:00:00.123') AS y)"
+note = "coalesce: timestamp(3)"
+
+[[case]]
+id = "TV8"
+sql = "SELECT y FROM (SELECT coalesce(TIMESTAMP '2026-01-01 10:00:00.1', TIMESTAMP '2026-01-01 10:00:00.12') AS y)"
+note = "coalesce of timestamp(1) and timestamp(2): timestamp(2)"
+
+[[case]]
+id = "TV9"
+sql = "SELECT typeof(greatest(TIMESTAMP '2026-01-01 10:00:00', TIMESTAMP '2026-01-01 09:00:00.123')), CAST(greatest(TIMESTAMP '2026-01-01 10:00:00', TIMESTAMP '2026-01-01 09:00:00.123') AS varchar)"
+note = "greatest: timestamp(3)"
+
+[[case]]
+id = "TV10"
+sql = "SELECT TIMESTAMP '2026-01-01 10:00:00.123' IN (TIMESTAMP '2026-01-01 10:00:00', TIMESTAMP '2026-01-01 11:00:00'), TIMESTAMP '2026-01-01 10:00:00' IN (TIMESTAMP '2026-01-01 10:00:00.123'), TIMESTAMP '2026-01-01 10:00:00' IN (TIMESTAMP '2026-01-01 10:00:00.000')"
+note = "IN compares at the finer precision"
+
+[[case]]
+id = "TV11"
+sql = "SELECT x FROM (VALUES TIMESTAMP '2026-01-01 10:00:00.123 America/Sao_Paulo', TIMESTAMP '2026-01-01 10:00:00 America/Sao_Paulo') t(x)"
+note = "VALUES with time zone: timestamp(3) with time zone"
+
+# ---------------------------------------------------------------- INTERSECT, EXCEPT
+
+[[case]]
+id = "TS1"
+sql = "SELECT CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.123' AS x EXCEPT SELECT TIMESTAMP '2026-01-01 10:00:00')"
+note = "compared at timestamp(3): .123 is not :00 (the engine failed: duplicate projection names)"
+
+[[case]]
+id = "TS2"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.000' AS x INTERSECT SELECT TIMESTAMP '2026-01-01 10:00:00')"
+note = "the common row, as timestamp(3)"
+
+[[case]]
+id = "TS3"
+sql = "SELECT x FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.1' AS x INTERSECT SELECT TIMESTAMP '2026-01-01 10:00:00.10')"
+note = "timestamp(1) INTERSECT timestamp(2): timestamp(2)"
+
+# ---------------------------------------------------------------- time(p)
+
+[[case]]
+id = "TT1"
+sql = "SELECT x FROM (SELECT TIME '10:00:00.123' AS x UNION ALL SELECT TIME '10:00:00')"
+note = "UNION of time(3) and time(0): time(3) (was time(9))"
+
+[[case]]
+id = "TT2"
+sql = "SELECT x FROM (SELECT TIME '10:00:00' AS x UNION ALL SELECT TIME '11:00:00' UNION ALL SELECT TIME '10:00:00.123')"
+note = "three inputs, the first two time(0)"
+
+[[case]]
+id = "TT3"
+sql = "SELECT x FROM (SELECT TIME '10:00:00.1' AS x UNION ALL SELECT TIME '10:00:00.12345')"
+note = "time(1) with time(5): time(5)"
+
+[[case]]
+id = "TT4"
+sql = "SELECT y FROM (SELECT CASE WHEN b THEN TIME '10:00:00' ELSE TIME '10:00:00.123' END AS y FROM (VALUES true, false) t(b))"
+note = "CASE: time(3) (ISS-061)"
+
+[[case]]
+id = "TT5"
+sql = "SELECT x FROM (VALUES TIME '10:00:00.250') t(x)"
+note = "VALUES keeps time(3) (ISS-061's example)"
+
+[[case]]
+id = "TT6"
+sql = "SELECT x FROM (VALUES TIME '10:00:00', TIME '10:00:00.25') t(x)"
+note = "VALUES of time(0) and time(2): time(2)"

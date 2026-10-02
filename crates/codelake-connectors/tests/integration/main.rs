@@ -58,3 +58,5 @@ mod sqlserver_join_build_side;
 mod sqlserver_smoke;
 #[cfg(all(feature = "sqlserver", feature = "hive"))]
 mod sqlserver_union_text_types;
+#[cfg(all(feature = "sqlserver", feature = "hive"))]
+mod sqlserver_union_timestamp_types;
