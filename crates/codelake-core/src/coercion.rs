@@ -1279,6 +1279,39 @@ fn agreed_number(types: &[DataType], declared: &DataType) -> Option<DataType> {
     only_type(types).filter(|t| t != declared && is_number(t))
 }
 
+/// The finest unit among timestamps of the same kind (all with a zone, or
+/// none), when an input or the union has another: Trino 431 unites
+/// `timestamp(3)` and `timestamp(0)` as `timestamp(3)`; `DataFusion`'s type
+/// coercion took the coarser unit and cut the fraction (`.123` became
+/// `.000`, ISS-032 item 8). Every input is cast to it here (widening is
+/// exact), so type coercion finds them alike. The zone is the union's.
+fn finest_timestamp(types: &[DataType], declared: &DataType) -> Option<DataType> {
+    let DataType::Timestamp(_, zone) = declared else {
+        return None;
+    };
+    let rank = |unit: &TimeUnit| match unit {
+        TimeUnit::Second => 0,
+        TimeUnit::Millisecond => 1,
+        TimeUnit::Microsecond => 2,
+        TimeUnit::Nanosecond => 3,
+    };
+    let mut finest: Option<TimeUnit> = None;
+    for t in types.iter().filter(|t| !t.is_null()) {
+        let DataType::Timestamp(unit, own) = t else {
+            return None;
+        };
+        if own.is_some() != zone.is_some() {
+            return None;
+        }
+        if finest.is_none_or(|f| rank(unit) > rank(&f)) {
+            finest = Some(*unit);
+        }
+    }
+    let target = DataType::Timestamp(finest?, zone.clone());
+    let differs = |t: &DataType| !t.is_null() && t != &target;
+    (types.iter().any(differs) || &target != declared).then_some(target)
+}
+
 fn unify_union_numbers(union: Union) -> Result<Transformed<LogicalPlan>> {
     let columns = union.schema.fields().len();
     let mut targets: Vec<Option<DataType>> = Vec::with_capacity(columns);
@@ -1288,8 +1321,11 @@ fn unify_union_numbers(union: Union) -> Result<Transformed<LogicalPlan>> {
             .iter()
             .map(|input| input.schema().field(j).data_type().clone())
             .collect();
+        let declared = union.schema.field(j).data_type();
         targets.push(
-            common_numeric_type(&types).or_else(|| agreed_number(&types, union.schema.field(j).data_type())),
+            common_numeric_type(&types)
+                .or_else(|| agreed_number(&types, declared))
+                .or_else(|| finest_timestamp(&types, declared)),
         );
     }
     if targets.iter().all(Option::is_none) {

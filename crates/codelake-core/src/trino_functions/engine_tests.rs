@@ -543,3 +543,78 @@ async fn current_timestamps_are_in_the_session_zone() {
         &DataType::Timestamp(TimeUnit::Millisecond, Some(Arc::from("UTC")))
     );
 }
+
+/// A union of timestamps of different precisions is typed at the finest
+/// (Trino 431: `timestamp(3)` with `timestamp(0)` is `timestamp(3)`), with
+/// or without a zone, nested or not: no fraction is cut. `current_time` is
+/// the session's wall time at the millisecond, never nine digits.
+#[tokio::test]
+async fn unions_of_timestamps_keep_the_finest_precision() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    let engine = &engine;
+    let ts =
+        |text: &str, unit: &str, zone: &str| format!("arrow_cast('{text}', 'Timestamp({unit}, {zone})')");
+    let texts = |sql: String| async move {
+        let batches = rows(engine, &sql).await;
+        batches
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows()).map(move |i| {
+                    b.columns()
+                        .iter()
+                        .map(|c| datafusion::arrow::util::display::array_value_to_string(c, i).unwrap())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let naive = format!(
+        "SELECT typeof(x), x FROM (SELECT {} AS x UNION ALL SELECT {}) ORDER BY x",
+        ts("2026-01-01 10:00:00.123", "Millisecond", "None"),
+        ts("2026-01-01 10:00:00", "Second", "None"),
+    );
+    assert_eq!(
+        texts(naive).await,
+        [
+            ["timestamp(3)", "2026-01-01T10:00:00"],
+            ["timestamp(3)", "2026-01-01T10:00:00.123"]
+        ]
+    );
+    let zoned = format!(
+        "SELECT typeof(x), x FROM (SELECT {} AS x UNION ALL SELECT {}) ORDER BY x",
+        ts("2026-01-01 10:00:00", "Second", "Some(\"UTC\")"),
+        ts("2026-01-01 10:00:00.123456", "Microsecond", "Some(\"UTC\")"),
+    );
+    assert_eq!(
+        texts(zoned).await,
+        [
+            ["timestamp(6) with time zone", "2026-01-01T10:00:00Z"],
+            ["timestamp(6) with time zone", "2026-01-01T10:00:00.123456Z"]
+        ]
+    );
+    let nested = format!(
+        "SELECT typeof(x), x FROM (SELECT {} AS x UNION ALL SELECT {} UNION ALL SELECT {}) ORDER BY x",
+        ts("2026-01-01 10:00:00", "Second", "None"),
+        ts("2026-01-01 10:00:00.1", "Millisecond", "None"),
+        ts("2026-01-01 10:00:00.000001", "Microsecond", "None"),
+    );
+    assert_eq!(
+        texts(nested).await,
+        [
+            ["timestamp(6)", "2026-01-01T10:00:00"],
+            ["timestamp(6)", "2026-01-01T10:00:00.000001"],
+            ["timestamp(6)", "2026-01-01T10:00:00.100"]
+        ]
+    );
+    let same = format!(
+        "SELECT typeof(x) FROM (SELECT {} AS x UNION ALL SELECT {})",
+        ts("2026-01-01 10:00:00.1", "Millisecond", "None"),
+        ts("2026-01-01 10:00:00.2", "Millisecond", "None"),
+    );
+    assert_eq!(texts(same).await, [["timestamp(3)"], ["timestamp(3)"]]);
+    assert_eq!(
+        texts("SELECT typeof(current_time), typeof(localtime)".to_owned()).await,
+        [["time(3)", "time(3)"]]
+    );
+}

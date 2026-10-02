@@ -979,8 +979,21 @@ pub(crate) fn current_date() -> ScalarUDF {
 }
 
 pub(crate) fn localtime() -> ScalarUDF {
+    wall_time("localtime")
+}
+
+/// `current_time`: Trino 431's is a `time(3) with time zone`. The engine has
+/// no time with a zone (ISS-032 item 7): it is the session's wall time at the
+/// millisecond, as `localtime`. It was the library's `time(9)`, nine digits
+/// a client may refuse (the .NET driver reads at most seven).
+pub(crate) fn current_time() -> ScalarUDF {
+    wall_time("current_time")
+}
+
+/// The session's wall time, a `time(3)`.
+fn wall_time(name: &'static str) -> ScalarUDF {
     Func::new(
-        "localtime",
+        name,
         |name, types| coerce_each(name, types, &[]),
         |_| Ok(DataType::Time32(TimeUnit::Millisecond)),
         |call| {
@@ -1627,6 +1640,7 @@ pub(crate) fn udfs() -> Vec<ScalarUDF> {
         localtimestamp(),
         current_date(),
         localtime(),
+        current_time(),
         current_timezone(),
         with_timezone(),
         at_timezone(),
