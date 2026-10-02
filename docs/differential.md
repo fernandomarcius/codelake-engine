@@ -20,14 +20,18 @@ it ends (also on failure):
 | Engine | Image | Reached as |
 |---|---|---|
 | Trino 431 (oracle) | `trinodb/trino:431`, `hive` catalog on a file metastore | HTTP statement protocol |
-| PostgreSQL 17 (oracle and source) | `postgres:17-alpine` | PostgreSQL wire; as a source, the `pg` catalog of both engines |
+| PostgreSQL 17 (oracle and source) | `postgres:17-alpine` | PostgreSQL wire; as a source, the `pg`, `pg_overflow` and `pg_rounded` catalogs of both engines |
 | CodeLake under test | the toolbelt image + the binary just built, `tools/differential/stack/codelake.toml` | Trino protocol (`[server.trino]`) and PostgreSQL wire |
 
 When a case file needs PostgreSQL, both engines also read it as a source, through a catalog
 named `pg` (Trino's `postgresql` connector, CodeLake's `postgres` connector) connected as the
 role `source`, whose default zone is `America/Sao_Paulo` (`stack/postgres-source.sql`); neither
 engine's statements keep it: Trino's run in `Etc/UTC`, CodeLake's in the client's zone (`Etc/UTC`
-without one; ISS-060). Such a
+without one; ISS-060). Two more catalogs read the same database with the reference's
+`decimal-mapping=ALLOW_OVERFLOW` (`stack/pg_overflow.properties`, `stack/pg_rounded.properties`,
+the sources of the same names in `stack/codelake-postgres.toml`): `pg_overflow` with its default
+rounding (`UNNECESSARY`) and scale (0), `pg_rounded` rounding `HALF_EVEN` to scale 2
+(`postgres_decimals.toml`). Such a
 file creates its tables in the `source` schema with `setup_postgres` and compares CodeLake with
 Trino reading the same rows (`postgres_pushdown.toml`). Every file's `setup_postgres` runs
 before CodeLake starts: CodeLake lists a source's tables once, when it starts.

@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use codelake_core::catalog::{FederatedCatalog, LiveListing, TableResolver};
+pub use codelake_core::config::{DecimalMapping, DecimalRoundingMode};
 use codelake_core::{Connector, ConnectorError};
 use datafusion::catalog::{CatalogProvider, TableProvider};
 use datafusion::error::{DataFusionError, Result as DfResult};
@@ -39,6 +40,19 @@ pub struct PostgresParams {
     pub user: String,
     pub password: SecretString,
     pub sslmode: String,
+    pub decimals: Decimals,
+}
+
+/// What a `numeric` without precision, or with more than 38 digits, is, and
+/// how a value is rounded to its decimal's scale: the reference engine's
+/// `decimal-mapping`, `decimal-rounding-mode` and `decimal-default-scale`
+/// (by default such a column is left out, as there; ISS-060).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Decimals {
+    pub mapping: DecimalMapping,
+    pub rounding_mode: DecimalRoundingMode,
+    /// 0 to 38.
+    pub default_scale: u8,
 }
 
 #[derive(Debug)]
@@ -96,7 +110,9 @@ impl TableResolver for PostgresResolver {
 /// A relation with a column of a type the connector does not read
 /// (`jsonb`, `uuid`) is a feature `CodeLake` lacks, not a failing source:
 /// `NotImplemented`, which a catalog listing (`system.jdbc`,
-/// `information_schema`) lists without columns instead of failing whole.
+/// `information_schema`) lists without columns instead of failing whole. So
+/// is a relation whose every column is left out, named `NOT_FOUND` as the
+/// reference engine names it.
 fn unsupported_as_not_implemented(error: DataFusionError) -> DataFusionError {
     use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Error as DbError;
     let DataFusionError::External(inner) = &error else {
@@ -106,6 +122,9 @@ fn unsupported_as_not_implemented(error: DataFusionError) -> DataFusionError {
     while let Some(current) = cause {
         if let Some(unsupported @ DbError::UnsupportedDataType { .. }) = current.downcast_ref::<DbError>() {
             return DataFusionError::NotImplemented(unsupported.to_string());
+        }
+        if let Some(empty) = current.downcast_ref::<catalog::NoSupportedColumns>() {
+            return DataFusionError::NotImplemented(empty.to_string());
         }
         cause = current.source();
     }
@@ -202,5 +221,19 @@ mod tests {
             unsupported_as_not_implemented(DataFusionError::Plan("x".into())),
             DataFusionError::Plan(_)
         ));
+    }
+
+    #[test]
+    fn a_relation_without_a_supported_column_is_not_found() {
+        let empty = DbError::UnableToGetSchema {
+            source: Box::new(catalog::NoSupportedColumns::new("hub.totals", 2)),
+        };
+        match unsupported_as_not_implemented(DataFusionError::External(Box::new(Wrapped(empty)))) {
+            DataFusionError::NotImplemented(message) => assert_eq!(
+                message,
+                "NOT_FOUND: Table 'hub.totals' has no supported columns (all 2 columns are not supported)"
+            ),
+            other => panic!("{other}"),
+        }
     }
 }

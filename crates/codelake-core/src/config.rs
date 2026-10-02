@@ -506,6 +506,22 @@ pub enum SourceKind {
         /// `disable`, `prefer`, `require`, `verify-ca` or `verify-full`.
         #[serde(default = "default_sslmode")]
         sslmode: String,
+        /// The reference engine's `decimal-mapping`: what a `numeric` without
+        /// precision, or with more than 38 digits, is. `strict` (default)
+        /// leaves such a column out of its relation; `allow_overflow` makes it
+        /// a `decimal(38, s)` whose values are rounded to `s` digits by
+        /// `decimal_rounding_mode` (ISS-060).
+        #[serde(default)]
+        decimal_mapping: DecimalMapping,
+        /// The reference engine's `decimal-rounding-mode` (`unnecessary`, the
+        /// default: a value with more fraction digits than the column's scale
+        /// fails the query instead of being rounded).
+        #[serde(default)]
+        decimal_rounding_mode: DecimalRoundingMode,
+        /// The reference engine's `decimal-default-scale` (0 to 38, default 0):
+        /// the scale of a `numeric` without precision under `allow_overflow`.
+        #[serde(default)]
+        decimal_default_scale: u8,
     },
     Mysql {
         host: String,
@@ -692,6 +708,48 @@ fn default_mysql_sslmode() -> String {
 fn default_mssql_encrypt() -> String {
     "required".to_owned()
 }
+/// What a PostgreSQL `numeric` without precision, or with more than 38
+/// digits, is: the reference engine's `decimal-mapping` (default `STRICT`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecimalMapping {
+    /// Left out of its relation, as the reference engine leaves it.
+    #[default]
+    Strict,
+    /// A `decimal(38, s)`: `s` is `decimal_default_scale` without precision,
+    /// the smaller of the declared scale and it with more than 38 digits; an
+    /// array of `numeric` without precision is an `array(decimal(38, 0))`.
+    AllowOverflow,
+}
+
+/// How a value with more fraction digits than its decimal column's scale is
+/// rounded: the reference engine's `decimal-rounding-mode`, Java's
+/// `RoundingMode` (default `UNNECESSARY`: such a value fails the query).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecimalRoundingMode {
+    /// Away from zero.
+    Up,
+    /// Towards zero.
+    Down,
+    /// Towards positive infinity.
+    Ceiling,
+    /// Towards negative infinity.
+    Floor,
+    /// To the nearest, a tie away from zero.
+    HalfUp,
+    /// To the nearest, a tie towards zero.
+    HalfDown,
+    /// To the nearest, a tie to the even neighbor.
+    HalfEven,
+    /// Never: the value fails the query.
+    #[default]
+    Unnecessary,
+}
+
+/// Largest `decimal_default_scale`: a decimal's largest precision.
+const MAX_DECIMAL_SCALE: u8 = 38;
+
 /// Trino's `hive.timestamp-precision` (default `MILLISECONDS`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -1248,8 +1306,18 @@ impl Config {
                 errors.push(format!("source `{name}`: duplicate name"));
             }
             match &source.kind {
-                SourceKind::Postgres { sslmode, host, .. } => {
+                SourceKind::Postgres {
+                    sslmode,
+                    host,
+                    decimal_default_scale,
+                    ..
+                } => {
                     check_sql_source(name, host, ("sslmode", sslmode), &PG_SSL_MODES, errors);
+                    if *decimal_default_scale > MAX_DECIMAL_SCALE {
+                        errors.push(format!(
+                            "source `{name}`: decimal_default_scale must be between 0 and {MAX_DECIMAL_SCALE}"
+                        ));
+                    }
                 }
                 SourceKind::Mysql { sslmode, host, .. } => {
                     check_sql_source(name, host, ("sslmode", sslmode), &MYSQL_SSL_MODES, errors);
@@ -2027,6 +2095,74 @@ mod tests {
             "{VALID}\n[[source]]\nname = \"hive\"\nkind = \"hive\"\nwarehouse = \"/wh\"\ntimestamp_precision = \"SECONDS\"\n"
         );
         assert!(toml::from_str::<Config>(&wrong).is_err());
+    }
+
+    /// A PostgreSQL catalog's decimals as the reference engine's
+    /// `decimal-mapping`, `decimal-rounding-mode` and `decimal-default-scale`
+    /// (defaults `STRICT`, `UNNECESSARY`, 0).
+    #[test]
+    fn postgres_decimal_mapping_defaults_to_strict_like_trino() {
+        let pg = |keys: &str| {
+            format!(
+                "{VALID}\n[[source]]\nname = \"hub\"\nkind = \"postgres\"\nhost = \"h\"\ndatabase = \"d\"\n\
+                 user = \"u\"\npassword_env = \"P\"\n{keys}\n"
+            )
+        };
+        let decimals = |doc: &str| {
+            parse(doc)
+                .sources
+                .iter()
+                .find_map(|source| match &source.kind {
+                    SourceKind::Postgres {
+                        decimal_mapping,
+                        decimal_rounding_mode,
+                        decimal_default_scale,
+                        ..
+                    } if source.name == "hub" => {
+                        Some((*decimal_mapping, *decimal_rounding_mode, *decimal_default_scale))
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            decimals(&pg("")),
+            (DecimalMapping::Strict, DecimalRoundingMode::Unnecessary, 0)
+        );
+        let modes = [
+            ("up", DecimalRoundingMode::Up),
+            ("down", DecimalRoundingMode::Down),
+            ("ceiling", DecimalRoundingMode::Ceiling),
+            ("floor", DecimalRoundingMode::Floor),
+            ("half_up", DecimalRoundingMode::HalfUp),
+            ("half_down", DecimalRoundingMode::HalfDown),
+            ("half_even", DecimalRoundingMode::HalfEven),
+            ("unnecessary", DecimalRoundingMode::Unnecessary),
+        ];
+        for (name, mode) in modes {
+            let doc = pg(&format!(
+                "decimal_mapping = \"allow_overflow\"\ndecimal_rounding_mode = \"{name}\"\ndecimal_default_scale = 38"
+            ));
+            assert_eq!(
+                decimals(&doc),
+                (DecimalMapping::AllowOverflow, mode, 38),
+                "{name}"
+            );
+            parse(&doc).validate(&full_env, &|_| true).unwrap();
+        }
+        let errors = errors_of(&pg("decimal_default_scale = 39"), &full_env);
+        assert_eq!(
+            errors,
+            ["source `hub`: decimal_default_scale must be between 0 and 38"]
+        );
+        for wrong in [
+            "decimal_mapping = \"STRICT\"",
+            "decimal_mapping = \"overflow\"",
+            "decimal_rounding_mode = \"HALF_UP\"",
+            "decimal_default_scale = -1",
+        ] {
+            assert!(toml::from_str::<Config>(&pg(wrong)).is_err(), "{wrong}");
+        }
     }
 
     #[test]

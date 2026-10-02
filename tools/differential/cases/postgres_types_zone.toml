@@ -5,8 +5,9 @@ What a PostgreSQL relation's dates, times and numbers are, and the zone its stat
 a view reading `current_date` answered another day between 21:00 and 24:00 in
 America/Sao_Paulo, the role's default zone, which CodeLake's sessions kept while the reference
 engine's run in `Etc/UTC`; a `numeric` without precision, which the reference engine leaves out
-(`decimal-mapping=STRICT`), is a `decimal(38,20)` on CodeLake, and a value it cannot hold must
-fail, never be rounded.
+(`decimal-mapping=STRICT`), was a `decimal(38,20)` on CodeLake, which the Warehouse API's .NET driver
+handed on as `{}`: it is left out too (2026-10-02; `postgres_decimals` has the catalogs that map
+it).
 
 CodeLake's statements run in the client session's zone (`X-Trino-Time-Zone`, `SET TIME ZONE`;
 `Etc/UTC` without one), the reference engine's always in `Etc/UTC`: with a client zone, a view
@@ -94,41 +95,13 @@ sql = "SELECT id, n2 FROM pg.source.ptz_nums"
 [[case]]
 id = "NUM2"
 sql = "SELECT id, n FROM pg.source.ptz_nums WHERE id < 10"
-expect = "EXTRA"
-accepted = "ISS-060 item 8"
-note = "the reference engine leaves a numeric without precision out (COLUMN_NOT_FOUND); CodeLake reads it exactly"
+note = "a numeric without precision is left out (COLUMN_NOT_FOUND), as decimal-mapping=STRICT leaves it"
 
 [[case]]
 id = "NUM3"
-sql = "SELECT n FROM pg.source.ptz_nums WHERE id = 10"
-expect = "ERRO"
-accepted = "ISS-060 item 8"
-error = "the PostgreSQL value 100000000000000000000 of column \"n\" does not fit decimal(38,20): more than 18 integer digits"
+sql = "SELECT * FROM pg.source.ptz_nums"
+note = "every row is read, NaN and ±Infinity included: the column is not"
 
 [[case]]
 id = "NUM4"
-sql = "SELECT n FROM pg.source.ptz_nums WHERE id = 11"
-expect = "ERRO"
-accepted = "ISS-060 item 8"
-error = "the PostgreSQL value 0.123456789012345678901 of column \"n\" does not fit decimal(38,20): more than 20 fraction digits"
-
-[[case]]
-id = "NUM5"
-sql = "SELECT n FROM pg.source.ptz_nums WHERE id = 12"
-expect = "ERRO"
-accepted = "ISS-060 item 8"
-error = "the PostgreSQL value NaN of column \"n\" does not fit decimal(38,20): a decimal holds only finite numbers"
-
-[[case]]
-id = "NUM6"
-sql = "SELECT n FROM pg.source.ptz_nums WHERE id = 13"
-expect = "ERRO"
-accepted = "ISS-060 item 8"
-error = "the PostgreSQL value Infinity of column \"n\""
-
-[[case]]
-id = "NUM7"
-sql = "SELECT n FROM pg.source.ptz_nums WHERE id = 14"
-expect = "ERRO"
-accepted = "ISS-060 item 8"
-error = "the PostgreSQL value -Infinity of column \"n\""
+sql = "SELECT column_name, data_type FROM pg.information_schema.columns WHERE table_schema = 'source' AND table_name = 'ptz_nums'"

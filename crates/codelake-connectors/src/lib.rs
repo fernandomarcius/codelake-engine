@@ -53,6 +53,9 @@ pub fn build(source: &SourceConfig, secrets: &Secrets) -> Result<Arc<dyn Connect
             user,
             password_env,
             sslmode,
+            decimal_mapping,
+            decimal_rounding_mode,
+            decimal_default_scale,
         } => Ok(Arc::new(postgres::PostgresConnector::new(
             name.clone(),
             postgres::PostgresParams {
@@ -62,6 +65,11 @@ pub fn build(source: &SourceConfig, secrets: &Secrets) -> Result<Arc<dyn Connect
                 user: user.clone(),
                 password: secret(password_env)?,
                 sslmode: sslmode.clone(),
+                decimals: postgres::Decimals {
+                    mapping: *decimal_mapping,
+                    rounding_mode: *decimal_rounding_mode,
+                    default_scale: *decimal_default_scale,
+                },
             },
         ))),
         #[cfg(feature = "mysql")]

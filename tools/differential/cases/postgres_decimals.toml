@@ -1,0 +1,189 @@
+description = """
+What a PostgreSQL `numeric` without precision, or with more than 38 digits, is (ISS-060), on the
+reference engine's three settings: `pg` (`decimal-mapping=STRICT`, the default), `pg_overflow`
+(`ALLOW_OVERFLOW`, rounding `UNNECESSARY`, default scale 0: their defaults) and `pg_rounded`
+(`ALLOW_OVERFLOW`, `HALF_EVEN`, scale 2); CodeLake's catalogs of the same names set
+`decimal_mapping`, `decimal_rounding_mode` and `decimal_default_scale` alike.
+
+Found by the Warehouse API against the shadow run (2026-10-02): CodeLake exposed such a column as
+`decimal(38,20)`, which the API's .NET driver (NH.Trino.Data.ADO) cannot hold in a
+`System.Decimal` and handed on as an object serialized `{}` (`/api/boletos/saude`:
+`ultima_rodada_pct_aceite` 98.5 on the reference engine, which computes it itself when the column
+is absent, `{}` on CodeLake; `/api/boletos/fila` items gained `"vl_recebido": {}`). The panel's
+`ordenar=vl_recebido` must fail as on the reference engine (`COLUMN_NOT_FOUND`).
+
+A value that does not fit (more fraction digits than the scale without a rounding mode, more
+integer digits than the precision after rounding, `NaN`, `±Infinity`) fails on both engines, with
+their own errors: the reference engine's are its JDBC driver's (`JDBC_ERROR`: "Rounding
+necessary", "Decimal overflow", "Bad value for type BigDecimal : NaN"), CodeLake's name the value
+and the column (accepted divergence, ISS-060).
+"""
+oracle = "trino"
+
+setup_postgres = [
+  """CREATE TABLE source.pd_nums (id INT, n NUMERIC, n2 NUMERIC(10,2), w NUMERIC(50,10),
+       w0 NUMERIC(40), a NUMERIC[], a2 NUMERIC(10,2)[], aw NUMERIC(50,10)[])""",
+  """INSERT INTO source.pd_nums VALUES
+       (1, 1.5, 1.50, 1.5, 15, '{1.5,NULL}', '{1.50}', '{1.5}'),
+       (2, 2.5, NULL, 2.5, NULL, '{2.5}', NULL, '{2.5}'),
+       (3, -2.5, NULL, -2.5, NULL, '{-2.5}', NULL, '{-2.5}'),
+       (4, 0.125, NULL, 0.12345678901, NULL, '{0.125}', NULL, NULL),
+       (5, 123.456789, NULL, NULL, NULL, NULL, NULL, NULL),
+       (6, 1e20, NULL, 1e20, 1e20, NULL, NULL, NULL),
+       (7, 99999999999999999999999999999999999999, NULL, NULL, 99999999999999999999999999999999999999, NULL, NULL, NULL),
+       (8, 1e38, NULL, NULL, 1e38, NULL, NULL, NULL),
+       (9, 'NaN', NULL, 'NaN', NULL, '{NaN}', NULL, NULL),
+       (10, 'Infinity', NULL, NULL, NULL, NULL, NULL, NULL),
+       (11, '-Infinity', NULL, NULL, NULL, NULL, NULL, NULL),
+       (12, 0.00004999, NULL, NULL, NULL, NULL, NULL, NULL),
+       (13, -0.00005, NULL, NULL, NULL, NULL, NULL, NULL),
+       (14, 99999999999999999999999999999999999999.5, NULL, NULL, NULL, NULL, NULL, NULL),
+       (15, 0, 0, 0, 0, '{}', '{}', '{}'),
+       (16, 1.000000, NULL, NULL, NULL, NULL, NULL, NULL),
+       (17, 42, NULL, NULL, NULL, '{1,2}', NULL, NULL),
+       (18, 1.125, NULL, 1.125, NULL, '{3.5,10.5}', NULL, '{1.125}'),
+       (19, 2.135, NULL, -2.135, NULL, NULL, NULL, NULL)""",
+  """CREATE VIEW source.pd_recebimentos AS
+       SELECT id, n AS vl_recebido, n2, round(n2, 1) AS r FROM source.pd_nums""",
+  "CREATE VIEW source.pd_totals AS SELECT sum(n) AS total FROM source.pd_nums WHERE id IN (1, 2)",
+  "GRANT SELECT ON source.pd_nums, source.pd_recebimentos, source.pd_totals TO source",
+]
+
+# ---------------------------------------------------------------- pg: STRICT
+
+[[case]]
+id = "PD1"
+sql = "SELECT table_name, column_name, ordinal_position, data_type FROM pg.information_schema.columns WHERE table_schema = 'source' AND table_name IN ('pd_nums', 'pd_recebimentos')"
+note = "numeric without precision, numeric(50,10), numeric(40) and arrays of them are left out; numeric(p<=38,s) is kept"
+
+[[case]]
+id = "PD2"
+sql = "SELECT table_name, column_name, ordinal_position, data_type, type_name, column_size, decimal_digits FROM system.jdbc.columns WHERE table_cat = 'pg' AND table_schem = 'source' AND table_name IN ('pd_nums', 'pd_recebimentos')"
+
+[[case]]
+id = "PD3"
+sql = "DESCRIBE pg.source.pd_recebimentos"
+
+[[case]]
+id = "PD4"
+sql = "SELECT * FROM pg.source.pd_recebimentos WHERE id < 3"
+note = "the API's `select x.*`: no vl_recebido, no r (round of a numeric is a numeric without precision)"
+
+[[case]]
+id = "PD5"
+sql = "SELECT x.* FROM pg.source.pd_recebimentos x ORDER BY vl_recebido DESC NULLS LAST OFFSET 0 LIMIT 51"
+note = "the panel's ordenar=vl_recebido: COLUMN_NOT_FOUND on both"
+
+[[case]]
+id = "PD6"
+sql = "SELECT id FROM pg.source.pd_nums WHERE n > 1"
+
+[[case]]
+id = "PD7"
+sql = "SELECT * FROM pg.source.pd_nums"
+note = "every row is read, NaN and ±Infinity included"
+
+[[case]]
+id = "PD8"
+sql = "SELECT * FROM pg.source.pd_totals"
+note = "a relation whose every column is left out"
+
+# ------------------------------------------- pg_overflow: ALLOW_OVERFLOW, defaults
+
+[[case]]
+id = "PO1"
+sql = "SELECT table_name, column_name, ordinal_position, data_type FROM pg_overflow.information_schema.columns WHERE table_schema = 'source' AND table_name IN ('pd_nums', 'pd_recebimentos', 'pd_totals')"
+note = "decimal(38,0) (the default scale), numeric(50,10) as decimal(38,0), arrays as array(decimal(38,0))"
+
+[[case]]
+id = "PO2"
+sql = "SELECT id, n, n2, w, w0, a, a2, aw FROM pg_overflow.source.pd_nums WHERE id IN (6, 7, 15, 16, 17)"
+note = "integral values fit exactly; 1.000000 is 1"
+
+[[case]]
+id = "PO3"
+sql = "SELECT * FROM pg_overflow.source.pd_nums WHERE id = 1"
+expect = "ERRO"
+accepted = "ISS-060: the reference engine's JDBC_ERROR 'Rounding necessary'"
+error = "the PostgreSQL value 1.5 of column \"n\" does not fit decimal(38,0): more than 0 fraction digits"
+
+[[case]]
+id = "PO4"
+sql = "SELECT n FROM pg_overflow.source.pd_nums WHERE id = 8"
+expect = "ERRO"
+accepted = "ISS-060: the reference engine's JDBC_ERROR 'Decimal overflow'"
+error = "the PostgreSQL value 100000000000000000000000000000000000000 of column \"n\" does not fit decimal(38,0): more than 38 integer digits"
+
+[[case]]
+id = "PO5"
+sql = "SELECT n FROM pg_overflow.source.pd_nums WHERE id = 9"
+expect = "ERRO"
+accepted = "ISS-060: the reference engine's JDBC_ERROR 'Bad value for type BigDecimal : NaN'"
+error = "the PostgreSQL value NaN of column \"n\" does not fit decimal(38,0): a decimal holds only finite numbers"
+
+[[case]]
+id = "PO6"
+sql = "SELECT n FROM pg_overflow.source.pd_nums WHERE id = 11"
+expect = "ERRO"
+accepted = "ISS-060: the reference engine's JDBC_ERROR 'Bad value for type BigDecimal : -Infinity'"
+error = "the PostgreSQL value -Infinity of column \"n\""
+
+[[case]]
+id = "PO7"
+sql = "SELECT a FROM pg_overflow.source.pd_nums WHERE id = 4"
+expect = "ERRO"
+accepted = "ISS-060: the reference engine's JDBC_ERROR 'Rounding necessary'"
+error = "the PostgreSQL value 0.125 of column \"a\" does not fit decimal(38,0): more than 0 fraction digits"
+
+[[case]]
+id = "PO8"
+sql = "SELECT id FROM pg_overflow.source.pd_nums WHERE n > 1 AND id < 6"
+note = "compared at the source: no value of n is read"
+
+[[case]]
+id = "PO9"
+sql = "SELECT sum(n), count(*) FROM pg_overflow.source.pd_nums WHERE id IN (6, 15, 17)"
+
+# --------------------------------- pg_rounded: ALLOW_OVERFLOW, HALF_EVEN, scale 2
+
+[[case]]
+id = "PR1"
+sql = "SELECT table_name, column_name, ordinal_position, data_type FROM pg_rounded.information_schema.columns WHERE table_schema = 'source' AND table_name IN ('pd_nums', 'pd_recebimentos', 'pd_totals')"
+note = "decimal(38,2); numeric(50,10) as decimal(38,2); numeric(40) as decimal(38,0); numeric[] as array(decimal(38,0)) whatever the scale"
+
+[[case]]
+id = "PR2"
+sql = "SELECT id, n, n2, w, w0, a, a2, aw FROM pg_rounded.source.pd_nums WHERE id IN (1, 2, 3, 4, 5, 6, 12, 13, 15, 16, 17, 18, 19)"
+note = "half to even: 0.125 is 0.12, 1.125 is 1.12, 2.135 is 2.14, 2.5 and 10.5 in a numeric[] are 2 and 10"
+
+[[case]]
+id = "PR3"
+sql = "SELECT n FROM pg_rounded.source.pd_nums WHERE id = 14"
+expect = "ERRO"
+accepted = "ISS-060: the reference engine's JDBC_ERROR 'Decimal overflow'"
+error = "of column \"n\" does not fit decimal(38,2): more than 36 integer digits"
+
+[[case]]
+id = "PR4"
+sql = "SELECT n FROM pg_rounded.source.pd_nums WHERE id = 10"
+expect = "ERRO"
+accepted = "ISS-060: the reference engine's JDBC_ERROR 'Bad value for type BigDecimal : Infinity'"
+error = "the PostgreSQL value Infinity of column \"n\""
+
+[[case]]
+id = "PR5"
+sql = "SELECT * FROM pg_rounded.source.pd_recebimentos WHERE id < 6"
+
+[[case]]
+id = "PR6"
+sql = "SELECT * FROM pg_rounded.source.pd_totals"
+
+[[case]]
+id = "PR7"
+sql = "SELECT typeof(n), typeof(w0), typeof(a), typeof(aw) FROM pg_rounded.source.pd_nums WHERE id = 15"
+
+[[case]]
+id = "PR8"
+sql = "SELECT id, vl_recebido FROM pg_rounded.source.pd_recebimentos WHERE id < 7 OR id > 14 ORDER BY vl_recebido DESC NULLS LAST, id OFFSET 0 LIMIT 3"
+compare = "ordered"
+note = "the panel's ordenar=vl_recebido where the column is mapped (rows whose values fit)"

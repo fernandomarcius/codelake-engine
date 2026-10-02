@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::common;
 use codelake_connectors::mysql::{MysqlConnector, MysqlParams};
-use codelake_connectors::postgres::{PostgresConnector, PostgresParams};
+use codelake_connectors::postgres::{Decimals, PostgresConnector, PostgresParams};
 use mysql_async::prelude::Queryable;
 use secrecy::SecretString;
 use testcontainers_modules::mysql::Mysql;
@@ -75,6 +75,7 @@ async fn joins_across_mysql_and_postgres() {
                 user: "postgres".into(),
                 password: SecretString::from("postgres"),
                 sslmode: "disable".into(),
+                decimals: Decimals::default(),
             },
         )),
     )

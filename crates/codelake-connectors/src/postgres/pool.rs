@@ -39,9 +39,9 @@ use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
 use secrecy::ExposeSecret;
 
-use super::PostgresParams;
 use super::catalog;
 use super::types;
+use super::{Decimals, PostgresParams};
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
 
@@ -63,6 +63,8 @@ pub(super) struct PgPool {
     /// Sources with the same server, database and user may be joined at the
     /// source (the upstream pool's rule).
     join_context: String,
+    /// What its `numeric` columns are, and how their values are rounded.
+    decimals: Decimals,
 }
 
 impl fmt::Debug for PgPool {
@@ -126,6 +128,7 @@ impl PgPool {
                 "host={},port={},db={},user={},",
                 params.host, params.port, params.database, params.user
             ),
+            decimals: params.decimals,
         })
     }
 
@@ -153,6 +156,7 @@ impl crate::postgres_pushdown::ZonedSource for PgPool {
             let connection = PgConnection {
                 client: pool.client().await?,
                 time_zone,
+                decimals: pool.decimals,
             };
             connection.query_arrow(&sql, &[], Some(schema)).await
         })
@@ -180,7 +184,11 @@ pub(super) fn zone_statement(zone: Option<&str>) -> String {
 #[async_trait]
 impl DbConnectionPool<Client, Param> for PgPool {
     async fn connect(&self) -> Result<Box<dyn DbConnection<Client, Param>>, GenericError> {
-        Ok(Box::new(PgConnection::new(self.client().await?)))
+        Ok(Box::new(PgConnection {
+            client: self.client().await?,
+            time_zone: None,
+            decimals: self.decimals,
+        }))
     }
 
     fn join_push_down(&self) -> JoinPushDown {
@@ -192,6 +200,7 @@ pub(super) struct PgConnection {
     client: Client,
     /// The engine session's zone its statements run in ([`zone_statement`]).
     time_zone: Option<String>,
+    decimals: Decimals,
 }
 
 impl PgConnection {
@@ -224,6 +233,7 @@ impl AsyncDbConnection<Client, Param> for PgConnection {
         Self {
             client,
             time_zone: None,
+            decimals: Decimals::default(),
         }
     }
 
@@ -243,7 +253,7 @@ impl AsyncDbConnection<Client, Param> for PgConnection {
 
     async fn get_schema(&self, table: &TableReference) -> Result<SchemaRef, DbError> {
         let schema = table.schema().unwrap_or("public");
-        catalog::schema_of(&self.client, schema, table.table())
+        catalog::schema_of(&self.client, schema, table.table(), self.decimals)
             .await
             .map(Arc::new)
     }
@@ -261,7 +271,10 @@ impl AsyncDbConnection<Client, Param> for PgConnection {
             .query_raw(sql.as_ref(), params.iter().copied())
             .await
             .map_err(db_error)?;
-        let decode_schema = projected_schema.clone();
+        // The decoder reads a list of decimals as the list of texts it was sent as.
+        let decode_schema = projected_schema.as_deref().map(|p| Arc::new(types::decoded(p)));
+        let wanted = projected_schema.clone();
+        let rounding = self.decimals.rounding_mode;
         let mut batches = rows
             .chunks(ROWS_PER_BATCH)
             .map(move |rows| {
@@ -270,7 +283,7 @@ impl AsyncDbConnection<Client, Param> for PgConnection {
                     .collect::<Result<Vec<Row>, _>>()
                     .map_err(db_error)?;
                 let batch = rows_to_arrow(&rows, &decode_schema).map_err(|e| Box::new(e) as GenericError)?;
-                types::restore(batch, decode_schema.as_deref()).map_err(GenericError::from)
+                types::restore(batch, wanted.as_deref(), rounding).map_err(GenericError::from)
             })
             .boxed();
         let Some(first) = batches.next().await else {

@@ -101,7 +101,7 @@ spill_limit = "40GiB"
 "#;
 
 /// Keys of a source in the order they are written; any other key follows.
-const KEY_ORDER: [&str; 18] = [
+const KEY_ORDER: [&str; 21] = [
     "name",
     "kind",
     "host",
@@ -112,6 +112,9 @@ const KEY_ORDER: [&str; 18] = [
     "encrypt",
     "trust_server_certificate",
     "sslmode",
+    "decimal_mapping",
+    "decimal_rounding_mode",
+    "decimal_default_scale",
     "warehouse",
     "s3_endpoint",
     "s3_region",
