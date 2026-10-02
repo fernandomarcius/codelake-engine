@@ -40,6 +40,11 @@ scrapes do not load the sources.
 | `codelake_queries_timed_out_total{phase}` | counter | time limit reached; `phase`: `queued`, `running` |
 | `codelake_queries_completed_total{protocol,state}` | counter | governed queries ended, `FINISHED` or `FAILED` |
 | `codelake_statements_total{protocol}` | counter | statements received on the PostgreSQL wire (`simple`, `extended`) |
+| `codelake_connections_open{listener}`, `codelake_connections_max{listener}` | gauge | open connections and the limit of each listener (`ops`, `pg`, `trino`; ADR 0018) |
+| `codelake_connections_refused_total{listener,reason}` | counter | answered with an error and closed: `limit` (listener full), `descriptors` (no descriptor left) |
+| `codelake_connections_closed_total{listener,reason}` | counter | HTTP connections closed by a timeout: `idle`, `header_read` |
+| `codelake_accept_errors_total{listener,error}` | counter | failed `accept`: `descriptors` (`EMFILE`/`ENFILE`), `other` |
+| `codelake_open_files`, `codelake_open_files_limit` | gauge | descriptors open now and the soft limit |
 
 The canary adds, when run with `--textfile`: `codelake_canary_run_ok`,
 `codelake_canary_check_ok{check,status}`, `codelake_canary_latency_seconds`,
@@ -73,6 +78,12 @@ groups:
         expr: codelake_spill_used_bytes / codelake_spill_limit_bytes > 0.8
         for: 10m
         labels: { severity: ticket }
+      - alert: CodeLakeConnectionsRefused
+        expr: increase(codelake_connections_refused_total[10m]) > 0
+        labels: { severity: ticket }
+      - alert: CodeLakeDescriptorsExhausted
+        expr: increase(codelake_accept_errors_total{error="descriptors"}[5m]) > 0
+        labels: { severity: page }
       - alert: CodeLakeContainerNearLimit
         expr: >
           container_memory_working_set_bytes{container="codelake"}
