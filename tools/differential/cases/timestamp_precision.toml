@@ -1,0 +1,72 @@
+description = """
+The precision of every timestamp and time a query can return, against Trino 431: the declared
+type and the digits of each value. A client reads the digits the type declares; the .NET
+driver (NH.Trino.Data.ADO) refuses a timestamp with more than 7 fraction digits ("Timestamp
+with time zone has more than 7 digits of precision"), which CodeLake sent for every PostgreSQL
+`timestamptz` (`timestamp(9) with time zone`, Trino: `timestamp(6) with time zone`; ISS-060):
+the Warehouse boletos API answered 503 on every route reading one. Functions of the current
+instant are compared by type only (the instant differs between the engines).
+"""
+oracle = "trino"
+setup_trino = [
+  "CREATE SCHEMA hive.tsp",
+  "CREATE TABLE hive.tsp.t (id integer, ts timestamp, d date) WITH (format = 'PARQUET')",
+  "INSERT INTO hive.tsp.t VALUES (1, TIMESTAMP '2026-09-23 12:20:59.195', DATE '2026-09-23'), (2, TIMESTAMP '1960-01-01 00:00:00.5', DATE '1960-01-01'), (3, NULL, NULL)",
+]
+setup_postgres = [
+  "CREATE TABLE source.tsp_pg (id INT, ts TIMESTAMP, tz TIMESTAMPTZ, tz3 TIMESTAMPTZ(3), t TIME)",
+  "INSERT INTO source.tsp_pg VALUES (1, '2026-09-23 12:20:59.195337', '2026-09-23 12:20:59.195337+00', '2026-09-23 12:20:59.195+00', '12:20:59.195337'), (2, NULL, NULL, NULL, NULL)",
+  "GRANT SELECT ON source.tsp_pg TO source",
+]
+
+[[case]]
+id = "TP1-current"
+sql = "SELECT typeof(now()), typeof(current_timestamp), typeof(current_timestamp(6)), typeof(localtimestamp), typeof(localtimestamp(6)), typeof(localtime)"
+
+[[case]]
+id = "TP2-current-derived"
+sql = "SELECT typeof(CAST(now() AS timestamp)), typeof(date_trunc('day', now())), typeof(now() + INTERVAL '1' HOUR), typeof(date_add('hour', 1, now())), typeof(now() AT TIME ZONE 'UTC'), typeof(max(now())), typeof(CAST(now() AS timestamp(6)))"
+
+[[case]]
+id = "TP3-casts"
+sql = "SELECT CAST('2026-09-23 12:20:59.195337' AS timestamp), CAST('2026-09-23 12:20:59.195337' AS timestamp(6)), CAST(DATE '2026-09-23' AS timestamp), CAST(TIMESTAMP '2026-09-23 12:20:59.195' AS timestamp(6) with time zone), CAST('2026-09-23 12:20:59.1953376 UTC' AS timestamp(7) with time zone)"
+
+[[case]]
+id = "TP4-literals"
+sql = "SELECT TIMESTAMP '2026-09-23 12:20:59', TIMESTAMP '2026-09-23 12:20:59.1', TIMESTAMP '2026-09-23 12:20:59.195337', TIMESTAMP '2026-09-23 12:20:59.1953376', TIMESTAMP '2026-09-23 12:20:59.195337 UTC', TIME '12:20:59.195'"
+
+[[case]]
+id = "TP5-parsing"
+sql = "SELECT from_iso8601_timestamp('2026-09-23T12:20:59.195337Z'), date_parse('2026-09-23 12:20:59', '%Y-%m-%d %H:%i:%s'), from_unixtime(1758630059.195337), with_timezone(TIMESTAMP '2026-09-23 12:20:59.195', 'UTC'), at_timezone(TIMESTAMP '2026-09-23 12:20:59.195 UTC', 'America/Sao_Paulo')"
+
+# Hive timestamps by type only: Trino writes them in its JVM's zone (UTC here), CodeLake's
+# catalog reads them in its parquet_time_zone (America/Sao_Paulo, production's): the values
+# differ by the stack's configuration, not by precision.
+[[case]]
+id = "TP6-hive-column"
+sql = "SELECT typeof(ts), typeof(ts + INTERVAL '1' HOUR), typeof(date_trunc('hour', ts)), typeof(CAST(ts AS timestamp(6))), typeof(CAST(d AS timestamp)), typeof(coalesce(ts, TIMESTAMP '2000-01-01 00:00:00')) FROM hive.tsp.t WHERE id = 1"
+
+[[case]]
+id = "TP7-hive-aggregates"
+sql = "SELECT typeof(max(ts)), typeof(min(ts)), typeof(max(CAST(d AS timestamp))) FROM hive.tsp.t"
+
+[[case]]
+id = "TP8-pg-columns"
+sql = "SELECT id, ts, tz, tz3, t, tz + INTERVAL '1' HOUR, date_trunc('hour', tz), CAST(tz AS timestamp), tz AT TIME ZONE 'America/Sao_Paulo', coalesce(tz, TIMESTAMP '2000-01-01 00:00:00 UTC') FROM pg.source.tsp_pg"
+
+[[case]]
+id = "TP9-pg-aggregates"
+sql = "SELECT max(tz), min(ts), max(tz3), max(t) FROM pg.source.tsp_pg"
+
+[[case]]
+id = "TP10-pg-varchar"
+sql = "SELECT CAST(tz AS varchar), CAST(ts AS varchar), CAST(t AS varchar) FROM pg.source.tsp_pg WHERE id = 1"
+
+[[case]]
+id = "TP11-union-pg-hive"
+sql = "SELECT typeof(x) FROM (SELECT ts AS x FROM pg.source.tsp_pg UNION ALL SELECT ts FROM hive.tsp.t) GROUP BY 1"
+note = "timestamp(6) with timestamp(3): timestamp(6) (ISS-032 item 8)"
+
+[[case]]
+id = "TP12-union-values"
+sql = "SELECT CAST(x AS varchar) FROM (SELECT ts AS x FROM pg.source.tsp_pg WHERE id = 1 UNION ALL SELECT TIMESTAMP '2026-09-23 12:20:59') ORDER BY 1"

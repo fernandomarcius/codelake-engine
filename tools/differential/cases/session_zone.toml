@@ -57,11 +57,9 @@ id = "Z11-current-time-type"
 sql = "SELECT typeof(current_time)"
 expect = "WRONG"
 known = "ISS-032"
-note = "time(3) with time zone in Trino 431; the engine has no time with time zone type and answers time(9) (its local wall time is the session's)"
+note = "time(3) with time zone in Trino 431; the engine has no time with time zone type and answers time(3), the session's wall time (it answered time(9): nine digits)"
 
 [[case]]
 id = "Z12-union-timestamp-precision"
 sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.123' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00')"
-expect = "WRONG"
-known = "ISS-032"
-note = "found here, not about the zone: a UNION of timestamp(3) and timestamp(0) is timestamp(0) and loses the fraction (Trino 431: timestamp(3))"
+note = "found here, not about the zone: a UNION of timestamp(3) and timestamp(0) was timestamp(0) and lost the fraction; timestamp(3), as Trino 431 (ISS-032 item 8, fixed)"
