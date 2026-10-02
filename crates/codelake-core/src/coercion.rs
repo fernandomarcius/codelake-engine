@@ -1611,19 +1611,37 @@ mod tests {
         let naive = |unit| DataType::Timestamp(unit, None);
         let utc = |unit, zone: &str| DataType::Timestamp(unit, Some(zone.into()));
         let (s, ms, us) = (TimeUnit::Second, TimeUnit::Millisecond, TimeUnit::Microsecond);
-        assert_eq!(finest_timestamp(&[naive(ms), naive(s)], &naive(s)), Some(naive(ms)));
-        assert_eq!(finest_timestamp(&[naive(ms), naive(s)], &naive(ms)), Some(naive(ms)));
-        assert_eq!(finest_timestamp(&[naive(s), naive(us), naive(ms)], &naive(s)), Some(naive(us)));
-        assert_eq!(finest_timestamp(&[naive(ms), naive(ms)], &naive(s)), Some(naive(ms)));
+        assert_eq!(
+            finest_timestamp(&[naive(ms), naive(s)], &naive(s)),
+            Some(naive(ms))
+        );
+        assert_eq!(
+            finest_timestamp(&[naive(ms), naive(s)], &naive(ms)),
+            Some(naive(ms))
+        );
+        assert_eq!(
+            finest_timestamp(&[naive(s), naive(us), naive(ms)], &naive(s)),
+            Some(naive(us))
+        );
+        assert_eq!(
+            finest_timestamp(&[naive(ms), naive(ms)], &naive(s)),
+            Some(naive(ms))
+        );
         assert_eq!(finest_timestamp(&[naive(ms), naive(ms)], &naive(ms)), None);
         assert_eq!(finest_timestamp(&[DataType::Null, naive(ms)], &naive(ms)), None);
-        assert_eq!(finest_timestamp(&[DataType::Null, naive(ms)], &naive(s)), Some(naive(ms)));
+        assert_eq!(
+            finest_timestamp(&[DataType::Null, naive(ms)], &naive(s)),
+            Some(naive(ms))
+        );
         assert_eq!(
             finest_timestamp(&[utc(s, "UTC"), utc(us, "+00:00")], &utc(s, "UTC")),
             Some(utc(us, "UTC"))
         );
         assert_eq!(finest_timestamp(&[naive(ms), utc(s, "UTC")], &naive(ms)), None);
-        assert_eq!(finest_timestamp(&[utc(ms, "UTC"), naive(s)], &utc(ms, "UTC")), None);
+        assert_eq!(
+            finest_timestamp(&[utc(ms, "UTC"), naive(s)], &utc(ms, "UTC")),
+            None
+        );
         assert_eq!(finest_timestamp(&[DataType::Int64, naive(ms)], &naive(ms)), None);
         assert_eq!(finest_timestamp(&[naive(ms), naive(s)], &DataType::Int64), None);
         assert_eq!(finest_timestamp(&[DataType::Null], &naive(s)), None);
