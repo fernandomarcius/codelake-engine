@@ -1,7 +1,7 @@
 # ISS-063 — Connection and descriptor limits: defaults applied by recommendation
 
 - Kind: behavior · Recorded by the availability front (`fix/fd-limit-idle-connections`), 2026-10-02 ·
-  Status: awaiting-confirmation
+  Accepted by: Fernando Farias, 2026-10-02 · Status: closed
 - Context: the shadow's production-query replay (2026-10-02, `fdprobe`) left every new client hanging
   behind ~1000 idle keep-alive connections (ADR 0018). The fix needed values nobody had chosen; each was
   applied by recommendation:

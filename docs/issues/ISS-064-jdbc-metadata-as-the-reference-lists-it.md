@@ -1,7 +1,7 @@
 # ISS-064 — JDBC/ODBC metadata as the reference lists it: choices and what still differs
 
-- Kind: behavior · Recorded by the metadata front (`fix/jdbc-metadata`), 2026-10-02 · Status:
-  awaiting-confirmation (items 1–3 applied by recommendation; items 4 and 5 open)
+- Kind: behavior · Recorded by the metadata front (`fix/jdbc-metadata`), 2026-10-02 · Items 1–3
+  accepted by: Fernando Farias, 2026-10-02 · Status: open (items 4 and 5)
 - Context: the shadow's production-query replay (2026-10-02) showed what DBeaver, the JDBC driver and
   ODBC tools read differently from the reference engine (Trino 431): `system.jdbc.types` had 18 rows
   against 48, the engine's own `datafusion` catalog was listed (`system.jdbc.catalogs`,

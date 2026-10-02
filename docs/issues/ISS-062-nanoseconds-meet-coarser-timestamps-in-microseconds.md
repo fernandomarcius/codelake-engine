@@ -1,7 +1,7 @@
 # ISS-062 — Nanoseconds meet a coarser timestamp in microseconds
 
 - Kind: deliberate divergence · Applied by recommendation (review of `fix/union-timestamp-precision`,
-  2026-10-02), no explicit human answer yet · Status: awaiting-confirmation
+  2026-10-02) · Accepted by: Fernando Farias, 2026-10-02 · Status: closed
 - Context: Trino 431 has one `timestamp(p)` for every `p` up to 12 and the whole year range. An Arrow
   timestamp in nanoseconds holds only the years 1677 to 2262; microseconds hold far beyond. SQL Server
   `datetime2` columns (`datetime2(7)` by default, read in microseconds as `timestamp(6)`, the 7th digit
