@@ -295,7 +295,8 @@ versioning: [SemVer](https://semver.org/).
     with a client zone CodeLake answers the client's day (accepted divergence, ISS-060).
   - `timestamp`, `timestamptz` and `time` columns were `timestamp(9)`, `timestamp(9) with time zone` and
     `time(9)`; they have the precision PostgreSQL declares, as in the reference (6 without one:
-    `timestamp(6) with time zone`; `timestamp(3)`, `timestamp(1)`, `time(4)`…), also as array elements.
+    `timestamp(6) with time zone`; `timestamp(3)`, `timestamp(1)`, `time(4)`…), also as array elements;
+    `typeof` names a declared `timestamp(p)` / `time(p)` too (it answered the Arrow unit's precision).
   - **Wrong result**: a `timestamptz` outside 1677–2262 (a `9999-12-31` sentinel) was read as
     `1970-01-01 00:00:00`, and a `timestamp` before 1970 failed the batch; timestamps travel as their
     microseconds since 1970 and keep their whole range.
