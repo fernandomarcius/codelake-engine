@@ -14,6 +14,10 @@
 //! | arithmetic other than on integers, casts other than widening | decimal result scales differ; float overflow is an error |
 //! | timestamp literals finer than the microsecond, temporal literals out of years 1–9999 | PostgreSQL rounds to the microsecond; no faithful rendering |
 //!
+//! A timestamp column the engine widens to a finer unit to compare it with a
+//! literal (`codelake_exact_cast(CAST(c AS timestamp(9)))`, which changes no
+//! value) is compared at the source as the column itself.
+//!
 //! Text equality, `IN`, `GROUP BY`, `DISTINCT` and join keys on text are
 //! pushed: under a deterministic collation (every collation PostgreSQL ships)
 //! two strings are equal only when their bytes are.
@@ -21,12 +25,17 @@
 //! A `timestamp with time zone` literal is sent as `CAST('…+00' AS TIMESTAMP
 //! WITH TIME ZONE)`, an instant: the unparser's `CAST('…' AS TIMESTAMP)` drops
 //! the offset, and PostgreSQL then reads it in the session's `TimeZone`.
+//!
+//! The statement runs in the engine session's time zone
+//! ([`codelake_core::federation_guard::remote_time_zone`], read when the
+//! remote node starts; see `postgres::pool`).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use codelake_core::federation_policy::{PushdownPolicy, restrict_federation};
-use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use codelake_core::functions::EXACT_CAST;
+use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::arrow::temporal_conversions::timestamp_us_to_datetime;
 use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
@@ -38,6 +47,7 @@ use datafusion::logical_expr::{
     Aggregate, BinaryExpr, Cast, Distinct, Expr, ExprSchemable, JoinType, LogicalPlan, Operator,
 };
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::{Dialect, PostgreSqlDialect};
 use datafusion_federation::FederatedTableProviderAdaptor;
@@ -45,7 +55,10 @@ use datafusion_federation::sql::{
     LogicalOptimizer, RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
 };
 use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
-use datafusion_table_providers_common::sql::sql_provider_datafusion::SqlTable;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::GenericError;
+use datafusion_table_providers_common::sql::sql_provider_datafusion::{SqlTable, to_execution_error};
+use futures::TryStreamExt;
+use futures::future::BoxFuture;
 
 /// Which plan nodes PostgreSQL may evaluate.
 #[derive(Debug, Default)]
@@ -200,10 +213,46 @@ fn safe_expr(expr: &Expr, schema: &DFSchema) -> bool {
     }
 }
 
+fn unit_rank(unit: TimeUnit) -> u8 {
+    match unit {
+        TimeUnit::Second => 0,
+        TimeUnit::Millisecond => 1,
+        TimeUnit::Microsecond => 2,
+        TimeUnit::Nanosecond => 3,
+    }
+}
+
+/// The column of `codelake_exact_cast(CAST(column AS <finer timestamp>))`,
+/// with or without a zone as the column: the engine widens a timestamp
+/// column to compare it with a finer literal, which changes no value.
+/// [`PostgresPolicy::prepare`] sends the column itself.
+fn widened_column<'a>(expr: &'a Expr, schema: &DFSchema) -> Option<&'a Expr> {
+    let Expr::ScalarFunction(function) = expr else {
+        return None;
+    };
+    let ([Expr::Cast(cast)], true) = (function.args.as_slice(), function.func.name() == EXACT_CAST) else {
+        return None;
+    };
+    let column = cast.expr.as_ref();
+    if !matches!(column, Expr::Column(_)) {
+        return None;
+    }
+    match (type_of(column, schema)?, cast.field.data_type()) {
+        (DataType::Timestamp(from, from_zone), DataType::Timestamp(to, to_zone))
+            if unit_rank(from) <= unit_rank(*to) && from_zone.is_some() == to_zone.is_some() =>
+        {
+            Some(column)
+        }
+        _ => None,
+    }
+}
+
 /// `left <op> right`: both operands safe (or a temporal literal, rendered
-/// by [`PostgresPolicy::prepare`]) and of types PostgreSQL compares alike.
+/// by [`PostgresPolicy::prepare`], or a widened timestamp column) and of
+/// types PostgreSQL compares alike.
 fn safe_comparison(left: &Expr, op: Operator, right: &Expr, schema: &DFSchema) -> bool {
-    let operand = |e: &Expr| safe_expr(e, schema) || temporal_literal(e);
+    let operand =
+        |e: &Expr| safe_expr(e, schema) || temporal_literal(e) || widened_column(e, schema).is_some();
     let (Some(lt), Some(rt)) = (type_of(left, schema), type_of(right, schema)) else {
         return false;
     };
@@ -401,7 +450,8 @@ impl PushdownPolicy for PostgresPolicy {
     ///   reference the base table's qualifier from outside it (`SELECT DISTINCT
     ///   c` became "missing FROM-clause entry");
     /// - `sum(CAST(x AS bigint))` of a narrower integer becomes `sum(x)`;
-    /// - a `timestamp with time zone` literal becomes a cast of its UTC text.
+    /// - a `timestamp with time zone` literal becomes a cast of its UTC text;
+    /// - a timestamp column widened to a finer unit becomes the column.
     fn prepare(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
         let plan = plan
             .transform_up(|node| {
@@ -442,7 +492,14 @@ impl PushdownPolicy for PostgresPolicy {
             if !matches!(node, LogicalPlan::Filter(_) | LogicalPlan::Join(_)) {
                 return Ok(Transformed::no(node));
             }
-            node.map_expressions(|expr| expr.transform(|e| Ok(instant_literal(e))))
+            // Columns of a filter's or a join's predicate resolve in its schema.
+            let schema = Arc::clone(node.schema());
+            node.map_expressions(|expr| {
+                expr.transform_down(|e| match widened_column(&e, &schema) {
+                    Some(column) => Ok(Transformed::yes(column.clone())),
+                    None => Ok(instant_literal(e)),
+                })
+            })
         })
         .data()
     }
@@ -470,10 +527,23 @@ pub(crate) fn policy() -> Arc<dyn PushdownPolicy> {
     Arc::new(PostgresPolicy)
 }
 
+/// Where a PostgreSQL table's statements run: a statement with the schema
+/// of its answer, in the time zone of the engine session it answers
+/// (`None`: the engine's, UTC).
+pub(crate) trait ZonedSource: Send + Sync {
+    fn query(
+        &self,
+        time_zone: Option<String>,
+        sql: String,
+        schema: SchemaRef,
+    ) -> BoxFuture<'static, std::result::Result<SendableRecordBatchStream, GenericError>>;
+}
+
 /// The executor of a PostgreSQL table, with [`PostgresPolicy`] restricting
-/// what federation sends to it.
+/// what federation sends to it; its statements run at `source`.
 pub(crate) struct PostgresExecutor<E> {
     inner: Arc<E>,
+    source: Arc<dyn ZonedSource>,
 }
 
 impl<E> std::fmt::Debug for PostgresExecutor<E> {
@@ -503,13 +573,22 @@ impl<E: SQLExecutor + 'static> SQLExecutor for PostgresExecutor<E> {
         }))
     }
 
+    /// Runs `query` in the zone of the session whose remote node is being
+    /// started (the dynamic `filters` are ignored, as upstream).
     fn execute(
         &self,
         query: &str,
         schema: SchemaRef,
-        filters: &[Arc<dyn PhysicalExpr>],
+        _filters: &[Arc<dyn PhysicalExpr>],
     ) -> Result<SendableRecordBatchStream> {
-        self.inner.execute(query, schema, filters)
+        let answer = self.source.query(
+            codelake_core::federation_guard::remote_time_zone(),
+            query.to_owned(),
+            Arc::clone(&schema),
+        );
+        let stream =
+            futures::stream::once(async move { answer.await.map_err(to_execution_error) }).try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
     async fn table_names(&self) -> Result<Vec<String>> {
@@ -522,9 +601,10 @@ impl<E: SQLExecutor + 'static> SQLExecutor for PostgresExecutor<E> {
 }
 
 /// The remote table `reference` as a federated provider whose sub-plans go
-/// through [`PostgresPolicy`].
+/// through [`PostgresPolicy`] and run at `source`.
 pub(crate) async fn table_provider<T: 'static, P: 'static>(
     pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
+    source: Arc<dyn ZonedSource>,
     reference: TableReference,
 ) -> Result<Arc<dyn TableProvider>> {
     let table = SqlTable::new("postgres", pool, reference.clone())
@@ -534,6 +614,7 @@ pub(crate) async fn table_provider<T: 'static, P: 'static>(
     let schema = table.schema();
     let executor = Arc::new(PostgresExecutor {
         inner: Arc::new(table),
+        source,
     });
     let source = Arc::new(SQLTableSource::new_with_schema(
         Arc::new(SQLFederationProvider::new(executor)),
@@ -804,6 +885,81 @@ mod tests {
         ));
         let sql = render(filter(col("ts").gt_eq(naive)));
         assert!(sql.contains("CAST('2025-09-14 00:00:00' AS TIMESTAMP)"), "{sql}");
+    }
+
+    /// A timestamp column the engine widens (`codelake_exact_cast`) to meet
+    /// a finer literal is compared at the source as itself; a narrowing, a
+    /// change of zone kind or a literal finer than the microsecond stays local.
+    #[test]
+    fn timestamp_columns_widened_for_a_literal_are_compared_as_themselves() {
+        use datafusion::logical_expr::expr::ScalarFunction;
+        use datafusion::logical_expr::{Volatility, create_udf};
+        let micros = Schema::new(vec![
+            Field::new("us", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new(
+                "utz",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+        ]);
+        let filtered = |predicate: Expr| {
+            table_scan(Some("t"), &micros, None)
+                .unwrap()
+                .filter(predicate)
+                .unwrap()
+                .build()
+                .unwrap()
+        };
+        let widened = |column: &str, to: DataType| {
+            let identity = create_udf(
+                EXACT_CAST,
+                vec![to.clone()],
+                to.clone(),
+                Volatility::Immutable,
+                Arc::new(|args: &[datafusion::logical_expr::ColumnarValue]| Ok(args[0].clone())),
+            );
+            Expr::ScalarFunction(ScalarFunction::new_udf(
+                Arc::new(identity),
+                vec![cast(col(column), to)],
+            ))
+        };
+        let ns = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let ns_utc = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
+        let naive = |v: i64| lit(ScalarValue::TimestampNanosecond(Some(v), None));
+        let zoned = |v: i64| lit(ScalarValue::TimestampNanosecond(Some(v), Some("UTC".into())));
+
+        let plan = filtered(widened("us", ns.clone()).gt_eq(naive(1_757_808_000_000_000_000)));
+        assert!(pushable(&plan));
+        let sql = render(plan);
+        assert!(
+            sql.ends_with(r#"WHERE ("t"."us" >= CAST('2025-09-14 00:00:00' AS TIMESTAMP))"#),
+            "{sql}"
+        );
+        let plan = filtered(widened("utz", ns_utc.clone()).lt(zoned(1_757_808_000_123_456_000)));
+        assert!(pushable(&plan));
+        let sql = render(plan);
+        assert!(
+            sql.ends_with(
+                r#"WHERE ("t"."utz" < CAST('2025-09-14 00:00:00.123456+00' AS TIMESTAMP WITH TIME ZONE))"#
+            ),
+            "{sql}"
+        );
+        // Finer than the microsecond: PostgreSQL would round the literal.
+        assert!(!pushable(&filtered(
+            widened("us", ns.clone()).gt_eq(naive(1_757_808_000_000_000_001))
+        )));
+        // A narrowing changes values; a zone added or dropped changes the instant.
+        let ms = DataType::Timestamp(TimeUnit::Millisecond, None);
+        assert!(!pushable(&filtered(widened("us", ms).gt_eq(lit(
+            ScalarValue::TimestampMillisecond(Some(1_757_808_000_000), None)
+        )))));
+        assert!(!pushable(&filtered(
+            widened("us", ns_utc).gt_eq(zoned(1_757_808_000_000_000_000))
+        )));
+        // Only a widened column: a bare cast stays local.
+        assert!(!pushable(&filtered(
+            cast(col("us"), ns).gt_eq(naive(1_757_808_000_000_000_000))
+        )));
     }
 
     #[test]

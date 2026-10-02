@@ -25,6 +25,12 @@
 //! node is traced: one `codelake.remote` span per federated scan, for every
 //! SQL source, with the executor name, rows returned, duration and errors.
 //! Connectors add their own child spans below it (e.g. the SQL they sent).
+//!
+//! It is also where a remote node learns the session it runs for: the
+//! `SQLExecutor` of `datafusion-federation` is started without the task
+//! context, so the barrier starts its input with the session's time zone in
+//! scope ([`remote_time_zone`]): a source whose answer depends on its own
+//! session zone (PostgreSQL's `current_date`, `now()`) runs in it.
 
 use std::fmt;
 use std::sync::Arc;
@@ -43,6 +49,26 @@ use futures::{StreamExt, TryStreamExt};
 use tracing::field::Empty;
 
 use crate::trace::{self, TARGET, TracedStream};
+
+tokio::task_local! {
+    /// The session time zone of the federated scan being started.
+    static REMOTE_TIME_ZONE: Option<String>;
+}
+
+/// The time zone of the session (`datafusion.execution.time_zone`: the
+/// client's `X-Trino-Time-Zone` or `SET TIME ZONE`) whose federated scan is
+/// being started, for an `SQLExecutor::execute` to read while it is called:
+/// a [`FederationFilterBarrier`] starts its input with it in scope. `None`
+/// when the session has none (the engine's zone, UTC) and outside a barrier.
+pub fn remote_time_zone() -> Option<String> {
+    REMOTE_TIME_ZONE.try_with(Clone::clone).ok().flatten()
+}
+
+/// `start` with [`remote_time_zone`] answering the zone of `context`'s session.
+fn in_session_zone<T>(context: &TaskContext, start: impl FnOnce() -> T) -> T {
+    let zone = context.session_config().options().execution.time_zone.clone();
+    REMOTE_TIME_ZONE.sync_scope(zone, start)
+}
 
 /// Detects the remote-SQL leaf of `datafusion-federation` by type, not by name:
 /// a renamed string upstream would silently disable the guard, a changed type
@@ -245,7 +271,8 @@ impl ExecutionPlan for FederationFilterBarrier {
                 .hash_join_inlist_pushdown_max_distinct_values;
             let stream = futures::stream::once(async move {
                 let input = this.narrowed_input(max_keys);
-                started.in_scope(|| input.execute(partition, context))
+                started
+                    .in_scope(|| in_session_zone(&context, || input.execute(partition, Arc::clone(&context))))
             })
             .try_flatten();
             let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()));
@@ -253,7 +280,9 @@ impl ExecutionPlan for FederationFilterBarrier {
         }
         // Connectors start their remote work inside `execute`: their spans
         // become children of this one.
-        match span.in_scope(|| self.input.execute(partition, context)) {
+        match span
+            .in_scope(|| in_session_zone(&context, || self.input.execute(partition, Arc::clone(&context))))
+        {
             Ok(stream) => Ok(Box::pin(TracedStream::new(stream, span))),
             Err(err) => {
                 trace::record_error(&span, &err);
@@ -388,6 +417,59 @@ mod tests {
             .one_line()
             .to_string();
         assert_eq!(plain.trim(), "FederationFilterBarrier");
+    }
+
+    fn barrier_of(plan: &Arc<dyn ExecutionPlan>) -> Option<&FederationFilterBarrier> {
+        plan.downcast_ref::<FederationFilterBarrier>()
+            .or_else(|| plan.children().into_iter().find_map(barrier_of))
+    }
+
+    /// A remote node starts with its session's time zone in scope, on both
+    /// paths of the barrier (with and without dynamic filters); without a
+    /// session zone, and outside a barrier, there is none.
+    #[tokio::test]
+    async fn remote_nodes_start_in_the_session_zone() {
+        use crate::testing::{int64, remote_table_observed};
+        use datafusion::physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, lit};
+        use datafusion::physical_plan::collect;
+
+        let ctx = crate::testing::federated_session();
+        let (table, _, zones) = remote_table_observed("erp", "t", vec![("a", int64(&[1, 2]))], None);
+        ctx.register_table("t", table).unwrap();
+        let started = |zone: Option<&str>| {
+            let mut config = ctx.copied_config();
+            config.options_mut().execution.time_zone = zone.map(str::to_owned);
+            Arc::new(TaskContext::from(&ctx.state()).with_session_config(config))
+        };
+        let plan = ctx
+            .sql("SELECT a FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        collect(Arc::clone(&plan), started(Some("America/Sao_Paulo")))
+            .await
+            .unwrap();
+        collect(Arc::clone(&plan), started(None)).await.unwrap();
+
+        let barrier = barrier_of(&plan).expect("a barrier above the remote node");
+        let dynamic: Arc<dyn PhysicalExpr> = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::new(Column::new("a", 0))],
+            lit(true),
+        ));
+        let filtered: Arc<dyn ExecutionPlan> = Arc::new(barrier.with_dynamic_filters(vec![dynamic]));
+        collect(filtered, started(Some("-03:00"))).await.unwrap();
+
+        assert_eq!(
+            *zones.lock().unwrap(),
+            [
+                Some("America/Sao_Paulo".to_owned()),
+                None,
+                Some("-03:00".to_owned())
+            ]
+        );
+        assert_eq!(remote_time_zone(), None);
     }
 
     /// Reproduces the upstream defect without Docker (see `crate::testing`).

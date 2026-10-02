@@ -85,7 +85,8 @@ impl fmt::Debug for PostgresResolver {
 impl TableResolver for PostgresResolver {
     async fn resolve(&self, schema: &str, table: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
         let pool: Arc<dyn DbConnectionPool<Client, Param> + Send + Sync> = self.0.clone();
-        crate::postgres_pushdown::table_provider(&pool, TableReference::partial(schema, table))
+        let source: Arc<dyn crate::postgres_pushdown::ZonedSource> = self.0.clone();
+        crate::postgres_pushdown::table_provider(&pool, source, TableReference::partial(schema, table))
             .await
             .map(Some)
     }

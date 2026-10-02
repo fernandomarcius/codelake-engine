@@ -40,6 +40,8 @@ pub(crate) struct IgnoresFilters {
     columns: HashMap<&'static str, ArrayRef>,
     policy: Option<Arc<dyn PushdownPolicy>>,
     pub(crate) statements: Arc<Mutex<Vec<String>>>,
+    /// [`crate::federation_guard::remote_time_zone`] at each `execute`.
+    pub(crate) zones: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 #[async_trait]
@@ -67,6 +69,9 @@ impl SQLExecutor for IgnoresFilters {
     ) -> Result<SendableRecordBatchStream> {
         if let Ok(mut statements) = self.statements.lock() {
             statements.push(query.to_owned());
+        }
+        if let Ok(mut zones) = self.zones.lock() {
+            zones.push(crate::federation_guard::remote_time_zone());
         }
         let arrays = schema
             .fields()
@@ -107,6 +112,21 @@ pub(crate) fn remote_table_recording(
     columns: Vec<(&'static str, ArrayRef)>,
     policy: Option<Arc<dyn PushdownPolicy>>,
 ) -> (Arc<dyn TableProvider>, Arc<Mutex<Vec<String>>>) {
+    let (provider, statements, _) = remote_table_observed(context, table, columns, policy);
+    (provider, statements)
+}
+
+/// The zones [`crate::federation_guard::remote_time_zone`] answered each time
+/// the executor started.
+pub(crate) type StartZones = Arc<Mutex<Vec<Option<String>>>>;
+
+/// [`remote_table_recording`], also recording the zone of each start.
+pub(crate) fn remote_table_observed(
+    context: &'static str,
+    table: &str,
+    columns: Vec<(&'static str, ArrayRef)>,
+    policy: Option<Arc<dyn PushdownPolicy>>,
+) -> (Arc<dyn TableProvider>, Arc<Mutex<Vec<String>>>, StartZones) {
     let schema = Arc::new(Schema::new(
         columns
             .iter()
@@ -114,11 +134,13 @@ pub(crate) fn remote_table_recording(
             .collect::<Vec<_>>(),
     ));
     let statements = Arc::new(Mutex::new(Vec::new()));
+    let zones: StartZones = Arc::new(Mutex::new(Vec::new()));
     let executor = Arc::new(IgnoresFilters {
         context,
         columns: columns.into_iter().collect(),
         policy,
         statements: Arc::clone(&statements),
+        zones: Arc::clone(&zones),
     });
     let provider = Arc::new(SQLFederationProvider::new(executor));
     let source = SQLTableSource::new_with_schema(
@@ -129,6 +151,7 @@ pub(crate) fn remote_table_recording(
     (
         Arc::new(FederatedTableProviderAdaptor::new(Arc::new(source))),
         statements,
+        zones,
     )
 }
 
@@ -139,6 +162,7 @@ pub(crate) fn executor(context: &'static str) -> Arc<dyn SQLExecutor> {
         columns: HashMap::new(),
         policy: None,
         statements: Arc::new(Mutex::new(Vec::new())),
+        zones: Arc::new(Mutex::new(Vec::new())),
     })
 }
 

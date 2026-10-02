@@ -1279,6 +1279,38 @@ fn agreed_number(types: &[DataType], declared: &DataType) -> Option<DataType> {
     only_type(types).filter(|t| t != declared && is_number(t))
 }
 
+/// The finest unit among timestamps of the same kind (all with a zone, or
+/// none), when an input or the union has another: Trino 431 unites
+/// `timestamp(3)` and `timestamp(0)` as `timestamp(3)`; `DataFusion`'s type
+/// coercion took the coarser unit and cut the fraction (`.123` became
+/// `.000`, ISS-032 item 8). Every input is cast to it here (widening is
+/// exact), so type coercion finds them alike. The zone is the union's.
+fn finest_timestamp(types: &[DataType], declared: &DataType) -> Option<DataType> {
+    let DataType::Timestamp(_, zone) = declared else {
+        return None;
+    };
+    let rank = |unit: &TimeUnit| match unit {
+        TimeUnit::Second => 0,
+        TimeUnit::Millisecond => 1,
+        TimeUnit::Microsecond => 2,
+        TimeUnit::Nanosecond => 3,
+    };
+    let mut units = Vec::with_capacity(types.len());
+    for t in types.iter().filter(|t| !t.is_null()) {
+        let DataType::Timestamp(unit, own) = t else {
+            return None;
+        };
+        if own.is_some() != zone.is_some() {
+            return None;
+        }
+        units.push(*unit);
+    }
+    let finest = units.into_iter().max_by_key(rank)?;
+    let target = DataType::Timestamp(finest, zone.clone());
+    let differs = |t: &DataType| !t.is_null() && t != &target;
+    (types.iter().any(differs) || &target != declared).then_some(target)
+}
+
 fn unify_union_numbers(union: Union) -> Result<Transformed<LogicalPlan>> {
     let columns = union.schema.fields().len();
     let mut targets: Vec<Option<DataType>> = Vec::with_capacity(columns);
@@ -1288,8 +1320,11 @@ fn unify_union_numbers(union: Union) -> Result<Transformed<LogicalPlan>> {
             .iter()
             .map(|input| input.schema().field(j).data_type().clone())
             .collect();
+        let declared = union.schema.field(j).data_type();
         targets.push(
-            common_numeric_type(&types).or_else(|| agreed_number(&types, union.schema.field(j).data_type())),
+            common_numeric_type(&types)
+                .or_else(|| agreed_number(&types, declared))
+                .or_else(|| finest_timestamp(&types, declared)),
         );
     }
     if targets.iter().all(Option::is_none) {
@@ -1567,6 +1602,50 @@ impl AnalyzerRule for TrinoCommonTypes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The finest unit of a union's timestamps (ISS-032 item 8): only when
+    /// an input or the union differs from it, only among timestamps of one
+    /// kind, `NULL` inputs aside.
+    #[test]
+    fn unions_take_the_finest_timestamp() {
+        let naive = |unit| DataType::Timestamp(unit, None);
+        let utc = |unit, zone: &str| DataType::Timestamp(unit, Some(zone.into()));
+        let (s, ms, us) = (TimeUnit::Second, TimeUnit::Millisecond, TimeUnit::Microsecond);
+        assert_eq!(
+            finest_timestamp(&[naive(ms), naive(s)], &naive(s)),
+            Some(naive(ms))
+        );
+        assert_eq!(
+            finest_timestamp(&[naive(ms), naive(s)], &naive(ms)),
+            Some(naive(ms))
+        );
+        assert_eq!(
+            finest_timestamp(&[naive(s), naive(us), naive(ms)], &naive(s)),
+            Some(naive(us))
+        );
+        assert_eq!(
+            finest_timestamp(&[naive(ms), naive(ms)], &naive(s)),
+            Some(naive(ms))
+        );
+        assert_eq!(finest_timestamp(&[naive(ms), naive(ms)], &naive(ms)), None);
+        assert_eq!(finest_timestamp(&[DataType::Null, naive(ms)], &naive(ms)), None);
+        assert_eq!(
+            finest_timestamp(&[DataType::Null, naive(ms)], &naive(s)),
+            Some(naive(ms))
+        );
+        assert_eq!(
+            finest_timestamp(&[utc(s, "UTC"), utc(us, "+00:00")], &utc(s, "UTC")),
+            Some(utc(us, "UTC"))
+        );
+        assert_eq!(finest_timestamp(&[naive(ms), utc(s, "UTC")], &naive(ms)), None);
+        assert_eq!(
+            finest_timestamp(&[utc(ms, "UTC"), naive(s)], &utc(ms, "UTC")),
+            None
+        );
+        assert_eq!(finest_timestamp(&[DataType::Int64, naive(ms)], &naive(ms)), None);
+        assert_eq!(finest_timestamp(&[naive(ms), naive(s)], &DataType::Int64), None);
+        assert_eq!(finest_timestamp(&[DataType::Null], &naive(s)), None);
+    }
 
     #[test]
     fn common_numbers_follow_trino() {

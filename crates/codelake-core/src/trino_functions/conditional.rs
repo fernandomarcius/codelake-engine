@@ -13,7 +13,7 @@ use datafusion::logical_expr::type_coercion::binary::BinaryTypeCoercer;
 use datafusion::logical_expr::type_coercion::binary::type_union_resolution;
 use datafusion::logical_expr::{Operator, ScalarUDF};
 
-use crate::trino_types::{Declared, declared};
+use crate::trino_types::declared;
 
 use super::support::{Call, Func, as_bool, bools, not_found, string_array, trino_type_name};
 
@@ -66,12 +66,10 @@ pub(crate) fn typeof_function() -> ScalarUDF {
             let field = call.fields.first();
             let name = if field.is_some_and(|f| super::support::is_json_field(f)) {
                 "json".to_owned()
-            } else if let Some(bounded @ (Declared::Char(_) | Declared::Varchar(_))) =
-                field.and_then(|f| declared(f))
-            {
+            } else if let Some((field, recorded)) = field.and_then(|f| declared(f).map(|d| (f, d))) {
                 // Recorded in the field (`crate::char_semantics`,
-                // `crate::declared`).
-                bounded.name(&DataType::Utf8)
+                // `crate::declared`, a source's `timestamp(1)` column).
+                recorded.name(field.data_type())
             } else {
                 trino_type_name(call.arg(0)?.data_type())
             };
@@ -105,4 +103,78 @@ pub(crate) fn mod_function() -> ScalarUDF {
 
 pub(crate) fn udfs() -> Vec<ScalarUDF> {
     vec![if_function(), typeof_function(), mod_function()]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{
+        RecordBatch, StringArray, Time64MicrosecondArray, TimestampMillisecondArray,
+    };
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+
+    use crate::trino_types::Declared;
+
+    /// `typeof` names the type a field declares besides its Arrow type: a
+    /// `timestamp(1)` carried in milliseconds, a `time(4)` in microseconds.
+    #[tokio::test]
+    async fn typeof_names_the_declared_type() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts1", DataType::Timestamp(TimeUnit::Millisecond, None), true)
+                .with_metadata(Declared::Timestamp(1).metadata()),
+            Field::new(
+                "tz2",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                true,
+            )
+            .with_metadata(Declared::Timestamp(2).metadata()),
+            Field::new("t4", DataType::Time64(TimeUnit::Microsecond), true)
+                .with_metadata(Declared::Time(4).metadata()),
+            Field::new("v5", DataType::Utf8, true).with_metadata(Declared::Varchar(5).metadata()),
+            Field::new("ts3", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(vec![100])),
+                Arc::new(TimestampMillisecondArray::from(vec![120]).with_timezone("UTC")),
+                Arc::new(Time64MicrosecondArray::from(vec![1_234])),
+                Arc::new(StringArray::from(vec!["ab"])),
+                Arc::new(TimestampMillisecondArray::from(vec![123])),
+            ],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_udf(super::typeof_function());
+        ctx.register_table(
+            "t",
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
+        )
+        .unwrap();
+        let batches = ctx
+            .sql("SELECT typeof(ts1), typeof(tz2), typeof(t4), typeof(v5), typeof(ts3) FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let names: Vec<String> = batches[0]
+            .columns()
+            .iter()
+            .map(|c| datafusion::arrow::util::display::array_value_to_string(c, 0).unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "timestamp(1)",
+                "timestamp(2) with time zone",
+                "time(4)",
+                "varchar(5)",
+                "timestamp(3)"
+            ]
+        );
+    }
 }

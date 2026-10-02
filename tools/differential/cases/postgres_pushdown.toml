@@ -1,7 +1,8 @@
 description = """A PostgreSQL table read through both engines' `pg` catalog: what CodeLake
 sends to PostgreSQL must not change the answer. The text column sorts by an ICU
-collation (pt-BR) and the sessions run in America/Sao_Paulo (stack/postgres-source.sql),
-where PostgreSQL disagrees with Trino on ordering and on zoneless timestamps; the
+collation (pt-BR) and the role's default zone is America/Sao_Paulo (stack/postgres-source.sql;
+both engines' sessions run in Etc/UTC here, ISS-060), where PostgreSQL disagrees with Trino on
+ordering and on zoneless timestamps; the
 engine's own functions (count_if, arrays_overlap, subscripts, FILTER) do not exist
 there under those names."""
 oracle = "trino"

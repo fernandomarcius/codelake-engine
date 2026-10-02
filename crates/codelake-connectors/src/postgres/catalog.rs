@@ -8,8 +8,9 @@
 //!   `f`), outside the system schemas (`pg_*`, `information_schema`). They are
 //!   not filtered by privilege: reading one the user may not read fails at
 //!   the source (`permission denied`), as on the reference engine.
-//! - Columns: in order, with the Arrow type of [`super::types`]; an array
-//!   column whose elements have no type there is left out.
+//! - Columns: in order, with the Arrow type of [`super::types`] (and the
+//!   precision it declares besides); an array column whose elements have no
+//!   type there is left out.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -26,7 +27,7 @@ use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{
 use codelake_core::catalog::NameSource;
 
 use super::pool::{PgPool, db_error};
-use super::types::{Column, arrow_type};
+use super::types::{Column, arrow_type, declared};
 
 const SCHEMAS: &str = "
 SELECT nspname::text
@@ -148,7 +149,11 @@ pub(super) async fn schema_of(client: &Client, schema: &str, table: &str) -> Res
         else {
             continue;
         };
-        fields.push(Field::new(column.name, data_type, !column.not_null));
+        let field = Field::new(&column.name, data_type, !column.not_null);
+        fields.push(match declared(&column) {
+            Some(declared) => field.with_metadata(declared.metadata()),
+            None => field,
+        });
     }
     Ok(Schema::new(fields))
 }

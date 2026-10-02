@@ -107,9 +107,9 @@ class Case:
             raise CaseError(f"{where}: rows_json is for the value oracle")
         self.session = raw.get("codelake_session")
         self.time_zone = raw.get("time_zone", defaults.get("time_zone"))
-        if self.time_zone is not None and (self.protocol != "trino" or self.oracle != "trino"):
-            raise CaseError(f"{where}: time_zone (X-Trino-Time-Zone, to both engines) is for the trino oracle "
-                            "over the trino protocol")
+        if self.time_zone is not None and (self.protocol != "trino" or self.oracle not in ("trino", "value")):
+            raise CaseError(f"{where}: time_zone (X-Trino-Time-Zone, to both engines) is for the trino or value "
+                            "oracle over the trino protocol")
         self.note = raw.get("note")
 
     @property
