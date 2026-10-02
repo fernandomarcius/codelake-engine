@@ -1179,6 +1179,12 @@ mod tests {
                 ["datafusion", "system"],
                 "{ddl}"
             );
+            // No connector serves it: Trino's name of an in-memory catalog's.
+            assert_eq!(
+                rows(&ctx, "SELECT * FROM system.metadata.catalogs ORDER BY 1").await,
+                ["datafusion datafusion memory", "system system system"],
+                "{ddl}"
+            );
         }
         let names = |catalogs: &dyn CatalogProviderList| listed_catalogs(catalogs);
         let ctx = context();
@@ -1430,5 +1436,15 @@ mod tests {
         ] {
             assert!(names.iter().any(|n| n == name), "{name}");
         }
+        // Name, java.sql.Types code, precision, searchable and radix as Trino 431 lists them.
+        let listed = |name: &str| TYPES.iter().find(|t| t.0 == name).copied();
+        assert_eq!(listed("tinyint"), Some(("tinyint", -6, Some(3), 3, Some(10))));
+        assert_eq!(listed("bigint"), Some(("bigint", -5, Some(19), 3, Some(10))));
+        assert_eq!(
+            listed("varbinary"),
+            Some(("varbinary", -3, Some(UNBOUNDED), 3, None))
+        );
+        assert_eq!(listed("array"), Some(("array", 2003, None, 0, None)));
+        assert_eq!(rows[2][1], ScalarValue::Int64(Some(4)));
     }
 }
