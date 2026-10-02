@@ -239,6 +239,27 @@ class Session(unittest.TestCase):
         self.assertEqual(runner.split_session("/*CLSESSION b=2*/SELECT 1", "a=1"), ("SELECT 1", "a=1,b=2"))
         self.assertEqual(runner.split_session("SELECT 1", "a=1"), ("SELECT 1", "a=1"))
 
+    def test_codelake_setup_takes_the_session_prefix(self):
+        calls = []
+
+        class Engine:
+            def query(self, sql, catalog, schema=None, session=None, time_zone=None):
+                calls.append((sql, session))
+                return {"rows": []}
+
+        class Engines:
+            trino = Engine()
+            codelake = Engine()
+
+        class Suite:
+            name = "s"
+            setup = []
+            setup_trino = []
+            setup_codelake = ["/*CLSESSION hive.x=true*/ ALTER TABLE t EXECUTE optimize", "SELECT 1"]
+
+        self.assertEqual(runner.run_setup(Engines(), Suite()), [])
+        self.assertEqual(calls, [("ALTER TABLE t EXECUTE optimize", "hive.x=true"), ("SELECT 1", None)])
+
     def test_catalog_templates(self):
         self.assertEqual(runner.for_trino("{c}.s.t_{e}"), "memory.s.t_tr")
         self.assertEqual(runner.for_codelake("{c}.s.t_{e}"), "datafusion.s.t_cl")

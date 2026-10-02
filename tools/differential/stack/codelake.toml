@@ -21,11 +21,12 @@ spill_limit = "2GiB"
 metadata_cache_limit = "8MiB"
 
 # The warehouse Trino 431 writes too (hive.properties): files one engine
-# writes, the other reads.
+# writes, the other reads. Spelled as Trino's hive.metastore.catalog.dir
+# (`file:/wh`): "$path" values start with it on both engines.
 [[source]]
 name = "hive"
 kind = "hive"
-warehouse = "/wh"
+warehouse = "file:/wh"
 
 # Trino 431 shares this warehouse: its file metastore names (ISS-011).
 [source.metastore_names]

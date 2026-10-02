@@ -65,6 +65,15 @@ versioning: [SemVer](https://semver.org/).
   stay the small views (1 MB of hash tables instead of 1.5 GB).
 
 ### Added
+- Hive hidden columns, as the reference engine's Hive connector has them: `"$path"` (the URI of a row's
+  data file: the `warehouse` as written, then `<schema>/<table>/<file>`), `"$file_size"` (`bigint`) and
+  `"$file_modified_time"` (`timestamp(3) with time zone`, UTC). A query reads, filters, groups and joins
+  by them, in views too; `*`, `DESCRIBE`, `SHOW COLUMNS` and `information_schema` never show them; a filter
+  on them alone (`"$path" = '…'`) reads only the files it keeps. `"$partition"` and `"$bucket"` are
+  unknown columns (no partitioned or bucketed table is read). The 8 production views of `dte` read
+  `"$path"`. A `*` over several tables whose hidden columns the query reads, joined by `USING`, is
+  refused (ISS-065). Write `warehouse` as the reference's `hive.metastore.catalog.dir` for the paths to
+  match.
 - Distributed execution (M4, ADR 0011), behind the `distributed` feature: a `[distributed]` coordinator
   plans every query and sends the stages of those that read only Hive tables to its workers
   (datafusion-distributed 3.0.0, patched in `vendor/`); each node keeps its memory ceiling. Single node

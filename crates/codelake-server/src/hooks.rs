@@ -212,6 +212,10 @@ pub(crate) async fn plan_checked(session_context: &SessionContext, sql: &str) ->
         other => (other, None),
     };
     codelake_core::regroup_distinct_from(&mut statement);
+    // Hive hidden columns (`"$path"`, …) the statement names.
+    codelake_core::hidden_columns::expose(&state, &mut statement)
+        .await
+        .map_err(api_error)?;
     let plan = state.statement_to_plan(statement).await.map_err(api_error)?;
     let plan = match &prepared {
         Some(prepared) => prepared.record(plan).map_err(api_error)?,
@@ -306,15 +310,20 @@ impl QueryHook for SimpleRunHook {
         let changed = identifier_case::fold_identifiers(&mut folded);
         let prepared = codelake_core::postgres_statement(&folded);
         let regrouped = codelake_core::regrouped_statement(&prepared.statement);
-        if !changed && !prepared.differs() && regrouped.is_none() {
+        let hidden = codelake_core::hidden_columns::names_hidden_columns(&folded);
+        if !changed && !prepared.differs() && regrouped.is_none() && !hidden {
             return None;
         }
         let planned = regrouped.unwrap_or_else(|| prepared.statement.clone());
-        let planned = session_context
-            .state()
-            .statement_to_plan(datafusion::sql::parser::Statement::Statement(Box::new(planned)))
-            .await
-            .and_then(|plan| prepared.record(plan));
+        let mut planned = datafusion::sql::parser::Statement::Statement(Box::new(planned));
+        let state = session_context.state();
+        let planned = match codelake_core::hidden_columns::expose(&state, &mut planned).await {
+            Ok(()) => state
+                .statement_to_plan(planned)
+                .await
+                .and_then(|plan| prepared.record(plan)),
+            Err(err) => Err(err),
+        };
         Some(planned.map_err(api_error))
     }
 

@@ -69,7 +69,7 @@ stops startup.
 | `postgres` | `host`, `port` (5432), `database`, `user`, `password_env`, `sslmode` (`verify-full`), `decimal_mapping` (`strict`), `decimal_rounding_mode` (`unnecessary`), `decimal_default_scale` (0) | `numeric` without precision: below |
 | `mysql` | `host`, `port` (3306), `database`, `user`, `password_env`, `sslmode` (`required`) | |
 | `mongodb` | `connection_string_env` | the whole URI is the secret |
-| `hive` | `warehouse` (absolute path or `file:` URL), `timestamp_precision` (`MILLISECONDS`, `MICROSECONDS`, `NANOSECONDS`), `parquet_time_zone` (`America/Sao_Paulo`), `[source.metastore_names]` (below) | Parquet in the file-metastore layout (ADR 0007). S3/MinIO warehouses are not in this build |
+| `hive` | `warehouse` (absolute path or `file:` URL, spelled as the reference engine's `hive.metastore.catalog.dir` when it shares the warehouse: the hidden column `"$path"` starts with it), `timestamp_precision` (`MILLISECONDS`, `MICROSECONDS`, `NANOSECONDS`), `parquet_time_zone` (`America/Sao_Paulo`), `[source.metastore_names]` (below) | Parquet in the file-metastore layout (ADR 0007). S3/MinIO warehouses are not in this build |
 
 ### PostgreSQL `numeric` without precision
 

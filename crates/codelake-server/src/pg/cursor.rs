@@ -754,13 +754,13 @@ impl QueryHook for CursorHook {
                 codelake_core::identifier_case::fold_identifiers(inner);
             }
             codelake_core::regroup_distinct_from(&mut query);
-            return Some(
-                session_context
-                    .state()
-                    .statement_to_plan(query)
-                    .await
-                    .map_err(|error| PgWireError::ApiError(Box::new(error))),
-            );
+            let state = session_context.state();
+            // Hive hidden columns (`"$path"`, …) the query names.
+            let planned = match codelake_core::hidden_columns::expose(&state, &mut query).await {
+                Ok(()) => state.statement_to_plan(query).await,
+                Err(error) => Err(error),
+            };
+            return Some(planned.map_err(|error| PgWireError::ApiError(Box::new(error))));
         }
         matches!(
             statement,

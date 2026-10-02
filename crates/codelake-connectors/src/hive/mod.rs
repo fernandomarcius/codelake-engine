@@ -9,6 +9,8 @@ mod exact_timestamps;
 #[cfg(test)]
 mod f2_tests;
 #[cfg(test)]
+mod hidden_columns_tests;
+#[cfg(test)]
 mod limits_redteam_tests;
 #[cfg(test)]
 mod limits_tests;
@@ -197,6 +199,7 @@ impl HiveConnector {
             }
         };
         let metastore = FileMetastore::new(store, root)
+            .with_location(&self.params.warehouse)
             .with_timestamp_precision(self.precision)
             .with_parquet_time_zone(self.zone)
             .with_names(self.names.clone());

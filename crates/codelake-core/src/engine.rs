@@ -1107,7 +1107,13 @@ impl Engine {
             }
             Some(Prepared::View { .. }) | None => {}
         }
-        let plan = traced(Phase::Plan, state.statement_to_plan(statement)).await?;
+        let mut statement = statement;
+        let plan = traced(Phase::Plan, async {
+            // Hive hidden columns (`"$path"`, …) the statement names.
+            crate::hidden_columns::expose(&state, &mut statement).await?;
+            state.statement_to_plan(statement).await
+        })
+        .await?;
         statement_policy::check_plan(&plan)?;
         crate::operand_checks::check_plan(&plan)?;
         if ddl::is_routable(&plan)
@@ -2993,6 +2999,40 @@ mod tests {
             .unwrap();
         let n = count[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(n.value(0), 1);
+    }
+
+    #[tokio::test]
+    async fn statements_read_the_hidden_columns_they_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), ByteSize::mib(64));
+        run(&engine, "CREATE TABLE t AS SELECT 1 AS a").await.unwrap();
+        // The table as a catalog with hidden columns serves it under its
+        // second name (`crate::hidden_columns`).
+        let hidden = engine
+            .context()
+            .sql(
+                "SELECT 1 AS a, 'f1' AS \"$path\", CAST(5 AS bigint) AS \"$file_size\", \
+                 now() AS \"$file_modified_time\"",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let table = datafusion::datasource::MemTable::try_new(hidden[0].schema(), vec![hidden]).unwrap();
+        engine
+            .context()
+            .register_table(
+                datafusion::common::TableReference::bare(crate::hidden_columns::with_hidden_columns("t")),
+                Arc::new(table),
+            )
+            .unwrap();
+        let rows = run(&engine, "SELECT *, \"$path\" FROM t").await.unwrap();
+        let schema = rows[0].schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["a", "$path"]);
+        let star = run(&engine, "SELECT * FROM t").await.unwrap();
+        assert_eq!(star[0].num_columns(), 1);
     }
 
     async fn run(engine: &Engine, sql: &str) -> Result<Vec<RecordBatch>, DataFusionError> {

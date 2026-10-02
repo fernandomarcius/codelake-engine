@@ -36,7 +36,7 @@ them as part of the migration.
 | `postgresql` | `postgres` | `jdbc:postgresql://<host>:<port>/<db>` → `host`, `port`, `database`; TLS → `sslmode` |
 | `mysql` | `mysql` | `jdbc:mysql://<host>:<port>` → `host`, `port`; the database → `database` |
 | `mongodb` | `mongodb` | `mongodb.connection-url` → a secret named by `connection_string_env` |
-| `hive` with `hive.metastore=file` | `hive` | `hive.metastore.catalog.dir=file:///<path>` → `warehouse = "<path>"`; `hive.timestamp-precision` → `timestamp_precision` |
+| `hive` with `hive.metastore=file` | `hive` | `hive.metastore.catalog.dir` → `warehouse`, spelled exactly as there (`file:///<path>`, `file:/<path>` or `<path>`): the hidden column `"$path"` starts with it, as on the reference engine; `hive.timestamp-precision` → `timestamp_precision` |
 
 ```toml
 [[source]]

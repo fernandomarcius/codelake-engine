@@ -24,6 +24,7 @@ pub mod federation_policy;
 mod function_names;
 pub mod functions;
 pub mod governance;
+pub mod hidden_columns;
 pub mod identifier_case;
 pub mod information_schema;
 pub mod join_guard;
