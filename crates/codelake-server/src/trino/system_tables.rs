@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use codelake_core::information_schema::refresh_listing;
 use datafusion::arrow::array::{ArrayRef, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::information_schema::{INFORMATION_SCHEMA, InformationSchemaProvider};
@@ -731,6 +732,17 @@ impl Rows {
     }
 
     async fn collect(&self, emit: &mut (dyn FnMut(Row) -> Result<()> + Send)) -> Result<()> {
+        // The kinds that list schemas and tables.
+        if matches!(
+            self.kind,
+            Kind::JdbcSchemas | Kind::JdbcTables | Kind::JdbcColumns | Kind::TableComments
+        ) {
+            for name in self.catalog_names() {
+                if let Some(catalog) = self.catalogs.catalog(&name) {
+                    refresh_listing(catalog.as_ref()).await;
+                }
+            }
+        }
         match self.kind {
             Kind::Catalogs => {
                 for name in self.catalog_names() {

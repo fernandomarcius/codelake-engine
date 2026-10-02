@@ -66,6 +66,8 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream;
 
+use crate::catalog::FederatedCatalog;
+
 /// Catalogs of the engine, each with its own `information_schema`.
 #[derive(Debug, Default)]
 pub struct CatalogList {
@@ -174,6 +176,28 @@ impl SchemaProvider for LowerCaseSchema {
 
     fn table_exist(&self, name: &str) -> bool {
         self.inner.table_exist(&name.to_lowercase())
+    }
+}
+
+/// Reads again the names of a catalog that follows its source
+/// ([`FederatedCatalog::refresh`]) before they are listed, looking through the
+/// wrappers of this module; other catalogs have nothing to read. A source that
+/// cannot be listed now is logged and listed as it was last read.
+pub async fn refresh_listing(catalog: &dyn CatalogProvider) {
+    let mut catalog = catalog;
+    loop {
+        if let Some(with) = catalog.downcast_ref::<WithInformationSchema>() {
+            catalog = with.catalog.as_ref();
+        } else if let Some(tolerant) = catalog.downcast_ref::<Tolerant>() {
+            catalog = tolerant.catalog.as_ref();
+        } else {
+            break;
+        }
+    }
+    if let Some(federated) = catalog.downcast_ref::<FederatedCatalog>()
+        && let Err(error) = federated.refresh().await
+    {
+        tracing::warn!(%error, "catalog listed as last read: its source cannot be listed");
     }
 }
 
@@ -479,6 +503,7 @@ impl Rows {
     }
 
     async fn collect(&self, emit: &mut (dyn FnMut(Row) -> Result<()> + Send)) -> Result<()> {
+        refresh_listing(self.catalog.as_ref()).await;
         let catalog = self.catalog_name.as_str();
         match self.kind {
             Kind::Schemata => {
@@ -804,6 +829,66 @@ mod tests {
     async fn count(ctx: &SessionContext, sql: &str) -> i64 {
         let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
         batches[0].column(0).as_primitive::<Int64Type>().value(0)
+    }
+
+    /// Names of a source that a test changes, for a live listing.
+    #[derive(Debug, Default)]
+    struct Names {
+        tables: std::sync::Mutex<Vec<String>>,
+        down: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl crate::catalog::NameSource for Names {
+        async fn list(&self) -> Result<std::collections::BTreeMap<String, Vec<String>>> {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(DataFusionError::Execution("source down".into()));
+            }
+            Ok([("s".to_owned(), self.tables.lock().unwrap().clone())].into())
+        }
+
+        async fn find(&self, _: &str, _: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Debug)]
+    struct Empty;
+
+    #[async_trait]
+    impl crate::catalog::TableResolver for Empty {
+        async fn resolve(&self, _: &str, _: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+            Ok(Some(Arc::new(datafusion::datasource::empty::EmptyTable::new(
+                Arc::new(Schema::empty()),
+            ))))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listing_reads_again_a_catalog_that_follows_its_source() {
+        let ctx = ctx();
+        let names = Arc::new(Names::default());
+        names.tables.lock().unwrap().push("a".to_owned());
+        let listing = crate::catalog::LiveListing::read(names.clone(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        ctx.register_catalog("src", Arc::new(FederatedCatalog::live(listing, Arc::new(Empty))));
+        let tables = "SELECT count(*) FROM src.information_schema.tables WHERE table_schema = 's'";
+        assert_eq!(count(&ctx, tables).await, 1);
+
+        names.tables.lock().unwrap().push("b".to_owned());
+        assert_eq!(count(&ctx, tables).await, 2);
+        // Through the wrappers a catalog list hands out.
+        names.tables.lock().unwrap().push("c".to_owned());
+        let catalog = ctx.catalog("src").unwrap();
+        refresh_listing(catalog.as_ref()).await;
+        assert_eq!(catalog.schema("s").unwrap().table_names(), vec!["a", "b", "c"]);
+
+        // A source that cannot be listed is listed as last read.
+        names.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(count(&ctx, tables).await, 3);
+        // Other catalogs have nothing to read.
+        refresh_listing(ctx.catalog("other").unwrap().as_ref()).await;
     }
 
     #[tokio::test]

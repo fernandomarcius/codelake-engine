@@ -58,6 +58,11 @@ codelake-connectors = { path = "crates/codelake-connectors" }
 # which rustls refuses.
 tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "native-tls"] }
 bb8 = "0.9"
+# PostgreSQL connections of the connector's own pool (the upstream pool sets a
+# Redshift parameter PostgreSQL refuses, ISS-060); versions already in the graph.
+bb8-postgres = "0.9"
+postgres-native-tls = "0.5"
+native-tls = "0.2"
 
 # Hive catalog (Trino file metastore layout)
 object_store = { version = "0.13", default-features = false, features = ["fs"] }
