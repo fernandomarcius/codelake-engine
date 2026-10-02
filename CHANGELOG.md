@@ -260,6 +260,21 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- Availability, found by the shadow's production-query replay (2026-10-02; ADR 0018, ISS-063): ~1000 idle
+  HTTP keep-alive connections left every new client — `SELECT 1`, the health checks — waiting until it
+  timed out, with nothing logged. The server ran with the container's soft open-files limit (1024), never
+  closed an idle connection, and its accept loops retried `EMFILE` in silence (PostgreSQL: in a busy
+  loop). Now the server raises its soft limit to the hard one (`server.open_files_limit` caps it), gives
+  each listener a share of it (`server.reserved_files` kept apart; `[server.trino] max_connections`) and
+  answers a client past the share at once (HTTP `503`, PostgreSQL `53300`); HTTP connections are closed
+  after `server.http_idle_timeout_secs` (200, the reference's) idle and `server.http_header_read_timeout_secs`
+  (30) without a complete request head; when descriptors run out anyway, a spare descriptor answers the
+  waiting client (the ops listener serves the probe), `accept` errors are logged once per 10 s and
+  retried with a pause. New metrics: `codelake_connections_{open,max,refused_total,closed_total}`,
+  `codelake_accept_errors_total`, `codelake_open_files{,_limit}`. `fdprobe` (1100 idle connections, then
+  a new `SELECT 1`; soft limit 1024, hard 524288): before, 1012 served and every new client timed out;
+  after, 1100 served, `SELECT 1` in 4 ms while they are held, all closed after 200 s idle. With a hard
+  limit of 1024 that cannot be raised: 480 served, the other 620 answered `503` at once.
 - Found by the differential gate (2026-10-01, ISS-032 item 8; a union first took the finest unit of its
   inputs, below — this replaces that with the common type):
   - **Wrong result**: timestamps of different precisions met in the coarser one, dropping the fraction.

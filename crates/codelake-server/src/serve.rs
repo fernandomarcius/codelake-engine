@@ -4,12 +4,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use codelake_core::{Engine, EngineError, TrinoProtocolConfig, ValidatedConfig};
-use datafusion_postgres::ServerOptions;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::net::listener::{GuardedListener, OnExhausted};
+use crate::net::{http, limits};
 use crate::{hooks, ops, pg, trino};
 
 /// How often abandoned queries are canceled and old ones forgotten.
@@ -27,6 +28,8 @@ pub(crate) enum ServeError {
     Metrics(#[from] metrics_exporter_prometheus::BuildError),
     #[error("PostgreSQL listener stopped: {0}")]
     PgListener(String),
+    #[error("connection limits: {0}")]
+    Limits(String),
     #[cfg(not(feature = "distributed"))]
     #[error("[distributed] is configured but this build has no `distributed` feature")]
     NotDistributed,
@@ -56,6 +59,8 @@ pub(crate) fn run(validated: ValidatedConfig, session_sampling: Option<f64>) -> 
 async fn serve(validated: ValidatedConfig, session_sampling: Option<f64>) -> Result<(), ServeError> {
     let ValidatedConfig { config, secrets } = validated;
     let prometheus = PrometheusBuilder::new().install_recorder()?;
+    // First: source pools, spill and data files open descriptors too.
+    let (budget, timeouts) = connection_limits(&config.server)?;
 
     std::fs::create_dir_all(&config.memory.spill_dir)?;
     let mut engine = Engine::with_governance(
@@ -82,7 +87,7 @@ async fn serve(validated: ValidatedConfig, session_sampling: Option<f64>) -> Res
         #[cfg(feature = "distributed")]
         {
             if worker {
-                return serve_worker(engine, distributed.listen, &config, prometheus).await;
+                return serve_worker(engine, distributed.listen, &config, prometheus, timeouts).await;
             }
             coordinate(&mut engine, distributed, &config)?;
         }
@@ -97,27 +102,35 @@ async fn serve(validated: ValidatedConfig, session_sampling: Option<f64>) -> Res
 
     let state = Arc::new(ops::OpsState::new(Arc::clone(&engine), prometheus));
     let shutdown = CancellationToken::new();
-    let http_listener = TcpListener::bind(config.server.http_listen).await?;
-    info!(addr = %config.server.http_listen, "ops HTTP listening");
     let http = tokio::spawn(
-        axum::serve(http_listener, ops::router(Arc::clone(&state)))
-            .with_graceful_shutdown(shutdown.clone().cancelled_owned())
-            .into_future(),
+        start_ops(
+            config.server.http_listen,
+            ops::router(Arc::clone(&state)),
+            timeouts,
+            shutdown.clone(),
+        )
+        .await?,
     );
 
-    let trino = match &config.server.trino {
-        Some(settings) => Some(start_trino(&engine, settings, &shutdown).await?),
-        None => None,
+    let trino = match (&config.server.trino, budget.trino) {
+        (Some(settings), Some(max)) => Some(start_trino(&engine, settings, max, timeouts, &shutdown).await?),
+        _ => None,
     };
 
     let server = &config.server;
-    let tls = server.tls.as_ref();
-    let options = ServerOptions::new()
-        .with_host(server.pg_listen.ip().to_string())
-        .with_port(server.pg_listen.port())
-        .with_max_connections(server.max_connections)
-        .with_tls_cert_path(tls.map(|t| t.cert_path.display().to_string()))
-        .with_tls_key_path(tls.map(|t| t.key_path.display().to_string()));
+    let tls = server
+        .tls
+        .as_ref()
+        .map(|t| crate::net::pg::tls_acceptor(&t.cert_path, &t.key_path))
+        .transpose()?;
+    let pg_listener = GuardedListener::new(
+        TcpListener::bind(server.pg_listen).await?,
+        "pg",
+        budget.pg,
+        OnExhausted::Refuse,
+        crate::net::pg::refusal,
+    );
+    info!(addr = %server.pg_listen, tls = tls.is_some(), "PostgreSQL listening");
     let session = Arc::new(engine.context().clone());
     let handlers = Arc::new(pg::Handlers::new(
         Arc::clone(&engine),
@@ -127,10 +140,9 @@ async fn serve(validated: ValidatedConfig, session_sampling: Option<f64>) -> Res
     spawn_sweeper(&engine, trino.clone(), &shutdown);
 
     tokio::select! {
-        result = datafusion_postgres::serve_with_handlers(handlers, &options) => {
+        () = crate::net::pg::serve(pg_listener, handlers, tls) => {
             shutdown.cancel();
-            let reason = result.err().map_or_else(|| "exited".to_owned(), |e| e.to_string());
-            return Err(ServeError::PgListener(reason));
+            return Err(ServeError::PgListener("exited".to_owned()));
         }
         () = shutdown_signal() => {}
     }
@@ -146,11 +158,38 @@ async fn serve(validated: ValidatedConfig, session_sampling: Option<f64>) -> Res
     warn!(?grace, "shutdown requested, draining");
     tokio::time::sleep(grace).await;
     shutdown.cancel();
-    if let Ok(Err(err)) = http.await {
+    if let Err(err) = http.await {
         warn!(error = %err, "ops HTTP server ended with error");
     }
     info!("shutdown complete");
     Ok(())
+}
+
+/// Raises the open-files limit and shares it between the listeners
+/// (ADR 0018).
+fn connection_limits(
+    server: &codelake_core::config::ServerConfig,
+) -> Result<(limits::Budget, http::Timeouts), ServeError> {
+    let open_files = limits::raise_open_files(server.open_files_limit);
+    let budget = limits::budget(
+        open_files.soft,
+        server.reserved_files,
+        server.max_connections,
+        limits::TrinoShare::of(server.trino.as_ref()),
+    )
+    .map_err(ServeError::Limits)?;
+    info!(
+        ops = budget.ops,
+        pg = budget.pg,
+        trino = ?budget.trino,
+        reserved = server.reserved_files,
+        "connection limits"
+    );
+    let timeouts = http::Timeouts {
+        idle: Duration::from_secs(server.http_idle_timeout_secs),
+        header_read: Duration::from_secs(server.http_header_read_timeout_secs),
+    };
+    Ok((budget, timeouts))
 }
 
 /// Makes `engine` the coordinator of `distributed.workers`. A connection to a
@@ -187,15 +226,19 @@ async fn serve_worker(
     listen: std::net::SocketAddr,
     config: &codelake_core::Config,
     prometheus: metrics_exporter_prometheus::PrometheusHandle,
+    timeouts: http::Timeouts,
 ) -> Result<(), ServeError> {
     let engine = Arc::new(engine);
     let state = Arc::new(ops::OpsState::new(Arc::clone(&engine), prometheus));
     let shutdown = CancellationToken::new();
-    let http_listener = TcpListener::bind(config.server.http_listen).await?;
     let http = tokio::spawn(
-        axum::serve(http_listener, ops::router(Arc::clone(&state)))
-            .with_graceful_shutdown(shutdown.clone().cancelled_owned())
-            .into_future(),
+        start_ops(
+            config.server.http_listen,
+            ops::router(Arc::clone(&state)),
+            timeouts,
+            shutdown.clone(),
+        )
+        .await?,
     );
     info!(addr = %listen, "distributed worker listening");
     let stop = shutdown.clone();
@@ -208,10 +251,30 @@ async fn serve_worker(
     .await;
     state.start_draining();
     shutdown.cancel();
-    if let Ok(Err(err)) = http.await {
+    if let Err(err) = http.await {
         warn!(error = %err, "ops HTTP server ended with error");
     }
     served.map_err(|e| ServeError::Distributed(e.to_string()))
+}
+
+/// Binds the ops listener (probes, `/metrics`) and returns its serving loop.
+/// On descriptor exhaustion it serves the client it accepts on its spare
+/// descriptor: a probe gets its real answer (ADR 0018).
+async fn start_ops(
+    addr: std::net::SocketAddr,
+    router: axum::Router,
+    timeouts: http::Timeouts,
+    shutdown: CancellationToken,
+) -> Result<impl std::future::Future<Output = ()> + Send + 'static, ServeError> {
+    let listener = GuardedListener::new(
+        TcpListener::bind(addr).await?,
+        "ops",
+        limits::OPS_MAX_CONNECTIONS,
+        OnExhausted::Serve,
+        http::refusal,
+    );
+    info!(%addr, "ops HTTP listening");
+    Ok(http::serve(listener, router, timeouts, shutdown))
 }
 
 /// Starts the HTTP statement protocol listener; its catalog `system` adds the
@@ -219,6 +282,8 @@ async fn serve_worker(
 async fn start_trino(
     engine: &Arc<Engine>,
     settings: &TrinoProtocolConfig,
+    max_connections: usize,
+    timeouts: http::Timeouts,
     shutdown: &CancellationToken,
 ) -> Result<Arc<trino::TrinoState>, ServeError> {
     let limits = trino::Limits {
@@ -239,13 +304,20 @@ async fn start_trino(
     engine
         .context()
         .register_catalog("system", state.system_catalog().map_err(EngineError::from)?);
-    let listener = TcpListener::bind(settings.listen).await?;
-    info!(addr = %settings.listen, "Trino protocol listening");
-    tokio::spawn(
-        axum::serve(listener, trino::router(Arc::clone(&state)))
-            .with_graceful_shutdown(shutdown.clone().cancelled_owned())
-            .into_future(),
+    let listener = GuardedListener::new(
+        TcpListener::bind(settings.listen).await?,
+        "trino",
+        max_connections,
+        OnExhausted::Refuse,
+        http::refusal,
     );
+    info!(addr = %settings.listen, max_connections, "Trino protocol listening");
+    tokio::spawn(http::serve(
+        listener,
+        trino::router(Arc::clone(&state)),
+        timeouts,
+        shutdown.clone(),
+    ));
     Ok(state)
 }
 

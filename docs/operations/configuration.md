@@ -112,7 +112,7 @@ per-user limit restrains well-behaved clients, not a hostile one.
 | `server.pg_listen` | PostgreSQL wire (psql, BI tools) |
 | `server.http_listen` | ops HTTP: `/livez`, `/readyz`, `/healthz`, `/metrics` |
 | `[server.trino] listen` | client HTTP protocol (`/v1/statement`; the CLI, JDBC, Python and dbt clients of the reference engine). Off when the table is absent |
-| `server.max_connections` | PostgreSQL connections (default 256) |
+| `server.max_connections` | PostgreSQL connections (default 256); one more is answered `FATAL 53300 sorry, too many clients already` |
 | `server.shutdown_grace_secs` | drain time after SIGTERM (default 30); keep it below the orchestrator's kill timeout |
 | `[server.trino] max_active_queries` | accepted and unfinished queries (default 100); more are refused with `QUERY_QUEUE_FULL` |
 | `[server.trino] client_timeout_secs` | a query whose client stops polling this long is canceled (`ABANDONED_QUERY`, default 300) |
@@ -120,7 +120,41 @@ per-user limit restrains well-behaved clients, not a hostile one.
 | `[server.trino] max_query_length` | longest SQL text (1 000 000 characters) |
 | `[server.trino] header_prefix` | prefix of the protocol's headers (`X-CodeLake-`: `X-CodeLake-User`, `X-CodeLake-Catalog`, …); clients built for another engine send that engine's prefix, set here (ISS-011) |
 | `[server.trino] reported_version` | version in `/v1/info` and `version()` (the CodeLake version); some clients check it |
+| `[server.trino] max_connections` | open connections of the Trino listener; one more gets `503` at once. Default: what the open-files limit leaves (below) |
 | `server.tls` | `cert_path`, `key_path` for the PostgreSQL listener; a missing file stops startup |
+
+### Connections and file descriptors
+
+Every connection holds a file descriptor; ADR 0018 has the reasons and the
+measurements.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `server.open_files_limit` | the hard limit | soft `RLIMIT_NOFILE` the server sets at startup (logged as `open files limit` with `soft_before`, `soft`, `hard`); never above the hard limit, which only the platform raises (`ulimit -Hn`, Docker `--ulimit nofile=`, systemd `LimitNOFILE=`). Must exceed `reserved_files + max_connections` |
+| `server.reserved_files` | 256 | descriptors never given to client connections: source pools, spill and data files, logs |
+| `server.http_idle_timeout_secs` | 200 | ops and Trino listeners: a connection with no request in flight is closed this long after its last response (the reference engine's `http-server.net.max-idle-time`) |
+| `server.http_header_read_timeout_secs` | 30 | ops and Trino listeners: time for a request head to arrive in full, from the connection's opening (first request) or the head's first byte (next ones) |
+
+How the limit is shared (logged at startup as `connection limits`): the
+reserve, 32 connections for the ops listener (probes and `/metrics` keep
+answering when the query listeners are full), `server.max_connections` for
+PostgreSQL, the rest for the Trino listener. A limit that cannot hold them
+stops startup with the arithmetic. With a soft limit of 1024 that cannot be
+raised: 1024 − 256 − 32 − 256 = 480 Trino connections.
+
+At the limit a listener answers at once and closes — HTTP `503` with
+`retry-after: 1`, PostgreSQL `53300` — instead of leaving the client
+waiting. If descriptors run out anyway (`EMFILE`, counted in
+`codelake_accept_errors_total{error="descriptors"}`), each listener answers
+the waiting client with a spare descriptor (query listeners `503` / `53000`,
+the ops listener the probe itself), logs one line per 10 s and retries with
+a pause of 5 ms to 1 s. Raise `reserved_files` when that counter grows.
+
+PostgreSQL sessions have no idle timeout, as in PostgreSQL
+(`idle_session_timeout = 0`): BI tools keep pooled sessions on purpose. Their
+number is bounded by `server.max_connections`; TCP keepalive ends the
+sessions of clients that vanished; a client that never completes its startup
+is dropped after 60 s.
 
 **There is no client authentication yet** on either query listener (ROADMAP
 M1 item 5). Anyone who reaches the port can query every catalog with the

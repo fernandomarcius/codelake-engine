@@ -95,6 +95,12 @@ tokio-util = "0.7"
 futures = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json", "query"] }
+# The HTTP listeners' connection loop (idle and header-read timeouts, connection
+# limits; ADR 0018): the versions axum already brings.
+hyper = { version = "1.11", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
+http-body = "1.0"
+tower-service = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 toml = "1.1"

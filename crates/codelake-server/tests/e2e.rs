@@ -30,6 +30,9 @@ mod pg_operands;
 #[path = "e2e/limits_redteam.rs"]
 mod limits_redteam;
 
+#[path = "e2e/connection_limits.rs"]
+mod connection_limits;
+
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
