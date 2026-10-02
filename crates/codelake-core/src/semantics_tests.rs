@@ -1403,3 +1403,516 @@ async fn a_view_lists_the_text_types_of_its_rows() {
     )
     .await;
 }
+
+/// Timestamps of different precisions meet in the highest one, the fraction
+/// kept, however many inputs a union has (`a UNION ALL b UNION ALL c` is a
+/// union of `a UNION ALL b` and `c`, planned with the coarser unit): a union
+/// of `timestamp(3)` and `timestamp(0)` was `timestamp(0)` and dropped the
+/// `.123`. A precision no Arrow unit has is declared on the column, and an
+/// input's own declaration does not round the others. Types and values
+/// observed on Trino 431 (differential file `timestamp_common_types`).
+#[tokio::test]
+async fn timestamps_meet_in_the_highest_precision_across_every_input_of_a_union() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    let ms = "TIMESTAMP '2026-01-01 10:00:00.123'";
+    let s = "TIMESTAMP '2026-01-01 10:00:00'";
+    let s11 = "TIMESTAMP '2026-01-01 11:00:00'";
+    assert_same(
+        &engine,
+        &[
+            (
+                &format!("SELECT x FROM (SELECT {ms} AS x UNION ALL SELECT {s}) ORDER BY 1"),
+                answer(
+                    &["timestamp(3)"],
+                    &[&["2026-01-01T10:00:00"], &["2026-01-01T10:00:00.123"]],
+                ),
+            ),
+            (
+                &format!("SELECT x FROM (SELECT {s} AS x UNION ALL SELECT {ms}) ORDER BY 1"),
+                answer(
+                    &["timestamp(3)"],
+                    &[&["2026-01-01T10:00:00"], &["2026-01-01T10:00:00.123"]],
+                ),
+            ),
+            (
+                &format!(
+                    "SELECT x FROM (SELECT {s} AS x UNION ALL SELECT {ms} \
+                     UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.123456') ORDER BY 1"
+                ),
+                answer(
+                    &["timestamp(6)"],
+                    &[
+                        &["2026-01-01T10:00:00"],
+                        &["2026-01-01T10:00:00.123"],
+                        &["2026-01-01T10:00:00.123456"],
+                    ],
+                ),
+            ),
+            (
+                &format!(
+                    "SELECT x FROM (SELECT {s} AS x UNION ALL SELECT {s11} UNION ALL SELECT {ms}) ORDER BY 1"
+                ),
+                answer(
+                    &["timestamp(3)"],
+                    &[
+                        &["2026-01-01T10:00:00"],
+                        &["2026-01-01T10:00:00.123"],
+                        &["2026-01-01T11:00:00"],
+                    ],
+                ),
+            ),
+            (
+                &format!(
+                    "SELECT x FROM (SELECT {ms} AS x UNION ALL SELECT {s} UNION ALL SELECT {s11}) ORDER BY 1"
+                ),
+                answer(
+                    &["timestamp(3)"],
+                    &[
+                        &["2026-01-01T10:00:00"],
+                        &["2026-01-01T10:00:00.123"],
+                        &["2026-01-01T11:00:00"],
+                    ],
+                ),
+            ),
+            (
+                &format!(
+                    "SELECT x FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.000' AS x UNION SELECT {s} \
+                     UNION SELECT {ms}) ORDER BY 1"
+                ),
+                answer(
+                    &["timestamp(3)"],
+                    &[&["2026-01-01T10:00:00"], &["2026-01-01T10:00:00.123"]],
+                ),
+            ),
+        ],
+    )
+    .await;
+}
+
+/// The precision of a timestamp no Arrow unit has (`timestamp(1)`,
+/// `timestamp(7)`) is declared on the union's column; one input's
+/// declaration does not round the others; a date counts as `timestamp(0)`.
+#[tokio::test]
+async fn declared_timestamp_precisions_meet_across_a_union() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    let ms = "TIMESTAMP '2026-01-01 10:00:00.123'";
+    let s = "TIMESTAMP '2026-01-01 10:00:00'";
+    assert_same(
+        &engine,
+        &[
+            (
+                &format!(
+                    "SELECT x FROM (SELECT {s} AS x UNION ALL SELECT NULL \
+                     UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.5') ORDER BY 1"
+                ),
+                answer(
+                    &["timestamp(1)"],
+                    &[&["2026-01-01T10:00:00"], &["2026-01-01T10:00:00.500"], &["NULL"]],
+                ),
+            ),
+            (
+                "SELECT x FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.1' AS x \
+                 UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.12') ORDER BY 1",
+                answer(
+                    &["timestamp(2)"],
+                    &[&["2026-01-01T10:00:00.100"], &["2026-01-01T10:00:00.120"]],
+                ),
+            ),
+            (
+                &format!("SELECT x FROM (SELECT {ms} AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.1') ORDER BY 1"),
+                answer(
+                    &["timestamp(3)"],
+                    &[&["2026-01-01T10:00:00.100"], &["2026-01-01T10:00:00.123"]],
+                ),
+            ),
+            (
+                "SELECT x FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.1234567' AS x \
+                 UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.12345678') ORDER BY 1",
+                answer(
+                    &["timestamp(8)"],
+                    &[&["2026-01-01T10:00:00.123456700"], &["2026-01-01T10:00:00.123456780"]],
+                ),
+            ),
+            (
+                &format!(
+                    "SELECT x FROM (SELECT {ms} AS x UNION ALL SELECT DATE '2026-01-02' \
+                     UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.1234') ORDER BY 1"
+                ),
+                answer(
+                    &["timestamp(4)"],
+                    &[
+                        &["2026-01-01T10:00:00.123"],
+                        &["2026-01-01T10:00:00.123400"],
+                        &["2026-01-02T00:00:00"],
+                    ],
+                ),
+            ),
+            (
+                &format!("SELECT typeof(x), CAST(x AS varchar) FROM (SELECT DATE '2026-01-01' AS x UNION ALL SELECT {ms}) ORDER BY 2"),
+                answer(
+                    &["varchar", "varchar"],
+                    &[
+                        &["timestamp(3)", "2026-01-01 00:00:00.000"],
+                        &["timestamp(3)", "2026-01-01 10:00:00.123"],
+                    ],
+                ),
+            ),
+        ],
+    )
+    .await;
+}
+
+/// With a time zone the same, in the zone the values share; a timestamp
+/// without time zone meeting one with is the local time in the session
+/// zone.
+#[tokio::test]
+async fn zoned_timestamps_meet_in_the_highest_precision() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    let zone = Some("America/Sao_Paulo");
+    for (sql, expected) in [
+        (
+            "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.123 America/Sao_Paulo' AS x \
+             UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00 America/Sao_Paulo') ORDER BY 2",
+            answer(
+                &["varchar", "varchar"],
+                &[
+                    &[
+                        "timestamp(3) with time zone",
+                        "2026-01-01 10:00:00.000 America/Sao_Paulo",
+                    ],
+                    &[
+                        "timestamp(3) with time zone",
+                        "2026-01-01 10:00:00.123 America/Sao_Paulo",
+                    ],
+                ],
+            ),
+        ),
+        (
+            "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00 America/Sao_Paulo' AS x \
+             UNION ALL SELECT TIMESTAMP '2026-01-01 11:00:00 America/Sao_Paulo' \
+             UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.123456 America/Sao_Paulo') ORDER BY 2",
+            answer(
+                &["varchar", "varchar"],
+                &[
+                    &[
+                        "timestamp(6) with time zone",
+                        "2026-01-01 10:00:00.000000 America/Sao_Paulo",
+                    ],
+                    &[
+                        "timestamp(6) with time zone",
+                        "2026-01-01 10:00:00.123456 America/Sao_Paulo",
+                    ],
+                    &[
+                        "timestamp(6) with time zone",
+                        "2026-01-01 11:00:00.000000 America/Sao_Paulo",
+                    ],
+                ],
+            ),
+        ),
+        (
+            "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.123' AS x \
+             UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00 America/Sao_Paulo') ORDER BY 2",
+            answer(
+                &["varchar", "varchar"],
+                &[
+                    &[
+                        "timestamp(3) with time zone",
+                        "2026-01-01 10:00:00.000 America/Sao_Paulo",
+                    ],
+                    &[
+                        "timestamp(3) with time zone",
+                        "2026-01-01 10:00:00.123 America/Sao_Paulo",
+                    ],
+                ],
+            ),
+        ),
+        (
+            "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.123' AS x \
+             UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00 UTC' UNION ALL SELECT TIMESTAMP '2026-01-01 11:00:00 UTC') \
+             ORDER BY 2",
+            answer(
+                &["varchar", "varchar"],
+                &[
+                    &["timestamp(3) with time zone", "2026-01-01 10:00:00.000 UTC"],
+                    &["timestamp(3) with time zone", "2026-01-01 11:00:00.000 UTC"],
+                    &["timestamp(3) with time zone", "2026-01-01 13:00:00.123 UTC"],
+                ],
+            ),
+        ),
+    ] {
+        assert_eq!(run_in(&engine, zone, sql).await.unwrap(), expected, "{sql}");
+    }
+}
+
+/// Columns of a table (as a SQL Server `datetime` and `smalldatetime` or a
+/// hive `timestamp(3)` meet a `timestamp(0)`), and what `CREATE TABLE AS`
+/// stores for their union.
+#[tokio::test]
+async fn timestamp_columns_meet_in_the_highest_precision() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    for statement in [
+        "CREATE SCHEMA datafusion.tsp",
+        "CREATE TABLE datafusion.tsp.cols AS SELECT CAST(TIMESTAMP '2026-01-01 10:00:00' AS timestamp(0)) AS s0, \
+         CAST(TIMESTAMP '2026-01-01 10:00:00.1' AS timestamp(1)) AS s1, \
+         CAST(TIMESTAMP '2026-01-01 10:00:00.123' AS timestamp(3)) AS s3, \
+         CAST(TIMESTAMP '2026-01-01 10:00:00.123456' AS timestamp(6)) AS s6",
+        "CREATE TABLE datafusion.tsp.mixed AS SELECT s3 AS x FROM datafusion.tsp.cols \
+         UNION ALL SELECT s0 FROM datafusion.tsp.cols UNION ALL SELECT s0 FROM datafusion.tsp.cols",
+    ] {
+        run(&engine, statement).await;
+    }
+    let cols = |c: &str| format!("SELECT {c} AS x FROM datafusion.tsp.cols");
+    assert_same(
+        &engine,
+        &[
+            (
+                &format!(
+                    "SELECT x FROM ({} UNION ALL {}) ORDER BY 1",
+                    cols("s0"),
+                    cols("s3")
+                ),
+                answer(
+                    &["timestamp(3)"],
+                    &[&["2026-01-01T10:00:00"], &["2026-01-01T10:00:00.123"]],
+                ),
+            ),
+            (
+                &format!(
+                    "SELECT x FROM ({} UNION ALL {} UNION ALL {}) ORDER BY 1",
+                    cols("s0"),
+                    cols("s0"),
+                    cols("s6")
+                ),
+                answer(
+                    &["timestamp(6)"],
+                    &[
+                        &["2026-01-01T10:00:00"],
+                        &["2026-01-01T10:00:00"],
+                        &["2026-01-01T10:00:00.123456"],
+                    ],
+                ),
+            ),
+            (
+                &format!(
+                    "SELECT x FROM ({} UNION ALL {}) ORDER BY 1",
+                    cols("s0"),
+                    cols("s1")
+                ),
+                answer(
+                    &["timestamp(1)"],
+                    &[&["2026-01-01T10:00:00"], &["2026-01-01T10:00:00.100"]],
+                ),
+            ),
+            (
+                &format!(
+                    "SELECT count(*) FROM ({} UNION {} UNION {} UNION {})",
+                    cols("s0"),
+                    cols("s3"),
+                    cols("s6"),
+                    cols("CAST(s0 AS timestamp(6))")
+                ),
+                answer(&["bigint"], &[&["3"]]),
+            ),
+            (
+                "SELECT column_name, data_type FROM datafusion.information_schema.columns \
+                 WHERE table_schema = 'tsp' AND table_name = 'mixed'",
+                answer(&["varchar", "varchar"], &[&["x", "timestamp(3)"]]),
+            ),
+            (
+                "SELECT x FROM datafusion.tsp.mixed ORDER BY 1",
+                answer(
+                    &["timestamp(3)"],
+                    &[
+                        &["2026-01-01T10:00:00"],
+                        &["2026-01-01T10:00:00"],
+                        &["2026-01-01T10:00:00.123"],
+                    ],
+                ),
+            ),
+        ],
+    )
+    .await;
+}
+
+/// `VALUES`, `CASE`, `coalesce`, `INTERSECT` and `EXCEPT` meet in the same
+/// type, and keep a `time(p)` (ISS-061): `VALUES` of `timestamp(3)` and
+/// `timestamp(0)` was `timestamp(0)`, a `CASE` of a date and a
+/// `timestamp(3)` was `timestamp(9)`, `EXCEPT` of the two failed.
+#[tokio::test]
+async fn timestamps_and_times_meet_in_values_case_and_set_operations() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    let ms = "TIMESTAMP '2026-01-01 10:00:00.123'";
+    let s = "TIMESTAMP '2026-01-01 10:00:00'";
+    let cases = "(VALUES true, false) t(b)";
+    assert_same(
+        &engine,
+        &[
+            (
+                &format!("SELECT x FROM (VALUES {ms}, {s}) t(x) ORDER BY 1"),
+                answer(&["timestamp(3)"], &[&["2026-01-01T10:00:00"], &["2026-01-01T10:00:00.123"]]),
+            ),
+            (
+                "SELECT x FROM (VALUES TIMESTAMP '2026-01-01 10:00:00.1', TIMESTAMP '2026-01-01 10:00:00.12') t(x) \
+                 ORDER BY 1",
+                answer(
+                    &["timestamp(2)"],
+                    &[&["2026-01-01T10:00:00.100"], &["2026-01-01T10:00:00.120"]],
+                ),
+            ),
+            (
+                &format!("SELECT CASE WHEN b THEN {s} ELSE {ms} END AS y FROM {cases} ORDER BY 1"),
+                answer(&["timestamp(3)"], &[&["2026-01-01T10:00:00"], &["2026-01-01T10:00:00.123"]]),
+            ),
+            (
+                &format!(
+                    "SELECT CASE WHEN b THEN TIMESTAMP '2026-01-01 10:00:00.1' \
+                     ELSE TIMESTAMP '2026-01-01 10:00:00.12' END AS y FROM {cases} ORDER BY 1"
+                ),
+                answer(
+                    &["timestamp(2)"],
+                    &[&["2026-01-01T10:00:00.100"], &["2026-01-01T10:00:00.120"]],
+                ),
+            ),
+            (
+                &format!("SELECT CASE WHEN b THEN DATE '2026-01-01' ELSE {ms} END AS y FROM {cases} ORDER BY 1"),
+                answer(&["timestamp(3)"], &[&["2026-01-01T00:00:00"], &["2026-01-01T10:00:00.123"]]),
+            ),
+            (
+                "SELECT coalesce(TIMESTAMP '2026-01-01 10:00:00.1', TIMESTAMP '2026-01-01 10:00:00.12') AS y",
+                answer(&["timestamp(2)"], &[&["2026-01-01T10:00:00.100"]]),
+            ),
+            (
+                &format!("SELECT x FROM (SELECT {ms} AS x EXCEPT SELECT {s})"),
+                answer(&["timestamp(3)"], &[&["2026-01-01T10:00:00.123"]]),
+            ),
+            (
+                &format!("SELECT x FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.000' AS x INTERSECT SELECT {s})"),
+                answer(&["timestamp(3)"], &[&["2026-01-01T10:00:00"]]),
+            ),
+            (
+                "SELECT x FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.1' AS x \
+                 INTERSECT SELECT TIMESTAMP '2026-01-01 10:00:00.10')",
+                answer(&["timestamp(2)"], &[&["2026-01-01T10:00:00.100"]]),
+            ),
+            (
+                &format!("SELECT a.x, b.y FROM (SELECT {s} AS x) a CROSS JOIN (SELECT {ms} AS y) b"),
+                answer(
+                    &["timestamp(0)", "timestamp(3)"],
+                    &[&["2026-01-01T10:00:00", "2026-01-01T10:00:00.123"]],
+                ),
+            ),
+            (
+                "SELECT x FROM (SELECT TIME '10:00:00.123' AS x UNION ALL SELECT TIME '10:00:00') ORDER BY 1",
+                answer(&["time(3)"], &[&["10:00:00"], &["10:00:00.123"]]),
+            ),
+            (
+                "SELECT x FROM (SELECT TIME '10:00:00' AS x UNION ALL SELECT TIME '11:00:00' \
+                 UNION ALL SELECT TIME '10:00:00.12345') ORDER BY 1",
+                answer(&["time(5)"], &[&["10:00:00"], &["10:00:00.123450"], &["11:00:00"]]),
+            ),
+            (
+                &format!("SELECT CASE WHEN b THEN TIME '10:00:00' ELSE TIME '10:00:00.123' END AS y FROM {cases} ORDER BY 1"),
+                answer(&["time(3)"], &[&["10:00:00"], &["10:00:00.123"]]),
+            ),
+            (
+                "SELECT x FROM (VALUES TIME '10:00:00.250') t(x)",
+                answer(&["time(3)"], &[&["10:00:00.250"]]),
+            ),
+        ],
+    )
+    .await;
+}
+
+/// Nanoseconds are never the common type of a coarser value: a nanosecond
+/// timestamp holds only the years 1677 to 2262, and a column of
+/// microseconds or milliseconds holds `9999-12-31` (the open-end sentinel of
+/// SQL Server `datetime2`); widening it overflowed. The values meet in
+/// microseconds, a nanosecond value exactly or refused, never rounded.
+#[tokio::test]
+async fn nanoseconds_meet_coarser_timestamps_in_microseconds() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    let sentinel = "TIMESTAMP '9999-12-31 23:59:59.999999'";
+    let nanos = "CAST(TIMESTAMP '2026-01-01 10:00:00.123' AS timestamp(9))";
+    let cases = "(VALUES true, false) t(b)";
+    assert_same(
+        &engine,
+        &[
+            (
+                &format!("SELECT x FROM (SELECT {sentinel} AS x UNION ALL SELECT {nanos}) ORDER BY 1"),
+                answer(
+                    &["timestamp(6)"],
+                    &[&["2026-01-01T10:00:00.123"], &["9999-12-31T23:59:59.999999"]],
+                ),
+            ),
+            (
+                &format!("SELECT coalesce({sentinel}, {nanos}), greatest({nanos}, {sentinel})"),
+                answer(
+                    &["timestamp(6)", "timestamp(6)"],
+                    &[&["9999-12-31T23:59:59.999999", "9999-12-31T23:59:59.999999"]],
+                ),
+            ),
+            (
+                &format!("SELECT CASE WHEN b THEN {sentinel} ELSE {nanos} END AS y FROM {cases} ORDER BY 1"),
+                answer(
+                    &["timestamp(6)"],
+                    &[&["2026-01-01T10:00:00.123"], &["9999-12-31T23:59:59.999999"]],
+                ),
+            ),
+            (
+                &format!("SELECT x FROM (VALUES {sentinel}, {nanos}) t(x) ORDER BY 1"),
+                answer(
+                    &["timestamp(6)"],
+                    &[&["2026-01-01T10:00:00.123"], &["9999-12-31T23:59:59.999999"]],
+                ),
+            ),
+        ],
+    )
+    .await;
+    // Nanoseconds among themselves, or a nanosecond column: nanoseconds.
+    assert_same(
+        &engine,
+        &[(
+            "SELECT TIMESTAMP '2026-01-01 10:00:00.1234567' < TIMESTAMP '2026-01-01 10:00:00.1234568', \
+             x > TIMESTAMP '2026-01-01 10:00:00.123', x = TIMESTAMP '2026-01-01 10:00:00.1234567' \
+             FROM (VALUES CAST(TIMESTAMP '2026-01-01 10:00:00.1234567' AS timestamp(9))) t(x)",
+            answer(&["boolean", "boolean", "boolean"], &[&["true", "true", "true"]]),
+        )],
+    )
+    .await;
+    // Compared with a constant in nanoseconds: in microseconds, so the
+    // sentinel does not overflow.
+    assert_same(
+        &engine,
+        &[(
+            &format!(
+                "SELECT x = {nanos}, x > {nanos}, x < CAST(TIMESTAMP '2026-01-01 10:00:00.1234560' AS timestamp(9)) \
+                 FROM (VALUES {sentinel}, TIMESTAMP '2026-01-01 10:00:00.123') t(x) ORDER BY x"
+            ),
+            answer(
+                &["boolean", "boolean", "boolean"],
+                &[&["true", "false", "true"], &["false", "true", "false"]],
+            ),
+        )],
+    )
+    .await;
+    for sql in [
+        format!("SELECT x FROM (VALUES {sentinel}) t(x) WHERE x = TIMESTAMP '2026-01-01 10:00:00.1234567'"),
+        format!(
+            "SELECT x FROM (SELECT {sentinel} AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.1234567')"
+        ),
+        "SELECT coalesce(CAST(NULL AS timestamp(6)), TIMESTAMP '2026-01-01 10:00:00.1234567')".to_owned(),
+    ] {
+        assert_error(
+            &engine,
+            &sql,
+            "TIMESTAMP '2026-01-01 10:00:00.123456700' has more than 6 fraction digits",
+        )
+        .await;
+    }
+}

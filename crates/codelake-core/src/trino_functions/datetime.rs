@@ -816,8 +816,12 @@ pub(crate) fn parse_date(text: &str) -> Option<NaiveDate> {
 // Session constants: current_timestamp, localtimestamp, current_date, …
 // ---------------------------------------------------------------------------
 
+/// The instant to fold the session constants with: the statement's start
+/// ([`super::support::StatementClock`]), never while a plan is optimized
+/// without a start time (a prepared statement folds them when executed).
 fn start_time(info: &SimplifyContext) -> Option<DateTime<Utc>> {
-    info.query_execution_start_time()
+    let start = info.query_execution_start_time()?;
+    Some(super::support::statement_start(info.config_options()).unwrap_or(start))
 }
 
 fn precision_unit(precision: i64) -> Result<TimeUnit> {
@@ -935,7 +939,7 @@ pub(crate) fn current_timestamp() -> ScalarUDF {
                 Some(Arc::from(r.zone)),
             ))
         },
-        |call| repeat(&current_timestamp_value(Utc::now(), call.return_type)?, call.rows),
+        |call| repeat(&current_timestamp_value(call.now, call.return_type)?, call.rows),
     )
     .alias("now")
     .volatility(Volatility::Stable)
@@ -951,7 +955,7 @@ pub(crate) fn localtimestamp() -> ScalarUDF {
         |r| Ok(DataType::Timestamp(literal_precision(r)?, None)),
         |call| {
             repeat(
-                &localtimestamp_value(Utc::now(), &call.zone, call.return_type)?,
+                &localtimestamp_value(call.now, &call.zone, call.return_type)?,
                 call.rows,
             )
         },
@@ -968,7 +972,7 @@ pub(crate) fn current_date() -> ScalarUDF {
         |name, types| coerce_each(name, types, &[]),
         |_| Ok(DataType::Date32),
         |call| {
-            let days = days_from_date(local_now(Utc::now(), &call.zone)?.date());
+            let days = days_from_date(local_now(call.now, &call.zone)?.date());
             repeat(&ScalarValue::Date32(Some(days)), call.rows)
         },
     )
@@ -997,7 +1001,7 @@ fn wall_time(name: &'static str) -> ScalarUDF {
         |name, types| coerce_each(name, types, &[]),
         |_| Ok(DataType::Time32(TimeUnit::Millisecond)),
         |call| {
-            let local = local_now(Utc::now(), &call.zone)?;
+            let local = local_now(call.now, &call.zone)?;
             let millis = i32::try_from(local.num_seconds_from_midnight()).unwrap_or(0) * 1_000
                 + i32::try_from(local.nanosecond() / 1_000_000).unwrap_or(0);
             Ok(Arc::new(Time32MillisecondArray::from(vec![

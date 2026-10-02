@@ -54,13 +54,23 @@ fn carried(key: &str) -> bool {
     !key.starts_with("distributed.") && !key.starts_with("codelake_session.")
 }
 
+/// Every option of `options` under the key `ConfigOptions::set` takes:
+/// `ConfigOptions::entries` names an extension's options without the
+/// extension's prefix (`start_nanos`, not `codelake_statement_clock.start_nanos`),
+/// which a worker could not set ("could not find config namespace").
 fn entries(options: &ConfigOptions) -> Vec<(String, Option<String>)> {
-    options
+    let own = options
         .entries()
         .into_iter()
-        .filter(|entry| carried(&entry.key))
-        .map(|entry| (entry.key, entry.value))
-        .collect()
+        .filter(|entry| entry.key.starts_with("datafusion."))
+        .map(|entry| (entry.key, entry.value));
+    let extensions = options.extensions.iter().flat_map(|(prefix, extension)| {
+        extension
+            .entries()
+            .into_iter()
+            .map(move |entry| (format!("{prefix}.{}", entry.key), entry.value))
+    });
+    own.chain(extensions).filter(|(key, _)| carried(key)).collect()
 }
 
 /// The settings of `query` that differ from `base`, encoded for
@@ -312,5 +322,34 @@ mod tests {
         assert_eq!(restored.execution.time_zone.as_deref(), Some("America/Sao_Paulo"));
         assert_eq!(restored.catalog.default_schema, "vendas");
         assert_eq!(encode_difference(&base, &base_options), "");
+    }
+
+    /// An extension's option reaches the worker under its prefix: the
+    /// statement's start (`now()` on every worker) and the engine's
+    /// join-spill setting.
+    #[test]
+    fn extension_settings_are_carried_under_their_prefix() {
+        use codelake_core::StatementClock;
+        let with_extensions = || {
+            let mut options = ConfigOptions::default();
+            options.extensions.insert(StatementClock::default());
+            options
+        };
+        let base_options = with_extensions();
+        let base = entries(&base_options);
+        let mut query = with_extensions();
+        query.extensions.get_mut::<StatementClock>().unwrap().start_nanos = Some(1_767_261_600_123_456_789);
+        let encoded = encode_difference(&base, &query);
+        let mut restored = with_extensions();
+        apply_difference(&mut restored, &encoded).unwrap();
+        assert_eq!(
+            restored.extensions.get::<StatementClock>().unwrap().start_nanos,
+            Some(1_767_261_600_123_456_789)
+        );
+        assert!(
+            entries(&query)
+                .iter()
+                .all(|(key, _)| !key.starts_with("codelake_session."))
+        );
     }
 }

@@ -13,5 +13,9 @@
   the reference engine too); a `time(9)` value fails to parse there. Values are equal.
 - Fix: a time unit per precision with the engine's own coercion between time units (planning and
   `VALUES`), or the declaration carried through the expressions that keep their input's type.
+- Partly fixed 2026-10-01 (`fix/union-timestamp-precision`, ISS-032 item 8): `VALUES`, `UNION`,
+  `INTERSECT`/`EXCEPT`, `CASE` and `coalesce`/`greatest`/`least` declare the highest `time(p)` of their
+  values (`VALUES TIME '12:00:00.250'` is `time(3)`, `CT8` is `OK`). Still `time(9)`: functions and other
+  expressions over a time, `CAST(x AS time)`, and `typeof`/`CAST(x AS varchar)` of a time.
 - Revisit when: a client reads times computed by an expression.
 - References: differential case `client_protocol` CT8.

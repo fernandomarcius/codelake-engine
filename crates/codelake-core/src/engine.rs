@@ -847,6 +847,7 @@ impl Engine {
         }
         ctx.register_udf(crate::coercion::named_cast());
         ctx.register_udf(crate::coercion::exact_cast());
+        ctx.register_udf(crate::coercion::exact_micros());
         crate::trino_functions::install(&mut ctx)?;
         // Every derived state resolves each name as this one does.
         crate::function_names::settle(&mut ctx.state_ref().write())?;
@@ -999,6 +1000,17 @@ impl Engine {
         if let Some(zone) = &options.time_zone {
             state.config_mut().options_mut().execution.time_zone = Some(zone.clone());
             with_functions_for_config(&mut state)?;
+        }
+        // One instant for the statement's session constants (`now()`, …).
+        if let Some(clock) = state
+            .config_mut()
+            .options_mut()
+            .extensions
+            .get_mut::<crate::trino_functions::StatementClock>()
+        {
+            clock.start_nanos = chrono::Utc::now()
+                .timestamp_nanos_opt()
+                .and_then(|nanos| u64::try_from(nanos).ok());
         }
         if let Some(value) = options
             .properties

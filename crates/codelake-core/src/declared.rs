@@ -119,7 +119,7 @@ fn declared_of(scalar: Option<&ScalarValue>) -> Result<Option<Declared>> {
 }
 
 /// The smallest Arrow unit holding `p` fraction digits.
-fn unit_for(precision: u8) -> TimeUnit {
+pub(crate) fn unit_for(precision: u8) -> TimeUnit {
     match precision {
         0 => TimeUnit::Second,
         1..=3 => TimeUnit::Millisecond,
