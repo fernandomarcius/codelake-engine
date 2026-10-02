@@ -82,4 +82,5 @@ pub use session_properties::{
 pub use table_procedure::{ProcedureArgument, ProcedureCall, TableProcedure};
 pub use timestamps::trino_time_zone;
 pub use trace::{QueryTrace, TraceParent};
+pub use trino_functions::StatementClock;
 pub use trino_sql_checks::{regroup_distinct_from, regrouped_statement};

@@ -63,7 +63,7 @@ mod sketch;
 mod statistics;
 mod string;
 mod support;
-pub(crate) use support::StatementClock;
+pub use support::StatementClock;
 mod syntax;
 mod try_expr;
 mod url;
