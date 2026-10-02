@@ -52,7 +52,7 @@ schema (on its own task: that query still fails, the next one finds the schema).
   integer digits`, `more than 20 fraction digits`); it is never rounded nor cut. Cases: integration
   `unbounded_numerics_are_exact_or_fail_naming_the_column` (`1e20`, `1e18`,
   `0.123456789012345678901`, `NaN`, `±Infinity`, and 38 exact digits read whole); differential
-  `postgres_types_zone` PN2 (`EXTRA`), PN3–PN7 (`ERRO`, CodeLake's error pinned).
+  `postgres_types_zone` NUM2 (`EXTRA`), NUM3–NUM7 (`ERRO`, CodeLake's error pinned).
 
 ## Still different from the reference engine
 
