@@ -285,6 +285,26 @@ versioning: [SemVer](https://semver.org/).
     arrays of other types are left out of the relation, as the reference leaves them.
   - Every connection ran `SET json_serialization_enable` (a Redshift parameter), one `ERROR` in the server's
     log per connection. The connector opens plain sessions.
+- PostgreSQL, found by the second shadow run of the Warehouse boletos panel (2026-10-01 22:06, ISS-060):
+  - **Wrong result**: statements ran in the server's (or the role's) default `TimeZone`, so a view reading
+    `current_date` or `now()` answered another day between 21:00 and 24:00 in `America/Sao_Paulo`
+    (`saude_fontes`: `dias_sem_recebimento` 23 against 22, `recebimentos_30d` 22 against 30). Each
+    statement now runs in the client session's zone (`X-Trino-Time-Zone`, `SET TIME ZONE`; `Etc/UTC`
+    without one), set on its connection before it runs, so a pooled connection carries no zone from one
+    statement to the next. The reference engine runs its sessions in `Etc/UTC` whatever the client's zone:
+    with a client zone CodeLake answers the client's day (accepted divergence, ISS-060).
+  - `timestamp`, `timestamptz` and `time` columns were `timestamp(9)`, `timestamp(9) with time zone` and
+    `time(9)`; they have the precision PostgreSQL declares, as in the reference (6 without one:
+    `timestamp(6) with time zone`; `timestamp(3)`, `timestamp(1)`, `time(4)`…), also as array elements.
+  - **Wrong result**: a `timestamptz` outside 1677–2262 (a `9999-12-31` sentinel) was read as
+    `1970-01-01 00:00:00`, and a `timestamp` before 1970 failed the batch; timestamps travel as their
+    microseconds since 1970 and keep their whole range.
+  - A `numeric` without precision (`decimal(38,20)`) was decoded through a 96-bit decimal
+    (`rust_decimal`), which rounds past 28 significant digits, and a value above `decimal(38,20)`'s 18
+    integer digits but within 128 bits was kept as an invalid decimal. It travels as its text; a value that does not fit `decimal(38,20)` exactly (more than 18 integer or 20 fraction digits,
+    `NaN`, `±Infinity`) fails the query naming the column (`the PostgreSQL value NaN of column
+    "vl_recebido" does not fit decimal(38,20)`). The reference leaves such a column out of the relation
+    (`decimal-mapping=STRICT`): accepted divergence, ISS-060.
 - PostgreSQL sources get a pushdown policy, as SQL Server has: only what PostgreSQL evaluates exactly like
   the engine is sent to it. Found on a dashboard reading PostgreSQL views (2026-10-01):
   - `count_if`, `arrays_overlap`, array subscripts and `count(*) FILTER (WHERE …)` were sent as written

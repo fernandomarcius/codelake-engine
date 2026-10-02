@@ -25,7 +25,9 @@ it ends (also on failure):
 
 When a case file needs PostgreSQL, both engines also read it as a source, through a catalog
 named `pg` (Trino's `postgresql` connector, CodeLake's `postgres` connector) connected as the
-role `source`, whose sessions run in `America/Sao_Paulo` (`stack/postgres-source.sql`). Such a
+role `source`, whose default zone is `America/Sao_Paulo` (`stack/postgres-source.sql`); neither
+engine's statements keep it: Trino's run in `Etc/UTC`, CodeLake's in the client's zone (`Etc/UTC`
+without one; ISS-060). Such a
 file creates its tables in the `source` schema with `setup_postgres` and compares CodeLake with
 Trino reading the same rows (`postgres_pushdown.toml`). Every file's `setup_postgres` runs
 before CodeLake starts: CodeLake lists a source's tables once, when it starts.
@@ -116,7 +118,7 @@ Other case keys:
 | `oracle_sql` | trino oracle | the SQL Trino runs when it differs (inlined parameters) |
 | `rows_json = '[[1, null]]'` | value oracle | the expected rows (JSON: TOML has no null) |
 | `codelake_session = "k=v"` | trino protocol | `X-Trino-Session` sent to CodeLake only; the `/*CLSESSION k=v*/ SQL` prefix does the same |
-| `time_zone = "America/Sao_Paulo"` | trino oracle, trino protocol | `X-Trino-Time-Zone` sent to both engines (also at file level) |
+| `time_zone = "America/Sao_Paulo"` | trino or value oracle, trino protocol | `X-Trino-Time-Zone` sent to both engines (to CodeLake alone with the value oracle; also at file level) |
 | `types = false` | trino oracle | do not compare column types nor names |
 | `compare` | any | as at file level |
 
