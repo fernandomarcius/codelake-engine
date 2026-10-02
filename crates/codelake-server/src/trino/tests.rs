@@ -712,6 +712,63 @@ async fn show_create_answers_one_varchar_row() {
     }
 }
 
+/// `SHOW CATALOGS` and `SHOW SCHEMAS` as Trino 431 answers them (ISS-064):
+/// the catalog column is `varchar(n)` of the longest listed name, the engine's
+/// in-memory catalog is listed once a client created something in it.
+#[tokio::test]
+async fn catalogs_and_schemas_are_shown() {
+    use serde_json::json;
+    let h = harness();
+    let column = |out: &Outcome| out.columns.clone();
+    let catalogs = h.run("SHOW CATALOGS", &[]).await;
+    assert_eq!(
+        column(&catalogs),
+        [("Catalog".to_owned(), "varchar(6)".to_owned())]
+    );
+    assert_eq!(catalogs.rows, [[json!("system")]]);
+    let none = h.run("SHOW CATALOGS LIKE 'x%'", &[]).await;
+    assert_eq!(column(&none), [("Catalog".to_owned(), "varchar(6)".to_owned())]);
+    assert!(none.rows.is_empty());
+
+    assert_eq!(
+        h.run("CREATE SCHEMA datafusion.mine", &[]).await.state(),
+        "FINISHED"
+    );
+    let catalogs = h.run("SHOW CATALOGS", &[]).await;
+    assert_eq!(
+        column(&catalogs),
+        [("Catalog".to_owned(), "varchar(10)".to_owned())]
+    );
+    assert_eq!(catalogs.rows, [[json!("datafusion")], [json!("system")]]);
+    let like = h.run("SHOW CATALOGS LIKE 'd\\_t%' ESCAPE '\\'", &[]).await;
+    assert!(like.rows.is_empty(), "{:?}", like.rows);
+    let like = h.run("SHOW CATALOGS LIKE 'd%'", &[]).await;
+    assert_eq!(like.rows, [[json!("datafusion")]]);
+
+    let schemas = h.run("SHOW SCHEMAS FROM datafusion", &[]).await;
+    assert_eq!(column(&schemas), [("Schema".to_owned(), "varchar".to_owned())]);
+    assert_eq!(
+        schemas.rows,
+        [[json!("information_schema")], [json!("mine")], [json!("public")]]
+    );
+    let like = h.run("SHOW SCHEMAS IN \"DataFusion\" LIKE 'p%'", &[]).await;
+    assert_eq!(like.rows, [[json!("public")]]);
+    let quoted = h.run("SHOW SCHEMAS FROM datafusion LIKE 'it''s'", &[]).await;
+    assert_eq!(quoted.state(), "FINISHED", "{}", quoted.last);
+    assert!(quoted.rows.is_empty());
+    let session = h
+        .run("SHOW SCHEMAS LIKE 'm%'", &[("x-trino-catalog", "datafusion")])
+        .await;
+    assert_eq!(session.rows, [[json!("mine")]]);
+
+    let missing = h.run("SHOW SCHEMAS FROM nope", &[]).await;
+    assert_eq!(missing.error_name(), Some("CATALOG_NOT_FOUND"));
+    assert_eq!(missing.last["error"]["message"], "Catalog 'nope' does not exist");
+    let unset = h.run("SHOW SCHEMAS", &[]).await;
+    assert_eq!(unset.error_name(), Some("MISSING_CATALOG_NAME"));
+    assert_eq!(unset.last["error"]["errorCode"], 56);
+}
+
 #[tokio::test]
 async fn show_session_filters_and_formats_defaults() {
     let h = harness();

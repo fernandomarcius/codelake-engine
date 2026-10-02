@@ -1,0 +1,227 @@
+description = """
+What metadata clients read (DBeaver, the JDBC driver's DatabaseMetaData, ODBC tools): every
+`system.jdbc` table, `system.metadata`, `information_schema` and `SHOW CATALOGS` / `SHOW SCHEMAS`,
+over the hive catalog (written by the reference engine) and the PostgreSQL source `pg` (ISS-064).
+Found by the production-query replay on the shadow run (2026-10-02): `system.jdbc.types` had 18
+rows against 48, the engine's own `datafusion` catalog was listed, a SQL Server catalog lacked
+its `db_*`, `guest` and `sys` schemas (integration test `jdbc_metadata`, SQL Server 2022), and
+`system.jdbc.columns` named a `varchar(20)` column `varchar`. Before the fix a PostgreSQL relation
+with a `jsonb` column also failed the whole `system.jdbc.tables` listing of its catalog, and
+`SHOW CATALOGS` / `SHOW SCHEMAS` were refused.
+
+The reference engine here also has its image's catalogs (`jmx`, `memory`, `tpch`, `tpcds`):
+catalog listings are compared on the catalogs both have. Other case files create schemas in the
+engine's in-memory catalog, which is listed once used (ISS-064 item 2).
+"""
+oracle = "trino"
+compare = "multiset"
+
+setup_postgres = [
+  "CREATE SCHEMA jm_empty",
+  "GRANT USAGE ON SCHEMA jm_empty TO source",
+  "CREATE SCHEMA \"JmMixed\"",
+  "GRANT USAGE ON SCHEMA \"JmMixed\" TO source",
+  """CREATE TABLE source.jm_types (id INT NOT NULL, si SMALLINT, bi BIGINT, r REAL, f DOUBLE PRECISION,
+       d NUMERIC(10,2), t TEXT, b BOOLEAN, dt DATE, ts TIMESTAMP(3), ts6 TIMESTAMP, tz TIMESTAMPTZ,
+       tm TIME(3), by BYTEA, a INT[])""",
+  "CREATE VIEW source.jm_view AS SELECT id, d, t FROM source.jm_types",
+  "CREATE TABLE source.jm_bounded (id INT, vc VARCHAR(20), c CHAR(3))",
+  "CREATE TABLE source.jm_json (id INT, j JSONB)",
+  "GRANT SELECT ON ALL TABLES IN SCHEMA source TO source",
+]
+
+setup_trino = [
+  "CREATE SCHEMA hive.jm",
+  "CREATE SCHEMA hive.jm_empty",
+  """CREATE TABLE hive.jm.t (a bigint, b varchar(10), c decimal(5,2), d timestamp(3), h char(3),
+       i varbinary, j date, k boolean, l real, m double, n tinyint, o smallint, p integer, q varchar)""",
+  "CREATE VIEW hive.jm.v AS SELECT a, b, c FROM hive.jm.t",
+  "CREATE TABLE hive.jm.nested (e array(integer), f map(varchar, integer), g row(x integer, y varchar))",
+]
+
+# ---------------------------------------------------------------- system.jdbc
+
+[[case]]
+id = "JM1"
+sql = "SELECT * FROM system.jdbc.types"
+note = "Trino 431's 48 types, `integer` twice, whether CodeLake produces the type or not"
+
+[[case]]
+id = "JM2"
+sql = "SELECT table_schem, table_name, column_name, data_type, type_name, ordinal_position, is_nullable FROM system.jdbc.columns WHERE table_cat = 'system' AND table_schem IN ('jdbc', 'metadata')"
+note = "the columns of every system.jdbc and system.metadata table"
+
+[[case]]
+id = "JM3"
+sql = "SELECT * FROM system.jdbc.catalogs WHERE table_cat IN ('hive', 'pg', 'system')"
+
+[[case]]
+id = "JM4"
+sql = "SELECT * FROM system.jdbc.schemas WHERE table_catalog = 'pg' AND table_schem <> 'JmMixed' AND table_schem <> 'jmmixed'"
+note = "pg_catalog, public, source, an empty schema and the catalog's own information_schema"
+
+[[case]]
+id = "JM5"
+sql = "SELECT * FROM system.jdbc.schemas WHERE table_catalog = 'hive' AND table_schem LIKE 'jm%'"
+
+[[case]]
+id = "JM6"
+sql = "SELECT * FROM system.jdbc.tables WHERE table_cat = 'hive' AND table_schem LIKE 'jm%'"
+
+[[case]]
+id = "JM7"
+sql = "SELECT * FROM system.jdbc.tables WHERE table_cat = 'pg' AND table_schem = 'source' AND table_name LIKE 'jm%'"
+note = "jm_json is listed: a column of a type CodeLake does not read no longer fails the listing"
+
+[[case]]
+id = "JM8"
+sql = "SELECT * FROM system.jdbc.columns WHERE table_cat = 'hive' AND table_schem = 'jm' AND table_name IN ('t', 'v')"
+note = "varchar(10) and char(3) as declared (it was varchar), view columns nullable"
+
+[[case]]
+id = "JM9"
+sql = "SELECT * FROM system.jdbc.columns WHERE table_cat = 'pg' AND table_schem = 'source' AND table_name IN ('jm_types', 'jm_view')"
+
+[[case]]
+id = "JM10"
+sql = "SELECT * FROM system.jdbc.columns WHERE table_cat = 'pg' AND table_schem = 'source' AND table_name = 'jm_json'"
+expect = "WRONG"
+known = "ISS-064 item 5"
+note = "jsonb is not read by the PostgreSQL connector: the relation is listed without columns (the reference: id integer, j json)"
+
+[[case]]
+id = "JM11"
+sql = "SELECT * FROM system.jdbc.columns WHERE table_cat = 'pg' AND table_schem = 'source' AND table_name = 'jm_bounded'"
+expect = "WRONG"
+known = "ISS-064 item 5"
+note = "the PostgreSQL connector does not declare varchar(20) nor char(3) (varchar)"
+
+[[case]]
+id = "JM12"
+sql = "SELECT * FROM system.jdbc.columns WHERE table_cat = 'hive' AND table_schem = 'jm' AND table_name = 'nested'"
+expect = "WRONG"
+known = "ISS-064 item 5"
+note = "the hive connector does not read array, map nor row columns (unknown)"
+
+[[case]]
+id = "JM13"
+sql = "SELECT table_schem FROM system.jdbc.schemas WHERE table_catalog = 'pg' AND lower(table_schem) = 'jmmixed'"
+expect = "WRONG"
+known = "ISS-064 item 5"
+note = "the PostgreSQL connector keeps the case of a schema the reference folds to lower case"
+
+[[case]]
+id = "JM14"
+sql = "SELECT * FROM system.jdbc.table_types"
+
+[[case]]
+id = "JM15"
+sql = "SELECT * FROM system.jdbc.procedures"
+
+[[case]]
+id = "JM16"
+sql = "SELECT * FROM system.jdbc.procedure_columns"
+
+[[case]]
+id = "JM17"
+sql = "SELECT * FROM system.jdbc.pseudo_columns"
+
+[[case]]
+id = "JM18"
+sql = "SELECT * FROM system.jdbc.super_types"
+
+[[case]]
+id = "JM19"
+sql = "SELECT * FROM system.jdbc.super_tables"
+
+[[case]]
+id = "JM20"
+sql = "SELECT * FROM system.jdbc.udts"
+
+[[case]]
+id = "JM21"
+sql = "SELECT * FROM system.jdbc.attributes"
+
+[[case]]
+id = "JM22"
+sql = "SELECT * FROM system.jdbc.tables WHERE table_cat = 'system' AND table_schem = 'runtime'"
+expect = "WRONG"
+known = "ISS-064 item 4"
+note = "system.runtime has no nodes, tasks, transactions nor optimizer_rule_stats"
+
+# ---------------------------------------------------------------- system.metadata
+
+[[case]]
+id = "JM23"
+sql = "SELECT * FROM system.metadata.catalogs WHERE catalog_name IN ('hive', 'pg', 'system')"
+note = "connector_name postgresql (it was postgres)"
+
+[[case]]
+id = "JM24"
+sql = "SELECT * FROM system.metadata.table_comments WHERE catalog_name = 'hive' AND schema_name LIKE 'jm%'"
+
+[[case]]
+id = "JM25"
+sql = "SELECT * FROM system.metadata.materialized_views WHERE catalog_name IN ('hive', 'pg')"
+
+[[case]]
+id = "JM26"
+sql = "SELECT * FROM system.metadata.table_properties WHERE catalog_name = 'pg'"
+
+[[case]]
+id = "JM27"
+sql = "SELECT * FROM system.metadata.table_properties WHERE catalog_name = 'hive'"
+expect = "WRONG"
+accepted = "ISS-064 item 3"
+note = "CodeLake lists no property it would refuse in WITH (…)"
+
+# ---------------------------------------------------------------- information_schema
+
+[[case]]
+id = "JM28"
+sql = "SELECT * FROM pg.information_schema.schemata WHERE schema_name <> 'JmMixed' AND schema_name <> 'jmmixed'"
+
+[[case]]
+id = "JM29"
+sql = "SELECT * FROM pg.information_schema.tables WHERE table_schema = 'source' AND table_name LIKE 'jm%'"
+
+[[case]]
+id = "JM30"
+sql = "SELECT * FROM hive.information_schema.columns WHERE table_schema = 'jm' AND table_name IN ('t', 'v')"
+
+# ---------------------------------------------------------------- SHOW
+
+[[case]]
+id = "JM31"
+sql = "SHOW CATALOGS LIKE 'pg'"
+types = false
+note = "varchar(n) of the longest catalog name: the engines have other catalogs here (the integration test compares the type)"
+
+[[case]]
+id = "JM32"
+sql = "SHOW CATALOGS LIKE 'h%'"
+types = false
+
+[[case]]
+id = "JM33"
+sql = "SHOW SCHEMAS FROM pg LIKE 'jm\\_%' ESCAPE '\\'"
+compare = "ordered"
+note = "jm_empty; the mixed-case schema is not matched on either engine"
+
+[[case]]
+id = "JM34"
+sql = "SHOW SCHEMAS IN hive LIKE 'jm\\_%' ESCAPE '\\'"
+compare = "ordered"
+
+[[case]]
+id = "JM35"
+sql = "SHOW SCHEMAS FROM no_such_catalog"
+note = "CATALOG_NOT_FOUND on both"
+
+[[case]]
+id = "JM36"
+sql = "SHOW SCHEMAS FROM pg"
+compare = "ordered"
+expect = "WRONG"
+known = "ISS-064 item 5"
+note = "JmMixed against jmmixed"

@@ -36,14 +36,42 @@ use self::pool::{Manager, Pool};
 const BATCH_SIZE: usize = 8192;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
-const LIST_TABLES: &str = "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
-     WHERE TABLE_SCHEMA NOT IN ('sys', 'INFORMATION_SCHEMA') \
-     AND TABLE_TYPE IN ('BASE TABLE', 'VIEW')";
+/// The schemas the login sees, as the reference lists them (the JDBC
+/// driver's `getSchemas`: `sys.schemas`): the database roles' schemas
+/// (`db_owner`, `db_datareader`, …), `guest` and `sys` included, and empty
+/// ones too. `INFORMATION_SCHEMA` is the catalog's own (`codelake_core`).
+const LIST_SCHEMAS: &str = "SELECT name FROM sys.schemas WHERE name <> 'INFORMATION_SCHEMA'";
 
-const LIST_COLUMNS: &str = "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, \
-     CHARACTER_MAXIMUM_LENGTH, DATETIME_PRECISION, COLLATION_NAME \
-     FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = @P1 AND TABLE_NAME = @P2 \
-     ORDER BY ORDINAL_POSITION";
+/// The tables and views the login sees, as the reference lists them (the
+/// JDBC driver's `getTables` for `TABLE` and `VIEW`, i.e. `sp_tables`):
+/// `sys.all_objects` holds the system views of `sys` besides the user's
+/// objects (`sys.objects`, what `INFORMATION_SCHEMA.TABLES` reads).
+const LIST_TABLES: &str = "SELECT SCHEMA_NAME(schema_id), name FROM sys.all_objects \
+     WHERE type IN ('U', 'V') AND SCHEMA_NAME(schema_id) <> 'INFORMATION_SCHEMA'";
+
+/// The columns of a table or view, as `INFORMATION_SCHEMA.COLUMNS` describes
+/// them (its definition, `OBJECT_DEFINITION(OBJECT_ID('INFORMATION_SCHEMA.COLUMNS'))`,
+/// with what its internal `COLUMNPROPERTY` and `ODBCSCALE` compute written
+/// out) over `sys.all_columns`: that view only reads `sys.columns`, which has
+/// no column of a system view. For a user table it answers what that view
+/// answers, type by type (compared on SQL Server 2022 over a table of every
+/// type; the connector's integration suite reads every type through it).
+const LIST_COLUMNS: &str = "SELECT c.name, ISNULL(TYPE_NAME(c.system_type_id), t.name), \
+     CONVERT(tinyint, CASE WHEN c.system_type_id IN (48, 52, 56, 59, 60, 62, 106, 108, 122, 127) THEN c.precision END), \
+     CONVERT(int, CASE WHEN c.system_type_id IN (48, 52, 56, 127) THEN 0 \
+       WHEN c.system_type_id IN (60, 106, 108, 122) THEN c.scale END), \
+     CONVERT(varchar(3), CASE c.is_nullable WHEN 1 THEN 'YES' ELSE 'NO' END), \
+     CONVERT(int, CASE WHEN c.system_type_id IN (165, 167, 173, 175) THEN c.max_length \
+       WHEN c.system_type_id IN (231, 239) THEN CASE WHEN c.max_length = -1 THEN -1 ELSE c.max_length / 2 END \
+       WHEN c.system_type_id IN (34, 35) THEN 2147483647 WHEN c.system_type_id = 99 THEN 1073741823 \
+       WHEN c.system_type_id = 241 THEN -1 END), \
+     CONVERT(smallint, CASE WHEN c.system_type_id IN (40, 58) THEN 0 WHEN c.system_type_id = 61 THEN 3 \
+       WHEN c.system_type_id IN (41, 42, 43) THEN c.scale END), \
+     c.collation_name \
+     FROM sys.all_columns c JOIN sys.all_objects o ON o.object_id = c.object_id \
+     LEFT JOIN sys.types t ON t.user_type_id = c.user_type_id \
+     WHERE o.type IN ('U', 'V') AND SCHEMA_NAME(o.schema_id) = @P1 AND o.name = @P2 \
+     ORDER BY c.column_id";
 
 /// Field metadata key holding the column's SQL Server type, e.g. `binary(10)`
 /// or `datetime2(7)`. The pushdown policy relies on it.
@@ -138,6 +166,8 @@ impl SqlServerParams {
 /// Real names of the exposed (lower-case) schemas and tables.
 #[derive(Debug, Default)]
 struct NameMap {
+    /// Every exposed schema, with tables or not.
+    schemas: std::collections::BTreeSet<String>,
     tables: HashMap<(String, String), (String, String)>,
 }
 
@@ -202,6 +232,14 @@ impl SqlServerConnector {
 
     async fn list_tables(&self, pool: &Pool) -> Result<NameMap, ConnectorError> {
         let mut conn = pool.get().await.map_err(|e| self.unreachable(format!("{e:?}")))?;
+        let schemas = conn
+            .client
+            .simple_query(LIST_SCHEMAS)
+            .await
+            .map_err(|e| self.metadata(e))?
+            .into_first_result()
+            .await
+            .map_err(|e| self.metadata(e))?;
         let rows = conn
             .client
             .simple_query(LIST_TABLES)
@@ -223,6 +261,14 @@ impl SqlServerConnector {
                 .push((schema.to_owned(), table.to_owned()));
         }
         let mut names = NameMap::default();
+        for row in schemas {
+            let schema: &str = row.get(0).unwrap_or_default();
+            if safe_name(schema) {
+                names.schemas.insert(schema.to_lowercase());
+            } else {
+                tracing::warn!(source = %self.name, %schema, "name contains `]`; not exposed");
+            }
+        }
         for (lower, mut real) in seen {
             if real.len() == 1 {
                 names.tables.insert(lower, real.remove(0));
@@ -366,7 +412,11 @@ impl Connector for SqlServerConnector {
     async fn catalog(&self) -> Result<Arc<dyn CatalogProvider>, ConnectorError> {
         let pool = self.pool().await?;
         let names = self.list_tables(&pool).await?;
-        let mut listing: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut listing: BTreeMap<String, Vec<String>> = names
+            .schemas
+            .iter()
+            .map(|schema| (schema.clone(), Vec::new()))
+            .collect();
         for (schema, table) in names.tables.keys() {
             listing.entry(schema.clone()).or_default().push(table.clone());
         }

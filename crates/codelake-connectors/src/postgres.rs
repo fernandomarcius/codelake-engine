@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use codelake_core::catalog::{FederatedCatalog, LiveListing, TableResolver};
 use codelake_core::{Connector, ConnectorError};
 use datafusion::catalog::{CatalogProvider, TableProvider};
-use datafusion::error::Result as DfResult;
+use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::sql::TableReference;
 use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
 use secrecy::SecretString;
@@ -89,7 +89,27 @@ impl TableResolver for PostgresResolver {
         crate::postgres_pushdown::table_provider(&pool, source, TableReference::partial(schema, table))
             .await
             .map(Some)
+            .map_err(unsupported_as_not_implemented)
     }
+}
+
+/// A relation with a column of a type the connector does not read
+/// (`jsonb`, `uuid`) is a feature `CodeLake` lacks, not a failing source:
+/// `NotImplemented`, which a catalog listing (`system.jdbc`,
+/// `information_schema`) lists without columns instead of failing whole.
+fn unsupported_as_not_implemented(error: DataFusionError) -> DataFusionError {
+    use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Error as DbError;
+    let DataFusionError::External(inner) = &error else {
+        return error;
+    };
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(inner.as_ref());
+    while let Some(current) = cause {
+        if let Some(unsupported @ DbError::UnsupportedDataType { .. }) = current.downcast_ref::<DbError>() {
+            return DataFusionError::NotImplemented(unsupported.to_string());
+        }
+        cause = current.source();
+    }
+    error
 }
 
 #[async_trait]
@@ -125,5 +145,62 @@ impl Connector for PostgresConnector {
                 source_name: self.name.clone(),
                 cause,
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Error as DbError;
+
+    /// The error a relation with a `jsonb` column raised: wrapped by the SQL table.
+    #[derive(Debug)]
+    struct Wrapped(DbError);
+
+    impl fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "Unable to get schema: {}", self.0)
+        }
+    }
+
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    fn unsupported() -> DbError {
+        DbError::UnsupportedDataType {
+            data_type: "jsonb".into(),
+            field_name: "j".into(),
+        }
+    }
+
+    #[test]
+    fn an_unsupported_column_type_is_not_implemented() {
+        for error in [
+            DataFusionError::External(Box::new(unsupported())),
+            DataFusionError::External(Box::new(Wrapped(unsupported()))),
+        ] {
+            match unsupported_as_not_implemented(error) {
+                DataFusionError::NotImplemented(message) => {
+                    assert!(message.contains("jsonb"), "{message}");
+                }
+                other => panic!("{other}"),
+            }
+        }
+        // Any other failure stays what it is.
+        let refused = DataFusionError::External(Box::new(DbError::UndefinedTable {
+            table_name: "s.t".into(),
+            source: "relation does not exist".into(),
+        }));
+        assert!(matches!(
+            unsupported_as_not_implemented(refused),
+            DataFusionError::External(_)
+        ));
+        assert!(matches!(
+            unsupported_as_not_implemented(DataFusionError::Plan("x".into())),
+            DataFusionError::Plan(_)
+        ));
     }
 }

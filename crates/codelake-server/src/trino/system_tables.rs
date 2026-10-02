@@ -17,12 +17,17 @@
 //! connector without the feature: materialized views, procedures, user
 //! defined types, table and column comments, and catalog properties (no
 //! connector declares `WITH (…)` properties besides the Hive `format`).
+//!
+//! The engine's own in-memory catalog is left out of every listing while a
+//! client has created nothing in it ([`listed_catalogs`]), and
+//! `system.jdbc.types` is Trino 431's list (ISS-064).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use codelake_core::information_schema::refresh_listing;
+use codelake_core::trino_types::field_display_name;
 use datafusion::arrow::array::{ArrayRef, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::information_schema::{INFORMATION_SCHEMA, InformationSchemaProvider};
@@ -674,14 +679,10 @@ impl Rows {
     }
 
     fn catalog_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self
-            .catalogs
-            .catalog_names()
+        listed_catalogs(self.catalogs.as_ref())
             .into_iter()
             .filter(|name| self.names.keeps(0, name))
-            .collect();
-        names.sort();
-        names
+            .collect()
     }
 
     /// Schemas of `catalog`, sorted, including `information_schema`.
@@ -746,15 +747,12 @@ impl Rows {
         match self.kind {
             Kind::Catalogs => {
                 for name in self.catalog_names() {
-                    let connector = self
-                        .connectors
-                        .get(&name)
-                        .copied()
-                        .unwrap_or(match name.as_str() {
-                            "system" => "system",
-                            // A catalog no connector serves is DataFusion's in-memory one.
-                            _ => "memory",
-                        });
+                    let connector = match self.connectors.get(&name).copied() {
+                        Some(kind) => trino_connector_name(kind),
+                        None if name == "system" => "system",
+                        // A catalog no connector serves is DataFusion's in-memory one.
+                        None => "memory",
+                    };
                     emit(vec![text(&name), text(&name), text(connector)])?;
                 }
             }
@@ -830,6 +828,55 @@ impl Rows {
     }
 }
 
+/// The engine's own in-memory catalog: `DataFusion`'s default, which every
+/// session has and sources may not be named after
+/// (`codelake_core::config`). The reference engine has no such catalog.
+pub(crate) const ENGINE_CATALOG: &str = "datafusion";
+
+/// The schema the engine's in-memory catalog starts with.
+const ENGINE_SCHEMA: &str = "public";
+
+/// The catalogs a client lists (`system.jdbc.catalogs`, `system.metadata`,
+/// `SHOW CATALOGS`), sorted: every catalog of the session but the engine's
+/// in-memory one while it holds nothing a client created, i.e. only its
+/// empty `public` schema. Listing it then would show the engine's internals
+/// to a client that never used it, and the reference engine has no such
+/// catalog; once a client creates a schema or a table in it, it is listed,
+/// so nothing it holds is hidden (ISS-064 item 2).
+pub(crate) fn listed_catalogs(catalogs: &dyn CatalogProviderList) -> Vec<String> {
+    let mut names: Vec<String> = catalogs
+        .catalog_names()
+        .into_iter()
+        .filter(|name| {
+            name != ENGINE_CATALOG || catalogs.catalog(name).is_some_and(|c| holds_objects(c.as_ref()))
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Whether the engine's in-memory catalog holds a schema or a table a client
+/// created.
+fn holds_objects(catalog: &dyn CatalogProvider) -> bool {
+    catalog.schema_names().iter().any(|name| match name.as_str() {
+        INFORMATION_SCHEMA => false,
+        ENGINE_SCHEMA => catalog
+            .schema(name)
+            .is_some_and(|schema| !schema.table_names().is_empty()),
+        _ => true,
+    })
+}
+
+/// Trino's name of the connector serving a catalog, for a `CodeLake`
+/// connector kind (`Connector::kind`): `postgresql` for `postgres`; the
+/// others share Trino's names.
+fn trino_connector_name(kind: &'static str) -> &'static str {
+    match kind {
+        "postgres" => "postgresql",
+        other => other,
+    }
+}
+
 /// A view for Trino: `information_schema` relations are tables there, while
 /// `DataFusion` implements them as views.
 fn is_view(schema: &str, table: &dyn TableProvider) -> bool {
@@ -839,7 +886,7 @@ fn is_view(schema: &str, table: &dyn TableProvider) -> bool {
 /// One `system.jdbc.columns` row. View columns are nullable, as in Trino;
 /// table columns follow the table's schema.
 fn column_row([catalog, schema, table]: [&str; 3], position: usize, field: &Field, view: bool) -> Row {
-    let column = jdbc_column(field.data_type());
+    let column = jdbc_column(&field_display_name(field));
     let nullable = view || field.is_nullable();
     vec![
         text(catalog),
@@ -883,142 +930,151 @@ struct JdbcColumn {
 
 const UNBOUNDED: i64 = 2_147_483_647;
 
-fn precision(unit: TimeUnit) -> i64 {
-    match unit {
-        TimeUnit::Second => 0,
-        TimeUnit::Millisecond => 3,
-        TimeUnit::Microsecond => 6,
-        TimeUnit::Nanosecond => 9,
-    }
-}
-
 /// Characters of the fraction of a `p`-digit time value (`.` plus digits).
 fn fraction(p: i64) -> i64 {
     if p > 0 { p + 1 } else { 0 }
 }
 
-/// Trino's `Type.getDisplayName()` for the Trino type an Arrow type is sent
-/// as (see `types::trino_type`): `decimal(10,2)`, `map(varchar, integer)`.
-fn display_name(data_type: &DataType) -> String {
-    jdbc_column(data_type).name
+/// The argument of `name(argument)`.
+fn argument<'a>(type_name: &'a str, name: &str) -> Option<&'a str> {
+    type_name.strip_prefix(name)?.strip_prefix('(')?.strip_suffix(')')
 }
 
-/// Values observed on Trino 431 (`SELECT * FROM system.jdbc.columns`).
-fn jdbc_column(data_type: &DataType) -> JdbcColumn {
-    let plain = |code: i64, name: &str, size: Option<i64>, radix: Option<i64>| JdbcColumn {
+/// A column of Trino type `type_name` (its display name, the spelling of
+/// `information_schema.columns.data_type`) as Trino 431's
+/// `system.jdbc.columns` describes it: values observed on a real server for
+/// every type (`SELECT * FROM system.jdbc.columns` over a view of each).
+fn jdbc_column(type_name: &str) -> JdbcColumn {
+    let plain = |code: i64, size: Option<i64>, radix: Option<i64>| JdbcColumn {
         code,
-        name: name.to_owned(),
+        name: type_name.to_owned(),
         size,
         digits: None,
         radix,
         octets: None,
     };
-    match data_type {
-        DataType::Boolean => plain(16, "boolean", None, None),
-        DataType::Int8 => plain(-6, "tinyint", Some(3), Some(10)),
-        DataType::Int16 | DataType::UInt8 => plain(5, "smallint", Some(5), Some(10)),
-        DataType::Int32 | DataType::UInt16 => plain(4, "integer", Some(10), Some(10)),
-        DataType::Int64 | DataType::UInt32 | DataType::UInt64 => plain(-5, "bigint", Some(19), Some(10)),
-        DataType::Float32 => plain(7, "real", Some(24), Some(2)),
-        DataType::Float64 => plain(8, "double", Some(53), Some(2)),
-        DataType::Decimal128(p, s) => JdbcColumn {
-            digits: Some(i64::from(*s)),
-            ..plain(3, &format!("decimal({p},{s})"), Some(i64::from(*p)), Some(10))
+    let text = |code: i64, length: i64| JdbcColumn {
+        octets: Some(length),
+        ..plain(code, Some(length), None)
+    };
+    let temporal = |code: i64, p: &str, base: i64| match p.parse::<i64>() {
+        Ok(p) => JdbcColumn {
+            digits: Some(p),
+            ..plain(code, Some(base + fraction(p)), None)
         },
-        DataType::Binary | DataType::LargeBinary | DataType::BinaryView | DataType::FixedSizeBinary(_) => {
-            JdbcColumn {
-                octets: Some(UNBOUNDED),
-                ..plain(-3, "varbinary", Some(UNBOUNDED), None)
+        Err(_) => plain(2000, None, None),
+    };
+    let length = |n: &str| n.parse::<i64>().ok();
+    match type_name {
+        "boolean" => plain(16, None, None),
+        "tinyint" => plain(-6, Some(3), Some(10)),
+        "smallint" => plain(5, Some(5), Some(10)),
+        "integer" => plain(4, Some(10), Some(10)),
+        "bigint" => plain(-5, Some(19), Some(10)),
+        "real" => plain(7, Some(24), Some(2)),
+        "double" => plain(8, Some(53), Some(2)),
+        "varchar" => text(12, UNBOUNDED),
+        "varbinary" => text(-3, UNBOUNDED),
+        "date" => plain(91, Some(14), None),
+        _ => {
+            if let Some((p, s)) = argument(type_name, "decimal").and_then(|a| a.split_once(','))
+                && let (Ok(p), Ok(s)) = (p.trim().parse::<i64>(), s.trim().parse::<i64>())
+            {
+                return JdbcColumn {
+                    digits: Some(s),
+                    ..plain(3, Some(p), Some(10))
+                };
             }
-        }
-        DataType::Date32 | DataType::Date64 => plain(91, "date", Some(14), None),
-        DataType::Timestamp(unit, None) => {
-            let p = precision(*unit);
-            JdbcColumn {
-                digits: Some(p),
-                ..plain(93, &format!("timestamp({p})"), Some(21 + fraction(p)), None)
+            if let Some(n) = argument(type_name, "varchar").and_then(length) {
+                return text(12, n);
             }
-        }
-        DataType::Timestamp(unit, Some(_)) => {
-            let p = precision(*unit);
-            JdbcColumn {
-                digits: Some(p),
-                ..plain(
-                    2014,
-                    &format!("timestamp({p}) with time zone"),
-                    Some(55 + fraction(p)),
-                    None,
-                )
+            if let Some(n) = argument(type_name, "char").and_then(length) {
+                return text(1, n);
             }
-        }
-        DataType::Time32(unit) | DataType::Time64(unit) => {
-            let p = precision(*unit);
-            JdbcColumn {
-                digits: Some(p),
-                ..plain(92, &format!("time({p})"), Some(8 + fraction(p)), None)
+            if let Some(zoned) = type_name.strip_suffix(" with time zone") {
+                if let Some(p) = argument(zoned, "timestamp") {
+                    return temporal(2014, p, 55);
+                }
+                if let Some(p) = argument(zoned, "time") {
+                    return temporal(2013, p, 14);
+                }
             }
+            if let Some(p) = argument(type_name, "timestamp") {
+                return temporal(93, p, 21);
+            }
+            if let Some(p) = argument(type_name, "time") {
+                return temporal(92, p, 8);
+            }
+            if type_name.starts_with("array(") {
+                return plain(2003, None, None);
+            }
+            // `map(…)`, `row(…)`, `unknown`, intervals and every other type.
+            plain(2000, None, None)
         }
-        DataType::List(field) | DataType::LargeList(field) => plain(
-            2003,
-            &format!("array({})", display_name(field.data_type())),
-            None,
-            None,
-        ),
-        DataType::Map(entries, _) => {
-            let name = match entries.data_type() {
-                DataType::Struct(fields) if fields.len() == 2 => format!(
-                    "map({}, {})",
-                    display_name(fields[0].data_type()),
-                    display_name(fields[1].data_type())
-                ),
-                other => format!("map({})", display_name(other)),
-            };
-            plain(2000, &name, None, None)
-        }
-        DataType::Struct(fields) => {
-            let fields: Vec<String> = fields
-                .iter()
-                .map(|f| format!("{} {}", f.name(), display_name(f.data_type())))
-                .collect();
-            plain(2000, &format!("row({})", fields.join(", ")), None, None)
-        }
-        DataType::Null => plain(2000, "unknown", None, None),
-        // Everything else travels as text (`types::trino_type`).
-        _ => JdbcColumn {
-            octets: Some(UNBOUNDED),
-            ..plain(12, "varchar", Some(UNBOUNDED), None)
-        },
     }
 }
 
 /// A `system.jdbc.types` entry: name, code, precision, searchable, radix.
 type TypeInfo = (&'static str, i64, Option<i64>, i64, Option<i64>);
 
-/// `system.jdbc.types`: the Trino types `CodeLake` produces, with the values
-/// Trino 431 lists for them (parametric types by their base name).
+/// `system.jdbc.types` of Trino 431, row for row and in its order (the same
+/// on every start; `integer` is listed twice there): the types of its
+/// standard plugins, whether `CodeLake` produces them or not, since a client
+/// reads this list as the reference engine's.
+const TYPES: [TypeInfo; 48] = [
+    ("uuid", 2000, None, 3, None),
+    ("color", 2000, None, 3, None),
+    ("integer", 4, Some(10), 3, Some(10)),
+    ("HyperLogLog", 2000, None, 0, None),
+    ("varbinary", -3, Some(UNBOUNDED), 3, None),
+    ("KdbTree", 2000, None, 0, None),
+    ("BingTile", 2000, None, 3, None),
+    ("boolean", 16, None, 3, None),
+    ("CodePoints", 2000, None, 0, None),
+    ("json2016", 2000, None, 0, None),
+    ("JsonPath", 2000, None, 0, None),
+    ("Regressor", 2000, None, 0, None),
+    ("SphericalGeography", 2000, None, 0, None),
+    ("real", 7, Some(24), 3, Some(2)),
+    ("JoniRegExp", 2000, None, 0, None),
+    ("json", 2000, None, 3, None),
+    ("unknown", 2000, None, 3, None),
+    ("ipaddress", 2000, None, 3, None),
+    ("ObjectId", 2000, None, 3, None),
+    ("bigint", -5, Some(19), 3, Some(10)),
+    ("interval year to month", 2000, None, 3, None),
+    ("SetDigest", 2000, None, 0, None),
+    ("P4HyperLogLog", 2000, None, 0, None),
+    ("Re2JRegExp", 2000, None, 0, None),
+    ("double", 8, Some(53), 3, Some(2)),
+    ("Geometry", 2000, None, 0, None),
+    ("interval day to second", 2000, None, 3, None),
+    ("Model", 2000, None, 0, None),
+    ("smallint", 5, Some(5), 3, Some(10)),
+    ("tinyint", -6, Some(3), 3, Some(10)),
+    ("tdigest", 2000, None, 0, None),
+    ("JsonPath2016", 2000, None, 0, None),
+    ("date", 91, Some(14), 3, None),
+    ("LikePattern", 2000, None, 0, None),
+    ("integer", 4, Some(10), 3, Some(10)),
+    ("time with time zone", 2000, None, 0, None),
+    ("varchar", 2000, None, 0, None),
+    ("qdigest", 2000, None, 0, None),
+    ("timestamp with time zone", 2000, None, 0, None),
+    ("array", 2003, None, 0, None),
+    ("function", 2000, None, 0, None),
+    ("char", 2000, None, 0, None),
+    ("Classifier", 2000, None, 0, None),
+    ("row", 2000, None, 0, None),
+    ("time", 2000, None, 0, None),
+    ("decimal", 2000, None, 0, None),
+    ("map", 2000, None, 0, None),
+    ("timestamp", 2000, None, 0, None),
+];
+
+/// The rows of `system.jdbc.types` ([`TYPES`]).
 fn type_rows() -> Vec<Row> {
-    // (name, code, precision, searchable, radix)
-    let types: [TypeInfo; 18] = [
-        ("boolean", 16, None, 3, None),
-        ("tinyint", -6, Some(3), 3, Some(10)),
-        ("smallint", 5, Some(5), 3, Some(10)),
-        ("integer", 4, Some(10), 3, Some(10)),
-        ("bigint", -5, Some(19), 3, Some(10)),
-        ("real", 7, Some(24), 3, Some(2)),
-        ("double", 8, Some(53), 3, Some(2)),
-        ("decimal", 2000, None, 0, None),
-        ("varchar", 2000, None, 0, None),
-        ("varbinary", -3, Some(UNBOUNDED), 3, None),
-        ("date", 91, Some(14), 3, None),
-        ("time", 2000, None, 0, None),
-        ("timestamp", 2000, None, 0, None),
-        ("timestamp with time zone", 2000, None, 0, None),
-        ("array", 2003, None, 0, None),
-        ("map", 2000, None, 0, None),
-        ("row", 2000, None, 0, None),
-        ("unknown", 2000, None, 3, None),
-    ];
-    types
+    TYPES
         .into_iter()
         .map(|(name, code, precision, searchable, radix)| {
             vec![
@@ -1048,13 +1104,12 @@ fn type_rows() -> Vec<Row> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::datatypes::Fields;
     use datafusion::prelude::{SessionConfig, SessionContext};
 
     fn context() -> SessionContext {
         let ctx = SessionContext::new_with_config(SessionConfig::new().with_information_schema(true));
         let system = MemoryCatalogProvider::new();
-        register(&system, vec![("lake".into(), "hive")]).unwrap();
+        register(&system, vec![("lake".into(), "hive"), ("pg".into(), "postgres")]).unwrap();
         ctx.register_catalog("system", Arc::new(system));
         ctx
     }
@@ -1080,14 +1135,26 @@ mod tests {
     #[tokio::test]
     async fn catalogs_come_from_the_session() {
         let ctx = context();
+        ctx.register_catalog("pg", Arc::new(MemoryCatalogProvider::new()));
+        ctx.register_catalog("lake", Arc::new(MemoryCatalogProvider::new()));
+        // The engine's in-memory catalog holds only its empty `public`: not listed.
         assert_eq!(
             rows(&ctx, "SELECT * FROM system.metadata.catalogs ORDER BY 1").await,
-            ["datafusion datafusion memory", "system system system"]
+            ["lake lake hive", "pg pg postgresql", "system system system"]
         );
         assert_eq!(
             rows(&ctx, "SELECT table_cat FROM system.jdbc.catalogs").await,
-            ["datafusion", "system"]
+            ["lake", "pg", "system"]
         );
+        assert!(
+            rows(
+                &ctx,
+                "SELECT * FROM system.jdbc.schemas WHERE table_catalog = 'datafusion'"
+            )
+            .await
+            .is_empty()
+        );
+        // Still there for whoever names it.
         assert_eq!(
             rows(
                 &ctx,
@@ -1096,6 +1163,35 @@ mod tests {
             .await,
             ["0"]
         );
+    }
+
+    /// Once a client creates something in the engine's in-memory catalog, it is listed.
+    #[tokio::test]
+    async fn the_engine_catalog_is_listed_once_used() {
+        for ddl in [
+            "CREATE TABLE datafusion.public.t (a bigint)",
+            "CREATE SCHEMA datafusion.mine",
+        ] {
+            let ctx = context();
+            ctx.sql(ddl).await.unwrap();
+            assert_eq!(
+                rows(&ctx, "SELECT table_cat FROM system.jdbc.catalogs").await,
+                ["datafusion", "system"],
+                "{ddl}"
+            );
+            // No connector serves it: Trino's name of an in-memory catalog's.
+            assert_eq!(
+                rows(&ctx, "SELECT * FROM system.metadata.catalogs ORDER BY 1").await,
+                ["datafusion datafusion memory", "system system system"],
+                "{ddl}"
+            );
+        }
+        let names = |catalogs: &dyn CatalogProviderList| listed_catalogs(catalogs);
+        let ctx = context();
+        assert_eq!(names(ctx.state().catalog_list().as_ref()), ["system"]);
+        ctx.sql("CREATE SCHEMA datafusion.mine").await.unwrap();
+        ctx.sql("DROP SCHEMA datafusion.mine").await.unwrap();
+        assert_eq!(names(ctx.state().catalog_list().as_ref()), ["system"]);
     }
 
     #[tokio::test]
@@ -1225,39 +1321,130 @@ mod tests {
         assert!(!like(&pattern("a\\"), Some('\\'), &text("a")));
     }
 
+    /// `system.jdbc.columns` of Trino 431 for a view with a column of each
+    /// type: (type name, data type, size, decimal digits, radix, octets).
     #[test]
-    fn nested_type_names_match_trino() {
-        let entries = Field::new(
-            "entries",
-            DataType::Struct(Fields::from(vec![
-                Field::new("key", DataType::Utf8, false),
-                Field::new("value", DataType::Int32, true),
-            ])),
-            false,
-        );
+    fn columns_describe_types_as_trino() {
+        type Expected = (i64, Option<i64>, Option<i64>, Option<i64>, Option<i64>);
+        let observed: [(&str, Expected); 31] = [
+            ("boolean", (16, None, None, None, None)),
+            ("tinyint", (-6, Some(3), None, Some(10), None)),
+            ("smallint", (5, Some(5), None, Some(10), None)),
+            ("integer", (4, Some(10), None, Some(10), None)),
+            ("bigint", (-5, Some(19), None, Some(10), None)),
+            ("real", (7, Some(24), None, Some(2), None)),
+            ("double", (8, Some(53), None, Some(2), None)),
+            ("decimal(20,0)", (3, Some(20), Some(0), Some(10), None)),
+            ("decimal(38,10)", (3, Some(38), Some(10), Some(10), None)),
+            ("varchar", (12, Some(UNBOUNDED), None, None, Some(UNBOUNDED))),
+            ("varchar(7)", (12, Some(7), None, None, Some(7))),
+            ("char(5)", (1, Some(5), None, None, Some(5))),
+            ("varbinary", (-3, Some(UNBOUNDED), None, None, Some(UNBOUNDED))),
+            ("date", (91, Some(14), None, None, None)),
+            ("time(0)", (92, Some(8), Some(0), None, None)),
+            ("time(3)", (92, Some(12), Some(3), None, None)),
+            ("time(9)", (92, Some(18), Some(9), None, None)),
+            ("time(3) with time zone", (2013, Some(18), Some(3), None, None)),
+            ("timestamp(0)", (93, Some(21), Some(0), None, None)),
+            ("timestamp(6)", (93, Some(28), Some(6), None, None)),
+            ("timestamp(12)", (93, Some(34), Some(12), None, None)),
+            (
+                "timestamp(0) with time zone",
+                (2014, Some(55), Some(0), None, None),
+            ),
+            (
+                "timestamp(3) with time zone",
+                (2014, Some(59), Some(3), None, None),
+            ),
+            (
+                "timestamp(9) with time zone",
+                (2014, Some(65), Some(9), None, None),
+            ),
+            ("array(varchar(3))", (2003, None, None, None, None)),
+            ("map(varchar, integer)", (2000, None, None, None, None)),
+            ("row(a bigint)", (2000, None, None, None, None)),
+            ("uuid", (2000, None, None, None, None)),
+            ("json", (2000, None, None, None, None)),
+            ("interval day to second", (2000, None, None, None, None)),
+            ("unknown", (2000, None, None, None, None)),
+        ];
+        for (name, (code, size, digits, radix, octets)) in observed {
+            assert_eq!(
+                jdbc_column(name),
+                JdbcColumn {
+                    code,
+                    name: name.to_owned(),
+                    size,
+                    digits,
+                    radix,
+                    octets,
+                },
+                "{name}"
+            );
+        }
+        // A malformed parameter is not a size.
+        assert_eq!(jdbc_column("time(x)").code, 2000);
+        assert_eq!(jdbc_column("varchar(x)").code, 2000);
+        assert_eq!(jdbc_column("decimal(10)").code, 2000);
+    }
+
+    /// The declared type of a field (`varchar(20)` of a SQL Server column,
+    /// `time(3)`) is the one listed, as in `information_schema.columns`.
+    #[tokio::test]
+    async fn columns_list_the_declared_type() {
+        let ctx = context();
+        let fields = vec![
+            Field::new("v", DataType::Utf8, true)
+                .with_metadata(codelake_core::trino_types::Declared::Varchar(20).metadata()),
+            Field::new("t", DataType::Time64(TimeUnit::Nanosecond), true)
+                .with_metadata(codelake_core::trino_types::Declared::Time(3).metadata()),
+            Field::new("n", DataType::UInt64, false),
+        ];
+        let table =
+            datafusion::datasource::MemTable::try_new(Arc::new(Schema::new(fields)), vec![vec![]]).unwrap();
+        ctx.register_table("datafusion.public.typed", Arc::new(table))
+            .unwrap();
         assert_eq!(
-            display_name(&DataType::Map(Arc::new(entries), false)),
-            "map(varchar, integer)"
+            rows(
+                &ctx,
+                "SELECT column_name, data_type, type_name, column_size, decimal_digits, char_octet_length, nullable \
+                 FROM system.jdbc.columns WHERE table_name = 'typed'"
+            )
+            .await,
+            [
+                "v 12 varchar(20) 20 20 1",
+                "t 92 time(3) 12 3 1",
+                "n 3 decimal(20,0) 20 0 0",
+            ]
         );
-        let row = DataType::Struct(Fields::from(vec![
-            Field::new("x", DataType::Int32, true),
-            Field::new("y", DataType::Utf8, true),
-        ]));
-        assert_eq!(display_name(&row), "row(x integer, y varchar)");
+    }
+
+    #[test]
+    fn types_are_trinos() {
+        let rows = type_rows();
+        assert_eq!(rows.len(), 48);
+        let names: Vec<String> = rows.iter().map(|row| row[0].to_string()).collect();
+        assert_eq!(names.iter().filter(|n| *n == "integer").count(), 2);
+        for name in [
+            "varchar",
+            "char",
+            "decimal",
+            "json",
+            "uuid",
+            "time with time zone",
+            "Geometry",
+        ] {
+            assert!(names.iter().any(|n| n == name), "{name}");
+        }
+        // Name, java.sql.Types code, precision, searchable and radix as Trino 431 lists them.
+        let listed = |name: &str| TYPES.iter().find(|t| t.0 == name).copied();
+        assert_eq!(listed("tinyint"), Some(("tinyint", -6, Some(3), 3, Some(10))));
+        assert_eq!(listed("bigint"), Some(("bigint", -5, Some(19), 3, Some(10))));
         assert_eq!(
-            jdbc_column(&DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))),
-            JdbcColumn {
-                code: 2014,
-                name: "timestamp(3) with time zone".into(),
-                size: Some(59),
-                digits: Some(3),
-                radix: None,
-                octets: None,
-            }
+            listed("varbinary"),
+            Some(("varbinary", -3, Some(UNBOUNDED), 3, None))
         );
-        assert_eq!(
-            jdbc_column(&DataType::Time64(TimeUnit::Microsecond)).size,
-            Some(15)
-        );
+        assert_eq!(listed("array"), Some(("array", 2003, None, 0, None)));
+        assert_eq!(rows[2][1], ScalarValue::Int64(Some(4)));
     }
 }
