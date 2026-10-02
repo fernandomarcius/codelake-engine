@@ -84,6 +84,23 @@ pub struct ServerConfig {
     /// Seconds to keep serving in-flight work after SIGTERM before exiting.
     #[serde(default = "default_shutdown_grace_secs")]
     pub shutdown_grace_secs: u64,
+    /// The soft open-files limit the server sets at startup. Absent: the
+    /// hard limit (`ulimit -Hn`), as high as the process may go (ADR 0018).
+    pub open_files_limit: Option<u64>,
+    /// Descriptors never given to client connections: source pools, spill
+    /// and data files, logs (ADR 0018).
+    #[serde(default = "default_reserved_files")]
+    pub reserved_files: u64,
+    /// HTTP listeners (ops and `[server.trino]`): a connection with no request
+    /// in flight is closed after this many seconds without a new one, as with
+    /// Trino's `http-server.net.max-idle-time` (ADR 0018).
+    #[serde(default = "default_http_idle_timeout_secs")]
+    pub http_idle_timeout_secs: u64,
+    /// HTTP listeners: seconds a request head may take to arrive in full,
+    /// counted from the connection's opening for its first request and from
+    /// the first byte for the next ones (ADR 0018).
+    #[serde(default = "default_http_header_read_timeout_secs")]
+    pub http_header_read_timeout_secs: u64,
     pub tls: Option<TlsConfig>,
     /// Explicit opt-in to expose the unauthenticated PostgreSQL listener beyond
     /// loopback (e.g. behind a sidecar proxy or a Kubernetes `NetworkPolicy`).
@@ -124,6 +141,9 @@ pub struct TrinoProtocolConfig {
     /// Version the server reports (`/v1/info`, `version()`); default
     /// `CodeLake`'s. Some clients check it.
     pub reported_version: Option<String>,
+    /// Open connections; more are answered `503` at once. Absent: every
+    /// descriptor the open-files limit leaves to this listener (ADR 0018).
+    pub max_connections: Option<usize>,
 }
 
 fn default_header_prefix() -> String {
@@ -621,6 +641,16 @@ const fn default_max_connections() -> usize {
 const fn default_shutdown_grace_secs() -> u64 {
     30
 }
+const fn default_reserved_files() -> u64 {
+    256
+}
+/// Trino's `http-server.net.max-idle-time` default (airlift `HttpServerConfig`).
+const fn default_http_idle_timeout_secs() -> u64 {
+    200
+}
+const fn default_http_header_read_timeout_secs() -> u64 {
+    30
+}
 const fn default_batch_size() -> usize {
     8192
 }
@@ -940,6 +970,7 @@ impl Config {
         if server.pg_listen == server.http_listen {
             errors.push("server.pg_listen and server.http_listen must differ".into());
         }
+        Self::validate_connections(server, errors);
         if let Some(trino) = &server.trino {
             Self::validate_trino(server, trino, errors);
         }
@@ -951,6 +982,27 @@ impl Config {
                     errors.push(format!("server.tls.{field} {} does not exist", path.display()));
                 }
             }
+        }
+    }
+
+    /// Descriptor and HTTP connection settings (ADR 0018). The budget each
+    /// listener gets depends on the limit the process obtains, which the
+    /// server checks again at startup.
+    fn validate_connections(server: &ServerConfig, errors: &mut Vec<String>) {
+        if let Some(limit) = server.open_files_limit {
+            let pg = u64::try_from(server.max_connections).unwrap_or(u64::MAX);
+            let floor = server.reserved_files.saturating_add(pg);
+            if limit <= floor {
+                errors.push(format!(
+                    "server.open_files_limit {limit} must exceed server.reserved_files + server.max_connections ({floor})"
+                ));
+            }
+        }
+        if server.http_idle_timeout_secs == 0 {
+            errors.push("server.http_idle_timeout_secs must be > 0".into());
+        }
+        if server.http_header_read_timeout_secs == 0 {
+            errors.push("server.http_header_read_timeout_secs must be > 0".into());
         }
     }
 
@@ -988,6 +1040,9 @@ impl Config {
         }
         if trino.max_query_length == 0 {
             errors.push("server.trino.max_query_length must be > 0".into());
+        }
+        if trino.max_connections == Some(0) {
+            errors.push("server.trino.max_connections must be > 0".into());
         }
     }
 
@@ -1705,6 +1760,64 @@ mod tests {
     }
 
     #[test]
+    fn connection_settings_have_defaults_and_are_validated() {
+        let validated = parse(VALID).validate(&full_env, &|_| true).unwrap();
+        let server = &validated.config.server;
+        assert_eq!(server.open_files_limit, None);
+        assert_eq!(server.reserved_files, 256);
+        assert_eq!(server.http_idle_timeout_secs, 200);
+        assert_eq!(server.http_header_read_timeout_secs, 30);
+
+        let with = |keys: &str| {
+            VALID.replace(
+                "http_listen = \"0.0.0.0:8080\"",
+                &format!("http_listen = \"0.0.0.0:8080\"\n{keys}"),
+            )
+        };
+        // The limit must leave room for the reserve and the PostgreSQL
+        // connections (256 + 256 by default).
+        assert_eq!(
+            errors_of(&with("open_files_limit = 512"), &full_env),
+            vec![
+                "server.open_files_limit 512 must exceed server.reserved_files + server.max_connections (512)"
+            ]
+        );
+        let validated = parse(&with("open_files_limit = 513"))
+            .validate(&full_env, &|_| true)
+            .unwrap();
+        assert_eq!(validated.config.server.open_files_limit, Some(513));
+        let small = "reserved_files = 10\nmax_connections = 5";
+        assert!(
+            parse(&with(&format!("{small}\nopen_files_limit = 16")))
+                .validate(&full_env, &|_| true)
+                .is_ok()
+        );
+        assert_eq!(
+            errors_of(&with(&format!("{small}\nopen_files_limit = 15")), &full_env),
+            vec![
+                "server.open_files_limit 15 must exceed server.reserved_files + server.max_connections (15)"
+            ]
+        );
+        let validated = parse(&with(
+            "http_idle_timeout_secs = 1\nhttp_header_read_timeout_secs = 1",
+        ))
+        .validate(&full_env, &|_| true)
+        .unwrap();
+        assert_eq!(validated.config.server.http_idle_timeout_secs, 1);
+        assert_eq!(validated.config.server.http_header_read_timeout_secs, 1);
+        assert_eq!(
+            errors_of(
+                &with("http_idle_timeout_secs = 0\nhttp_header_read_timeout_secs = 0"),
+                &full_env
+            ),
+            vec![
+                "server.http_idle_timeout_secs must be > 0",
+                "server.http_header_read_timeout_secs must be > 0",
+            ]
+        );
+    }
+
+    #[test]
     fn trino_listener_is_validated() {
         let with =
             |section: &str| VALID.replace("[memory]", &format!("[server.trino]\n{section}\n\n[memory]"));
@@ -1732,6 +1845,22 @@ mod tests {
             &full_env,
         );
         assert_eq!(errors.len(), 3, "{errors:#?}");
+
+        assert_eq!(trino_max_connections(&with("listen = \"127.0.0.1:8081\"")), None);
+        let one = with("listen = \"127.0.0.1:8081\"\nmax_connections = 1");
+        assert_eq!(trino_max_connections(&one), Some(1));
+        assert_eq!(
+            errors_of(
+                &with("listen = \"127.0.0.1:8081\"\nmax_connections = 0"),
+                &full_env
+            ),
+            vec!["server.trino.max_connections must be > 0"]
+        );
+    }
+
+    fn trino_max_connections(doc: &str) -> Option<usize> {
+        let validated = parse(doc).validate(&full_env, &|_| true).unwrap();
+        validated.config.server.trino.unwrap().max_connections
     }
 
     #[test]
