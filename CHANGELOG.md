@@ -260,6 +260,15 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- `now()`, `current_timestamp`, `current_timestamp(p)` and `from_unixtime` are `timestamp with time zone`
+  values in the session's zone (`X-Trino-Time-Zone`), as in the reference: they were in UTC, the engine's,
+  whatever the client sent (the same instant shown at another hour: `hour(now())` 12 instead of 9 in
+  `America/Sao_Paulo`, `CAST(now() AS timestamp)` the UTC wall clock). The session's functions were built
+  for the engine's zone and never updated for the client's. `current_timestamp(p)` and `localtimestamp(p)`
+  failed with "precision must be a constant".
+- `SET TIME ZONE 'zone'` and `SET TIME ZONE LOCAL` (they failed with "SET variant not implemented"): the
+  zone is sent back as the session property `time_zone_id`, which wins over `X-Trino-Time-Zone`, as the
+  reference does.
 - PostgreSQL, found by the shadow run of the Warehouse boletos panel (2026-10-01; its 28 queries failed;
   ISS-060):
   - Views, materialized views and foreign tables did not exist (`TABLE_NOT_FOUND`): relations were listed from

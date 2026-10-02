@@ -457,3 +457,89 @@ async fn float_negations_keep_nan_and_zeros_are_window_peers() {
         assert_eq!(int64s(&rows(&engine, sql).await, 0), [Some(expected)], "{sql}");
     }
 }
+
+/// `now()`, `current_timestamp`, `current_timestamp(p)` and `from_unixtime`
+/// are `timestamp with time zone` in the session's zone, as in Trino 431:
+/// the client's zone, not the engine's (UTC). The local wall clock is the
+/// session's (`hour(now())`, `CAST(now() AS timestamp)`), the instant the
+/// same (`AT TIME ZONE 'UTC'`).
+#[tokio::test]
+async fn current_timestamps_are_in_the_session_zone() {
+    use datafusion::arrow::array::{BooleanArray, TimestampMillisecondArray};
+    use datafusion::arrow::datatypes::TimeUnit;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    let zone = "America/Sao_Paulo";
+    let options = crate::engine::QueryOptions {
+        time_zone: Some(zone.to_owned()),
+        ..crate::engine::QueryOptions::for_user("u")
+    };
+    let sql = "SELECT now(), current_timestamp, current_timestamp(6), current_timestamp(0), from_unixtime(0), \
+               hour(now()) = hour(localtimestamp), \
+               date_diff('second', CAST(now() AS timestamp), localtimestamp) BETWEEN -2 AND 2, \
+               now() AT TIME ZONE 'UTC' = now(), \
+               hour(now() AT TIME ZONE 'UTC') = hour(CAST(now() AS timestamp)), \
+               CAST(now() AS date) = current_date";
+    let frame = engine.sql_with(&options, sql).await.unwrap();
+    let types: Vec<DataType> = frame
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.data_type().clone())
+        .collect();
+    let zoned = |unit| DataType::Timestamp(unit, Some(Arc::from(zone)));
+    assert_eq!(
+        types[..5],
+        [
+            zoned(TimeUnit::Millisecond),
+            zoned(TimeUnit::Millisecond),
+            zoned(TimeUnit::Microsecond),
+            zoned(TimeUnit::Second),
+            zoned(TimeUnit::Millisecond),
+        ]
+    );
+    let batches = frame.collect().await.unwrap();
+    let checks: Vec<Option<bool>> = (5..10)
+        .map(|i| {
+            let column = batches[0]
+                .column(i)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap();
+            (!column.is_null(0)).then(|| column.value(0))
+        })
+        .collect();
+    // Sao Paulo is UTC-3 since 2019: the UTC hour is another one.
+    assert_eq!(
+        checks,
+        [Some(true), Some(true), Some(true), Some(false), Some(true)]
+    );
+    let epoch = batches[0]
+        .column(4)
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .unwrap();
+    assert_eq!(epoch.value(0), 0, "the same instant, shown in the session zone");
+    // A set operation types its columns while the query is planned.
+    let frame = engine
+        .sql_with(
+            &options,
+            "SELECT x FROM (SELECT now() AS x UNION ALL SELECT now())",
+        )
+        .await
+        .unwrap();
+    assert_eq!(frame.schema().field(0).data_type(), &zoned(TimeUnit::Millisecond));
+    // A function the planner builds itself (`EXTRACT` is the engine's
+    // `date_part`) is still swapped for the library's, updated for the zone.
+    let frame = engine
+        .sql_with(&options, "SELECT EXTRACT(year FROM DATE '2020-05-01')")
+        .await
+        .unwrap();
+    assert_eq!(frame.schema().field(0).data_type(), &DataType::Int64);
+    // Without a client zone, the engine's: UTC.
+    let frame = engine.sql("SELECT now()").await.unwrap();
+    assert_eq!(
+        frame.schema().field(0).data_type(),
+        &DataType::Timestamp(TimeUnit::Millisecond, Some(Arc::from("UTC")))
+    );
+}

@@ -184,15 +184,11 @@ impl ClientSession {
             &names.shown("Prepared-Statement"),
         )
         .map_err(SessionError::BadRequest)?;
-        let time_zone = header(headers, names.time_zone.as_str())?
-            .map(|zone| {
-                codelake_core::trino_time_zone(&zone).ok_or_else(|| {
-                    SessionError::Query(QueryError::new(
-                        Code::NotSupported,
-                        format!("Time zone not supported: {zone}"),
-                    ))
-                })
-            })
+        // `SET TIME ZONE` sets the session's zone in place of the client's.
+        let time_zone = raw
+            .remove(TIME_ZONE_ID)
+            .or(header(headers, names.time_zone.as_str())?)
+            .map(|zone| zone_name(&zone).map_err(SessionError::Query))
             .transpose()?;
         Ok(Self {
             user,
@@ -252,12 +248,34 @@ pub(crate) fn percent_encode(text: &str) -> String {
     out
 }
 
+/// Session property `SET TIME ZONE` sets and `SET TIME ZONE LOCAL` clears:
+/// the session's zone, in place of `X-Trino-Time-Zone`.
+pub(crate) const TIME_ZONE_ID: &str = "time_zone_id";
+
+/// The zone as Trino names it, or the error Trino answers.
+fn zone_name(zone: &str) -> Result<String, QueryError> {
+    codelake_core::trino_time_zone(zone)
+        .ok_or_else(|| QueryError::new(Code::NotSupported, format!("Time zone not supported: {zone}")))
+}
+
 /// Statements that only change the client session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Control {
-    Use { catalog: Option<String>, schema: String },
-    SetSession { name: String, value: String },
-    ResetSession { name: String },
+    Use {
+        catalog: Option<String>,
+        schema: String,
+    },
+    SetSession {
+        name: String,
+        value: String,
+    },
+    ResetSession {
+        name: String,
+    },
+    /// `SET TIME ZONE 'zone'`, or `LOCAL` (`None`): back to the client's zone.
+    SetTimeZone {
+        zone: Option<String>,
+    },
 }
 
 impl Control {
@@ -266,6 +284,7 @@ impl Control {
             Self::Use { .. } => "USE",
             Self::SetSession { .. } => "SET SESSION",
             Self::ResetSession { .. } => "RESET SESSION",
+            Self::SetTimeZone { .. } => "SET TIME ZONE",
         }
     }
 }
@@ -403,6 +422,27 @@ pub(crate) fn control(
         let (value, _) = registry.validate(&name, &value).map_err(invalid_property)?;
         return Ok(Some(Control::SetSession { name, value }));
     }
+    if let Some(rest) = strip_keyword(sql, "SET")
+        .and_then(|r| strip_keyword(r, "TIME"))
+        .and_then(|r| strip_keyword(r, "ZONE"))
+    {
+        if rest.eq_ignore_ascii_case("LOCAL") {
+            return Ok(Some(Control::SetTimeZone { zone: None }));
+        }
+        let zone = rest
+            .starts_with('\'')
+            .then(|| literal(rest))
+            .flatten()
+            .ok_or_else(|| {
+                QueryError::new(
+                    Code::NotSupported,
+                    "SET TIME ZONE takes a zone name ('America/Sao_Paulo', '-03:00') or LOCAL",
+                )
+            })?;
+        return Ok(Some(Control::SetTimeZone {
+            zone: Some(zone_name(&zone)?),
+        }));
+    }
     if let Some(rest) = strip_keyword(sql, "RESET").and_then(|r| strip_keyword(r, "SESSION")) {
         let name = qualified_name(rest)
             .ok_or_else(|| syntax("invalid session property name"))?
@@ -529,6 +569,36 @@ mod tests {
         for unknown in ["Mars/Olympus", "america/sao_paulo"] {
             assert_eq!(query_error(zone(unknown)), "NOT_SUPPORTED", "{unknown}");
         }
+    }
+
+    /// `SET TIME ZONE` answers `X-Trino-Set-Session: time_zone_id=…`; the
+    /// client sends it back, and it wins over `X-Trino-Time-Zone`, as in
+    /// Trino 431. It is not a property `SHOW SESSION` lists.
+    #[test]
+    fn the_zone_set_in_the_session_wins_over_the_header() {
+        let registry = registry();
+        let session = |pairs: &[(&'static str, &'static str)]| {
+            ClientSession::from_headers(&headers(pairs), &registry, &HeaderNames::new("X-Trino-"))
+        };
+        let set = session(&[
+            ("X-Trino-User", "u"),
+            ("X-Trino-Time-Zone", "America/Sao_Paulo"),
+            ("X-Trino-Session", "time_zone_id=Asia%2FTokyo"),
+        ])
+        .unwrap();
+        assert_eq!(set.time_zone.as_deref(), Some("Asia/Tokyo"));
+        assert_eq!(set.properties.get(TIME_ZONE_ID), None);
+        assert!(set.properties.ignored().is_empty());
+        let without_header =
+            session(&[("X-Trino-User", "u"), ("X-Trino-Session", "time_zone_id=-03:00")]).unwrap();
+        assert_eq!(without_header.time_zone.as_deref(), Some("-03:00"));
+        assert_eq!(
+            query_error(session(&[
+                ("X-Trino-User", "u"),
+                ("X-Trino-Session", "time_zone_id=Mars/Olympus")
+            ])),
+            "NOT_SUPPORTED"
+        );
     }
 
     #[test]
@@ -664,6 +734,41 @@ mod tests {
             })
         );
         assert!(control("RESET SESSION bogus", &none, &registry, &Everything).is_err());
+        assert_eq!(
+            control(
+                "SET TIME ZONE 'America/Sao_Paulo';",
+                &none,
+                &registry,
+                &Everything
+            )
+            .unwrap(),
+            Some(Control::SetTimeZone {
+                zone: Some("America/Sao_Paulo".into())
+            })
+        );
+        assert_eq!(
+            control("set time zone '-03:00'", &none, &registry, &Everything).unwrap(),
+            Some(Control::SetTimeZone {
+                zone: Some("-03:00".into())
+            })
+        );
+        assert_eq!(
+            control("SET TIME ZONE local", &none, &registry, &Everything).unwrap(),
+            Some(Control::SetTimeZone { zone: None })
+        );
+        for refused in [
+            "SET TIME ZONE 'Mars/Olympus'",
+            "SET TIME ZONE INTERVAL '-03:00' HOUR TO MINUTE",
+            "SET TIME ZONE America/Sao_Paulo",
+        ] {
+            assert_eq!(
+                control(refused, &none, &registry, &Everything)
+                    .unwrap_err()
+                    .name(),
+                "NOT_SUPPORTED",
+                "{refused}"
+            );
+        }
         assert_eq!(control("SELECT 1", &none, &registry, &Everything).unwrap(), None);
         assert_eq!(
             control("user_table_scan", &none, &registry, &Everything).unwrap(),

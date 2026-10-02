@@ -740,6 +740,23 @@ pub fn rebuild_state(
     Ok(rebuilt)
 }
 
+/// The scalar functions of `state` that depend on its configuration
+/// registered again, updated for it, as `SET` updates them: a function typed
+/// by the session time zone (`now()` is a `timestamp(3) with time zone` in
+/// it) would otherwise keep the zone it was built with.
+fn with_functions_for_config(state: &mut datafusion::execution::SessionState) -> Result<(), DataFusionError> {
+    let config = state.config().options().clone();
+    let updated: Vec<Arc<ScalarUDF>> = state
+        .scalar_functions()
+        .values()
+        .filter_map(|f| f.inner().with_updated_config(&config).map(Arc::new))
+        .collect();
+    for f in updated {
+        state.register_udf(f)?;
+    }
+    Ok(())
+}
+
 /// Last step of every query's session configuration (see
 /// [`Engine::with_session_hook`]).
 pub type SessionHook = Arc<dyn Fn(&mut SessionConfig) + Send + Sync>;
@@ -981,6 +998,7 @@ impl Engine {
         }
         if let Some(zone) = &options.time_zone {
             state.config_mut().options_mut().execution.time_zone = Some(zone.clone());
+            with_functions_for_config(&mut state)?;
         }
         if let Some(value) = options
             .properties

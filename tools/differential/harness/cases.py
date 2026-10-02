@@ -11,11 +11,11 @@ from .compare import OUTCOMES
 
 ORACLES = ("trino", "postgres", "value")
 PROTOCOLS = ("trino", "pg")
-FILE_KEYS = {"description", "oracle", "protocol", "compare", "setup", "setup_trino",
+FILE_KEYS = {"description", "oracle", "protocol", "compare", "time_zone", "setup", "setup_trino",
              "setup_codelake", "setup_postgres", "case"}
 CASE_KEYS = {"id", "sql", "steps", "oracle", "protocol", "compare", "types", "expect",
              "known", "accepted", "diverges_at", "error", "params", "param_types",
-             "rows_json", "oracle_sql", "codelake_session", "note"}
+             "rows_json", "oracle_sql", "codelake_session", "time_zone", "note"}
 # A reference names where the divergence is tracked: an accepted issue, an ADR,
 # or the front (branch) fixing it, optionally followed by details.
 REF = re.compile(r"^(ISS-\d{3}|ADR \d{4}|front/[\w.-]+)\b")
@@ -106,6 +106,10 @@ class Case:
         elif "rows_json" in raw:
             raise CaseError(f"{where}: rows_json is for the value oracle")
         self.session = raw.get("codelake_session")
+        self.time_zone = raw.get("time_zone", defaults.get("time_zone"))
+        if self.time_zone is not None and (self.protocol != "trino" or self.oracle != "trino"):
+            raise CaseError(f"{where}: time_zone (X-Trino-Time-Zone, to both engines) is for the trino oracle "
+                            "over the trino protocol")
         self.note = raw.get("note")
 
     @property
@@ -127,7 +131,7 @@ class Suite:
         if unknown:
             raise CaseError(f"{self.name}: unknown file keys {sorted(unknown)}")
         self.description = raw.get("description", "")
-        defaults = {k: raw[k] for k in ("oracle", "protocol", "compare") if k in raw}
+        defaults = {k: raw[k] for k in ("oracle", "protocol", "compare", "time_zone") if k in raw}
         self.setup = raw.get("setup", [])
         self.setup_trino = raw.get("setup_trino", [])
         self.setup_codelake = raw.get("setup_codelake", [])

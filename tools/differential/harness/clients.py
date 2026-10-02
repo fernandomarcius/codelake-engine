@@ -35,13 +35,15 @@ class Trino:
         self.base = base.rstrip("/")
         self.user = user
 
-    def query(self, sql, catalog, schema=None, session=None):
+    def query(self, sql, catalog, schema=None, session=None, time_zone=None):
         h = {"X-Trino-User": self.user, "X-Trino-Catalog": catalog,
              "X-Trino-Client-Capabilities": "PARAMETRIC_DATETIME"}
         if schema:
             h["X-Trino-Schema"] = schema
         if session:
             h["X-Trino-Session"] = session
+        if time_zone:
+            h["X-Trino-Time-Zone"] = time_zone
         try:
             st, body = _http("POST", self.base + "/v1/statement", sql, h)
         except (OSError, TimeoutError) as e:

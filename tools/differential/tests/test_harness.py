@@ -152,6 +152,27 @@ class CaseFiles(unittest.TestCase):
                 steps = ["SELECT 1"]
             ''')
 
+    def test_a_time_zone_for_both_engines(self):
+        s = load('''
+            time_zone = "America/Sao_Paulo"
+            [[case]]
+            id = "a"
+            sql = "SELECT now()"
+            [[case]]
+            id = "b"
+            sql = "SELECT now()"
+            time_zone = "Asia/Tokyo"
+        ''')
+        self.assertEqual([c.time_zone for c in s.cases], ["America/Sao_Paulo", "Asia/Tokyo"])
+        with self.assertRaisesRegex(cases.CaseError, "trino oracle over the trino protocol"):
+            load('''
+                oracle = "postgres"
+                [[case]]
+                id = "a"
+                sql = "SELECT 1"
+                time_zone = "UTC"
+            ''')
+
     def test_duplicated_ids(self):
         with self.assertRaisesRegex(cases.CaseError, "duplicated"):
             load('''

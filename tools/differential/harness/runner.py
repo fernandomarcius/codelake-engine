@@ -151,11 +151,11 @@ def run_case(engines, case):
 
     sql, session = split_session(case.sql, case.session)
     if case.oracle == "trino":
-        want = engines.trino.query(for_trino(case.oracle_sql or sql), "memory")
+        want = engines.trino.query(for_trino(case.oracle_sql or sql), "memory", time_zone=case.time_zone)
     else:
         want = {"rows": case.rows}
     if case.protocol == "trino":
-        got = engines.codelake.query(for_codelake(sql), "datafusion", session=session)
+        got = engines.codelake.query(for_codelake(sql), "datafusion", session=session, time_zone=case.time_zone)
         compare_types = case.types and case.oracle == "trino"
     else:
         if case.oracle == "trino" and "rows" in want:
