@@ -145,6 +145,4 @@ sql = "SELECT CAST(TIME '12:34:56.789' AS varchar) AS a, CAST(TIME '12:34:56' AS
 id = "CT8"
 sql = "SELECT t FROM (VALUES TIME '12:00:00.250', TIME '08:30:00.125') v(t) ORDER BY t"
 compare = "ordered"
-expect = "WRONG"
-known = "ISS-061"
-note = "a VALUES row loses the literal's precision: time(9), nine digits (as before this front)"
+note = "a VALUES row keeps the literals' precision: time(3) (it was time(9), nine digits; ISS-061)"

@@ -260,6 +260,21 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- Found by the differential gate (2026-10-01, ISS-032 item 8):
+  - **Wrong result**: timestamps of different precisions met in the coarser one, dropping the fraction.
+    `SELECT TIMESTAMP '… 10:00:00.123' UNION ALL SELECT TIMESTAMP '… 10:00:00'` answered `timestamp(0)`
+    (`10:00:00` twice) where the reference answers `timestamp(3)` (`10:00:00.123`, `10:00:00.000`); likewise
+    with a time zone, over memory and hive Parquet columns and SQL Server `datetime2(n)`/`datetime`/
+    `smalldatetime` columns, in `VALUES`, and in a union of unions (three or more inputs, the outer one
+    planned with the coarser unit). `UNION` (distinct) merged rows that differ in the fraction, and
+    `CREATE TABLE AS` of such a union into a hive catalog was refused (`timestamp(0)` in a `MILLISECONDS`
+    catalog). Dates, timestamps and times now meet in the highest precision among them: a union's inputs,
+    the rows of `VALUES`, `INTERSECT`/`EXCEPT` (which failed with duplicate projection names) and the values
+    of `CASE`/`coalesce`/`greatest`/`least`; a date with `timestamp(3)` is `timestamp(3)` (it was
+    `timestamp(9)` in a union or a `CASE`). A precision no Arrow unit holds is declared on the result
+    (`timestamp(1)` with `timestamp(2)` is `timestamp(2)`, `TIME '… .123'` with `TIME '…'` is `time(3)`),
+    and one input's `timestamp(1)` no longer rounds the others. `VALUES` and `CASE` keep a `TIME` literal's
+    `time(p)` (ISS-061; it was `time(9)`).
 - `now()`, `current_timestamp`, `current_timestamp(p)` and `from_unixtime` are `timestamp with time zone`
   values in the session's zone (`X-Trino-Time-Zone`), as in the reference: they were in UTC, the engine's,
   whatever the client sent (the same instant shown at another hour: `hour(now())` 12 instead of 9 in

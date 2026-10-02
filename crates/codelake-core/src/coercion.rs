@@ -1,4 +1,4 @@
-//! Trino's common types of numbers.
+//! Trino's common types of numbers, dates and times.
 //!
 //! Where values of different types meet — the rows of `VALUES`, the inputs
 //! of `UNION`, the branches of `CASE`, the arguments of `coalesce`,
@@ -19,6 +19,12 @@
 //! `bigint` as `decimal(20,0)`. [`TrinoCommonTypes`] (analyzer, right before
 //! type coercion) casts each value to Trino's common type, so `DataFusion`'s
 //! coercion finds nothing left to do.
+//!
+//! Dates, timestamps and times meet in the highest precision among them
+//! (`timestamp(3)` with `timestamp(0)` or a date is `timestamp(3)`, `time(3)`
+//! with `time(0)` is `time(3)`), where `DataFusion` takes the coarser Arrow
+//! unit and drops the fraction; a precision no Arrow unit has is declared on
+//! the result (see [`common_temporal`]).
 //!
 //! Integer literals take their type (`integer` when the value fits 32 bits)
 //! from the function library's literal rewrite (`crate::trino_functions`).
@@ -759,6 +765,37 @@ fn unify(exprs: Vec<Expr>, schema: &DFSchema, session_zone: &str) -> Result<Tran
     ))
 }
 
+/// [`unify`] for values that become one result (`CASE`, `coalesce`, …):
+/// dates and timestamps meet in their common type too ([`common_temporal`]:
+/// `CASE … THEN DATE '…' ELSE TIMESTAMP '… .123' END` is `timestamp(3)`,
+/// where `DataFusion` answers nanoseconds).
+fn unify_results(exprs: Vec<Expr>, schema: &DFSchema, session_zone: &str) -> Result<Transformed<Vec<Expr>>> {
+    let fields = exprs
+        .iter()
+        .map(|e| e.to_field(schema).map(|(_, f)| f))
+        .collect::<Result<Vec<_>>>()?;
+    let own: Vec<&Field> = fields.iter().map(AsRef::as_ref).collect();
+    let dated = own
+        .iter()
+        .any(|f| matches!(f.data_type(), DataType::Date32 | DataType::Date64));
+    let Some(target) = common_temporal(&own, None).filter(|_| dated) else {
+        return unify(exprs, schema, session_zone);
+    };
+    Ok(Transformed::yes(
+        exprs
+            .into_iter()
+            .zip(&own)
+            .map(|(e, f)| {
+                if f.data_type().is_null() {
+                    e
+                } else {
+                    cast_temporal(e, f.data_type(), &target.data_type, session_zone)
+                }
+            })
+            .collect(),
+    ))
+}
+
 fn is_comparison(op: datafusion::logical_expr::Operator) -> bool {
     use datafusion::logical_expr::Operator::{
         Eq, Gt, GtEq, IsDistinctFrom, IsNotDistinctFrom, Lt, LtEq, NotEq,
@@ -872,6 +909,17 @@ fn common_types(expr: Expr, schema: &DFSchema, session_zone: &str) -> Result<Tra
     ))
 }
 
+/// `expr` declaring the precision [`temporal_result`] found, if any.
+fn with_temporal(expr: Transformed<Expr>, declared: Option<Declared>) -> Transformed<Expr> {
+    match declared {
+        None => expr,
+        Some(declared) => Transformed::yes(crate::declared::trino_typed().call(vec![
+            expr.data,
+            Expr::Literal(ScalarValue::Utf8(Some(typed_name(Some(declared)))), None),
+        ])),
+    }
+}
+
 fn common_values(expr: Expr, schema: &DFSchema, session_zone: &str) -> Result<Transformed<Expr>> {
     Ok(match expr {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_comparison(op) => {
@@ -891,7 +939,7 @@ fn common_values(expr: Expr, schema: &DFSchema, session_zone: &str) -> Result<Tr
             let mut branches = thens;
             let has_else = else_expr.is_some();
             branches.extend(else_expr.map(|e| *e));
-            unify(branches, schema, session_zone)?.update_data(|mut branches| {
+            unify_results(branches, schema, session_zone)?.update_data(|mut branches| {
                 let else_expr = has_else.then(|| Box::new(branches.pop().unwrap_or_default()));
                 Expr::Case(Case::new(
                     operand,
@@ -908,7 +956,7 @@ fn common_values(expr: Expr, schema: &DFSchema, session_zone: &str) -> Result<Tr
             return nullif(args, &func, schema);
         }
         Expr::ScalarFunction(ScalarFunction { func, args }) if unifies_arguments(func.name()) => {
-            unify(args, schema, session_zone)?.update_data(|args| func.call(args))
+            unify_results(args, schema, session_zone)?.update_data(|args| func.call(args))
         }
         Expr::InList(InList {
             expr: value,
@@ -1021,7 +1069,7 @@ fn expression_schema(plan: &LogicalPlan) -> Result<DFSchema> {
 
 /// `VALUES` with marked values: each column typed again (see the module
 /// documentation).
-fn retype_values(values: Values) -> Result<Transformed<LogicalPlan>> {
+fn retype_values(values: Values, session_zone: &str) -> Result<Transformed<LogicalPlan>> {
     let marked = values.values.iter().flatten().any(|cell| match cell {
         Expr::Cast(Cast { expr, .. }) => is_values_cell(expr),
         other => is_values_cell(other),
@@ -1039,15 +1087,27 @@ fn retype_values(values: Values) -> Result<Transformed<LogicalPlan>> {
     let mut rows: Vec<Vec<Expr>> = vec![Vec::new(); cells.len()];
     let mut fields = Vec::with_capacity(values.schema.fields().len());
     for (j, field) in values.schema.fields().iter().enumerate() {
-        let types = cells
+        let own = cells
             .iter()
-            .map(|row| row[j].get_type(&empty))
+            .map(|row| row[j].to_field(&empty).map(|(_, f)| f))
             .collect::<Result<Vec<_>>>()?;
-        let target = common_numeric_type(&types)
+        let types: Vec<DataType> = own.iter().map(|f| f.data_type().clone()).collect();
+        let numeric = common_numeric_type(&types);
+        // Dates, timestamps and times: the type and the precision they
+        // declare (`VALUES TIME '12:00:00.250'` is `time(3)`).
+        let temporal = if numeric.is_none() {
+            let own: Vec<&Field> = own.iter().map(AsRef::as_ref).collect();
+            common_temporal(&own, Some(field.data_type()))
+        } else {
+            None
+        };
+        let target = numeric
+            .or_else(|| temporal.as_ref().map(|t| t.data_type.clone()))
             .or_else(|| only_type(&types))
             .unwrap_or_else(|| field.data_type().clone());
         for ((row, cells), t) in rows.iter_mut().zip(&cells).zip(&types) {
-            row.push(cast_if_needed(cells[j].clone(), t, &target));
+            // A plain cast but where a local time meets a zone.
+            row.push(cast_temporal(cells[j].clone(), t, &target, session_zone));
         }
         // Text literals only: `varchar(n)`, `n` the longest (Trino).
         let lengths: Option<Vec<usize>> = cells
@@ -1061,9 +1121,11 @@ fn retype_values(values: Values) -> Result<Transformed<LogicalPlan>> {
             }
             _ => field.metadata().clone(),
         };
-        fields.push(Arc::new(
-            Field::new(field.name(), target, true).with_metadata(metadata),
-        ));
+        let field = Field::new(field.name(), target, true).with_metadata(metadata);
+        fields.push(Arc::new(match temporal {
+            Some(t) => with_declared(&field, t.declared),
+            None => field,
+        }));
     }
     let schema = DFSchema::from_unqualified_fields(fields.into(), values.schema.metadata().clone())?;
     Ok(Transformed::yes(LogicalPlan::Values(Values {
@@ -1259,8 +1321,248 @@ fn unify_union_text(union: Union) -> Result<Transformed<Union>> {
     Ok(Transformed::yes(Union { inputs, schema }))
 }
 
-fn unify_union(union: Union) -> Result<Transformed<LogicalPlan>> {
-    let text = unify_union_text(union)?;
+// ------------------------------------------------------- dates and times
+
+/// Trino's common type of dates, timestamps or times where they meet: its
+/// Arrow type and the `timestamp(p)`/`time(p)` it declares when its unit
+/// holds more digits (see [`Declared`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Temporal {
+    data_type: DataType,
+    declared: Option<Declared>,
+}
+
+/// Fraction digits a field holds: the precision it declares, its unit's
+/// otherwise; a date has none. `None` for anything else.
+fn fraction_digits(field: &Field) -> Option<u8> {
+    match (crate::trino_types::declared(field), field.data_type()) {
+        (Some(Declared::Timestamp(p)), DataType::Timestamp(..))
+        | (Some(Declared::Time(p)), DataType::Time32(_) | DataType::Time64(_)) => Some(p),
+        (_, DataType::Timestamp(unit, _) | DataType::Time32(unit) | DataType::Time64(unit)) => {
+            Some(unit_digits(*unit))
+        }
+        (_, DataType::Date32 | DataType::Date64) => Some(0),
+        _ => None,
+    }
+}
+
+/// Trino's common type of the values of `fields` (`NULL`s ignored) when
+/// they are all dates, timestamps or times: the highest precision among
+/// them, `timestamp(3)` for `timestamp(3)` with `timestamp(0)` or a date
+/// (`DataFusion` takes the coarser unit and drops the fraction), `time(3)`
+/// for `time(3)` with `time(0)`. A timestamp is carried by the smallest unit
+/// holding its digits.
+///
+/// With a `timestamp with time zone` among them, every value is one: the
+/// zone their values share, or `declared`'s (the zone `DataFusion` chose)
+/// when they have several (Arrow has one zone per column, ADR 0008); a
+/// timestamp without time zone is then the local time in the session zone
+/// ([`cast_temporal`]). Times of different Arrow types are left as they
+/// are.
+fn common_temporal(fields: &[&Field], declared: Option<&DataType>) -> Option<Temporal> {
+    let known: Vec<&Field> = fields
+        .iter()
+        .copied()
+        .filter(|f| !f.data_type().is_null())
+        .collect();
+    let precision = known
+        .iter()
+        .map(|f| fraction_digits(f))
+        .collect::<Option<Vec<u8>>>()?
+        .into_iter()
+        .max()?;
+    let first = known.first()?.data_type();
+    if matches!(first, DataType::Time32(_) | DataType::Time64(_)) {
+        let (DataType::Time32(unit) | DataType::Time64(unit)) = first else {
+            return None;
+        };
+        if !known.iter().all(|f| f.data_type() == first) {
+            return None;
+        }
+        return Some(Temporal {
+            data_type: first.clone(),
+            declared: (precision != unit_digits(*unit)).then_some(Declared::Time(precision)),
+        });
+    }
+    let mut zones: Vec<&Arc<str>> = Vec::new();
+    for field in &known {
+        match field.data_type() {
+            DataType::Timestamp(_, zone) => zones.extend(zone),
+            DataType::Date32 | DataType::Date64 => {}
+            _ => return None,
+        }
+    }
+    // Dates alone are left as they are.
+    if !known
+        .iter()
+        .any(|f| matches!(f.data_type(), DataType::Timestamp(..)))
+    {
+        return None;
+    }
+    let zone = match zones.as_slice() {
+        [] => None,
+        [first, rest @ ..] if rest.iter().all(|z| z == first) => Some(Arc::clone(first)),
+        [first, ..] => match declared {
+            Some(DataType::Timestamp(_, Some(chosen))) => Some(Arc::clone(chosen)),
+            _ => Some(Arc::clone(first)),
+        },
+    };
+    let unit = crate::declared::unit_for(precision);
+    Some(Temporal {
+        data_type: DataType::Timestamp(unit, zone),
+        declared: (precision != unit_digits(unit)).then_some(Declared::Timestamp(precision)),
+    })
+}
+
+/// `expr` of type `from` as a value of `to`'s Arrow type. A date or a
+/// timestamp without time zone becoming one with a time zone is the local
+/// time in the session zone, as Trino casts it (the engine's cast reads the
+/// local time in the target zone, `crate::timestamp_casts`).
+fn cast_temporal(expr: Expr, from: &DataType, to: &DataType, session_zone: &str) -> Expr {
+    if from == to {
+        return expr;
+    }
+    let local = matches!(
+        from,
+        DataType::Timestamp(_, None) | DataType::Date32 | DataType::Date64
+    );
+    let expr = match to {
+        DataType::Timestamp(unit, Some(zone)) if local && zone.as_ref() != session_zone => {
+            Expr::Cast(Cast::new(
+                Box::new(expr),
+                DataType::Timestamp(*unit, Some(session_zone.into())),
+            ))
+        }
+        _ => expr,
+    };
+    Expr::Cast(Cast::new(Box::new(expr), to.clone()))
+}
+
+/// `expr` (of `field`) as a value of `to`, declaring `to`'s precision (or
+/// none) like every other value it meets: a union answers the metadata of
+/// all its inputs merged, so one stale `timestamp(1)` would round the
+/// others.
+fn as_temporal(expr: Expr, field: &Field, to: &Temporal, session_zone: &str) -> Expr {
+    let cast = cast_temporal(expr, field.data_type(), &to.data_type, session_zone);
+    if to.declared.is_none() && crate::trino_types::declared(field).is_none() {
+        return cast;
+    }
+    crate::declared::trino_typed().call(vec![
+        cast,
+        Expr::Literal(ScalarValue::Utf8(Some(typed_name(to.declared))), None),
+    ])
+}
+
+/// Whether a value of `field` must change to be one of `to`.
+fn changes(field: &Field, to: &Temporal) -> bool {
+    *field.data_type() != to.data_type || crate::trino_types::declared(field) != to.declared
+}
+
+/// Dates, timestamps and times of a `UNION` meet in Trino's common type
+/// ([`common_temporal`]). Like [`unify_union_text`], the union's own schema
+/// is retyped even where its inputs agree: `a UNION ALL b UNION ALL c` is a
+/// union of `a UNION ALL b` and `c`, and the outer one would keep the
+/// `timestamp(0)` `DataFusion` gave it, casting every input back to it.
+fn unify_union_temporal(union: Union, session_zone: &str) -> Result<Transformed<Union>> {
+    let targets: Vec<Option<Temporal>> = (0..union.schema.fields().len())
+        .map(|j| {
+            let fields: Vec<&Field> = union
+                .inputs
+                .iter()
+                .map(|i| i.schema().field(j).as_ref())
+                .collect();
+            common_temporal(&fields, Some(union.schema.field(j).data_type()))
+        })
+        .collect();
+    if targets.iter().all(Option::is_none) {
+        return Ok(Transformed::no(union));
+    }
+    let fields: Vec<(Option<datafusion::sql::TableReference>, Arc<Field>)> = union
+        .schema
+        .iter()
+        .zip(&targets)
+        .map(|((qualifier, field), target)| match target {
+            Some(t) => (
+                qualifier.cloned(),
+                Arc::new(with_declared(
+                    &field.as_ref().clone().with_data_type(t.data_type.clone()),
+                    t.declared,
+                )),
+            ),
+            None => (qualifier.cloned(), Arc::clone(field)),
+        })
+        .collect();
+    let schema = Arc::new(DFSchema::new_with_metadata(
+        fields,
+        union.schema.metadata().clone(),
+    )?);
+    let mut changed = schema.fields() != union.schema.fields();
+    let mut inputs = Vec::with_capacity(union.inputs.len());
+    for input in union.inputs {
+        let retyped = input
+            .schema()
+            .fields()
+            .iter()
+            .zip(&targets)
+            .any(|(field, target)| target.as_ref().is_some_and(|t| changes(field, t)));
+        if !retyped {
+            inputs.push(input);
+            continue;
+        }
+        changed = true;
+        let exprs: Vec<Expr> = input
+            .schema()
+            .iter()
+            .zip(&targets)
+            .map(|((qualifier, field), target)| {
+                let column = Expr::Column(datafusion::common::Column::from((qualifier, field)));
+                match target {
+                    Some(t) => as_temporal(column, field, t, session_zone).alias(field.name()),
+                    None => column,
+                }
+            })
+            .collect();
+        inputs.push(Arc::new(LogicalPlan::Projection(
+            datafusion::logical_expr::Projection::try_new(exprs, input)?,
+        )));
+    }
+    if !changed {
+        return Ok(Transformed::no(Union {
+            inputs,
+            schema: union.schema,
+        }));
+    }
+    Ok(Transformed::yes(Union { inputs, schema }))
+}
+
+/// A `CASE` or `coalesce`-like result of timestamps or times declares the
+/// highest precision among its values (`CASE … THEN TIMESTAMP '… .1' ELSE
+/// TIMESTAMP '… .12' END` is `timestamp(2)`, of `TIME` literals `time(p)`)
+/// when its unit holds more digits; the expression itself names no type.
+/// Its values meet in the finer unit through [`unify_timestamps`].
+fn temporal_result(expr: &Expr, schema: &DFSchema) -> Result<Option<Declared>> {
+    let values: Vec<&Expr> = match expr {
+        Expr::Case(case) => case
+            .when_then_expr
+            .iter()
+            .map(|(_, then)| then.as_ref())
+            .chain(case.else_expr.as_deref())
+            .collect(),
+        Expr::ScalarFunction(ScalarFunction { func, args }) if unifies_arguments(func.name()) => {
+            args.iter().collect()
+        }
+        _ => return Ok(None),
+    };
+    let fields = values
+        .iter()
+        .map(|v| v.to_field(schema).map(|(_, f)| f))
+        .collect::<Result<Vec<_>>>()?;
+    let fields: Vec<&Field> = fields.iter().map(AsRef::as_ref).collect();
+    Ok(common_temporal(&fields, None).and_then(|t| t.declared))
+}
+
+fn unify_union(union: Union, session_zone: &str) -> Result<Transformed<LogicalPlan>> {
+    let text = unify_union_text(union)?.transform_data(|union| unify_union_temporal(union, session_zone))?;
     let (union, text_changed) = (text.data, text.transformed);
     let numeric = unify_union_numbers(union)?;
     Ok(Transformed::new_transformed(
@@ -1279,38 +1581,6 @@ fn agreed_number(types: &[DataType], declared: &DataType) -> Option<DataType> {
     only_type(types).filter(|t| t != declared && is_number(t))
 }
 
-/// The finest unit among timestamps of the same kind (all with a zone, or
-/// none), when an input or the union has another: Trino 431 unites
-/// `timestamp(3)` and `timestamp(0)` as `timestamp(3)`; `DataFusion`'s type
-/// coercion took the coarser unit and cut the fraction (`.123` became
-/// `.000`, ISS-032 item 8). Every input is cast to it here (widening is
-/// exact), so type coercion finds them alike. The zone is the union's.
-fn finest_timestamp(types: &[DataType], declared: &DataType) -> Option<DataType> {
-    let DataType::Timestamp(_, zone) = declared else {
-        return None;
-    };
-    let rank = |unit: &TimeUnit| match unit {
-        TimeUnit::Second => 0,
-        TimeUnit::Millisecond => 1,
-        TimeUnit::Microsecond => 2,
-        TimeUnit::Nanosecond => 3,
-    };
-    let mut units = Vec::with_capacity(types.len());
-    for t in types.iter().filter(|t| !t.is_null()) {
-        let DataType::Timestamp(unit, own) = t else {
-            return None;
-        };
-        if own.is_some() != zone.is_some() {
-            return None;
-        }
-        units.push(*unit);
-    }
-    let finest = units.into_iter().max_by_key(rank)?;
-    let target = DataType::Timestamp(finest, zone.clone());
-    let differs = |t: &DataType| !t.is_null() && t != &target;
-    (types.iter().any(differs) || &target != declared).then_some(target)
-}
-
 fn unify_union_numbers(union: Union) -> Result<Transformed<LogicalPlan>> {
     let columns = union.schema.fields().len();
     let mut targets: Vec<Option<DataType>> = Vec::with_capacity(columns);
@@ -1320,11 +1590,8 @@ fn unify_union_numbers(union: Union) -> Result<Transformed<LogicalPlan>> {
             .iter()
             .map(|input| input.schema().field(j).data_type().clone())
             .collect();
-        let declared = union.schema.field(j).data_type();
         targets.push(
-            common_numeric_type(&types)
-                .or_else(|| agreed_number(&types, declared))
-                .or_else(|| finest_timestamp(&types, declared)),
+            common_numeric_type(&types).or_else(|| agreed_number(&types, union.schema.field(j).data_type())),
         );
     }
     if targets.iter().all(Option::is_none) {
@@ -1393,10 +1660,32 @@ pub(crate) fn is_set_operation(join: &datafusion::logical_expr::Join) -> bool {
         })
 }
 
+/// Where the columns of a set operation meet.
+enum Meet {
+    /// One Arrow type (numbers, text).
+    Type(DataType),
+    /// Dates, timestamps and times ([`common_temporal`]).
+    Temporal(Temporal),
+}
+
 /// `plan` with each column cast to its target type (same qualifier and
 /// name), or `plan` itself when no type changes.
-fn cast_columns(plan: Arc<LogicalPlan>, targets: &[Option<DataType>]) -> Result<Arc<LogicalPlan>> {
-    if targets.iter().all(Option::is_none) {
+fn cast_columns(
+    plan: Arc<LogicalPlan>,
+    targets: &[Option<Meet>],
+    session_zone: &str,
+) -> Result<Arc<LogicalPlan>> {
+    let changed = plan
+        .schema()
+        .fields()
+        .iter()
+        .zip(targets)
+        .any(|(field, target)| match target {
+            Some(Meet::Type(t)) => t != field.data_type(),
+            Some(Meet::Temporal(t)) => changes(field, t),
+            None => false,
+        });
+    if !changed {
         return Ok(plan);
     }
     let exprs: Vec<Expr> = plan
@@ -1405,11 +1694,12 @@ fn cast_columns(plan: Arc<LogicalPlan>, targets: &[Option<DataType>]) -> Result<
         .zip(targets)
         .map(|((qualifier, field), target)| {
             let column = Expr::Column(datafusion::common::Column::from((qualifier, field)));
-            match target {
-                Some(t) if t != field.data_type() => Expr::Cast(Cast::new(Box::new(column), t.clone()))
-                    .alias_qualified(qualifier.cloned(), field.name()),
-                _ => column,
-            }
+            let cast = match target {
+                Some(Meet::Type(t)) => cast_if_needed(column, field.data_type(), t),
+                Some(Meet::Temporal(t)) => as_temporal(column, field, t, session_zone),
+                None => return column,
+            };
+            cast.alias_qualified(qualifier.cloned(), field.name())
         })
         .collect();
     Ok(Arc::new(LogicalPlan::Projection(
@@ -1438,8 +1728,11 @@ fn common_text_type(left: &DataType, right: &DataType) -> Option<DataType> {
 /// `integer INTERSECT bigint` is `bigint`); `DataFusion` keeps the left
 /// input's type and compares the two in their common type. Both inputs are
 /// cast to the common type first.
-fn unify_set_operation(join: datafusion::logical_expr::Join) -> Result<Transformed<LogicalPlan>> {
-    let targets: Vec<Option<DataType>> = join
+fn unify_set_operation(
+    join: datafusion::logical_expr::Join,
+    session_zone: &str,
+) -> Result<Transformed<LogicalPlan>> {
+    let targets: Vec<Option<Meet>> = join
         .left
         .schema()
         .fields()
@@ -1448,13 +1741,19 @@ fn unify_set_operation(join: datafusion::logical_expr::Join) -> Result<Transform
         .map(|(l, r)| {
             common_numeric_type(&[l.data_type().clone(), r.data_type().clone()])
                 .or_else(|| common_text_type(l.data_type(), r.data_type()))
+                .map(Meet::Type)
+                .or_else(|| {
+                    common_temporal(&[l.as_ref(), r.as_ref()], None)
+                        .filter(|t| changes(l, t) || changes(r, t))
+                        .map(Meet::Temporal)
+                })
         })
         .collect();
     if targets.iter().all(Option::is_none) {
         return Ok(Transformed::no(LogicalPlan::Join(join)));
     }
-    let left = cast_columns(Arc::clone(&join.left), &targets)?;
-    let right = cast_columns(Arc::clone(&join.right), &targets)?;
+    let left = cast_columns(Arc::clone(&join.left), &targets, session_zone)?;
+    let right = cast_columns(Arc::clone(&join.right), &targets, session_zone)?;
     let on = join.on.clone();
     let plan = LogicalPlan::Join(datafusion::logical_expr::Join::try_new(
         left,
@@ -1540,7 +1839,10 @@ fn rewrite_expressions(plan: LogicalPlan, session_zone: &str) -> Result<Transfor
         let name = names.save(&expr);
         expr.transform_up(|e| {
             let interval = zoned_day_interval(e, &schema)?;
-            let unified = common_types(interval.data, &schema, session_zone)?;
+            // Read before the values meet: a value cast to a finer unit no
+            // longer tells its precision.
+            let temporal = temporal_result(&interval.data, &schema)?;
+            let unified = with_temporal(common_types(interval.data, &schema, session_zone)?, temporal);
             let outer = refresh_outer_references(unified.data, &schema)?;
             Ok(Transformed::new_transformed(
                 outer.data,
@@ -1570,10 +1872,10 @@ fn common_types_node(plan: LogicalPlan, session_zone: &str) -> Result<Transforme
             let LogicalPlan::Values(values) = narrowed.data else {
                 return Ok(narrowed);
             };
-            return retype_values(values);
+            return retype_values(values, session_zone);
         }
-        LogicalPlan::Union(union) => return unify_union(union),
-        LogicalPlan::Join(join) if is_set_operation(&join) => return unify_set_operation(join),
+        LogicalPlan::Union(union) => return unify_union(union, session_zone),
+        LogicalPlan::Join(join) if is_set_operation(&join) => return unify_set_operation(join, session_zone),
         dml @ LogicalPlan::Dml(_) => return crate::declared::check_insert(dml),
         other => other,
     };
@@ -1603,50 +1905,6 @@ impl AnalyzerRule for TrinoCommonTypes {
 mod tests {
     use super::*;
 
-    /// The finest unit of a union's timestamps (ISS-032 item 8): only when
-    /// an input or the union differs from it, only among timestamps of one
-    /// kind, `NULL` inputs aside.
-    #[test]
-    fn unions_take_the_finest_timestamp() {
-        let naive = |unit| DataType::Timestamp(unit, None);
-        let utc = |unit, zone: &str| DataType::Timestamp(unit, Some(zone.into()));
-        let (s, ms, us) = (TimeUnit::Second, TimeUnit::Millisecond, TimeUnit::Microsecond);
-        assert_eq!(
-            finest_timestamp(&[naive(ms), naive(s)], &naive(s)),
-            Some(naive(ms))
-        );
-        assert_eq!(
-            finest_timestamp(&[naive(ms), naive(s)], &naive(ms)),
-            Some(naive(ms))
-        );
-        assert_eq!(
-            finest_timestamp(&[naive(s), naive(us), naive(ms)], &naive(s)),
-            Some(naive(us))
-        );
-        assert_eq!(
-            finest_timestamp(&[naive(ms), naive(ms)], &naive(s)),
-            Some(naive(ms))
-        );
-        assert_eq!(finest_timestamp(&[naive(ms), naive(ms)], &naive(ms)), None);
-        assert_eq!(finest_timestamp(&[DataType::Null, naive(ms)], &naive(ms)), None);
-        assert_eq!(
-            finest_timestamp(&[DataType::Null, naive(ms)], &naive(s)),
-            Some(naive(ms))
-        );
-        assert_eq!(
-            finest_timestamp(&[utc(s, "UTC"), utc(us, "+00:00")], &utc(s, "UTC")),
-            Some(utc(us, "UTC"))
-        );
-        assert_eq!(finest_timestamp(&[naive(ms), utc(s, "UTC")], &naive(ms)), None);
-        assert_eq!(
-            finest_timestamp(&[utc(ms, "UTC"), naive(s)], &utc(ms, "UTC")),
-            None
-        );
-        assert_eq!(finest_timestamp(&[DataType::Int64, naive(ms)], &naive(ms)), None);
-        assert_eq!(finest_timestamp(&[naive(ms), naive(s)], &DataType::Int64), None);
-        assert_eq!(finest_timestamp(&[DataType::Null], &naive(s)), None);
-    }
-
     #[test]
     fn common_numbers_follow_trino() {
         use DataType::{Decimal128 as D, Float32, Float64, Int8, Int16, Int32, Int64};
@@ -1665,6 +1923,208 @@ mod tests {
         assert_eq!(c(DataType::Utf8, Int64), None);
         assert_eq!(common_numeric_type(&[Int32, Int32]), None);
         assert_eq!(common_numeric_type(&[DataType::Null, Int32]), Some(Int32));
+    }
+
+    fn field(data_type: DataType, declared: Option<&str>) -> Field {
+        let field = Field::new("x", data_type, true);
+        match declared.and_then(Declared::parse) {
+            Some(d) => field.with_metadata(d.metadata()),
+            None => field,
+        }
+    }
+
+    fn common(fields: &[Field], declared: Option<&DataType>) -> Option<Temporal> {
+        let fields: Vec<&Field> = fields.iter().collect();
+        common_temporal(&fields, declared)
+    }
+
+    fn stamp(unit: TimeUnit, zone: Option<&str>, declared: Option<Declared>) -> Temporal {
+        Temporal {
+            data_type: DataType::Timestamp(unit, zone.map(Into::into)),
+            declared,
+        }
+    }
+
+    #[test]
+    fn timestamps_meet_in_the_highest_precision() {
+        use DataType::{Date32, Int64, Null, Timestamp as Ts, Utf8};
+        use TimeUnit::{Microsecond as Us, Millisecond as Ms, Nanosecond as Ns, Second as S};
+        let f = |t: DataType| field(t, None);
+        assert_eq!(
+            common(&[f(Ts(Ms, None)), f(Ts(S, None))], None),
+            Some(stamp(Ms, None, None))
+        );
+        assert_eq!(
+            common(&[f(Ts(S, None)), f(Ts(Us, None))], Some(&Ts(S, None))),
+            Some(stamp(Us, None, None))
+        );
+        assert_eq!(
+            common(&[f(Ts(Ns, None)), f(Ts(Ms, None))], None),
+            Some(stamp(Ns, None, None))
+        );
+        // Inputs that agree, the union typed coarser when planned.
+        assert_eq!(
+            common(&[f(Ts(Ms, None)), f(Ts(Ms, None))], Some(&Ts(S, None))),
+            Some(stamp(Ms, None, None))
+        );
+        assert_eq!(
+            common(&[f(Ts(S, None)), f(Null), f(Ts(Ms, None))], None),
+            Some(stamp(Ms, None, None))
+        );
+        assert_eq!(
+            common(&[f(Date32), f(Ts(Ms, None))], None),
+            Some(stamp(Ms, None, None))
+        );
+        assert_eq!(
+            common(&[f(Date32), f(Ts(S, None))], None),
+            Some(stamp(S, None, None))
+        );
+        // Dates alone, other types: nothing.
+        assert_eq!(common(&[f(Date32), f(Date32)], None), None);
+        assert_eq!(common(&[f(Ts(Ms, None)), f(Utf8)], None), None);
+        assert_eq!(common(&[f(Ts(Ms, None)), f(Int64)], None), None);
+        assert_eq!(common(&[f(Null)], None), None);
+        // Declared precisions.
+        let ms1 = field(Ts(Ms, None), Some("timestamp(1)"));
+        let ms2 = field(Ts(Ms, None), Some("timestamp(2)"));
+        let ns7 = field(Ts(Ns, None), Some("timestamp(7)"));
+        let us4 = field(Ts(Us, None), Some("timestamp(4)"));
+        assert_eq!(
+            common(&[ms1.clone(), ms2], None),
+            Some(stamp(Ms, None, Some(Declared::Timestamp(2))))
+        );
+        assert_eq!(
+            common(&[ms1.clone(), f(Ts(S, None))], None),
+            Some(stamp(Ms, None, Some(Declared::Timestamp(1))))
+        );
+        assert_eq!(
+            common(&[ms1.clone(), f(Ts(Ms, None))], None),
+            Some(stamp(Ms, None, None))
+        );
+        assert_eq!(
+            common(&[ns7, f(Ts(Ms, None))], None),
+            Some(stamp(Ns, None, Some(Declared::Timestamp(7))))
+        );
+        assert_eq!(
+            common(&[us4, f(Date32), f(Ts(Ms, None))], None),
+            Some(stamp(Us, None, Some(Declared::Timestamp(4))))
+        );
+        assert_eq!(common(&[f(Ts(Ns, None)), ms1], None), Some(stamp(Ns, None, None)));
+    }
+
+    #[test]
+    fn zoned_timestamps_meet_in_one_zone() {
+        use DataType::{Date32, Timestamp as Ts};
+        use TimeUnit::{Millisecond as Ms, Second as S};
+        let f = |t: DataType| field(t, None);
+        let sp = || Some(Arc::<str>::from("America/Sao_Paulo"));
+        let utc = || Some(Arc::<str>::from("UTC"));
+        assert_eq!(
+            common(&[f(Ts(Ms, sp())), f(Ts(S, sp()))], None),
+            Some(stamp(Ms, Some("America/Sao_Paulo"), None))
+        );
+        assert_eq!(
+            common(&[f(Ts(Ms, None)), f(Ts(S, sp())), f(Date32)], None),
+            Some(stamp(Ms, Some("America/Sao_Paulo"), None))
+        );
+        // One zone, whatever the union was planned with.
+        assert_eq!(
+            common(&[f(Ts(Ms, sp())), f(Ts(S, sp()))], Some(&Ts(S, utc()))),
+            Some(stamp(Ms, Some("America/Sao_Paulo"), None))
+        );
+        // Several zones: the one the union was planned with, else the first.
+        assert_eq!(
+            common(&[f(Ts(Ms, utc())), f(Ts(S, sp()))], Some(&Ts(S, sp()))),
+            Some(stamp(Ms, Some("America/Sao_Paulo"), None))
+        );
+        assert_eq!(
+            common(&[f(Ts(Ms, utc())), f(Ts(S, sp()))], Some(&Ts(S, None))),
+            Some(stamp(Ms, Some("UTC"), None))
+        );
+        assert_eq!(
+            common(&[f(Ts(Ms, utc())), f(Ts(S, sp()))], None),
+            Some(stamp(Ms, Some("UTC"), None))
+        );
+    }
+
+    #[test]
+    fn times_meet_in_the_highest_declared_precision() {
+        use DataType::{Time32, Time64, Timestamp as Ts};
+        use TimeUnit::{Millisecond as Ms, Nanosecond as Ns};
+        let t3 = field(Time64(Ns), Some("time(3)"));
+        let t0 = field(Time64(Ns), Some("time(0)"));
+        let time = |declared| {
+            Some(Temporal {
+                data_type: Time64(Ns),
+                declared,
+            })
+        };
+        assert_eq!(
+            common(&[t3.clone(), t0.clone()], None),
+            time(Some(Declared::Time(3)))
+        );
+        assert_eq!(
+            common(&[t0.clone(), t0.clone()], None),
+            time(Some(Declared::Time(0)))
+        );
+        assert_eq!(common(&[t0.clone(), field(Time64(Ns), None)], None), time(None));
+        // Times of different units, a time with a timestamp: nothing.
+        assert_eq!(common(&[t0.clone(), field(Time32(Ms), None)], None), None);
+        assert_eq!(common(&[t3, field(Ts(Ms, None), None)], None), None);
+        assert_eq!(common(&[field(Ts(Ms, None), None), t0], None), None);
+    }
+
+    #[test]
+    fn a_value_changes_when_its_type_or_declaration_differs() {
+        use DataType::Timestamp as Ts;
+        use TimeUnit::Millisecond as Ms;
+        let to = Temporal {
+            data_type: Ts(Ms, None),
+            declared: Some(Declared::Timestamp(2)),
+        };
+        assert!(!changes(&field(Ts(Ms, None), Some("timestamp(2)")), &to));
+        assert!(changes(&field(Ts(Ms, None), Some("timestamp(1)")), &to));
+        assert!(changes(&field(Ts(Ms, None), None), &to));
+        assert!(changes(
+            &field(Ts(TimeUnit::Second, None), Some("timestamp(2)")),
+            &to
+        ));
+    }
+
+    #[test]
+    fn a_local_time_meeting_a_zone_is_read_in_the_session_zone() {
+        use DataType::{Date32, Timestamp as Ts};
+        use TimeUnit::Millisecond as Ms;
+        let column = || Expr::Column(datafusion::common::Column::from_name("x"));
+        let cast = |e: Expr, t: DataType| Expr::Cast(Cast::new(Box::new(e), t));
+        let utc = Ts(Ms, Some("UTC".into()));
+        let session = Ts(Ms, Some("America/Sao_Paulo".into()));
+        assert_eq!(cast_temporal(column(), &utc, &utc, "America/Sao_Paulo"), column());
+        assert_eq!(
+            cast_temporal(column(), &Ts(Ms, None), &utc, "America/Sao_Paulo"),
+            cast(cast(column(), session.clone()), utc.clone())
+        );
+        assert_eq!(
+            cast_temporal(column(), &Date32, &utc, "America/Sao_Paulo"),
+            cast(cast(column(), session.clone()), utc.clone())
+        );
+        assert_eq!(
+            cast_temporal(column(), &Ts(Ms, None), &session, "America/Sao_Paulo"),
+            cast(column(), session.clone())
+        );
+        assert_eq!(
+            cast_temporal(
+                column(),
+                &Ts(TimeUnit::Second, Some("America/Sao_Paulo".into())),
+                &utc,
+                "America/Sao_Paulo"
+            ),
+            cast(column(), utc)
+        );
+        assert_eq!(
+            cast_temporal(column(), &Ts(TimeUnit::Second, None), &Ts(Ms, None), "UTC"),
+            cast(column(), Ts(Ms, None))
+        );
     }
 
     #[test]

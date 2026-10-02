@@ -41,11 +41,14 @@
      `time with time zone` type and answers a `time(3)`, the session's local wall time (it was
      a `time(9)`, nine digits the .NET driver refuses; branch
      `fix/postgres-session-zone-precision`).
-  8. ~~**`UNION` of timestamps of different precisions**~~ fixed in branch
-     `fix/postgres-session-zone-precision`: `timestamp(3)` with `timestamp(0)` was typed
-     `timestamp(0)` and the fraction lost; the union takes the finest unit of its inputs, as
-     Trino 431 (`Z12-union-timestamp-precision` and `timestamp_precision.toml` TP11/TP12 are
-     `OK`).
+  8. ~~**`UNION` of timestamps of different precisions**~~ fixed: `timestamp(3)` with
+     `timestamp(0)` was typed `timestamp(0)` and the fraction lost. A union first took the finest
+     unit of its inputs (`fix/postgres-session-zone-precision`); `fix/union-timestamp-precision`
+     replaces that with Trino's common type of dates, timestamps and times (highest precision,
+     declared when no Arrow unit holds it, never widened to nanoseconds next to a coarser value)
+     in unions, `VALUES`, `INTERSECT`/`EXCEPT`, `CASE` and `coalesce`
+     (`Z12-union-timestamp-precision`, `timestamp_precision.toml` TP11/TP12 and
+     `timestamp_common_types.toml` are `OK`).
   9. **MySQL dates and times keep the upstream provider's units** (audit of
      `timestamp_precision.toml`, 2026-10-02; no MySQL in the differential stack): `TIME` is a
      `time(9)` (Trino 431: `time(p)`, nine digits a .NET client refuses), `DATETIME(p)` and

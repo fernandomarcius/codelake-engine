@@ -62,4 +62,4 @@ note = "time(3) with time zone in Trino 431; the engine has no time with time zo
 [[case]]
 id = "Z12-union-timestamp-precision"
 sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.123' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00')"
-note = "found here, not about the zone: a UNION of timestamp(3) and timestamp(0) was timestamp(0) and lost the fraction; timestamp(3), as Trino 431 (ISS-032 item 8, fixed)"
+note = "found here, not about the zone: a UNION of timestamp(3) and timestamp(0) was timestamp(0) and lost the fraction; timestamp(3), as Trino 431 (ISS-032 item 8, fixed; timestamp_common_types.toml)"
