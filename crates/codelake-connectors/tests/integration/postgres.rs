@@ -888,6 +888,46 @@ async fn rows_in(engine: &Engine, zone: Option<&str>, sql: &str) -> Vec<Vec<Stri
     out
 }
 
+/// Dates and times of every precision, inside and outside 1677–2262.
+const DATETIMES: &str = "CREATE TABLE dt (id INT,
+       ts TIMESTAMP, ts0 TIMESTAMP(0), ts1 TIMESTAMP(1), ts3 TIMESTAMP(3), ts5 TIMESTAMP(5),
+       tz TIMESTAMPTZ, tz0 TIMESTAMPTZ(0), tz2 TIMESTAMPTZ(2), tz3 TIMESTAMPTZ(3),
+       t TIME, t0 TIME(0), t3 TIME(3), t4 TIME(4),
+       a_ts3 TIMESTAMP(3)[], a_tz TIMESTAMPTZ[], a_t TIME[]);
+     INSERT INTO dt VALUES (1,
+       '2026-10-01 12:34:56.123456', '2026-10-01 12:34:56', '2026-10-01 12:34:56.1',
+       '2026-10-01 12:34:56.123', '2026-10-01 12:34:56.12345',
+       '2026-10-01 12:34:56.123456+00', '2026-10-01 12:34:56+00', '2026-10-01 12:34:56.12+00',
+       '2026-10-01 12:34:56.123+00',
+       '12:34:56.123456', '12:34:56', '12:34:56.123', '12:34:56.1234',
+       ARRAY['2026-10-01 12:34:56.123'::TIMESTAMP(3)], ARRAY['2026-10-01 12:34:56.123456+00'::TIMESTAMPTZ],
+       ARRAY['12:34:56.123456'::TIME]);
+     INSERT INTO dt (id, ts, tz, ts3) VALUES
+       (2, '1960-01-01 00:00:00.5', '1960-01-01 00:00:00.5+00', '1969-12-31 23:59:59.999'),
+       (3, '0001-01-01 00:00:00', '9999-12-31 23:59:59.999999+00', '2300-01-01 00:00:00.001');
+     ALTER DATABASE postgres SET timezone TO 'America/Sao_Paulo';";
+
+/// The types of `DATETIMES`, as the reference engine declares them.
+const DATETIME_TYPES: [(&str, &str); 17] = [
+    ("id", "integer"),
+    ("ts", "timestamp(6)"),
+    ("ts0", "timestamp(0)"),
+    ("ts1", "timestamp(1)"),
+    ("ts3", "timestamp(3)"),
+    ("ts5", "timestamp(5)"),
+    ("tz", "timestamp(6) with time zone"),
+    ("tz0", "timestamp(0) with time zone"),
+    ("tz2", "timestamp(2) with time zone"),
+    ("tz3", "timestamp(3) with time zone"),
+    ("t", "time(6)"),
+    ("t0", "time(0)"),
+    ("t3", "time(3)"),
+    ("t4", "time(4)"),
+    ("a_ts3", "array(timestamp(3))"),
+    ("a_tz", "array(timestamp(6) with time zone)"),
+    ("a_t", "array(time(6))"),
+];
+
 /// Dates and times have the reference engine's precision: PostgreSQL's
 /// microsecond, or the precision a column declares; their values are read
 /// whole, also before 1970 and after 2262 (the upstream decoder dropped
@@ -899,25 +939,7 @@ async fn datetimes_have_the_reference_precision_and_their_whole_range() {
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     client(&host, port, "postgres", "postgres")
         .await
-        .batch_execute(
-            "CREATE TABLE dt (id INT,
-               ts TIMESTAMP, ts0 TIMESTAMP(0), ts1 TIMESTAMP(1), ts3 TIMESTAMP(3), ts5 TIMESTAMP(5),
-               tz TIMESTAMPTZ, tz0 TIMESTAMPTZ(0), tz2 TIMESTAMPTZ(2), tz3 TIMESTAMPTZ(3),
-               t TIME, t0 TIME(0), t3 TIME(3), t4 TIME(4),
-               a_ts3 TIMESTAMP(3)[], a_tz TIMESTAMPTZ[], a_t TIME[]);
-             INSERT INTO dt VALUES (1,
-               '2026-10-01 12:34:56.123456', '2026-10-01 12:34:56', '2026-10-01 12:34:56.1',
-               '2026-10-01 12:34:56.123', '2026-10-01 12:34:56.12345',
-               '2026-10-01 12:34:56.123456+00', '2026-10-01 12:34:56+00', '2026-10-01 12:34:56.12+00',
-               '2026-10-01 12:34:56.123+00',
-               '12:34:56.123456', '12:34:56', '12:34:56.123', '12:34:56.1234',
-               ARRAY['2026-10-01 12:34:56.123'::TIMESTAMP(3)], ARRAY['2026-10-01 12:34:56.123456+00'::TIMESTAMPTZ],
-               ARRAY['12:34:56.123456'::TIME]);
-             INSERT INTO dt (id, ts, tz, ts3) VALUES
-               (2, '1960-01-01 00:00:00.5', '1960-01-01 00:00:00.5+00', '1969-12-31 23:59:59.999'),
-               (3, '0001-01-01 00:00:00', '9999-12-31 23:59:59.999999+00', '2300-01-01 00:00:00.001');
-             ALTER DATABASE postgres SET timezone TO 'America/Sao_Paulo';",
-        )
+        .batch_execute(DATETIMES)
         .await
         .unwrap();
     let spill = tempfile::tempdir().unwrap();
@@ -930,27 +952,8 @@ async fn datetimes_have_the_reference_precision_and_their_whole_range() {
          WHERE table_schema = 'public' AND table_name = 'dt' ORDER BY ordinal_position",
     )
     .await;
-    let expected = [
-        ("id", "integer"),
-        ("ts", "timestamp(6)"),
-        ("ts0", "timestamp(0)"),
-        ("ts1", "timestamp(1)"),
-        ("ts3", "timestamp(3)"),
-        ("ts5", "timestamp(5)"),
-        ("tz", "timestamp(6) with time zone"),
-        ("tz0", "timestamp(0) with time zone"),
-        ("tz2", "timestamp(2) with time zone"),
-        ("tz3", "timestamp(3) with time zone"),
-        ("t", "time(6)"),
-        ("t0", "time(0)"),
-        ("t3", "time(3)"),
-        ("t4", "time(4)"),
-        ("a_ts3", "array(timestamp(3))"),
-        ("a_tz", "array(timestamp(6) with time zone)"),
-        ("a_t", "array(time(6))"),
-    ];
     let types: Vec<(&str, &str)> = types.iter().map(|r| (r[0].as_str(), r[1].as_str())).collect();
-    assert_eq!(types, expected);
+    assert_eq!(types, DATETIME_TYPES);
 
     let values = rows(
         &engine,
