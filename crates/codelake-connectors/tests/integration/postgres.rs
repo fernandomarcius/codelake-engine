@@ -525,7 +525,7 @@ async fn views_materialized_views_foreign_and_partitioned_tables_are_relations()
     for line in [
         "| id          | integer                     |",
         "| label       | varchar                     |",
-        "| ts          | timestamp(9) with time zone |",
+        "| ts          | timestamp(6) with time zone |",
     ] {
         assert!(columns.contains(line), "{line}:\n{columns}");
     }
@@ -704,10 +704,10 @@ async fn assert_contains(engine: &codelake_core::Engine, sql: &str, values: &[&s
 const ARRAY_COLUMNS: [(&str, &str); 24] = [
     ("id", "integer"),
     ("a_date", "array(date)"),
-    ("a_ts", "array(timestamp(9))"),
-    ("a_ts3", "array(timestamp(9))"),
-    ("a_tstz", "array(timestamp(9) with time zone)"),
-    ("a_time", "array(time(9))"),
+    ("a_ts", "array(timestamp(6))"),
+    ("a_ts3", "array(timestamp(3))"),
+    ("a_tstz", "array(timestamp(6) with time zone)"),
+    ("a_time", "array(time(6))"),
     ("a_num2", "array(decimal(10,2))"),
     ("a_text", "array(varchar)"),
     ("a_varchar", "array(varchar)"),
@@ -858,4 +858,304 @@ async fn sessions_leave_no_error_in_the_server_log() {
     let log = String::from_utf8_lossy(&container.stderr_to_vec().await.unwrap()).into_owned();
     assert!(log.contains("database system is ready"), "{log}");
     assert!(!log.contains("ERROR"), "{log}");
+}
+
+/// Rows of `sql` in a session with time zone `zone` (`None`: the engine's).
+async fn rows_in(engine: &Engine, zone: Option<&str>, sql: &str) -> Vec<Vec<String>> {
+    let options = codelake_core::QueryOptions {
+        time_zone: zone.map(str::to_owned),
+        ..codelake_core::QueryOptions::for_user("u")
+    };
+    let batches = engine
+        .sql_with(&options, sql)
+        .await
+        .unwrap_or_else(|e| panic!("planning `{sql}` failed: {e}"))
+        .collect()
+        .await
+        .unwrap_or_else(|e| panic!("executing `{sql}` failed: {e}"));
+    let mut out = Vec::new();
+    for batch in &batches {
+        for i in 0..batch.num_rows() {
+            out.push(
+                batch
+                    .columns()
+                    .iter()
+                    .map(|c| array_value_to_string(c, i).unwrap())
+                    .collect(),
+            );
+        }
+    }
+    out
+}
+
+/// Dates and times have the reference engine's precision: PostgreSQL's
+/// microsecond, or the precision a column declares; their values are read
+/// whole, also before 1970 and after 2262 (the upstream decoder dropped
+/// the first and turned the second into 1970-01-01).
+#[tokio::test]
+async fn datetimes_have_the_reference_precision_and_their_whole_range() {
+    let container = Postgres::default().with_tag("17-alpine").start().await.unwrap();
+    let host = common::host();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    client(&host, port, "postgres", "postgres")
+        .await
+        .batch_execute(
+            "CREATE TABLE dt (id INT,
+               ts TIMESTAMP, ts0 TIMESTAMP(0), ts1 TIMESTAMP(1), ts3 TIMESTAMP(3), ts5 TIMESTAMP(5),
+               tz TIMESTAMPTZ, tz0 TIMESTAMPTZ(0), tz2 TIMESTAMPTZ(2), tz3 TIMESTAMPTZ(3),
+               t TIME, t0 TIME(0), t3 TIME(3), t4 TIME(4),
+               a_ts3 TIMESTAMP(3)[], a_tz TIMESTAMPTZ[], a_t TIME[]);
+             INSERT INTO dt VALUES (1,
+               '2026-10-01 12:34:56.123456', '2026-10-01 12:34:56', '2026-10-01 12:34:56.1',
+               '2026-10-01 12:34:56.123', '2026-10-01 12:34:56.12345',
+               '2026-10-01 12:34:56.123456+00', '2026-10-01 12:34:56+00', '2026-10-01 12:34:56.12+00',
+               '2026-10-01 12:34:56.123+00',
+               '12:34:56.123456', '12:34:56', '12:34:56.123', '12:34:56.1234',
+               ARRAY['2026-10-01 12:34:56.123'::TIMESTAMP(3)], ARRAY['2026-10-01 12:34:56.123456+00'::TIMESTAMPTZ],
+               ARRAY['12:34:56.123456'::TIME]);
+             INSERT INTO dt (id, ts, tz, ts3) VALUES
+               (2, '1960-01-01 00:00:00.5', '1960-01-01 00:00:00.5+00', '1969-12-31 23:59:59.999'),
+               (3, '0001-01-01 00:00:00', '9999-12-31 23:59:59.999999+00', '2300-01-01 00:00:00.001');
+             ALTER DATABASE postgres SET timezone TO 'America/Sao_Paulo';",
+        )
+        .await
+        .unwrap();
+    let spill = tempfile::tempdir().unwrap();
+    let mut engine = common::engine(spill.path());
+    common::attach(&mut engine, Arc::new(connector(&host, port))).await;
+
+    let types = rows(
+        &engine,
+        "SELECT column_name, data_type FROM erp.information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'dt' ORDER BY ordinal_position",
+    )
+    .await;
+    let expected = [
+        ("id", "integer"),
+        ("ts", "timestamp(6)"),
+        ("ts0", "timestamp(0)"),
+        ("ts1", "timestamp(1)"),
+        ("ts3", "timestamp(3)"),
+        ("ts5", "timestamp(5)"),
+        ("tz", "timestamp(6) with time zone"),
+        ("tz0", "timestamp(0) with time zone"),
+        ("tz2", "timestamp(2) with time zone"),
+        ("tz3", "timestamp(3) with time zone"),
+        ("t", "time(6)"),
+        ("t0", "time(0)"),
+        ("t3", "time(3)"),
+        ("t4", "time(4)"),
+        ("a_ts3", "array(timestamp(3))"),
+        ("a_tz", "array(timestamp(6) with time zone)"),
+        ("a_t", "array(time(6))"),
+    ];
+    let types: Vec<(&str, &str)> = types.iter().map(|r| (r[0].as_str(), r[1].as_str())).collect();
+    assert_eq!(types, expected);
+
+    let values = rows(
+        &engine,
+        "SELECT ts, ts0, ts1, ts3, ts5, tz, tz0, tz2, tz3, t, t0, t3, t4, a_ts3, a_tz, a_t \
+         FROM erp.public.dt WHERE id = 1",
+    )
+    .await;
+    assert_eq!(
+        values,
+        [[
+            "2026-10-01T12:34:56.123456",
+            "2026-10-01T12:34:56",
+            "2026-10-01T12:34:56.100",
+            "2026-10-01T12:34:56.123",
+            "2026-10-01T12:34:56.123450",
+            "2026-10-01T12:34:56.123456Z",
+            "2026-10-01T12:34:56Z",
+            "2026-10-01T12:34:56.120Z",
+            "2026-10-01T12:34:56.123Z",
+            "12:34:56.123456",
+            "12:34:56",
+            "12:34:56.123",
+            "12:34:56.123400",
+            "[2026-10-01T12:34:56.123]",
+            "[2026-10-01T12:34:56.123456Z]",
+            "[12:34:56.123456]",
+        ]]
+    );
+    let range = rows(
+        &engine,
+        "SELECT id, ts, tz, ts3 FROM erp.public.dt WHERE id > 1 ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        range,
+        [
+            [
+                "2",
+                "1960-01-01T00:00:00.500",
+                "1960-01-01T00:00:00.500Z",
+                "1969-12-31T23:59:59.999",
+            ],
+            [
+                "3",
+                "0001-01-01T00:00:00",
+                "9999-12-31T23:59:59.999999Z",
+                "2300-01-01T00:00:00.001",
+            ],
+        ]
+    );
+    // Compared at the source with literals of other precisions.
+    let found = rows(
+        &engine,
+        "SELECT id FROM erp.public.dt WHERE ts < TIMESTAMP '1970-01-01 00:00:00' ORDER BY id",
+    )
+    .await;
+    assert_eq!(found, [["2"], ["3"]]);
+    let found = rows(
+        &engine,
+        "SELECT id FROM erp.public.dt WHERE tz > TIMESTAMP '9999-12-31 23:59:59.999998 UTC'",
+    )
+    .await;
+    assert_eq!(found, [["3"]]);
+}
+
+/// A `numeric` without precision is a `decimal(38,20)`; a value that does
+/// not fit it exactly fails the query, naming its column, rather than
+/// being rounded or cut (the reference engine leaves such a column out).
+#[tokio::test]
+async fn unbounded_numerics_are_exact_or_fail_naming_the_column() {
+    let container = Postgres::default().with_tag("17-alpine").start().await.unwrap();
+    let host = common::host();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    client(&host, port, "postgres", "postgres")
+        .await
+        .batch_execute(
+            "CREATE TABLE nums (id INT, n NUMERIC);
+             INSERT INTO nums VALUES (1, 1.5), (2, 123456789012345678.12345678901234567890),
+               (3, -999999999999999999.99999999999999999999), (4, 0.1000000000000000000000000),
+               (5, NULL),
+               (10, 1e20), (11, 0.123456789012345678901), (12, 'NaN'), (13, 'Infinity'),
+               (14, '-Infinity'), (15, 1000000000000000000), (16, 12345678901234.123456789012345678901);
+             CREATE VIEW recebimentos AS SELECT id, n AS vl_recebido FROM nums;",
+        )
+        .await
+        .unwrap();
+    let spill = tempfile::tempdir().unwrap();
+    let mut engine = common::engine(spill.path());
+    common::attach(&mut engine, Arc::new(connector(&host, port))).await;
+
+    let types = rows(
+        &engine,
+        "SELECT data_type FROM erp.information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'recebimentos' AND column_name = 'vl_recebido'",
+    )
+    .await;
+    assert_eq!(types, [["decimal(38,20)"]]);
+    let exact = rows(
+        &engine,
+        "SELECT id, n FROM erp.public.nums WHERE id < 10 ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        exact,
+        [
+            ["1", "1.50000000000000000000"],
+            ["2", "123456789012345678.12345678901234567890"],
+            ["3", "-999999999999999999.99999999999999999999"],
+            ["4", "0.10000000000000000000"],
+            ["5", "NULL"],
+        ]
+    );
+    let sum = rows(&engine, "SELECT sum(n) FROM erp.public.nums WHERE id IN (1, 4)").await;
+    assert_eq!(sum, [["1.60000000000000000000"]]);
+    for (id, value, why) in [
+        (10, "100000000000000000000", "more than 18 integer digits"),
+        (11, "0.123456789012345678901", "more than 20 fraction digits"),
+        (12, "NaN", "a decimal holds only finite numbers"),
+        (13, "Infinity", "a decimal holds only finite numbers"),
+        (14, "-Infinity", "a decimal holds only finite numbers"),
+        (15, "1000000000000000000", "more than 18 integer digits"),
+        (
+            16,
+            "12345678901234.123456789012345678901",
+            "more than 20 fraction digits",
+        ),
+    ] {
+        let sql = format!("SELECT vl_recebido FROM erp.public.recebimentos WHERE id = {id}");
+        let error = engine
+            .sql(&sql)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .expect_err(&sql)
+            .to_string();
+        let expected = format!(
+            "the PostgreSQL value {value} of column \"vl_recebido\" does not fit decimal(38,20): {why}"
+        );
+        assert!(error.contains(&expected), "{sql}: {error}");
+    }
+}
+
+/// Every statement runs in the client session's time zone, never in the
+/// server's or the role's default (`America/Sao_Paulo` here): a view that
+/// reads `current_date` answers the client's day. The reference engine runs
+/// its sessions in `Etc/UTC` whatever the client's (ISS-060); without a
+/// client zone the engine's is UTC, as `Etc/UTC`. A pooled connection
+/// carries no zone from one query to the next.
+#[tokio::test]
+async fn statements_run_in_the_client_time_zone() {
+    let container = Postgres::default().with_tag("17-alpine").start().await.unwrap();
+    let host = common::host();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    client(&host, port, "postgres", "postgres")
+        .await
+        .batch_execute(
+            "CREATE VIEW today AS SELECT current_setting('TimeZone') AS zone, current_date AS today,
+               (now() AT TIME ZONE 'UTC')::date AS utc_today,
+               (now() AT TIME ZONE 'Pacific/Kiritimati')::date AS kiritimati_today,
+               (now() AT TIME ZONE 'Etc/GMT+12')::date AS minus12_today,
+               extract(hour FROM now() AT TIME ZONE 'UTC')::int AS utc_hour;
+             ALTER DATABASE postgres SET timezone TO 'America/Sao_Paulo';",
+        )
+        .await
+        .unwrap();
+    let spill = tempfile::tempdir().unwrap();
+    let mut engine = common::engine(spill.path());
+    common::attach(&mut engine, Arc::new(connector(&host, port))).await;
+    let sql =
+        "SELECT zone, today, utc_today, kiritimati_today, minus12_today, utc_hour FROM erp.public.today";
+
+    // A zone whose date differs from UTC's now: +14 from 10:00 UTC, -12
+    // before 12:00 UTC.
+    let utc_hour: u32 = rows_in(&engine, None, sql).await[0][5].parse().unwrap();
+    let (zone, shown, column) = if utc_hour >= 11 {
+        ("Pacific/Kiritimati", "Pacific/Kiritimati", 3)
+    } else {
+        ("-12:00", "<-12>+12", 4)
+    };
+    let answer = &rows_in(&engine, Some(zone), sql).await[0];
+    assert_eq!(answer[0], shown);
+    assert_eq!(
+        answer[1], answer[column],
+        "current_date is the client's day: {answer:?}"
+    );
+    assert_ne!(answer[1], answer[2], "and not UTC's: {answer:?}");
+
+    let zone_of = |zone: Option<&'static str>| {
+        let engine = &engine;
+        async move { rows_in(engine, zone, "SELECT zone FROM erp.public.today").await[0][0].clone() }
+    };
+    assert_eq!(zone_of(None).await, "Etc/UTC");
+    assert_eq!(zone_of(Some("UTC")).await, "Etc/UTC");
+    assert_eq!(zone_of(Some("+05:45")).await, "<+05:45>-05:45");
+    // More queries at once than the pool has connections, in turn.
+    let zones = [
+        Some("Asia/Tokyo"),
+        None,
+        Some("America/Sao_Paulo"),
+        Some("-03:00"),
+    ];
+    let shown = ["Asia/Tokyo", "Etc/UTC", "America/Sao_Paulo", "<-03>+03"];
+    let answers = futures::future::join_all((0..40).map(|i| zone_of(zones[i % 4]))).await;
+    for (i, answer) in answers.iter().enumerate() {
+        assert_eq!(answer, shown[i % 4], "query {i}");
+    }
 }

@@ -5,6 +5,14 @@
 //! setting) on every connection it opens; PostgreSQL refuses it and logs an
 //! `ERROR` on the server for each connection (ISS-060). This pool opens plain
 //! sessions; its connections read rows with the upstream row decoder.
+//!
+//! Every statement runs in the time zone of the engine session it answers
+//! (the client's `X-Trino-Time-Zone` or `SET TIME ZONE`, UTC without one),
+//! never in the server's or the role's default: a view that reads
+//! `current_date` or `now()` answers the client's day. The connection sets
+//! its `TimeZone` before each statement, so a pooled connection carries no
+//! zone from one statement to the next. The reference engine runs its
+//! sessions in its JVM's zone (`Etc/UTC`) whatever the client's: ISS-060.
 
 use std::any::Any;
 use std::fmt;
@@ -25,6 +33,7 @@ use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{
 };
 use datafusion_table_providers_common::sql::db_connection_pool::{DbConnectionPool, JoinPushDown};
 use datafusion_table_providers_postgres::arrow_sql_gen::rows_to_arrow;
+use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt, stream};
 use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
@@ -48,6 +57,7 @@ const ROWS_PER_BATCH: usize = 4_000;
 /// Connections the pool keeps at most (the upstream pool's size).
 const POOL_SIZE: u32 = 10;
 
+#[derive(Clone)]
 pub(super) struct PgPool {
     pool: bb8::Pool<Manager>,
     /// Sources with the same server, database and user may be joined at the
@@ -131,6 +141,42 @@ fn pool_error(error: bb8::RunError<bb8_postgres::tokio_postgres::Error>) -> Gene
     }
 }
 
+impl crate::postgres_pushdown::ZonedSource for PgPool {
+    fn query(
+        &self,
+        time_zone: Option<String>,
+        sql: String,
+        schema: SchemaRef,
+    ) -> BoxFuture<'static, Result<SendableRecordBatchStream, GenericError>> {
+        let pool = self.clone();
+        Box::pin(async move {
+            let connection = PgConnection {
+                client: pool.client().await?,
+                time_zone,
+            };
+            connection.query_arrow(&sql, &[], Some(schema)).await
+        })
+    }
+}
+
+/// The statement setting a session's `TimeZone` to `zone`, the engine
+/// session's zone as Trino spells it (`UTC`, `-03:00`, `America/Sao_Paulo`;
+/// `None`: the engine's, UTC). An offset is an interval: as text PostgreSQL
+/// reads it as a POSIX zone, east and west swapped. UTC is `Etc/UTC`, the
+/// name the reference engine's sessions use.
+pub(super) fn zone_statement(zone: Option<&str>) -> String {
+    match zone.unwrap_or("UTC") {
+        "UTC" => "SET TIME ZONE 'Etc/UTC'".to_owned(),
+        offset
+            if offset.starts_with(['+', '-'])
+                && offset[1..].bytes().all(|b| b.is_ascii_digit() || b == b':') =>
+        {
+            format!("SET TIME ZONE INTERVAL '{offset}' HOUR TO MINUTE")
+        }
+        name => format!("SET TIME ZONE '{}'", name.replace('\'', "''")),
+    }
+}
+
 #[async_trait]
 impl DbConnectionPool<Client, Param> for PgPool {
     async fn connect(&self) -> Result<Box<dyn DbConnection<Client, Param>>, GenericError> {
@@ -144,6 +190,18 @@ impl DbConnectionPool<Client, Param> for PgPool {
 
 pub(super) struct PgConnection {
     client: Client,
+    /// The engine session's zone its statements run in ([`zone_statement`]).
+    time_zone: Option<String>,
+}
+
+impl PgConnection {
+    /// Sets the session's `TimeZone` for the next statement.
+    async fn in_session_zone(&self) -> Result<(), GenericError> {
+        self.client
+            .batch_execute(&zone_statement(self.time_zone.as_deref()))
+            .await
+            .map_err(db_error)
+    }
 }
 
 impl DbConnection<Client, Param> for PgConnection {
@@ -163,7 +221,10 @@ impl DbConnection<Client, Param> for PgConnection {
 #[async_trait]
 impl AsyncDbConnection<Client, Param> for PgConnection {
     fn new(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            time_zone: None,
+        }
     }
 
     async fn tables(&self, schema: &str) -> Result<Vec<String>, DbError> {
@@ -193,6 +254,7 @@ impl AsyncDbConnection<Client, Param> for PgConnection {
         params: &[Param],
         projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, GenericError> {
+        self.in_session_zone().await?;
         let sql = types::readable(sql, projected_schema.as_deref());
         let rows = self
             .client
@@ -207,7 +269,8 @@ impl AsyncDbConnection<Client, Param> for PgConnection {
                     .into_iter()
                     .collect::<Result<Vec<Row>, _>>()
                     .map_err(db_error)?;
-                rows_to_arrow(&rows, &decode_schema).map_err(|e| Box::new(e) as GenericError)
+                let batch = rows_to_arrow(&rows, &decode_schema).map_err(|e| Box::new(e) as GenericError)?;
+                types::restore(batch, decode_schema.as_deref()).map_err(GenericError::from)
             })
             .boxed();
         let Some(first) = batches.next().await else {
@@ -224,6 +287,7 @@ impl AsyncDbConnection<Client, Param> for PgConnection {
     }
 
     async fn execute(&self, sql: &str, params: &[Param]) -> Result<u64, GenericError> {
+        self.in_session_zone().await?;
         self.client.execute(sql, params).await.map_err(db_error)
     }
 }
@@ -234,5 +298,30 @@ pub(super) fn db_error(error: bb8_postgres::tokio_postgres::Error) -> GenericErr
     match error.as_db_error() {
         Some(db) => Box::new(db.clone()),
         None => Box::new(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::zone_statement;
+
+    #[test]
+    fn statements_run_in_the_engine_sessions_zone() {
+        assert_eq!(zone_statement(None), "SET TIME ZONE 'Etc/UTC'");
+        assert_eq!(zone_statement(Some("UTC")), "SET TIME ZONE 'Etc/UTC'");
+        assert_eq!(
+            zone_statement(Some("America/Sao_Paulo")),
+            "SET TIME ZONE 'America/Sao_Paulo'"
+        );
+        assert_eq!(
+            zone_statement(Some("-03:00")),
+            "SET TIME ZONE INTERVAL '-03:00' HOUR TO MINUTE"
+        );
+        assert_eq!(
+            zone_statement(Some("+05:45")),
+            "SET TIME ZONE INTERVAL '+05:45' HOUR TO MINUTE"
+        );
+        assert_eq!(zone_statement(Some("-03'x")), "SET TIME ZONE '-03''x'");
+        assert_eq!(zone_statement(Some("O'Zone")), "SET TIME ZONE 'O''Zone'");
     }
 }
