@@ -156,6 +156,20 @@ versioning: [SemVer](https://semver.org/).
   fronts' Definition of Done (docs/gates.md).
 
 ### Changed
+- **Breaking (ISS-060, awaiting confirmation):** a PostgreSQL `numeric` without precision, or with more than
+  38 digits, and arrays of them, are left out of their relation by default, as the reference engine's
+  `decimal-mapping=STRICT` leaves them (they were `decimal(38,20)`): absent from `SELECT *`,
+  `information_schema`, `system.jdbc` and `DESCRIBE`; naming one fails with `COLUMN_NOT_FOUND`; a relation
+  whose every column is left out is refused (`NOT_FOUND`), as there. Found by the Warehouse API against the
+  shadow run (2026-10-02): its .NET driver cannot hold a `decimal(38,20)` in a `System.Decimal` and handed
+  the API an object serialized `{}` (`/api/boletos/saude`: `ultima_rodada_pct_aceite` `98.5` on the
+  reference, `{}` on CodeLake; `/api/boletos/fila` items gained `"vl_recebido": {}`; the `fila`, `gerados`
+  and `conciliacao` spreadsheet exports answered 406 where the reference answered 200; `ordenar=vl_recebido`
+  answered 200 where production answers 503). A source exposes them on purpose with the reference's other
+  setting: `decimal_mapping = "allow_overflow"`, `decimal_rounding_mode` (`unnecessary` by default: a value
+  with more digits fails, as before) and `decimal_default_scale` (`docs/operations/configuration.md`;
+  `codelake config import` maps `decimal-mapping`, `decimal-rounding-mode`, `decimal-default-scale`).
+  Types and rounding verified against Trino 431 with PostgreSQL 17 (`postgres_decimals.toml`).
 - **Breaking (ISS-059):** `char(n)` values are never padded, from any origin: a hive table (and a file
   another tool wrote with trailing spaces), an in-memory table or view, `CAST`/`TRY_CAST`, a literal,
   and the common char type of `COALESCE`, `CASE`, `UNION`, `INTERSECT`, `EXCEPT`, `VALUES` and `USING`
@@ -365,7 +379,8 @@ versioning: [SemVer](https://semver.org/).
     integer digits but within 128 bits was kept as an invalid decimal. It travels as its text; a value that does not fit `decimal(38,20)` exactly (more than 18 integer or 20 fraction digits,
     `NaN`, `±Infinity`) fails the query naming the column (`the PostgreSQL value NaN of column
     "vl_recebido" does not fit decimal(38,20)`). The reference leaves such a column out of the relation
-    (`decimal-mapping=STRICT`): accepted divergence, ISS-060.
+    (`decimal-mapping=STRICT`): accepted divergence, ISS-060 (superseded: such a column is now left out by
+    default, see Changed).
 - Timestamps and times never reach a client with more digits than the reference declares (a protocol test
   checks that every value is sent with the digits its column's type declares, for every unit, zone and
   declared precision; `timestamp_precision.toml` compares functions, casts, literals, Hive and PostgreSQL

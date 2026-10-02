@@ -6,7 +6,9 @@ Nothing is published on the host: the harness container joins a private
 network with Trino 431, PostgreSQL 17 and CodeLake (the binary built by the gate,
 copied into a container of the toolbelt image). When PostgreSQL runs, both engines
 also read it as a source, through a catalog named `pg` (stack/pg.properties,
-stack/codelake-postgres.toml, stack/postgres-source.sql).
+stack/codelake-postgres.toml, stack/postgres-source.sql), and through `pg_overflow`
+and `pg_rounded`, the same database with the reference's
+`decimal-mapping=ALLOW_OVERFLOW` (the second rounding `HALF_EVEN` to scale 2).
 """
 
 import http.client
@@ -203,7 +205,8 @@ class Stack:
             self.docker.copy_in(t, "/etc/trino", {"jvm.config": (read("jvm.config"), 0o644)})
             catalogs = {"hive.properties": (read("hive.properties"), 0o644)}
             if source:
-                catalogs["pg.properties"] = (read("pg.properties"), 0o644)
+                for name in ("pg", "pg_overflow", "pg_rounded"):
+                    catalogs[f"{name}.properties"] = (read(f"{name}.properties"), 0o644)
             self.docker.copy_in(t, "/etc/trino/catalog", catalogs)
             self.docker.call("POST", f"/containers/{t}/start")
             self.endpoints["trino"] = "http://trino:8080"

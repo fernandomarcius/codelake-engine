@@ -11,3 +11,29 @@ database = "postgres"
 user = "source"
 password_env = "CODELAKE_DIFF_PG_PASSWORD"
 sslmode = "disable"
+
+# The same database with the reference's decimal-mapping=ALLOW_OVERFLOW
+# (pg_overflow.properties, pg_rounded.properties; ISS-060).
+[[source]]
+name = "pg_overflow"
+kind = "postgres"
+host = "postgres"
+port = 5432
+database = "postgres"
+user = "source"
+password_env = "CODELAKE_DIFF_PG_PASSWORD"
+sslmode = "disable"
+decimal_mapping = "allow_overflow"
+
+[[source]]
+name = "pg_rounded"
+kind = "postgres"
+host = "postgres"
+port = 5432
+database = "postgres"
+user = "source"
+password_env = "CODELAKE_DIFF_PG_PASSWORD"
+sslmode = "disable"
+decimal_mapping = "allow_overflow"
+decimal_rounding_mode = "half_even"
+decimal_default_scale = 2

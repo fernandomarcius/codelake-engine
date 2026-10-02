@@ -10,7 +10,8 @@
 //!   the source (`permission denied`), as on the reference engine.
 //! - Columns: in order, with the Arrow type of [`super::types`] (and the
 //!   precision it declares besides); an array column whose elements have no
-//!   type there is left out.
+//!   type there is left out, and so is a `numeric` without precision or with
+//!   more than 38 digits under the catalog's `decimal_mapping = "strict"`.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -26,6 +27,7 @@ use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{
 
 use codelake_core::catalog::NameSource;
 
+use super::Decimals;
 use super::pool::{PgPool, db_error};
 use super::types::{Column, arrow_type, declared};
 
@@ -112,7 +114,12 @@ async fn find(client: &Client, schema: &str, table: &str) -> Result<Option<Strin
 }
 
 /// The Arrow schema of relation `schema`.`table`.
-pub(super) async fn schema_of(client: &Client, schema: &str, table: &str) -> Result<Schema, DbError> {
+pub(super) async fn schema_of(
+    client: &Client,
+    schema: &str,
+    table: &str,
+    decimals: Decimals,
+) -> Result<Schema, DbError> {
     let unreadable = |source: GenericError| DbError::UnableToGetSchema { source };
     let rows = client
         .query(COLUMNS, &[&schema, &table])
@@ -125,6 +132,7 @@ pub(super) async fn schema_of(client: &Client, schema: &str, table: &str) -> Res
         });
     }
     let mut fields = Vec::with_capacity(rows.len());
+    let columns = rows.len();
     for row in rows {
         let read = || -> Result<Column, bb8_postgres::tokio_postgres::Error> {
             let names: Vec<String> = row.try_get(8)?;
@@ -142,10 +150,11 @@ pub(super) async fn schema_of(client: &Client, schema: &str, table: &str) -> Res
             })
         };
         let column = read().map_err(|e| unreadable(Box::new(e)))?;
-        let Some(data_type) = arrow_type(&column).map_err(|type_name| DbError::UnsupportedDataType {
-            data_type: type_name,
-            field_name: column.name.clone(),
-        })?
+        let Some(data_type) =
+            arrow_type(&column, decimals).map_err(|type_name| DbError::UnsupportedDataType {
+                data_type: type_name,
+                field_name: column.name.clone(),
+            })?
         else {
             continue;
         };
@@ -155,8 +164,43 @@ pub(super) async fn schema_of(client: &Client, schema: &str, table: &str) -> Res
             None => field,
         });
     }
+    if columns > 0 && fields.is_empty() {
+        return Err(DbError::UnableToGetSchema {
+            source: Box::new(NoSupportedColumns::new(format!("{schema}.{table}"), columns)),
+        });
+    }
     Ok(Schema::new(fields))
 }
+
+/// A relation whose every column is left out: the reference engine refuses it
+/// (`NOT_FOUND`), and so does a query naming it; a listing of the catalog
+/// lists it without columns.
+#[derive(Debug)]
+pub(super) struct NoSupportedColumns {
+    relation: String,
+    columns: usize,
+}
+
+impl NoSupportedColumns {
+    pub(super) fn new(relation: impl Into<String>, columns: usize) -> Self {
+        Self {
+            relation: relation.into(),
+            columns,
+        }
+    }
+}
+
+impl fmt::Display for NoSupportedColumns {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "NOT_FOUND: Table '{}' has no supported columns (all {} columns are not supported)",
+            self.relation, self.columns
+        )
+    }
+}
+
+impl std::error::Error for NoSupportedColumns {}
 
 /// The names of a source, for `codelake_core::catalog::LiveListing`.
 pub(super) struct PgNames {

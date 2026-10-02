@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::common;
-use codelake_connectors::postgres::{PostgresConnector, PostgresParams};
+use codelake_connectors::postgres::{Decimals, PostgresConnector, PostgresParams};
 use codelake_core::{Connector, Engine};
 use datafusion::arrow::array::{Array, ArrayRef, RecordBatch, StringArray};
 use datafusion::arrow::util::display::array_value_to_string;
@@ -39,6 +39,7 @@ fn connector(host: &str, port: u16) -> PostgresConnector {
             user: "postgres".into(),
             password: SecretString::from("postgres"),
             sslmode: "disable".into(),
+            decimals: Decimals::default(),
         },
     )
 }
@@ -424,6 +425,7 @@ fn connector_as(host: &str, port: u16, user: &str, password: &str) -> PostgresCo
             user: user.into(),
             password: SecretString::from(password.to_owned()),
             sslmode: "disable".into(),
+            decimals: Decimals::default(),
         },
     )
 }
@@ -1019,45 +1021,175 @@ async fn datetimes_have_the_reference_precision_and_their_whole_range() {
     assert_eq!(found, [["3"]]);
 }
 
-/// A `numeric` without precision is a `decimal(38,20)`; a value that does
-/// not fit it exactly fails the query, naming its column, rather than
-/// being rounded or cut (the reference engine leaves such a column out).
+fn connector_with(host: &str, port: u16, decimals: Decimals) -> PostgresConnector {
+    PostgresConnector::new(
+        "erp".into(),
+        PostgresParams {
+            decimals,
+            ..connector_params(host, port)
+        },
+    )
+}
+
+fn connector_params(host: &str, port: u16) -> PostgresParams {
+    PostgresParams {
+        host: host.into(),
+        port,
+        database: "postgres".into(),
+        user: "postgres".into(),
+        password: SecretString::from("postgres"),
+        sslmode: "disable".into(),
+        decimals: Decimals::default(),
+    }
+}
+
+/// `numeric` columns of every kind, the hub's view among them.
+const NUMERICS: &str = "
+    CREATE TABLE nums (id INT, n NUMERIC, n2 NUMERIC(10,2), w NUMERIC(50,10), a NUMERIC[]);
+    INSERT INTO nums (id, n, n2, w, a) VALUES (1, 1.5, 1.50, 1.5, '{1.5,NULL,-2.5}'),
+      (2, 123456789012345678.12345678901234567890, NULL, 0.12345, NULL),
+      (3, -999999999999999999.99999999999999999999, NULL, NULL, '{}'),
+      (4, 0.1000000000000000000000000, NULL, NULL, NULL), (5, NULL, NULL, NULL, NULL);
+    INSERT INTO nums (id, n) VALUES (10, 1e20), (11, 0.123456789012345678901), (12, 'NaN'),
+      (13, 'Infinity'), (14, '-Infinity'), (15, 1000000000000000000),
+      (16, 12345678901234.123456789012345678901);
+    CREATE VIEW recebimentos AS SELECT id, n AS vl_recebido, n2 FROM nums;
+    CREATE VIEW totals AS SELECT sum(n) AS total FROM nums WHERE id < 10;";
+
+async fn numerics_engine(host: &str, port: u16, decimals: Decimals) -> (Engine, tempfile::TempDir) {
+    let spill = tempfile::tempdir().unwrap();
+    let mut engine = common::engine(spill.path());
+    common::attach(&mut engine, Arc::new(connector_with(host, port, decimals))).await;
+    (engine, spill)
+}
+
+async fn error_of(engine: &Engine, sql: &str) -> String {
+    match engine.sql(sql).await {
+        Err(error) => error.to_string(),
+        Ok(frame) => frame.collect().await.expect_err(sql).to_string(),
+    }
+}
+
+/// By default a `numeric` without precision, or with more than 38 digits,
+/// and an array of them, is left out of its relation, as the reference
+/// engine leaves it (`decimal-mapping=STRICT`, ISS-060): the `Warehouse`
+/// API's .NET driver cannot hold the `decimal(38,20)` it was, and the API's
+/// JSON changed (`"vl_recebido": {}`). Naming it fails as there.
 #[tokio::test]
-async fn unbounded_numerics_are_exact_or_fail_naming_the_column() {
+async fn unbounded_numerics_are_left_out_by_default() {
     let container = Postgres::default().with_tag("17-alpine").start().await.unwrap();
     let host = common::host();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     client(&host, port, "postgres", "postgres")
         .await
-        .batch_execute(
-            "CREATE TABLE nums (id INT, n NUMERIC);
-             INSERT INTO nums VALUES (1, 1.5), (2, 123456789012345678.12345678901234567890),
-               (3, -999999999999999999.99999999999999999999), (4, 0.1000000000000000000000000),
-               (5, NULL),
-               (10, 1e20), (11, 0.123456789012345678901), (12, 'NaN'), (13, 'Infinity'),
-               (14, '-Infinity'), (15, 1000000000000000000), (16, 12345678901234.123456789012345678901);
-             CREATE VIEW recebimentos AS SELECT id, n AS vl_recebido FROM nums;",
-        )
+        .batch_execute(NUMERICS)
         .await
         .unwrap();
-    let spill = tempfile::tempdir().unwrap();
-    let mut engine = common::engine(spill.path());
-    common::attach(&mut engine, Arc::new(connector(&host, port))).await;
+    let (engine, _spill) = numerics_engine(&host, port, Decimals::default()).await;
 
-    let types = rows(
+    let columns = rows(
         &engine,
-        "SELECT data_type FROM erp.information_schema.columns \
-         WHERE table_schema = 'public' AND table_name = 'recebimentos' AND column_name = 'vl_recebido'",
+        "SELECT table_name, column_name, data_type FROM erp.information_schema.columns \
+         WHERE table_schema = 'public' AND table_name IN ('nums', 'recebimentos') \
+         ORDER BY table_name, ordinal_position",
     )
     .await;
-    assert_eq!(types, [["decimal(38,20)"]]);
-    let exact = rows(
+    assert_eq!(
+        columns,
+        [
+            ["nums", "id", "integer"],
+            ["nums", "n2", "decimal(10,2)"],
+            ["recebimentos", "id", "integer"],
+            ["recebimentos", "n2", "decimal(10,2)"],
+        ]
+    );
+    let all = rows(
+        &engine,
+        "SELECT * FROM erp.public.recebimentos WHERE id < 3 ORDER BY id",
+    )
+    .await;
+    assert_eq!(all, [["1", "1.50"], ["2", "NULL"]]);
+    // Every value is read, even those no decimal holds: the column is not.
+    let count = rows(&engine, "SELECT count(*) FROM erp.public.nums").await;
+    assert_eq!(count, [["12"]]);
+    for (sql, column) in [
+        ("SELECT vl_recebido FROM erp.public.recebimentos", "vl_recebido"),
+        (
+            "SELECT id FROM erp.public.recebimentos ORDER BY vl_recebido DESC NULLS LAST LIMIT 51",
+            "vl_recebido",
+        ),
+        ("SELECT id FROM erp.public.nums WHERE n > 1", "n"),
+        ("SELECT a FROM erp.public.nums", "a"),
+        ("SELECT w FROM erp.public.nums", "w"),
+    ] {
+        let error = error_of(&engine, sql).await;
+        assert!(
+            error.contains(&format!("No field named {column}")),
+            "{sql}: {error}"
+        );
+    }
+    // A relation whose every column is left out is refused, as there; a
+    // listing of the catalog still lists it.
+    let error = error_of(&engine, "SELECT * FROM erp.public.totals").await;
+    assert!(
+        error.contains(
+            "NOT_FOUND: Table 'public.totals' has no supported columns (all 1 columns are not supported)"
+        ),
+        "{error}"
+    );
+    let listed = rows(
+        &engine,
+        "SELECT table_name FROM erp.information_schema.tables \
+         WHERE table_schema = 'public' AND table_name = 'totals'",
+    )
+    .await;
+    assert_eq!(listed, [["totals"]]);
+}
+
+/// `decimal_mapping = "allow_overflow"` exposes such a column as
+/// `decimal(38, decimal_default_scale)`. With the default rounding mode
+/// (`unnecessary`) a value is exact or fails the query, naming its column:
+/// scale 20 is the `decimal(38,20)` it was before.
+#[tokio::test]
+async fn allow_overflow_keeps_values_exact_without_a_rounding_mode() {
+    use codelake_connectors::postgres::{DecimalMapping, DecimalRoundingMode};
+    let container = Postgres::default().with_tag("17-alpine").start().await.unwrap();
+    let host = common::host();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    client(&host, port, "postgres", "postgres")
+        .await
+        .batch_execute(NUMERICS)
+        .await
+        .unwrap();
+    let exact = Decimals {
+        mapping: DecimalMapping::AllowOverflow,
+        rounding_mode: DecimalRoundingMode::Unnecessary,
+        default_scale: 20,
+    };
+    let (engine, _spill) = numerics_engine(&host, port, exact).await;
+    let types = rows(
+        &engine,
+        "SELECT column_name, data_type FROM erp.information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'nums' ORDER BY ordinal_position",
+    )
+    .await;
+    assert_eq!(
+        types,
+        [
+            ["id", "integer"],
+            ["n", "decimal(38,20)"],
+            ["n2", "decimal(10,2)"],
+            ["w", "decimal(38,10)"],
+            ["a", "array(decimal(38,0))"],
+        ]
+    );
+    let exact_rows = rows(
         &engine,
         "SELECT id, n FROM erp.public.nums WHERE id < 10 ORDER BY id",
     )
     .await;
     assert_eq!(
-        exact,
+        exact_rows,
         [
             ["1", "1.50000000000000000000"],
             ["2", "123456789012345678.12345678901234567890"],
@@ -1068,6 +1200,8 @@ async fn unbounded_numerics_are_exact_or_fail_naming_the_column() {
     );
     let sum = rows(&engine, "SELECT sum(n) FROM erp.public.nums WHERE id IN (1, 4)").await;
     assert_eq!(sum, [["1.60000000000000000000"]]);
+    let total = rows(&engine, "SELECT total FROM erp.public.totals").await;
+    assert_eq!(total, [["-876543210987654320.27654321098765432109"]]);
     for (id, value, why) in [
         (10, "100000000000000000000", "more than 18 integer digits"),
         (11, "0.123456789012345678901", "more than 20 fraction digits"),
@@ -1082,19 +1216,78 @@ async fn unbounded_numerics_are_exact_or_fail_naming_the_column() {
         ),
     ] {
         let sql = format!("SELECT vl_recebido FROM erp.public.recebimentos WHERE id = {id}");
-        let error = engine
-            .sql(&sql)
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .expect_err(&sql)
-            .to_string();
+        let error = error_of(&engine, &sql).await;
         let expected = format!(
             "the PostgreSQL value {value} of column \"vl_recebido\" does not fit decimal(38,20): {why}"
         );
         assert!(error.contains(&expected), "{sql}: {error}");
     }
+    // The elements of a `numeric[]` are `decimal(38,0)`: 1.5 needs rounding.
+    let error = error_of(&engine, "SELECT a FROM erp.public.nums WHERE id = 1").await;
+    assert!(
+        error.contains(
+            "the PostgreSQL value 1.5 of column \"a\" does not fit decimal(38,0): more than 0 fraction digits"
+        ),
+        "{error}"
+    );
+}
+
+/// `allow_overflow` with a rounding mode rounds as the reference engine
+/// rounds (Trino 431: `HALF_UP` to the default scale; the elements of a
+/// `numeric[]` to 0 digits); a value no decimal holds still fails.
+#[tokio::test]
+async fn allow_overflow_rounds_with_the_catalogs_rounding_mode() {
+    use codelake_connectors::postgres::{DecimalMapping, DecimalRoundingMode};
+    let container = Postgres::default().with_tag("17-alpine").start().await.unwrap();
+    let host = common::host();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    client(&host, port, "postgres", "postgres")
+        .await
+        .batch_execute(NUMERICS)
+        .await
+        .unwrap();
+    let rounded = Decimals {
+        mapping: DecimalMapping::AllowOverflow,
+        rounding_mode: DecimalRoundingMode::HalfUp,
+        default_scale: 2,
+    };
+    let (engine, _spill) = numerics_engine(&host, port, rounded).await;
+    let values = rows(
+        &engine,
+        "SELECT id, n, w, a FROM erp.public.nums WHERE id < 6 ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        values,
+        [
+            ["1", "1.50", "1.50", "[2, , -3]"],
+            ["2", "123456789012345678.12", "0.12", "NULL"],
+            ["3", "-1000000000000000000.00", "NULL", "[]"],
+            ["4", "0.10", "NULL", "NULL"],
+            ["5", "NULL", "NULL", "NULL"],
+        ]
+    );
+    for id in [12, 13, 14] {
+        let sql = format!("SELECT n FROM erp.public.nums WHERE id = {id}");
+        let error = error_of(&engine, &sql).await;
+        assert!(
+            error.contains("a decimal holds only finite numbers"),
+            "{sql}: {error}"
+        );
+    }
+    let wide = rows(
+        &engine,
+        "SELECT id, n FROM erp.public.nums WHERE id IN (10, 15, 16) ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        wide,
+        [
+            ["10", "100000000000000000000.00"],
+            ["15", "1000000000000000000.00"],
+            ["16", "12345678901234.12"],
+        ]
+    );
 }
 
 /// Every statement runs in the client session's time zone, never in the

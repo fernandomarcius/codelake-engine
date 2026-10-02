@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::common;
-use codelake_connectors::postgres::{PostgresConnector, PostgresParams};
+use codelake_connectors::postgres::{Decimals, PostgresConnector, PostgresParams};
 use codelake_connectors::sqlserver::{SqlServerConnector, SqlServerParams};
 use codelake_core::{Connector, Engine};
 use datafusion::arrow::array::{Array, RecordBatch};
@@ -450,6 +450,7 @@ async fn dod(tag: &str, scope: Scope) {
                 user: "postgres".into(),
                 password: SecretString::from("postgres"),
                 sslmode: "disable".into(),
+                decimals: Decimals::default(),
             },
         )),
     )

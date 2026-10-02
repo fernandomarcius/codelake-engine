@@ -349,6 +349,7 @@ fn named(name: &str) -> Option<Code> {
         "INVALID_FUNCTION_ARGUMENT" => Code::InvalidFunctionArgument,
         "DIVISION_BY_ZERO" => Code::DivisionByZero,
         "INVALID_CAST_ARGUMENT" => Code::InvalidCastArgument,
+        "NOT_FOUND" => Code::NotFound,
         "NOT_SUPPORTED" => Code::NotSupported,
         "NUMERIC_VALUE_OUT_OF_RANGE" => Code::NumericValueOutOfRange,
         "EXCEEDED_FUNCTION_MEMORY_LIMIT" => Code::ExceededFunctionMemoryLimit,
@@ -666,6 +667,16 @@ mod tests {
                 "INVALID_LITERAL",
                 59,
                 "bad",
+            ),
+            // A PostgreSQL relation whose every column is left out (ISS-060).
+            (
+                DataFusionError::NotImplemented(
+                    "NOT_FOUND: Table 's.t' has no supported columns (all 1 columns are not supported)"
+                        .into(),
+                ),
+                "NOT_FOUND",
+                5,
+                "Table 's.t' has no supported columns (all 1 columns are not supported)",
             ),
             (
                 DataFusionError::Execution("EXCEEDED_FUNCTION_MEMORY_LIMIT: too big".into()),

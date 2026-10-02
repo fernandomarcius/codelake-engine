@@ -529,7 +529,47 @@ fn postgres(
     };
     insert_connection(source, "postgres", &settings, database);
     source.insert("sslmode".into(), Value::String(sslmode));
+    postgres_decimals(props, source)?;
     url_leftovers(&settings.url, notes);
+    Ok(())
+}
+
+/// The reference engine's `decimal-mapping`, `decimal-rounding-mode` and
+/// `decimal-default-scale` (ISS-060), when the catalog sets them; their
+/// values in lower case.
+fn postgres_decimals(props: &mut Props, source: &mut Table) -> Result<(), String> {
+    const MAPPINGS: [&str; 2] = ["STRICT", "ALLOW_OVERFLOW"];
+    const MODES: [&str; 8] = [
+        "UP",
+        "DOWN",
+        "CEILING",
+        "FLOOR",
+        "HALF_UP",
+        "HALF_DOWN",
+        "HALF_EVEN",
+        "UNNECESSARY",
+    ];
+    for (key, setting, values) in [
+        ("decimal-mapping", "decimal_mapping", &MAPPINGS[..]),
+        ("decimal-rounding-mode", "decimal_rounding_mode", &MODES[..]),
+    ] {
+        if let Some(value) = props.take(key) {
+            let value = literal(key, &value)?.trim().to_ascii_uppercase();
+            if !values.contains(&value.as_str()) {
+                return Err(format!("{key} is not one of {}", values.join(", ")));
+            }
+            source.insert(setting.into(), Value::String(value.to_ascii_lowercase()));
+        }
+    }
+    if let Some(scale) = props.take("decimal-default-scale") {
+        let scale = literal("decimal-default-scale", &scale)?
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .filter(|scale| *scale <= 38)
+            .ok_or("decimal-default-scale is not an integer from 0 to 38")?;
+        source.insert("decimal_default_scale".into(), Value::Integer(i64::from(scale)));
+    }
     Ok(())
 }
 
@@ -968,6 +1008,74 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("ignored settings: case-insensitive-name-matching"))
         );
+    }
+
+    #[test]
+    fn postgres_decimal_settings_are_imported() {
+        let base = [
+            ("connector.name", "postgresql"),
+            ("connection-url", "jdbc:postgresql://h/erp?sslmode=verify-full"),
+            ("connection-user", "u"),
+            ("connection-password", SECRET),
+        ];
+        let imported = import("hub", &base).unwrap();
+        for key in [
+            "decimal_mapping",
+            "decimal_rounding_mode",
+            "decimal_default_scale",
+        ] {
+            assert!(imported.source.get(key).is_none(), "{key}");
+        }
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut props = base.to_vec();
+            props.extend_from_slice(extra);
+            import("hub", &props)
+        };
+        let imported = with(&[
+            ("decimal-mapping", "ALLOW_OVERFLOW"),
+            ("decimal-rounding-mode", "half_even"),
+            ("decimal-default-scale", "4"),
+        ])
+        .unwrap();
+        assert_eq!(
+            imported.source["decimal_mapping"].as_str(),
+            Some("allow_overflow")
+        );
+        assert_eq!(
+            imported.source["decimal_rounding_mode"].as_str(),
+            Some("half_even")
+        );
+        assert_eq!(imported.source["decimal_default_scale"].as_integer(), Some(4));
+        assert!(
+            !imported.notes.iter().any(|n| n.contains("decimal")),
+            "{:?}",
+            imported.notes
+        );
+        for (key, value, reason) in [
+            (
+                "decimal-mapping",
+                "LOOSE",
+                "decimal-mapping is not one of STRICT, ALLOW_OVERFLOW",
+            ),
+            (
+                "decimal-rounding-mode",
+                "NEAREST",
+                "decimal-rounding-mode is not one of UP",
+            ),
+            (
+                "decimal-default-scale",
+                "39",
+                "decimal-default-scale is not an integer from 0 to 38",
+            ),
+            (
+                "decimal-default-scale",
+                "-1",
+                "decimal-default-scale is not an integer from 0 to 38",
+            ),
+        ] {
+            let skipped = with(&[(key, value)]).unwrap_err();
+            assert!(skipped.reason.contains(reason), "{skipped:?}");
+        }
     }
 
     #[test]

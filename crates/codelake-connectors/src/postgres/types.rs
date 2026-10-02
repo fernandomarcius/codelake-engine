@@ -10,13 +10,23 @@
 //! | Elements | List of |
 //! |---|---|
 //! | `smallint`, `integer`, `bigint`, `real`, `double precision`, `boolean` | the same type |
-//! | `numeric(p, s)` | `decimal(p, s)` (`numeric` without precision: left out) |
+//! | `numeric(p, s)` | `decimal(p, s)` (as a column, below) |
 //! | `text`, `varchar`, `char`, `"char"`, `name`, `uuid`, `json`, `jsonb`, `money`, enums | text |
 //! | `date`, `time(p)`, `timestamp(p)`, `timestamptz(p)` | the same type |
 //!
 //! Left out (also by the reference engine): `bytea[]`, `interval[]`, network
 //! addresses, geometric and range types, composites, `xml[]`. Left out here,
 //! mapped there (ISS-060): `oid[]` (`bigint`), `timetz[]` and `bit[]`.
+//!
+//! A `numeric(p, s)` with `p` up to 38 is a `decimal(p, s)`. One without
+//! precision, or with more than 38 digits, follows the catalog's
+//! `decimal_mapping`, the reference engine's `decimal-mapping` ([`Decimals`]):
+//! `strict` (the default, as there) leaves the column out of its relation, an
+//! array of them too; `allow_overflow` makes it a `decimal(38, s)`, `s` being
+//! `decimal_default_scale` without precision and the smaller of the declared
+//! scale and it beyond 38 digits. An array of `numeric` without precision is
+//! an `array(decimal(38, 0))` whatever the default scale, as there (Trino 431
+//! with PostgreSQL 17). A composite with such a field is left out.
 //!
 //! Dates and times have the reference engine's precision: `timestamp(p)`,
 //! `timestamp(p) with time zone` and `time(p)` as PostgreSQL declares them
@@ -34,26 +44,34 @@
 //! decimal, and the source sends each of them in a form the decoder reads
 //! exactly: a list as JSON (`to_json`), which the decoder turns into the
 //! list the schema declares; a timestamp as its microseconds since 1970 in
-//! UTC (`bigint`); a decimal as its text. [`restore`] turns the last two
-//! into the columns the schema declares, and a time into its declared unit;
-//! a decimal that does not fit its `decimal(p, s)` exactly (`NaN`,
-//! `Infinity`, more digits) fails the query, naming the column, rather than
-//! being rounded.
+//! UTC (`bigint`); a decimal as its text, and a list of decimals as a list of
+//! texts. [`restore`] turns them into the columns the schema declares, and a
+//! time into its declared unit. A decimal with more fraction digits than its
+//! scale is rounded by the catalog's `decimal_rounding_mode` (`unnecessary`,
+//! the default: it fails the query); one with more integer digits than its
+//! `decimal(p, s)` holds, after rounding, `NaN` or `±Infinity` fails the
+//! query, naming the column. Never rounded otherwise, never cut.
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use std::cmp::Ordering;
+
 use codelake_core::trino_types::Declared;
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, Decimal128Builder, PrimitiveArray, RecordBatch};
+use datafusion::arrow::array::{
+    Array, ArrayRef, AsArray, Decimal128Builder, ListArray, PrimitiveArray, RecordBatch,
+};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{
     DataType, Field, Fields, Int64Type, IntervalUnit, Schema, TimeUnit, TimestampMicrosecondType,
     TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType,
 };
 
-/// Precision and scale of a `numeric` without them (the upstream provider's).
-const UNBOUNDED_NUMERIC: (u8, i8) = (38, 20);
+use super::{DecimalMapping, DecimalRoundingMode, Decimals};
+
+/// A decimal's largest precision.
+const MAX_PRECISION: u8 = 38;
 
 /// A column as `pg_catalog` describes it.
 #[derive(Debug, Clone, Default)]
@@ -77,15 +95,16 @@ pub(super) struct Column {
 
 /// The column's Arrow type; `Ok(None)` leaves it out of the relation,
 /// `Err` names a type the engine cannot read.
-pub(super) fn arrow_type(column: &Column) -> Result<Option<DataType>, String> {
+pub(super) fn arrow_type(column: &Column, decimals: Decimals) -> Result<Option<DataType>, String> {
     if column.category == "A" {
-        return Ok(array_type(column));
+        return Ok(array_type(column, decimals));
     }
     match column.kind.as_str() {
         "e" => Ok(Some(DataType::Dictionary(
             Box::new(DataType::Int8),
             Box::new(DataType::Utf8),
         ))),
+        "c" if column.fields.iter().any(|(_, type_name)| wide_numeric(type_name)) => Ok(None),
         "c" => column
             .fields
             .iter()
@@ -96,10 +115,47 @@ pub(super) fn arrow_type(column: &Column) -> Result<Option<DataType>, String> {
             })
             .collect::<Result<Vec<_>, _>>()
             .map(|fields| Some(DataType::Struct(Fields::from(fields)))),
+        _ if base_name(&column.type_name) == "numeric" => {
+            Ok(numeric_type(&column.type_name, decimals, false))
+        }
         _ => scalar(&column.type_name)
             .map(Some)
             .ok_or_else(|| column.type_name.clone()),
     }
+}
+
+/// Whether `type_name` is a `numeric` without precision or with more than
+/// 38 digits.
+fn wide_numeric(type_name: &str) -> bool {
+    base_name(type_name) == "numeric"
+        && numeric_precision(type_name).is_none_or(|(precision, _)| precision > u32::from(MAX_PRECISION))
+}
+
+/// The decimal of a `numeric` column (`element`: of an array's elements):
+/// `decimal(p, s)` up to 38 digits; otherwise as `decimals` maps it, `None`
+/// leaving it out (see the module's documentation).
+fn numeric_type(type_name: &str, decimals: Decimals, element: bool) -> Option<DataType> {
+    let declared = numeric_precision(type_name);
+    if let Some((precision, scale)) = declared
+        && precision <= u32::from(MAX_PRECISION)
+    {
+        return Some(DataType::Decimal128(
+            u8::try_from(precision).ok()?,
+            i8::try_from(scale).ok()?,
+        ));
+    }
+    if decimals.mapping == DecimalMapping::Strict {
+        return None;
+    }
+    let default_scale = decimals.default_scale.min(MAX_PRECISION);
+    let scale = match declared {
+        // An array's elements, whatever the default scale: the reference
+        // engine's `array(decimal(38, 0))` (Trino 431 with PostgreSQL 17).
+        None if element => 0,
+        None => default_scale,
+        Some((_, scale)) => u8::try_from(scale.max(0)).map_or(default_scale, |s| s.min(default_scale)),
+    };
+    Some(DataType::Decimal128(MAX_PRECISION, i8::try_from(scale).ok()?))
 }
 
 /// `format_type`'s name without precision or length: `timestamp(3) with
@@ -115,7 +171,7 @@ fn base_name(type_name: &str) -> Cow<'_, str> {
 }
 
 /// `(p, s)` of `numeric(p,s)` / `numeric(p)`; `None` without precision.
-fn numeric_precision(type_name: &str) -> Option<(u8, i8)> {
+fn numeric_precision(type_name: &str) -> Option<(u32, i32)> {
     let inner = type_name.split_once('(')?.1.split_once(')')?.0;
     let mut parts = inner.split(',').map(str::trim);
     let precision = parts.next()?.parse().ok()?;
@@ -173,10 +229,8 @@ fn scalar(type_name: &str) -> Option<DataType> {
         "integer" => DataType::Int32,
         "bigint" | "money" => DataType::Int64,
         "oid" | "xid" | "regproc" => DataType::UInt32,
-        "numeric" => {
-            let (precision, scale) = numeric_precision(type_name).unwrap_or(UNBOUNDED_NUMERIC);
-            DataType::Decimal128(precision, scale)
-        }
+        // Up to 38 digits: the default mapping leaves a wider one out.
+        "numeric" => numeric_type(type_name, Decimals::default(), false)?,
         "real" => DataType::Float32,
         "double precision" => DataType::Float64,
         "\"char\"" => DataType::Int8,
@@ -203,15 +257,12 @@ fn scalar(type_name: &str) -> Option<DataType> {
 }
 
 /// Arrow type of an array's elements, when the reference engine maps them.
-fn element_type(type_name: &str, kind: Option<&str>) -> Option<DataType> {
+fn element_type(type_name: &str, kind: Option<&str>, decimals: Decimals) -> Option<DataType> {
     if kind == Some("e") {
         return Some(DataType::Utf8);
     }
     Some(match base_name(type_name).as_ref() {
-        "numeric" => {
-            let (precision, scale) = numeric_precision(type_name)?;
-            DataType::Decimal128(precision, scale)
-        }
+        "numeric" => numeric_type(type_name, decimals, true)?,
         "character" | "character varying" | "text" | "bpchar" | "\"char\"" | "name" | "uuid" | "json"
         | "jsonb" | "money" => DataType::Utf8,
         "smallint"
@@ -228,8 +279,12 @@ fn element_type(type_name: &str, kind: Option<&str>) -> Option<DataType> {
     })
 }
 
-fn array_type(column: &Column) -> Option<DataType> {
-    let mut data_type = element_type(column.element.as_deref()?, column.element_kind.as_deref())?;
+fn array_type(column: &Column, decimals: Decimals) -> Option<DataType> {
+    let mut data_type = element_type(
+        column.element.as_deref()?,
+        column.element_kind.as_deref(),
+        decimals,
+    )?;
     for _ in 0..column.dimensions.max(1) {
         data_type = DataType::List(Arc::new(Field::new("item", data_type, true)));
     }
@@ -246,23 +301,29 @@ fn micros_of(value: &str) -> String {
     )
 }
 
+/// The type of the innermost elements of a list (of lists).
+fn innermost(item: &Field) -> &DataType {
+    let mut innermost = item.data_type();
+    while let DataType::List(inner) = innermost {
+        innermost = inner.data_type();
+    }
+    innermost
+}
+
 /// How column `column` of the wrapped statement is sent: as it is; as JSON
-/// when it is a list (text elements cast to `text` first, so JSON holds
-/// them as strings: a `json[]` element stays its text); a timestamp as its
-/// microseconds since 1970 in UTC; a decimal as its text.
+/// when it is a list (text and decimal elements cast to `text` first, so
+/// JSON holds them as strings: a `json[]` element stays its text, a decimal
+/// keeps every digit); a timestamp as its microseconds since 1970 in UTC; a
+/// decimal as its text.
 fn sent_as(data_type: &DataType, column: &str) -> Option<String> {
     match data_type {
-        DataType::List(item) => {
-            let mut innermost = item.data_type();
-            while let DataType::List(inner) = innermost {
-                innermost = inner.data_type();
-            }
-            Some(if matches!(innermost, DataType::Utf8) {
+        DataType::List(item) => Some(
+            if matches!(innermost(item), DataType::Utf8 | DataType::Decimal128(..)) {
                 format!("to_json({column}::text[])")
             } else {
                 format!("to_json({column})")
-            })
-        }
+            },
+        ),
         DataType::Timestamp(_, None) => Some(micros_of(column)),
         DataType::Timestamp(_, Some(_)) => Some(micros_of(&format!("{column} AT TIME ZONE 'UTC'"))),
         DataType::Decimal128(..) => Some(format!("{column}::text")),
@@ -300,9 +361,40 @@ pub(super) fn readable<'a>(sql: &'a str, projected: Option<&Schema>) -> Cow<'a, 
     Cow::Owned(format!("{select} FROM ({sql}) AS codelake_rows({positions})"))
 }
 
+/// The schema the row decoder reads a [`readable`] statement's answer in:
+/// `projected`, with each list of decimals a list of texts (as sent).
+pub(super) fn decoded(projected: &Schema) -> Schema {
+    fn texts(data_type: &DataType) -> DataType {
+        match data_type {
+            DataType::List(item) => DataType::List(Arc::new(
+                item.as_ref().clone().with_data_type(texts(item.data_type())),
+            )),
+            DataType::Decimal128(..) => DataType::Utf8,
+            other => other.clone(),
+        }
+    }
+    let fields: Vec<Field> = projected
+        .fields()
+        .iter()
+        .map(|field| match field.data_type() {
+            list @ DataType::List(_) => field.as_ref().clone().with_data_type(texts(list)),
+            _ => field.as_ref().clone(),
+        })
+        .collect();
+    Schema::new_with_metadata(fields, projected.metadata().clone())
+}
+
 /// The unscaled value of `text`, a `numeric` as PostgreSQL spells it, in a
-/// `decimal(precision, scale)`: exact, or an error naming `column`.
-fn decimal_value(text: &str, precision: u8, scale: i8, column: &str) -> Result<i128, String> {
+/// `decimal(precision, scale)`: rounded to `scale` fraction digits as
+/// `rounding` says (`Unnecessary`: an error), or an error naming `column`
+/// when it does not fit then.
+fn decimal_value(
+    text: &str,
+    precision: u8,
+    scale: i8,
+    column: &str,
+    rounding: DecimalRoundingMode,
+) -> Result<i128, String> {
     let refuse = |why: &str| {
         format!(
             "the PostgreSQL value {text} of column \"{column}\" does not fit decimal({precision},{scale}): {why}"
@@ -321,19 +413,104 @@ fn decimal_value(text: &str, precision: u8, scale: i8, column: &str) -> Result<i
     let integer = integer.trim_start_matches('0');
     let fraction = fraction.trim_end_matches('0');
     let integer_digits = precision.saturating_sub(scale);
+    let too_long = || refuse(&format!("more than {integer_digits} integer digits"));
     if integer.len() > usize::from(integer_digits) {
-        return Err(refuse(&format!("more than {integer_digits} integer digits")));
+        return Err(too_long());
     }
-    if fraction.len() > usize::from(scale) {
-        return Err(refuse(&format!("more than {scale} fraction digits")));
-    }
-    let unscaled = format!("{integer}{fraction:0<width$}", width = usize::from(scale));
-    let magnitude: i128 = if unscaled.is_empty() {
+    let (kept, dropped) = fraction.split_at(fraction.len().min(usize::from(scale)));
+    // `dropped` is not zero: the fraction's trailing zeros are gone.
+    let away = match dropped.as_bytes() {
+        [] => false,
+        [first, rest @ ..] => {
+            let half = first.cmp(&b'5');
+            let past_half = !rest.is_empty();
+            // The last digit kept; ASCII digits have their value's parity.
+            let odd = integer
+                .bytes()
+                .chain(kept.bytes())
+                .next_back()
+                .is_some_and(|digit| digit % 2 == 1);
+            match rounding {
+                DecimalRoundingMode::Unnecessary => {
+                    return Err(refuse(&format!("more than {scale} fraction digits")));
+                }
+                DecimalRoundingMode::Up => true,
+                DecimalRoundingMode::Down => false,
+                DecimalRoundingMode::Ceiling => !negative,
+                DecimalRoundingMode::Floor => negative,
+                DecimalRoundingMode::HalfUp => half != Ordering::Less,
+                DecimalRoundingMode::HalfDown => {
+                    half == Ordering::Greater || half == Ordering::Equal && past_half
+                }
+                DecimalRoundingMode::HalfEven => {
+                    half == Ordering::Greater || half == Ordering::Equal && (past_half || odd)
+                }
+            }
+        }
+    };
+    let unscaled = format!("{integer}{kept:0<width$}", width = usize::from(scale));
+    let mut magnitude: i128 = if unscaled.is_empty() {
         0
     } else {
         unscaled.parse().map_err(|_| refuse("not a number"))?
     };
+    if away {
+        magnitude += 1;
+        if magnitude >= 10_i128.pow(u32::from(precision)) {
+            return Err(too_long());
+        }
+    }
     Ok(if negative { -magnitude } else { magnitude })
+}
+
+/// `texts`, the text of each decimal of a column, as `decimal(precision, scale)`.
+fn decimals_of(
+    texts: &ArrayRef,
+    (precision, scale): (u8, i8),
+    column: &str,
+    rounding: DecimalRoundingMode,
+) -> Result<ArrayRef, String> {
+    let mut values = Decimal128Builder::with_capacity(texts.len());
+    for text in texts.as_string::<i32>() {
+        match text {
+            Some(text) => values.append_value(decimal_value(text, precision, scale, column, rounding)?),
+            None => values.append_null(),
+        }
+    }
+    let values = values
+        .finish()
+        .with_precision_and_scale(precision, scale)
+        .map_err(|e| e.to_string())?;
+    Ok(Arc::new(values))
+}
+
+/// `column`, a list (of lists) of texts, as the list of decimals `target` is.
+fn decimal_lists(
+    column: &ArrayRef,
+    target: &DataType,
+    name: &str,
+    rounding: DecimalRoundingMode,
+) -> Result<ArrayRef, String> {
+    match (column.data_type(), target) {
+        (DataType::Utf8, DataType::Decimal128(precision, scale)) => {
+            decimals_of(column, (*precision, *scale), name, rounding)
+        }
+        (DataType::List(_), DataType::List(item)) => {
+            let list = column.as_list::<i32>();
+            let values = decimal_lists(list.values(), item.data_type(), name, rounding)?;
+            let list = ListArray::try_new(
+                Arc::clone(item),
+                list.offsets().clone(),
+                values,
+                list.nulls().cloned(),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(Arc::new(list))
+        }
+        (found, _) => Err(format!(
+            "the PostgreSQL list of column \"{name}\" was read as {found}, not as texts"
+        )),
+    }
 }
 
 /// `values` (microseconds since 1970) in `unit`, exactly.
@@ -375,22 +552,20 @@ fn timestamps_in(
 
 /// Column `column` as the projected field `field` declares it, when the
 /// source sent it in another form ([`sent_as`], or a time in nanoseconds).
-fn restored(column: &ArrayRef, field: &Field) -> Result<Option<ArrayRef>, String> {
+fn restored(
+    column: &ArrayRef,
+    field: &Field,
+    rounding: DecimalRoundingMode,
+) -> Result<Option<ArrayRef>, String> {
     let name = field.name();
     Ok(match (column.data_type(), field.data_type()) {
         (DataType::Utf8, DataType::Decimal128(precision, scale)) => {
-            let mut values = Decimal128Builder::with_capacity(column.len());
-            for text in column.as_string::<i32>() {
-                match text {
-                    Some(text) => values.append_value(decimal_value(text, *precision, *scale, name)?),
-                    None => values.append_null(),
-                }
-            }
-            let values = values
-                .finish()
-                .with_precision_and_scale(*precision, *scale)
-                .map_err(|e| e.to_string())?;
-            Some(Arc::new(values))
+            Some(decimals_of(column, (*precision, *scale), name, rounding)?)
+        }
+        (DataType::List(_), target @ DataType::List(item))
+            if matches!(innermost(item), DataType::Decimal128(..)) =>
+        {
+            Some(decimal_lists(column, target, name, rounding)?)
         }
         (DataType::Int64, DataType::Timestamp(unit, zone)) => Some(timestamps_in(
             column.as_primitive::<Int64Type>(),
@@ -408,8 +583,13 @@ fn restored(column: &ArrayRef, field: &Field) -> Result<Option<ArrayRef>, String
 }
 
 /// `batch`, a decoded answer to a [`readable`] statement, with each column
-/// the source sent in another form as `projected` declares it.
-pub(super) fn restore(batch: RecordBatch, projected: Option<&Schema>) -> Result<RecordBatch, String> {
+/// the source sent in another form as `projected` declares it, decimals
+/// rounded as `rounding` says.
+pub(super) fn restore(
+    batch: RecordBatch,
+    projected: Option<&Schema>,
+    rounding: DecimalRoundingMode,
+) -> Result<RecordBatch, String> {
     let Some(projected) = projected.filter(|p| p.fields().len() == batch.num_columns()) else {
         return Ok(batch);
     };
@@ -422,7 +602,7 @@ pub(super) fn restore(batch: RecordBatch, projected: Option<&Schema>) -> Result<
         .zip(batch.schema().fields())
         .zip(projected.fields())
     {
-        if let Some(column) = restored(column, wanted)? {
+        if let Some(column) = restored(column, wanted, rounding)? {
             changed = true;
             fields.push(wanted.as_ref().clone());
             columns.push(column);
@@ -440,6 +620,12 @@ pub(super) fn restore(batch: RecordBatch, projected: Option<&Schema>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const STRICT: Decimals = Decimals {
+        mapping: DecimalMapping::Strict,
+        rounding_mode: DecimalRoundingMode::Unnecessary,
+        default_scale: 0,
+    };
 
     fn column(type_name: &str) -> Column {
         Column {
@@ -477,7 +663,7 @@ mod tests {
             ("money", DataType::Int64),
             ("numeric(10,2)", DataType::Decimal128(10, 2)),
             ("numeric(5)", DataType::Decimal128(5, 0)),
-            ("numeric", DataType::Decimal128(38, 20)),
+            ("numeric(38,2)", DataType::Decimal128(38, 2)),
             ("real", DataType::Float32),
             ("double precision", DataType::Float64),
             ("character varying(10)", DataType::Utf8),
@@ -546,11 +732,15 @@ mod tests {
             ),
         ];
         for (type_name, expected) in cases {
-            assert_eq!(arrow_type(&column(type_name)), Ok(Some(expected)), "{type_name}");
+            assert_eq!(
+                arrow_type(&column(type_name), STRICT),
+                Ok(Some(expected)),
+                "{type_name}"
+            );
         }
-        assert_eq!(arrow_type(&column("jsonb")), Err("jsonb".to_owned()));
+        assert_eq!(arrow_type(&column("jsonb"), STRICT), Err("jsonb".to_owned()));
         assert_eq!(
-            arrow_type(&column("time with time zone")),
+            arrow_type(&column("time with time zone"), STRICT),
             Err("time with time zone".to_owned())
         );
     }
@@ -562,7 +752,7 @@ mod tests {
             ..column("mood")
         };
         assert_eq!(
-            arrow_type(&mood),
+            arrow_type(&mood, STRICT),
             Ok(Some(DataType::Dictionary(
                 Box::new(DataType::Int8),
                 Box::new(DataType::Utf8)
@@ -574,7 +764,7 @@ mod tests {
             ..column("pair")
         };
         assert_eq!(
-            arrow_type(&pair),
+            arrow_type(&pair, STRICT),
             Ok(Some(DataType::Struct(Fields::from(vec![
                 Field::new("a", DataType::Int32, true),
                 Field::new("b", DataType::Utf8, true),
@@ -584,7 +774,7 @@ mod tests {
             fields: vec![("a".into(), "jsonb".into())],
             ..pair
         };
-        assert_eq!(arrow_type(&odd), Err("jsonb".to_owned()));
+        assert_eq!(arrow_type(&odd, STRICT), Err("jsonb".to_owned()));
     }
 
     #[test]
@@ -631,7 +821,7 @@ mod tests {
         ];
         for (element, item) in cases {
             assert_eq!(
-                arrow_type(&array(element, 1)),
+                arrow_type(&array(element, 1), STRICT),
                 Ok(Some(list(item))),
                 "{element}[]"
             );
@@ -646,23 +836,26 @@ mod tests {
             "point",
             "int4range",
         ] {
-            assert_eq!(arrow_type(&array(element, 1)), Ok(None), "{element}[]");
+            assert_eq!(arrow_type(&array(element, 1), STRICT), Ok(None), "{element}[]");
         }
         let mood = Column {
             element_kind: Some("e".into()),
             ..array("mood", 1)
         };
-        assert_eq!(arrow_type(&mood), Ok(Some(list(DataType::Utf8))));
+        assert_eq!(arrow_type(&mood, STRICT), Ok(Some(list(DataType::Utf8))));
         assert_eq!(
-            arrow_type(&array("integer", 2)),
+            arrow_type(&array("integer", 2), STRICT),
             Ok(Some(list(list(DataType::Int32))))
         );
-        assert_eq!(arrow_type(&array("integer", 0)), Ok(Some(list(DataType::Int32))));
+        assert_eq!(
+            arrow_type(&array("integer", 0), STRICT),
+            Ok(Some(list(DataType::Int32)))
+        );
         let missing = Column {
             element: None,
             ..array("integer", 1)
         };
-        assert_eq!(arrow_type(&missing), Ok(None));
+        assert_eq!(arrow_type(&missing, STRICT), Ok(None));
     }
 
     #[test]
@@ -687,7 +880,7 @@ mod tests {
             readable("SELECT * FROM t", Some(&schema)),
             "SELECT codelake_rows.c1 AS \"id\", to_json(codelake_rows.c2) AS \"days\", \
              to_json(codelake_rows.c3::text[]) AS \"tags \"\"x\"\"\", to_json(codelake_rows.c4) AS \"grid\", \
-             to_json(codelake_rows.c5::text[]) AS \"names\", to_json(codelake_rows.c6) AS \"amounts\" \
+             to_json(codelake_rows.c5::text[]) AS \"names\", to_json(codelake_rows.c6::text[]) AS \"amounts\" \
              FROM (SELECT * FROM t) AS codelake_rows(c1, c2, c3, c4, c5, c6)"
         );
     }
@@ -739,7 +932,7 @@ mod tests {
 
     #[test]
     fn decimals_fit_exactly_or_fail_naming_the_column() {
-        let fits = |text: &str| decimal_value(text, 38, 20, "vl");
+        let fits = |text: &str| decimal_value(text, 38, 20, "vl", DecimalRoundingMode::Unnecessary);
         assert_eq!(fits("1.5"), Ok(150_000_000_000_000_000_000));
         assert_eq!(fits("-1.50"), Ok(-150_000_000_000_000_000_000));
         assert_eq!(fits("0"), Ok(0));
@@ -795,10 +988,16 @@ mod tests {
                 "{special}"
             );
         }
-        assert_eq!(decimal_value("12.5", 3, 1, "c"), Ok(125));
-        assert!(decimal_value("123.5", 3, 1, "c").is_err());
-        assert_eq!(decimal_value("-99", 2, 0, "c"), Ok(-99));
-        assert!(decimal_value("1", 2, -1, "c").is_err());
+        assert_eq!(
+            decimal_value("12.5", 3, 1, "c", DecimalRoundingMode::Unnecessary),
+            Ok(125)
+        );
+        assert!(decimal_value("123.5", 3, 1, "c", DecimalRoundingMode::Unnecessary).is_err());
+        assert_eq!(
+            decimal_value("-99", 2, 0, "c", DecimalRoundingMode::Unnecessary),
+            Ok(-99)
+        );
+        assert!(decimal_value("1", 2, -1, "c", DecimalRoundingMode::Unnecessary).is_err());
     }
 
     #[test]
@@ -840,7 +1039,7 @@ mod tests {
             Arc::new(Int64Array::from(vec![Some(-1), None])),
         ];
         let batch = RecordBatch::try_new(Arc::new(decoded), columns).unwrap();
-        let restored = restore(batch, Some(&projected)).unwrap();
+        let restored = restore(batch, Some(&projected), DecimalRoundingMode::Unnecessary).unwrap();
         assert_eq!(restored.schema().as_ref(), &projected);
         let n = restored
             .column(1)
@@ -886,9 +1085,18 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
         )
         .unwrap();
-        assert_eq!(restore(batch.clone(), Some(&plain)).unwrap(), batch);
-        assert_eq!(restore(batch.clone(), None).unwrap(), batch);
-        assert_eq!(restore(batch.clone(), Some(&projected)).unwrap(), batch);
+        assert_eq!(
+            restore(batch.clone(), Some(&plain), DecimalRoundingMode::Unnecessary).unwrap(),
+            batch
+        );
+        assert_eq!(
+            restore(batch.clone(), None, DecimalRoundingMode::Unnecessary).unwrap(),
+            batch
+        );
+        assert_eq!(
+            restore(batch.clone(), Some(&projected), DecimalRoundingMode::Unnecessary).unwrap(),
+            batch
+        );
     }
 
     /// A value the declared type cannot hold fails, naming its column.
@@ -901,6 +1109,7 @@ mod tests {
             restore(
                 RecordBatch::try_new(Arc::new(decoded), vec![column]).unwrap(),
                 Some(&projected),
+                DecimalRoundingMode::Unnecessary,
             )
         };
         let error = one(
@@ -921,6 +1130,324 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("column \"c\""), "{error}");
+    }
+
+    fn decimals(mapping: DecimalMapping, default_scale: u8) -> Decimals {
+        Decimals {
+            mapping,
+            rounding_mode: DecimalRoundingMode::Unnecessary,
+            default_scale,
+        }
+    }
+
+    /// The reference engine's `decimal-mapping`, as Trino 431 maps the
+    /// columns of a PostgreSQL 17 table (`SHOW COLUMNS`): `STRICT` leaves a
+    /// `numeric` without precision or with more than 38 digits out, and an
+    /// array of them; `ALLOW_OVERFLOW` makes it `decimal(38, s)`.
+    #[test]
+    fn numerics_follow_the_decimal_mapping() {
+        let overflow = |scale| decimals(DecimalMapping::AllowOverflow, scale);
+        let decimal = |p, s| Ok(Some(DataType::Decimal128(p, s)));
+        let decimal_list = |p, s| Ok(Some(list(DataType::Decimal128(p, s))));
+        for type_name in ["numeric", "numeric(50,10)", "numeric(40)", "numeric(1000,0)"] {
+            assert_eq!(arrow_type(&column(type_name), STRICT), Ok(None), "{type_name}");
+            assert_eq!(
+                arrow_type(&array(type_name, 1), STRICT),
+                Ok(None),
+                "{type_name}[]"
+            );
+        }
+        assert_eq!(arrow_type(&column("numeric(38,2)"), STRICT), decimal(38, 2));
+        assert_eq!(
+            arrow_type(&array("numeric(38,2)", 1), STRICT),
+            decimal_list(38, 2)
+        );
+        // Trino 431, decimal-default-scale 4 (SHOW COLUMNS).
+        let cases = [
+            ("numeric", decimal(38, 4)),
+            ("numeric(10,2)", decimal(10, 2)),
+            ("numeric(38,2)", decimal(38, 2)),
+            ("numeric(50,10)", decimal(38, 4)),
+            ("numeric(40)", decimal(38, 0)),
+            ("numeric(1000,0)", decimal(38, 0)),
+        ];
+        for (type_name, expected) in cases {
+            assert_eq!(
+                arrow_type(&column(type_name), overflow(4)),
+                expected,
+                "{type_name}"
+            );
+        }
+        assert_eq!(arrow_type(&array("numeric", 1), overflow(4)), decimal_list(38, 0));
+        assert_eq!(
+            arrow_type(&array("numeric(50,10)", 1), overflow(4)),
+            decimal_list(38, 4)
+        );
+        assert_eq!(
+            arrow_type(&array("numeric(10,2)", 1), overflow(4)),
+            decimal_list(10, 2)
+        );
+        assert_eq!(
+            arrow_type(&array("numeric", 2), overflow(4)),
+            Ok(Some(list(list(DataType::Decimal128(38, 0)))))
+        );
+        // Other default scales: the declared scale bounds it beyond 38 digits.
+        for (scale, unbounded, wide) in [(0, 0, 0), (1, 1, 1), (20, 20, 10), (37, 37, 10), (38, 38, 10)] {
+            assert_eq!(
+                arrow_type(&column("numeric"), overflow(scale)),
+                decimal(38, unbounded)
+            );
+            assert_eq!(
+                arrow_type(&column("numeric(50,10)"), overflow(scale)),
+                decimal(38, wide)
+            );
+            assert_eq!(
+                arrow_type(&array("numeric(50,10)", 1), overflow(scale)),
+                decimal_list(38, wide)
+            );
+            assert_eq!(
+                arrow_type(&array("numeric", 1), overflow(scale)),
+                decimal_list(38, 0)
+            );
+        }
+        // Beyond a decimal's largest scale, the largest.
+        assert_eq!(arrow_type(&column("numeric"), overflow(60)), decimal(38, 38));
+        // A composite with such a field is left out, with either mapping.
+        let composite = |field: &str| Column {
+            kind: "c".into(),
+            fields: vec![("a".into(), "integer".into()), ("b".into(), field.into())],
+            ..column("pair")
+        };
+        for mapping in [STRICT, overflow(4)] {
+            assert_eq!(arrow_type(&composite("numeric"), mapping), Ok(None));
+            assert_eq!(arrow_type(&composite("numeric(39,2)"), mapping), Ok(None));
+            assert_eq!(
+                arrow_type(&composite("numeric(10,2)"), mapping),
+                Ok(Some(DataType::Struct(Fields::from(vec![
+                    Field::new("a", DataType::Int32, true),
+                    Field::new("b", DataType::Decimal128(10, 2), true),
+                ]))))
+            );
+        }
+        assert!(wide_numeric("numeric"));
+        assert!(wide_numeric("numeric(39)"));
+        assert!(!wide_numeric("numeric(38,0)"));
+        assert!(!wide_numeric("integer"));
+        assert_eq!(numeric_precision("numeric(1000,5)"), Some((1000, 5)));
+    }
+
+    /// Rounding to the scale as Trino 431 rounds a PostgreSQL 17 `numeric`
+    /// read with `decimal-mapping=ALLOW_OVERFLOW` (each mode at scale 0, the
+    /// answers it gave); then the value must fit the precision.
+    #[test]
+    fn decimals_round_as_the_reference_engine() {
+        use DecimalRoundingMode::{Ceiling, Down, Floor, HalfDown, HalfEven, HalfUp, Unnecessary, Up};
+        const NINES: &str = "99999999999999999999999999999999999999";
+        let nines: i128 = NINES.parse().unwrap();
+        let values = ["1.5", "2.5", "-2.5", "0.125", "0.00004999", "-0.00005"];
+        let expected: [(DecimalRoundingMode, [i128; 6]); 7] = [
+            (Up, [2, 3, -3, 1, 1, -1]),
+            (Down, [1, 2, -2, 0, 0, 0]),
+            (Ceiling, [2, 3, -2, 1, 1, 0]),
+            (Floor, [1, 2, -3, 0, 0, -1]),
+            (HalfUp, [2, 3, -3, 0, 0, 0]),
+            (HalfDown, [1, 2, -2, 0, 0, 0]),
+            (HalfEven, [2, 2, -2, 0, 0, 0]),
+        ];
+        for (mode, answers) in expected {
+            for (value, answer) in values.iter().zip(answers) {
+                assert_eq!(
+                    decimal_value(value, 38, 0, "n", mode),
+                    Ok(answer),
+                    "{value} {mode:?}"
+                );
+            }
+            // Rounding past the precision overflows (Trino: "Decimal overflow").
+            let tie = format!("{NINES}.5");
+            let rounded = decimal_value(&tie, 38, 0, "n", mode);
+            if matches!(mode, Down | Floor | HalfDown) {
+                assert_eq!(rounded, Ok(nines), "{mode:?}");
+            } else {
+                assert_eq!(
+                    rounded,
+                    Err(format!(
+                        "the PostgreSQL value {tie} of column \"n\" does not fit decimal(38,0): \
+                         more than 38 integer digits"
+                    )),
+                    "{mode:?}"
+                );
+            }
+            assert_eq!(decimal_value("1.000000", 38, 0, "n", mode), Ok(1));
+            assert_eq!(decimal_value(NINES, 38, 0, "n", mode), Ok(nines));
+        }
+        // Without a rounding mode, a digit past the scale fails (Trino: "Rounding necessary").
+        for value in values {
+            assert_eq!(
+                decimal_value(value, 38, 0, "n", Unnecessary),
+                Err(format!(
+                    "the PostgreSQL value {value} of column \"n\" does not fit decimal(38,0): \
+                     more than 0 fraction digits"
+                ))
+            );
+        }
+        // HALF_UP at scale 4 (Trino 431: 123.4568, 0.1235, -0.0001, 0.0000).
+        let half_up = |value: &str| decimal_value(value, 38, 4, "n", HalfUp);
+        assert_eq!(half_up("123.456789"), Ok(1_234_568));
+        assert_eq!(half_up("0.12345678901"), Ok(1_235));
+        assert_eq!(half_up("-0.00005"), Ok(-1));
+        assert_eq!(half_up("0.00004999"), Ok(0));
+        assert_eq!(half_up("99.99995"), Ok(1_000_000));
+        assert_eq!(
+            half_up("100000000000000000000"),
+            Ok(1_000_000_000_000_000_000_000_000)
+        );
+        assert!(half_up("10000000000000000000000000000000000000").is_err());
+        assert!(half_up("NaN").is_err());
+        // HALF_EVEN looks at the last kept fraction digit, and past the half.
+        assert_eq!(decimal_value("0.125", 38, 2, "n", HalfEven), Ok(12));
+        assert_eq!(decimal_value("0.135", 38, 2, "n", HalfEven), Ok(14));
+        assert_eq!(decimal_value("0.1251", 38, 2, "n", HalfEven), Ok(13));
+        assert_eq!(decimal_value("0.1251", 38, 2, "n", HalfDown), Ok(13));
+        assert_eq!(decimal_value("0.125", 38, 2, "n", HalfDown), Ok(12));
+        assert_eq!(decimal_value("0.5", 38, 0, "n", HalfEven), Ok(0));
+        assert_eq!(decimal_value("1.125", 38, 2, "n", HalfEven), Ok(112));
+        assert_eq!(decimal_value("2.135", 38, 2, "n", HalfEven), Ok(214));
+        assert_eq!(decimal_value("-3.5", 38, 0, "n", HalfEven), Ok(-4));
+        assert_eq!(decimal_value("10.5", 38, 0, "n", HalfEven), Ok(10));
+        // decimal(38,38): no integer digit (Trino: "Decimal overflow" for 1.5).
+        assert!(decimal_value("1.5", 38, 38, "n", HalfUp).is_err());
+        assert_eq!(decimal_value("0.5", 38, 38, "n", HalfUp), Ok(5 * 10_i128.pow(37)));
+        assert_eq!(decimal_value("9.95", 2, 1, "n", HalfUp), Err(
+            "the PostgreSQL value 9.95 of column \"n\" does not fit decimal(2,1): more than 1 integer digits"
+                .to_owned()
+        ));
+        assert_eq!(decimal_value("9.94", 2, 1, "n", HalfUp), Ok(99));
+    }
+
+    /// A list of decimals travels as a list of texts, which the row decoder
+    /// reads as such.
+    #[test]
+    fn lists_of_decimals_travel_as_texts() {
+        let projected = Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("amounts", list(DataType::Decimal128(38, 0)), true),
+            Field::new("grid", list(list(DataType::Decimal128(10, 2))), true),
+            Field::new("tags", list(DataType::Utf8), true),
+            Field::new("n", DataType::Decimal128(38, 4), true),
+        ]);
+        let decoded = decoded(&projected);
+        let types: Vec<&DataType> = decoded.fields().iter().map(|f| f.data_type()).collect();
+        assert_eq!(
+            types,
+            [
+                &DataType::Int32,
+                &list(DataType::Utf8),
+                &list(list(DataType::Utf8)),
+                &list(DataType::Utf8),
+                &DataType::Decimal128(38, 4),
+            ]
+        );
+        assert_eq!(
+            readable("SELECT * FROM t", Some(&projected)),
+            "SELECT codelake_rows.c1 AS \"id\", to_json(codelake_rows.c2::text[]) AS \"amounts\", \
+             to_json(codelake_rows.c3::text[]) AS \"grid\", to_json(codelake_rows.c4::text[]) AS \"tags\", \
+             codelake_rows.c5::text AS \"n\" FROM (SELECT * FROM t) AS codelake_rows(c1, c2, c3, c4, c5)"
+        );
+    }
+
+    /// The decoded lists of texts become the declared lists of decimals,
+    /// rounded as the catalog says.
+    #[test]
+    fn decoded_decimal_lists_are_restored_and_rounded() {
+        use datafusion::arrow::array::{Decimal128Array, ListBuilder, StringBuilder};
+        let projected = Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("amounts", list(DataType::Decimal128(38, 0)), true),
+            Field::new("grid", list(list(DataType::Decimal128(10, 2))), true),
+            Field::new("tags", list(DataType::Utf8), true),
+            Field::new("n", DataType::Decimal128(38, 4), true),
+        ]);
+        let decoded = decoded(&projected);
+        let mut amounts = ListBuilder::new(StringBuilder::new());
+        amounts.values().append_value("1.5");
+        amounts.values().append_null();
+        amounts.append(true);
+        amounts.append(false);
+        amounts.values().append_value("-2.5");
+        amounts.append(true);
+        let mut grid = ListBuilder::new(ListBuilder::new(StringBuilder::new()));
+        grid.values().values().append_value("1.25");
+        grid.values().append(true);
+        grid.append(true);
+        grid.append(false);
+        grid.append(true);
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        tags.values().append_value("x");
+        tags.append(true);
+        tags.append(true);
+        tags.append(true);
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(datafusion::arrow::array::Int32Array::from(vec![1, 2, 3])),
+            Arc::new(amounts.finish()),
+            Arc::new(grid.finish()),
+            Arc::new(tags.finish()),
+            Arc::new(datafusion::arrow::array::StringArray::from(vec![
+                Some("0.00005"),
+                None,
+                Some("1"),
+            ])),
+        ];
+        // A decimal arrives as text: the decoder types it by what PostgreSQL sent.
+        let mut fields: Vec<Field> = decoded.fields().iter().map(|f| f.as_ref().clone()).collect();
+        fields[4] = Field::new("n", DataType::Utf8, true);
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        let restored = restore(batch.clone(), Some(&projected), DecimalRoundingMode::HalfUp).unwrap();
+        assert_eq!(restored.schema().as_ref(), &projected);
+        let amounts = restored.column(1).as_list::<i32>();
+        assert!(amounts.is_null(1));
+        let first = amounts.value(0);
+        let first = first.as_any().downcast_ref::<Decimal128Array>().unwrap();
+        assert_eq!((first.value(0), first.is_null(1)), (2, true));
+        let third = amounts.value(2);
+        assert_eq!(
+            third.as_any().downcast_ref::<Decimal128Array>().unwrap().value(0),
+            -3
+        );
+        let grid = restored.column(2).as_list::<i32>();
+        assert!(grid.is_null(1));
+        let inner = grid.value(0);
+        let inner = inner.as_list::<i32>().value(0);
+        assert_eq!(
+            inner.as_any().downcast_ref::<Decimal128Array>().unwrap().value(0),
+            125
+        );
+        let n = restored
+            .column(4)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!((n.value(0), n.is_null(1), n.value(2)), (1, true, 10_000));
+        assert_eq!(restored.column(3), batch.column(3));
+
+        // Without a rounding mode an element with more digits fails, naming its column.
+        let error = restore(batch, Some(&projected), DecimalRoundingMode::Unnecessary).unwrap_err();
+        assert_eq!(
+            error,
+            "the PostgreSQL value 1.5 of column \"amounts\" does not fit decimal(38,0): more than 0 fraction digits"
+        );
+        // A list the decoder did not read as texts is an error, not a guess.
+        let odd = Schema::new(vec![Field::new("amounts", list(DataType::Int32), true)]);
+        let mut ints = ListBuilder::new(datafusion::arrow::array::Int32Builder::new());
+        ints.values().append_value(1);
+        ints.append(true);
+        let batch = RecordBatch::try_new(Arc::new(odd), vec![Arc::new(ints.finish()) as ArrayRef]).unwrap();
+        let wanted = Schema::new(vec![Field::new(
+            "amounts",
+            list(DataType::Decimal128(10, 2)),
+            true,
+        )]);
+        let error = restore(batch, Some(&wanted), DecimalRoundingMode::HalfUp).unwrap_err();
+        assert!(error.contains("column \"amounts\""), "{error}");
     }
 
     #[test]

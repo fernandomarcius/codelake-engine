@@ -66,10 +66,38 @@ stops startup.
 | `kind` | Keys (defaults) | Notes |
 |---|---|---|
 | `sqlserver` | `host`, `port` (1433), `database`, `user`, `password_env`, `encrypt` (`required`), `trust_server_certificate` (false), `pool_size` (10) | `encrypt = "off"` sends credentials in clear text; `trust_server_certificate = true` skips server identity; both are logged as warnings and are for test networks only |
-| `postgres` | `host`, `port` (5432), `database`, `user`, `password_env`, `sslmode` (`verify-full`) | |
+| `postgres` | `host`, `port` (5432), `database`, `user`, `password_env`, `sslmode` (`verify-full`), `decimal_mapping` (`strict`), `decimal_rounding_mode` (`unnecessary`), `decimal_default_scale` (0) | `numeric` without precision: below |
 | `mysql` | `host`, `port` (3306), `database`, `user`, `password_env`, `sslmode` (`required`) | |
 | `mongodb` | `connection_string_env` | the whole URI is the secret |
 | `hive` | `warehouse` (absolute path or `file:` URL), `timestamp_precision` (`MILLISECONDS`, `MICROSECONDS`, `NANOSECONDS`), `parquet_time_zone` (`America/Sao_Paulo`), `[source.metastore_names]` (below) | Parquet in the file-metastore layout (ADR 0007). S3/MinIO warehouses are not in this build |
+
+### PostgreSQL `numeric` without precision
+
+A PostgreSQL `numeric(p, s)` with `p` up to 38 is a `decimal(p, s)`. One without precision, or
+with more than 38 digits, follows the source's `decimal_mapping`, the reference engine's
+`decimal-mapping` (ISS-060); `codelake config import` maps its `decimal-mapping`,
+`decimal-rounding-mode` and `decimal-default-scale`:
+
+| Key | Values | What |
+|---|---|---|
+| `decimal_mapping` | `strict` (default), `allow_overflow` | `strict` leaves such a column out of its relation, as the reference does by default: it does not exist for `SELECT *`, `information_schema`, `system.jdbc` or `DESCRIBE`, and naming it fails (`COLUMN_NOT_FOUND`); arrays of them too. A relation whose every column is left out is refused (`NOT_FOUND`). `allow_overflow` makes it a `decimal(38, s)`: `s` is `decimal_default_scale` without precision, the smaller of the declared scale and it with more than 38 digits; an array of `numeric` without precision is an `array(decimal(38, 0))` |
+| `decimal_rounding_mode` | `unnecessary` (default), `up`, `down`, `ceiling`, `floor`, `half_up`, `half_down`, `half_even` | how a value with more fraction digits than its column's scale is rounded (Java's `RoundingMode`); `unnecessary` fails the query instead |
+| `decimal_default_scale` | 0 (default) to 38 | the scale of a `numeric` without precision under `allow_overflow` |
+
+A value that does not fit after rounding (more integer digits than the precision holds, `NaN`,
+`±Infinity`) fails the query, naming the value and the column; it is never cut. Clients that hold
+decimals in 28 digits (the .NET `System.Decimal`) may not read a `decimal(38, s)`: keep `strict`
+unless the clients expect the column.
+
+```toml
+[[source]]
+name = "hub"
+kind = "postgres"
+# ...
+decimal_mapping = "allow_overflow"
+decimal_rounding_mode = "half_up"
+decimal_default_scale = 4
+```
 
 ### Metastore names: `[source.metastore_names]`
 
