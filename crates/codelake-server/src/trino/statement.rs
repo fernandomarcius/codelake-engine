@@ -210,13 +210,27 @@ fn show_session_filter(sql: &str) -> Result<Option<ShowSession>, QueryError> {
     let Some(rest) = session::strip_keyword(rest, "SESSION") else {
         return Ok(None);
     };
-    let syntax = |message: String| QueryError::new(Code::SyntaxError, message);
     let dialect = GenericDialect {};
     let mut parser = Parser::new(&dialect)
         .try_with_sql(rest)
         .map_err(|e| syntax(e.to_string()))?;
-    if !parser.parse_keyword(Keyword::LIKE) {
+    let Some(like) = like_clause(&mut parser)? else {
         return Err(syntax("SHOW SESSION expects LIKE 'pattern'".into()));
+    };
+    if parser.peek_token().token != Token::EOF {
+        return Err(syntax("Unexpected text after SHOW SESSION LIKE".into()));
+    }
+    Ok(Some(ShowSession::Like(like)))
+}
+
+fn syntax(message: String) -> QueryError {
+    QueryError::new(Code::SyntaxError, message)
+}
+
+/// `LIKE 'pattern' [ESCAPE 'c']`, when the next tokens are one.
+fn like_clause(parser: &mut Parser<'_>) -> Result<Option<Like>, QueryError> {
+    if !parser.parse_keyword(Keyword::LIKE) {
+        return Ok(None);
     }
     let pattern = parser.parse_literal_string().map_err(|e| syntax(e.to_string()))?;
     let escape = if parser.parse_keyword(Keyword::ESCAPE) {
@@ -234,10 +248,123 @@ fn show_session_filter(sql: &str) -> Result<Option<ShowSession>, QueryError> {
     } else {
         None
     };
-    if parser.peek_token().token != Token::EOF {
-        return Err(syntax("Unexpected text after SHOW SESSION LIKE".into()));
+    Ok(Some(Like { pattern, escape }))
+}
+
+/// `SHOW CATALOGS` and `SHOW SCHEMAS`, which `DataFusion` does not plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Listing {
+    /// `SHOW CATALOGS [LIKE 'pattern' [ESCAPE 'c']]`.
+    Catalogs(Option<Like>),
+    /// `SHOW SCHEMAS [FROM | IN catalog] [LIKE 'pattern' [ESCAPE 'c']]`.
+    Schemas {
+        catalog: Option<String>,
+        like: Option<Like>,
+    },
+}
+
+/// The listing `sql` asks for; `None` for other statements.
+fn listing(sql: &str) -> Result<Option<Listing>, QueryError> {
+    let text = sql.trim().trim_end_matches(';').trim_end();
+    let Some(rest) = session::strip_keyword(text, "SHOW") else {
+        return Ok(None);
+    };
+    let (what, rest) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, ""), |(what, rest)| (what, rest.trim_start()));
+    let catalogs = what.eq_ignore_ascii_case("CATALOGS");
+    if !catalogs && !what.eq_ignore_ascii_case("SCHEMAS") {
+        return Ok(None);
     }
-    Ok(Some(ShowSession::Like(Like { pattern, escape })))
+    let dialect = GenericDialect {};
+    let mut parser = Parser::new(&dialect)
+        .try_with_sql(rest)
+        .map_err(|e| syntax(e.to_string()))?;
+    let mut catalog = None;
+    if !catalogs
+        && parser
+            .parse_one_of_keywords(&[Keyword::FROM, Keyword::IN])
+            .is_some()
+    {
+        let name = parser.parse_identifier().map_err(|e| syntax(e.to_string()))?;
+        // Catalog names are case-insensitive, quoted or not.
+        catalog = Some(name.value.to_lowercase());
+    }
+    let like = like_clause(&mut parser)?;
+    if parser.peek_token().token != Token::EOF {
+        return Err(syntax(format!(
+            "Unexpected text after SHOW {}",
+            what.to_uppercase()
+        )));
+    }
+    Ok(Some(if catalogs {
+        Listing::Catalogs(like)
+    } else {
+        Listing::Schemas { catalog, like }
+    }))
+}
+
+/// The work of a listing: `SHOW CATALOGS` answers from the catalogs a client
+/// lists (`system.jdbc.catalogs`), as one `Catalog` column typed
+/// `varchar(n)`, `n` the longest name (Trino lists them as a `VALUES`);
+/// `SHOW SCHEMAS` reads the catalog's `information_schema.schemata`, as
+/// Trino rewrites it.
+fn listing_work(engine: &Engine, session: &ClientSession, listing: Listing) -> Result<Work, QueryError> {
+    match listing {
+        Listing::Catalogs(like) => {
+            let state = engine.context().state();
+            let names = super::system_tables::listed_catalogs(state.catalog_list().as_ref());
+            let width = names.iter().map(|name| name.chars().count()).max().unwrap_or(0);
+            let shown: StringArray = names
+                .iter()
+                .filter(|name| like.as_ref().is_none_or(|like| like.matches(name)))
+                .map(Some)
+                .collect();
+            let declared =
+                codelake_core::trino_types::Declared::Varchar(u32::try_from(width).unwrap_or(u32::MAX));
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("Catalog", DataType::Utf8, false).with_metadata(declared.metadata()),
+            ]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(shown)])
+                .map_err(|e| QueryError::from(&DataFusionError::from(e)))?;
+            let frame = engine
+                .context()
+                .read_batch(batch)
+                .map_err(|e| QueryError::from(&e))?;
+            Ok(Work::Frame(Box::new(frame)))
+        }
+        Listing::Schemas { catalog, like } => {
+            let Some(catalog) = catalog.or_else(|| session.catalog.clone()) else {
+                return Err(QueryError::new(
+                    Code::MissingCatalogName,
+                    "line 1:1: Catalog must be specified when session catalog is not set",
+                ));
+            };
+            if !EngineNames(engine).has_catalog(&catalog) {
+                return Err(QueryError::new(
+                    Code::CatalogNotFound,
+                    format!("Catalog '{catalog}' does not exist"),
+                ));
+            }
+            let quoted = |text: &str, quote: char| {
+                let doubled: String = [quote, quote].iter().collect();
+                format!("{quote}{}{quote}", text.replace(quote, &doubled))
+            };
+            let filter = like.map_or_else(String::new, |like| {
+                let escape = like.escape.map_or_else(String::new, |c| {
+                    format!(" ESCAPE {}", quoted(&c.to_string(), '\''))
+                });
+                format!(" WHERE schema_name LIKE {}{escape}", quoted(&like.pattern, '\''))
+            });
+            Ok(Work::Sql {
+                sql: format!(
+                    "SELECT schema_name AS \"Schema\" FROM {}.information_schema.schemata{filter} ORDER BY schema_name",
+                    quoted(&catalog, '"')
+                ),
+                planned: None,
+            })
+        }
+    }
 }
 
 /// A SQL `LIKE` pattern: `%` any text, `_` one character.
@@ -1059,7 +1186,9 @@ fn start(
         return Ok(());
     }
     exec.shape = shape(sql);
-    let work = if let Some(filter) = show_session_filter(sql)? {
+    let work = if let Some(listing) = listing(sql)? {
+        listing_work(&state.engine, &session, listing)?
+    } else if let Some(filter) = show_session_filter(sql)? {
         let like = match &filter {
             ShowSession::All => None,
             ShowSession::Like(like) => Some(like),
@@ -1631,6 +1760,66 @@ mod tests {
             Shape::Ack("CREATE VIEW")
         );
         assert_eq!(shape("SELECT 1 +"), Shape::Rows);
+    }
+
+    #[test]
+    fn catalog_and_schema_listings_are_recognized() {
+        let like = |pattern: &str, escape: Option<char>| {
+            Some(Like {
+                pattern: pattern.to_owned(),
+                escape,
+            })
+        };
+        assert_eq!(
+            listing(" show  CATALOGS ;").unwrap(),
+            Some(Listing::Catalogs(None))
+        );
+        assert_eq!(
+            listing("SHOW CATALOGS LIKE 'h%'").unwrap(),
+            Some(Listing::Catalogs(like("h%", None)))
+        );
+        assert_eq!(
+            listing("SHOW SCHEMAS").unwrap(),
+            Some(Listing::Schemas {
+                catalog: None,
+                like: None
+            })
+        );
+        assert_eq!(
+            listing("show schemas from Hive like 'x\\_%' escape '\\'").unwrap(),
+            Some(Listing::Schemas {
+                catalog: Some("hive".into()),
+                like: like("x\\_%", Some('\\'))
+            })
+        );
+        assert_eq!(
+            listing("SHOW SCHEMAS IN \"PG\"").unwrap(),
+            Some(Listing::Schemas {
+                catalog: Some("pg".into()),
+                like: None
+            })
+        );
+        for other in [
+            "SHOW TABLES",
+            "SHOW SESSION",
+            "SHOW CATALOGSX",
+            "SELECT 1",
+            "SHOW",
+        ] {
+            assert_eq!(listing(other).unwrap(), None, "{other}");
+        }
+        for wrong in [
+            "SHOW CATALOGS FROM x",
+            "SHOW SCHEMAS FROM",
+            "SHOW SCHEMAS LIKE",
+            "SHOW CATALOGS LIKE 'a' extra",
+        ] {
+            assert_eq!(listing(wrong).unwrap_err().name(), "SYNTAX_ERROR", "{wrong}");
+        }
+        assert_eq!(
+            listing("SHOW CATALOGS LIKE 'a' ESCAPE 'ab'").unwrap_err().name(),
+            "GENERIC_USER_ERROR"
+        );
     }
 
     #[test]
