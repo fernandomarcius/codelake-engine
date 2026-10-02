@@ -15,12 +15,12 @@ compare = "multiset"
 time_zone = "America/Sao_Paulo"
 
 setup = [
-  "CREATE SCHEMA {c}.tsp",
-  "CREATE TABLE {c}.tsp.cols AS SELECT CAST(TIMESTAMP '2026-01-01 10:00:00' AS timestamp(0)) AS s0, CAST(TIMESTAMP '2026-01-01 10:00:00.1' AS timestamp(1)) AS s1, CAST(TIMESTAMP '2026-01-01 10:00:00.123' AS timestamp(3)) AS s3, CAST(TIMESTAMP '2026-01-01 10:00:00.123456' AS timestamp(6)) AS s6",
-  "CREATE SCHEMA IF NOT EXISTS hive.tsp",
-  "CREATE TABLE hive.tsp.h_{e} WITH (format = 'PARQUET') AS SELECT CAST(TIMESTAMP '2026-01-01 10:00:00.123' AS timestamp(3)) AS t",
-  "CREATE TABLE hive.tsp.two_{e} WITH (format = 'PARQUET') AS SELECT CAST(TIMESTAMP '2026-01-01 10:00:00.123' AS timestamp(3)) AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00'",
-  "CREATE TABLE hive.tsp.three_{e} WITH (format = 'PARQUET') AS SELECT TIMESTAMP '2026-01-01 10:00:00' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 11:00:00' UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.123'",
+  "CREATE SCHEMA {c}.tct",
+  "CREATE TABLE {c}.tct.cols AS SELECT CAST(TIMESTAMP '2026-01-01 10:00:00' AS timestamp(0)) AS s0, CAST(TIMESTAMP '2026-01-01 10:00:00.1' AS timestamp(1)) AS s1, CAST(TIMESTAMP '2026-01-01 10:00:00.123' AS timestamp(3)) AS s3, CAST(TIMESTAMP '2026-01-01 10:00:00.123456' AS timestamp(6)) AS s6",
+  "CREATE SCHEMA IF NOT EXISTS hive.tct",
+  "CREATE TABLE hive.tct.h_{e} WITH (format = 'PARQUET') AS SELECT CAST(TIMESTAMP '2026-01-01 10:00:00.123' AS timestamp(3)) AS t",
+  "CREATE TABLE hive.tct.two_{e} WITH (format = 'PARQUET') AS SELECT CAST(TIMESTAMP '2026-01-01 10:00:00.123' AS timestamp(3)) AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00'",
+  "CREATE TABLE hive.tct.three_{e} WITH (format = 'PARQUET') AS SELECT TIMESTAMP '2026-01-01 10:00:00' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 11:00:00' UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.123'",
 ]
 
 # ---------------------------------------------------------------- UNION of literals
@@ -91,9 +91,9 @@ note = "nanoseconds only: timestamp(8), declared on the column"
 [[case]]
 id = "TU16"
 sql = "SELECT x FROM (SELECT CAST(TIMESTAMP '2026-01-01 10:00:00.123' AS timestamp(9)) AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00')"
-expect = "TIPO"
+expect = "WRONG"
 accepted = "ISS-062"
-note = "timestamp(9) with timestamp(0): same values, timestamp(6) in the engine (microseconds, the nanosecond value exact) where the reference answers timestamp(9)"
+note = "timestamp(9) with timestamp(0): the same instants, timestamp(6) in the engine (microseconds, the nanosecond value exact) where the reference answers timestamp(9), so the text has six digits, not nine"
 
 [[case]]
 id = "TU12"
@@ -143,61 +143,61 @@ note = "type and instants agree; the reference keeps each value's zone, Arrow ha
 
 [[case]]
 id = "TC1"
-sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT s0 AS x FROM {c}.tsp.cols UNION ALL SELECT s3 FROM {c}.tsp.cols)"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT s0 AS x FROM {c}.tct.cols UNION ALL SELECT s3 FROM {c}.tct.cols)"
 note = "memory table columns: timestamp(0) with timestamp(3)"
 
 [[case]]
 id = "TC2"
-sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT s0 AS x FROM {c}.tsp.cols UNION ALL SELECT s0 FROM {c}.tsp.cols UNION ALL SELECT s6 FROM {c}.tsp.cols)"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT s0 AS x FROM {c}.tct.cols UNION ALL SELECT s0 FROM {c}.tct.cols UNION ALL SELECT s6 FROM {c}.tct.cols)"
 note = "three inputs, the first two agreeing: timestamp(6)"
 
 [[case]]
 id = "TC3"
-sql = "SELECT x FROM (SELECT s0 AS x FROM {c}.tsp.cols UNION ALL SELECT s1 FROM {c}.tsp.cols)"
+sql = "SELECT x FROM (SELECT s0 AS x FROM {c}.tct.cols UNION ALL SELECT s1 FROM {c}.tct.cols)"
 note = "a timestamp(1) column with a timestamp(0) one: timestamp(1)"
 
 [[case]]
 id = "TC4"
-sql = "SELECT count(*), count(DISTINCT x) FROM (SELECT s0 AS x FROM {c}.tsp.cols UNION SELECT s3 FROM {c}.tsp.cols UNION SELECT s6 FROM {c}.tsp.cols UNION SELECT CAST(s0 AS timestamp(6)) FROM {c}.tsp.cols)"
+sql = "SELECT count(*), count(DISTINCT x) FROM (SELECT s0 AS x FROM {c}.tct.cols UNION SELECT s3 FROM {c}.tct.cols UNION SELECT s6 FROM {c}.tct.cols UNION SELECT CAST(s0 AS timestamp(6)) FROM {c}.tct.cols)"
 note = "UNION (distinct) of four inputs: three rows"
 
 [[case]]
 id = "TC5"
-sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT t AS x FROM hive.tsp.h_{e} UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00')"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT t AS x FROM hive.tct.h_{e} UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00')"
 note = "a hive Parquet timestamp(3) column with a timestamp(0) literal"
 
 [[case]]
 id = "TC6"
-sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00' AS x UNION ALL SELECT t FROM hive.tsp.h_{e})"
+sql = "SELECT typeof(x), CAST(x AS varchar) FROM (SELECT TIMESTAMP '2026-01-01 10:00:00' AS x UNION ALL SELECT t FROM hive.tct.h_{e})"
 note = "the literal first"
 
 [[case]]
 id = "TC7a"
-sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'tsp' AND table_name = 'two_{e}' ORDER BY ordinal_position"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'tct' AND table_name = 'two_{e}' ORDER BY ordinal_position"
 compare = "ordered"
 note = "CREATE TABLE AS of the union stores timestamp(3) (the engine refused it: timestamp(0) in a MILLISECONDS catalog)"
 
 [[case]]
 id = "TC7b"
-sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'tsp' AND table_name = 'two_tr' ORDER BY ordinal_position"
-oracle_sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'tsp' AND table_name = 'two_cl' ORDER BY ordinal_position"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'tct' AND table_name = 'two_tr' ORDER BY ordinal_position"
+oracle_sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'tct' AND table_name = 'two_cl' ORDER BY ordinal_position"
 compare = "ordered"
 note = "each engine reads the type the other stored"
 
 [[case]]
 id = "TC7c"
-sql = "SELECT CAST(x AS varchar) FROM hive.tsp.two_{e}"
+sql = "SELECT CAST(x AS varchar) FROM hive.tct.two_{e}"
 note = "the fraction stored"
 
 [[case]]
 id = "TC8a"
-sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'tsp' AND table_name = 'three_{e}' ORDER BY ordinal_position"
+sql = "SELECT column_name, data_type FROM hive.information_schema.columns WHERE table_schema = 'tct' AND table_name = 'three_{e}' ORDER BY ordinal_position"
 compare = "ordered"
 note = "three inputs, the first two timestamp(0)"
 
 [[case]]
 id = "TC8b"
-sql = "SELECT CAST(x AS varchar) FROM hive.tsp.three_{e}"
+sql = "SELECT CAST(x AS varchar) FROM hive.tct.three_{e}"
 
 # ---------------------------------------------------------------- VALUES, CASE, coalesce, IN
 
