@@ -847,6 +847,7 @@ impl Engine {
         }
         ctx.register_udf(crate::coercion::named_cast());
         ctx.register_udf(crate::coercion::exact_cast());
+        ctx.register_udf(crate::coercion::exact_micros());
         crate::trino_functions::install(&mut ctx)?;
         // Every derived state resolves each name as this one does.
         crate::function_names::settle(&mut ctx.state_ref().write())?;

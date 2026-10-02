@@ -1529,10 +1529,10 @@ async fn declared_timestamp_precisions_meet_across_a_union() {
             ),
             (
                 "SELECT x FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.1234567' AS x \
-                 UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.123') ORDER BY 1",
+                 UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.12345678') ORDER BY 1",
                 answer(
-                    &["timestamp(7)"],
-                    &[&["2026-01-01T10:00:00.123"], &["2026-01-01T10:00:00.123456700"]],
+                    &["timestamp(8)"],
+                    &[&["2026-01-01T10:00:00.123456700"], &["2026-01-01T10:00:00.123456780"]],
                 ),
             ),
             (
@@ -1826,4 +1826,93 @@ async fn timestamps_and_times_meet_in_values_case_and_set_operations() {
         ],
     )
     .await;
+}
+
+/// Nanoseconds are never the common type of a coarser value: a nanosecond
+/// timestamp holds only the years 1677 to 2262, and a column of
+/// microseconds or milliseconds holds `9999-12-31` (the open-end sentinel of
+/// SQL Server `datetime2`); widening it overflowed. The values meet in
+/// microseconds, a nanosecond value exactly or refused, never rounded.
+#[tokio::test]
+async fn nanoseconds_meet_coarser_timestamps_in_microseconds() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    let sentinel = "TIMESTAMP '9999-12-31 23:59:59.999999'";
+    let nanos = "CAST(TIMESTAMP '2026-01-01 10:00:00.123' AS timestamp(9))";
+    let cases = "(VALUES true, false) t(b)";
+    assert_same(
+        &engine,
+        &[
+            (
+                &format!("SELECT x FROM (SELECT {sentinel} AS x UNION ALL SELECT {nanos}) ORDER BY 1"),
+                answer(
+                    &["timestamp(6)"],
+                    &[&["2026-01-01T10:00:00.123"], &["9999-12-31T23:59:59.999999"]],
+                ),
+            ),
+            (
+                &format!("SELECT coalesce({sentinel}, {nanos}), greatest({nanos}, {sentinel})"),
+                answer(
+                    &["timestamp(6)", "timestamp(6)"],
+                    &[&["9999-12-31T23:59:59.999999", "9999-12-31T23:59:59.999999"]],
+                ),
+            ),
+            (
+                &format!("SELECT CASE WHEN b THEN {sentinel} ELSE {nanos} END AS y FROM {cases} ORDER BY 1"),
+                answer(
+                    &["timestamp(6)"],
+                    &[&["2026-01-01T10:00:00.123"], &["9999-12-31T23:59:59.999999"]],
+                ),
+            ),
+            (
+                &format!("SELECT x FROM (VALUES {sentinel}, {nanos}) t(x) ORDER BY 1"),
+                answer(
+                    &["timestamp(6)"],
+                    &[&["2026-01-01T10:00:00.123"], &["9999-12-31T23:59:59.999999"]],
+                ),
+            ),
+        ],
+    )
+    .await;
+    // Nanoseconds among themselves, or a nanosecond column: nanoseconds.
+    assert_same(
+        &engine,
+        &[(
+            "SELECT TIMESTAMP '2026-01-01 10:00:00.1234567' < TIMESTAMP '2026-01-01 10:00:00.1234568', \
+             x > TIMESTAMP '2026-01-01 10:00:00.123', x = TIMESTAMP '2026-01-01 10:00:00.1234567' \
+             FROM (VALUES CAST(TIMESTAMP '2026-01-01 10:00:00.1234567' AS timestamp(9))) t(x)",
+            answer(&["boolean", "boolean", "boolean"], &[&["true", "true", "true"]]),
+        )],
+    )
+    .await;
+    // Compared with a constant in nanoseconds: in microseconds, so the
+    // sentinel does not overflow.
+    assert_same(
+        &engine,
+        &[(
+            &format!(
+                "SELECT x = {nanos}, x > {nanos}, x < CAST(TIMESTAMP '2026-01-01 10:00:00.1234560' AS timestamp(9)) \
+                 FROM (VALUES {sentinel}, TIMESTAMP '2026-01-01 10:00:00.123') t(x) ORDER BY x"
+            ),
+            answer(
+                &["boolean", "boolean", "boolean"],
+                &[&["true", "false", "true"], &["false", "true", "false"]],
+            ),
+        )],
+    )
+    .await;
+    for sql in [
+        format!("SELECT x FROM (VALUES {sentinel}) t(x) WHERE x = TIMESTAMP '2026-01-01 10:00:00.1234567'"),
+        format!(
+            "SELECT x FROM (SELECT {sentinel} AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.1234567')"
+        ),
+        "SELECT coalesce(CAST(NULL AS timestamp(6)), TIMESTAMP '2026-01-01 10:00:00.1234567')".to_owned(),
+    ] {
+        assert_error(
+            &engine,
+            &sql,
+            "TIMESTAMP '2026-01-01 10:00:00.123456700' has more than 6 fraction digits",
+        )
+        .await;
+    }
 }

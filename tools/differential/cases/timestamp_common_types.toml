@@ -78,7 +78,22 @@ note = "timestamp(1) with timestamp(0): timestamp(1)"
 [[case]]
 id = "TU11"
 sql = "SELECT x FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.1234567' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.123')"
-note = "timestamp(7) with timestamp(3): timestamp(7)"
+expect = "RECUSA"
+accepted = "ISS-062"
+error = "has more than 6 fraction digits"
+note = "timestamp(7) with timestamp(3): the reference answers timestamp(7); the engine never widens a coarser value to nanoseconds (a 9999-12-31 sentinel overflows them), and refuses the 7th digit rather than round it"
+
+[[case]]
+id = "TU15"
+sql = "SELECT x FROM (SELECT TIMESTAMP '2026-01-01 10:00:00.1234567' AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00.12345678')"
+note = "nanoseconds only: timestamp(8), declared on the column"
+
+[[case]]
+id = "TU16"
+sql = "SELECT x FROM (SELECT CAST(TIMESTAMP '2026-01-01 10:00:00.123' AS timestamp(9)) AS x UNION ALL SELECT TIMESTAMP '2026-01-01 10:00:00')"
+expect = "TIPO"
+accepted = "ISS-062"
+note = "timestamp(9) with timestamp(0): same values, timestamp(6) in the engine (microseconds, the nanosecond value exact) where the reference answers timestamp(9)"
 
 [[case]]
 id = "TU12"
@@ -235,6 +250,11 @@ note = "greatest: timestamp(3)"
 id = "TV10"
 sql = "SELECT TIMESTAMP '2026-01-01 10:00:00.123' IN (TIMESTAMP '2026-01-01 10:00:00', TIMESTAMP '2026-01-01 11:00:00'), TIMESTAMP '2026-01-01 10:00:00' IN (TIMESTAMP '2026-01-01 10:00:00.123'), TIMESTAMP '2026-01-01 10:00:00' IN (TIMESTAMP '2026-01-01 10:00:00.000')"
 note = "IN compares at the finer precision"
+
+[[case]]
+id = "TV12"
+sql = "SELECT TIMESTAMP '2026-01-01 10:00:00.123' = CAST(TIMESTAMP '2026-01-01 10:00:00.123' AS timestamp(9)), TIMESTAMP '9999-12-31 23:59:59.999999' > CAST(TIMESTAMP '2026-01-01 10:00:00.123' AS timestamp(9))"
+note = "a nanosecond constant compared with a coarser timestamp: in microseconds, no overflow for the 9999-12-31 sentinel"
 
 [[case]]
 id = "TV11"

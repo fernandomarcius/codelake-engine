@@ -395,6 +395,86 @@ pub(crate) fn exact_cast() -> ScalarUDF {
     EXACT_CAST_UDF.as_ref().clone()
 }
 
+/// Name of [`ExactMicros`].
+pub(crate) const EXACT_MICROS: &str = "codelake_exact_micros";
+
+/// `codelake_exact_micros(x)`: nanosecond timestamps as microseconds, the
+/// zone kept, failing on a value with a digit past the sixth (never rounded):
+/// where nanoseconds meet a coarser timestamp, the common type is carried in
+/// microseconds ([`common_temporal`], [`unify_timestamps`], ISS-062).
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ExactMicros {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for ExactMicros {
+    fn name(&self) -> &'static str {
+        EXACT_MICROS
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        let [DataType::Timestamp(_, zone)] = arg_types else {
+            return exec_err!("{EXACT_MICROS} expects one timestamp");
+        };
+        Ok(DataType::Timestamp(TimeUnit::Microsecond, zone.clone()))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        use datafusion::arrow::array::{Array, AsArray};
+        use datafusion::arrow::datatypes::{Int64Type, TimestampMicrosecondType};
+        let [value] = args.args.as_slice() else {
+            return exec_err!("{EXACT_MICROS} expects one argument");
+        };
+        let array = value.to_array(args.number_rows)?;
+        let DataType::Timestamp(unit, zone) = array.data_type() else {
+            return exec_err!("{EXACT_MICROS} expects one timestamp");
+        };
+        let per_micro: i64 = match unit {
+            TimeUnit::Nanosecond => 1_000,
+            _ => 1,
+        };
+        let raw = datafusion::arrow::compute::cast(&array, &DataType::Int64)?;
+        let mut out = Vec::with_capacity(raw.len());
+        for v in raw.as_primitive::<Int64Type>() {
+            out.push(match v {
+                None => None,
+                Some(v) if v.rem_euclid(per_micro) == 0 => Some(v.div_euclid(per_micro)),
+                Some(v) => {
+                    let text = crate::timestamp_casts::timestamp_text(i128::from(v), 9)?;
+                    return exec_err!(
+                        "INVALID_CAST_ARGUMENT: TIMESTAMP '{text}' has more than 6 fraction digits where it meets \
+                         values kept in microseconds (a nanosecond timestamp holds only the years 1677 to 2262); \
+                         cast it to timestamp(6)"
+                    );
+                }
+            });
+        }
+        let micros = datafusion::arrow::array::PrimitiveArray::<TimestampMicrosecondType>::from(out)
+            .with_timezone_opt(zone.clone());
+        let micros: datafusion::arrow::array::ArrayRef = Arc::new(micros);
+        Ok(match value {
+            ColumnarValue::Scalar(_) => ColumnarValue::Scalar(ScalarValue::try_from_array(&micros, 0)?),
+            ColumnarValue::Array(_) => ColumnarValue::Array(micros),
+        })
+    }
+}
+
+static EXACT_MICROS_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
+    Arc::new(ScalarUDF::new_from_impl(ExactMicros {
+        signature: Signature::any(1, Volatility::Immutable),
+    }))
+});
+
+/// The function [`cast_temporal`] calls; the engine registers it so plans
+/// that carry it can be printed and planned again.
+pub(crate) fn exact_micros() -> ScalarUDF {
+    EXACT_MICROS_UDF.as_ref().clone()
+}
+
 /// A timestamp cast to a finer unit, kept from the simplifier (see
 /// [`ExactCast`]).
 fn widen_timestamp(expr: Expr, to: DataType) -> Expr {
@@ -704,6 +784,12 @@ fn unit_digits(unit: TimeUnit) -> u8 {
 /// Where timestamps with and without time zone meet, a timestamp without
 /// time zone is also the local time in the session zone (Trino casts it to
 /// `timestamp with time zone`); `DataFusion` reads it as UTC.
+///
+/// A constant in nanoseconds (`TIMESTAMP '… .1234567'`) meeting a coarser
+/// timestamp is compared in microseconds, exactly or refused
+/// ([`ExactMicros`]): widening the other side to nanoseconds overflowed on
+/// a `9999-12-31` sentinel, and a `datetime2(7)` column (read in
+/// microseconds) answered no row where it should have one.
 fn unify_timestamps(exprs: Vec<Expr>, types: &[DataType], session_zone: &str) -> Transformed<Vec<Expr>> {
     let zoned = types.iter().any(|t| matches!(t, DataType::Timestamp(_, Some(_))));
     let Some(finest) = types
@@ -716,14 +802,36 @@ fn unify_timestamps(exprs: Vec<Expr>, types: &[DataType], session_zone: &str) ->
     else {
         return Transformed::no(exprs);
     };
+    let coarser = types
+        .iter()
+        .any(|t| matches!(t, DataType::Timestamp(unit, _) if *unit != TimeUnit::Nanosecond));
+    // Every nanosecond operand a constant (no column).
+    let only_constants = exprs.iter().zip(types).all(|(e, t)| {
+        !matches!(t, DataType::Timestamp(TimeUnit::Nanosecond, _)) || e.column_refs().is_empty()
+    });
+    let narrowed = finest == TimeUnit::Nanosecond && coarser && only_constants;
+    let (exprs, types, finest) = if narrowed {
+        let (exprs, types): (Vec<Expr>, Vec<DataType>) = exprs
+            .into_iter()
+            .zip(types)
+            .map(|(e, t)| match t {
+                DataType::Timestamp(TimeUnit::Nanosecond, zone) => (
+                    EXACT_MICROS_UDF.call(vec![e]),
+                    DataType::Timestamp(TimeUnit::Microsecond, zone.clone()),
+                ),
+                other => (e, other.clone()),
+            })
+            .unzip();
+        (exprs, std::borrow::Cow::Owned(types), TimeUnit::Microsecond)
+    } else {
+        (exprs, std::borrow::Cow::Borrowed(types), finest)
+    };
+    let types: &[DataType] = &types;
     let target = |t: &DataType| match t {
         DataType::Timestamp(_, None) if zoned => Some(DataType::Timestamp(finest, Some(session_zone.into()))),
         DataType::Timestamp(_, zone) => Some(DataType::Timestamp(finest, zone.clone())),
         _ => None,
     };
-    if !types.iter().any(|t| target(t).is_some_and(|to| to != *t)) {
-        return Transformed::no(exprs);
-    }
     Transformed::yes(
         exprs
             .into_iter()
@@ -766,19 +874,18 @@ fn unify(exprs: Vec<Expr>, schema: &DFSchema, session_zone: &str) -> Result<Tran
 }
 
 /// [`unify`] for values that become one result (`CASE`, `coalesce`, …):
-/// dates and timestamps meet in their common type too ([`common_temporal`]:
+/// dates and timestamps meet in their common type ([`common_temporal`]:
 /// `CASE … THEN DATE '…' ELSE TIMESTAMP '… .123' END` is `timestamp(3)`,
-/// where `DataFusion` answers nanoseconds).
+/// where `DataFusion` answers nanoseconds, and a nanosecond value next to a
+/// `datetime2` column is carried in microseconds).
 fn unify_results(exprs: Vec<Expr>, schema: &DFSchema, session_zone: &str) -> Result<Transformed<Vec<Expr>>> {
     let fields = exprs
         .iter()
         .map(|e| e.to_field(schema).map(|(_, f)| f))
         .collect::<Result<Vec<_>>>()?;
     let own: Vec<&Field> = fields.iter().map(AsRef::as_ref).collect();
-    let dated = own
-        .iter()
-        .any(|f| matches!(f.data_type(), DataType::Date32 | DataType::Date64));
-    let Some(target) = common_temporal(&own, None).filter(|_| dated) else {
+    let Some(target) = common_temporal(&own, None).filter(|t| matches!(t.data_type, DataType::Timestamp(..)))
+    else {
         return unify(exprs, schema, session_zone);
     };
     Ok(Transformed::yes(
@@ -1351,7 +1458,8 @@ fn fraction_digits(field: &Field) -> Option<u8> {
 /// them, `timestamp(3)` for `timestamp(3)` with `timestamp(0)` or a date
 /// (`DataFusion` takes the coarser unit and drops the fraction), `time(3)`
 /// for `time(3)` with `time(0)`. A timestamp is carried by the smallest unit
-/// holding its digits.
+/// holding its digits, but never in nanoseconds next to a coarser value
+/// (ISS-062).
 ///
 /// With a `timestamp with time zone` among them, every value is one: the
 /// zone their values share, or `declared`'s (the zone `DataFusion` chose)
@@ -1407,6 +1515,14 @@ fn common_temporal(fields: &[&Field], declared: Option<&DataType>) -> Option<Tem
             _ => Some(Arc::clone(first)),
         },
     };
+    // Never widened to nanoseconds next to a coarser value: a nanosecond
+    // timestamp holds only the years 1677 to 2262, and a `datetime2` or a
+    // date column holds `9999-12-31` (an open-end sentinel). Microseconds
+    // then, the nanosecond values exact or refused ([`cast_temporal`]).
+    let nanos = known
+        .iter()
+        .all(|f| matches!(f.data_type(), DataType::Timestamp(TimeUnit::Nanosecond, _)));
+    let precision = if nanos { precision } else { precision.min(6) };
     let unit = crate::declared::unit_for(precision);
     Some(Temporal {
         data_type: DataType::Timestamp(unit, zone),
@@ -1421,6 +1537,13 @@ fn common_temporal(fields: &[&Field], declared: Option<&DataType>) -> Option<Tem
 fn cast_temporal(expr: Expr, from: &DataType, to: &DataType, session_zone: &str) -> Expr {
     if from == to {
         return expr;
+    }
+    // Nanoseconds carried in microseconds: exact, or refused.
+    if let (DataType::Timestamp(TimeUnit::Nanosecond, zone), DataType::Timestamp(unit, _)) = (from, to)
+        && *unit != TimeUnit::Nanosecond
+    {
+        let micros = DataType::Timestamp(TimeUnit::Microsecond, zone.clone());
+        return cast_temporal(EXACT_MICROS_UDF.call(vec![expr]), &micros, to, session_zone);
     }
     let local = matches!(
         from,
@@ -1960,7 +2083,7 @@ mod tests {
         );
         assert_eq!(
             common(&[f(Ts(Ns, None)), f(Ts(Ms, None))], None),
-            Some(stamp(Ns, None, None))
+            Some(stamp(Us, None, None))
         );
         // Inputs that agree, the union typed coarser when planned.
         assert_eq!(
@@ -2001,15 +2124,77 @@ mod tests {
             common(&[ms1.clone(), f(Ts(Ms, None))], None),
             Some(stamp(Ms, None, None))
         );
+        // Nanoseconds next to a coarser value: microseconds, never wider.
         assert_eq!(
-            common(&[ns7, f(Ts(Ms, None))], None),
-            Some(stamp(Ns, None, Some(Declared::Timestamp(7))))
+            common(&[ns7.clone(), f(Ts(Ms, None))], None),
+            Some(stamp(Us, None, None))
         );
+        assert_eq!(
+            common(&[ns7.clone(), f(Date32)], None),
+            Some(stamp(Us, None, None))
+        );
+        // Nanoseconds only: the highest precision they declare.
+        let ns8 = field(Ts(Ns, None), Some("timestamp(8)"));
+        assert_eq!(
+            common(&[ns7.clone(), ns8], None),
+            Some(stamp(Ns, None, Some(Declared::Timestamp(8))))
+        );
+        assert_eq!(common(&[ns7, f(Ts(Ns, None))], None), Some(stamp(Ns, None, None)));
         assert_eq!(
             common(&[us4, f(Date32), f(Ts(Ms, None))], None),
             Some(stamp(Us, None, Some(Declared::Timestamp(4))))
         );
-        assert_eq!(common(&[f(Ts(Ns, None)), ms1], None), Some(stamp(Ns, None, None)));
+        assert_eq!(common(&[f(Ts(Ns, None)), ms1], None), Some(stamp(Us, None, None)));
+    }
+
+    #[test]
+    fn nanoseconds_reach_microseconds_exactly_or_not_at_all() {
+        use datafusion::arrow::array::{Array, ArrayRef, AsArray, TimestampNanosecondArray};
+        use datafusion::arrow::datatypes::TimestampMicrosecondType;
+        let call = |values: Vec<Option<i64>>| {
+            let array: ArrayRef = Arc::new(TimestampNanosecondArray::from(values).with_timezone("UTC"));
+            let field = Arc::new(Field::new("x", array.data_type().clone(), true));
+            exact_micros().invoke_with_args(ScalarFunctionArgs {
+                args: vec![ColumnarValue::Array(array)],
+                arg_fields: vec![field],
+                number_rows: 3,
+                return_field: Arc::new(Field::new(
+                    "r",
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    true,
+                )),
+                config_options: Arc::new(ConfigOptions::default()),
+            })
+        };
+        let Ok(ColumnarValue::Array(out)) = call(vec![Some(-2_000), None, Some(1_767_261_600_123_456_000)])
+        else {
+            panic!("exact values are converted");
+        };
+        assert_eq!(
+            out.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        let micros = out.as_primitive::<TimestampMicrosecondType>();
+        assert_eq!(
+            micros.iter().collect::<Vec<_>>(),
+            [Some(-2), None, Some(1_767_261_600_123_456)]
+        );
+        let error = call(vec![Some(0), Some(1_767_261_600_123_456_700), None])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("TIMESTAMP '2026-01-01 10:00:00.123456700' has more than 6 fraction digits"),
+            "{error}"
+        );
+        assert!(call(vec![Some(-1), None, None]).is_err());
+        assert_eq!(
+            exact_micros()
+                .return_type(&[DataType::Timestamp(TimeUnit::Nanosecond, None)])
+                .unwrap(),
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        assert!(exact_micros().return_type(&[DataType::Int64]).is_err());
+        assert_eq!(exact_micros().name(), "codelake_exact_micros");
     }
 
     #[test]
@@ -2124,6 +2309,25 @@ mod tests {
         assert_eq!(
             cast_temporal(column(), &Ts(TimeUnit::Second, None), &Ts(Ms, None), "UTC"),
             cast(column(), Ts(Ms, None))
+        );
+        // Nanoseconds to microseconds exactly, then the zone.
+        let micros = |zone: Option<&str>| Ts(TimeUnit::Microsecond, zone.map(Into::into));
+        let exact = || EXACT_MICROS_UDF.call(vec![column()]);
+        assert_eq!(
+            cast_temporal(column(), &Ts(TimeUnit::Nanosecond, None), &micros(None), "UTC"),
+            exact()
+        );
+        assert_eq!(
+            cast_temporal(
+                column(),
+                &Ts(TimeUnit::Nanosecond, None),
+                &micros(Some("UTC")),
+                "America/Sao_Paulo"
+            ),
+            cast(
+                cast(exact(), micros(Some("America/Sao_Paulo"))),
+                micros(Some("UTC"))
+            )
         );
     }
 

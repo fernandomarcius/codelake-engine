@@ -260,7 +260,8 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
-- Found by the differential gate (2026-10-01, ISS-032 item 8):
+- Found by the differential gate (2026-10-01, ISS-032 item 8; a union first took the finest unit of its
+  inputs, below — this replaces that with the common type):
   - **Wrong result**: timestamps of different precisions met in the coarser one, dropping the fraction.
     `SELECT TIMESTAMP '… 10:00:00.123' UNION ALL SELECT TIMESTAMP '… 10:00:00'` answered `timestamp(0)`
     (`10:00:00` twice) where the reference answers `timestamp(3)` (`10:00:00.123`, `10:00:00.000`); likewise
@@ -275,6 +276,21 @@ versioning: [SemVer](https://semver.org/).
     (`timestamp(1)` with `timestamp(2)` is `timestamp(2)`, `TIME '… .123'` with `TIME '…'` is `time(3)`),
     and one input's `timestamp(1)` no longer rounds the others. `VALUES` and `CASE` keep a `TIME` literal's
     `time(p)` (ISS-061; it was `time(9)`).
+  - **Wrong result**: SQL Server's `9999-12-31 23:59:59.9999999` open-end sentinel in a `datetime2` column
+    (read in microseconds) became `+10000-01-01 00:00:00.000` in a union with a `datetime2(3)`, `datetime` or
+    `timestamp(3)` value (the common type was the coarser unit, rounded). It keeps its value. Nanoseconds are
+    never the common type of a coarser value, since they hold only the years 1677 to 2262: a nanosecond value
+    meeting one (`TIMESTAMP '… .1234567'`, `CAST(… AS timestamp(9))`) is carried in microseconds, exactly or
+    refused (`… has more than 6 fraction digits …`), never rounded; a comparison with a nanosecond constant
+    likewise, where widening the column overflowed on the sentinel and a `datetime2(7)` column answered no
+    row for `= TIMESTAMP '… .1234567'` (its 7th digit is not read). The reference answers `timestamp(7..9)`
+    there: ISS-062, awaiting confirmation.
+- **Wrong result**: `now()`, `current_timestamp`, `localtimestamp`, `current_date`, `current_time` and
+  `localtime` were not one value per statement. Where they were not folded into the plan (an aggregate's
+  argument: `count(DISTINCT current_timestamp(6))` over several batches) each batch read the wall clock, and
+  each fold took the time again, so occurrences of one statement differed (`min(current_timestamp(9)) =
+  max(current_timestamp(9))` was false; `now() AT TIME ZONE 'UTC' = now()` failed now and then). Every one is
+  the statement's start, as in the reference, in every occurrence, batch and partition.
 - `now()`, `current_timestamp`, `current_timestamp(p)` and `from_unixtime` are `timestamp with time zone`
   values in the session's zone (`X-Trino-Time-Zone`), as in the reference: they were in UTC, the engine's,
   whatever the client sent (the same instant shown at another hour: `hour(now())` 12 instead of 9 in
