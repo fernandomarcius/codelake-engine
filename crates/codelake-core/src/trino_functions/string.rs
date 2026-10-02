@@ -449,6 +449,7 @@ pub(crate) fn concat_operator() -> ScalarUDF {
                 rows: call.rows,
                 return_type: call.return_type,
                 zone: Arc::clone(&call.zone),
+                now: call.now,
             };
             super::array::concat_lists(&lists)
         },

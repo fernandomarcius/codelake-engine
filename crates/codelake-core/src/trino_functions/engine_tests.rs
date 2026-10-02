@@ -618,3 +618,125 @@ async fn unions_of_timestamps_keep_the_finest_precision() {
         [["time(3)", "time(3)"]]
     );
 }
+
+/// The text of every column of the only row of `batches` (`CAST`s in the SQL).
+fn texts(batches: &[RecordBatch]) -> Vec<String> {
+    let batch = batches.iter().find(|b| b.num_rows() > 0).unwrap();
+    batch
+        .columns()
+        .iter()
+        .map(|c| {
+            let text = datafusion::arrow::compute::cast(c, &DataType::Utf8).unwrap();
+            text.as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0)
+                .to_owned()
+        })
+        .collect()
+}
+
+/// 200 000 rows in 8 partitions: an expression of an aggregate is evaluated
+/// once per batch, never folded.
+fn many_rows(engine: &Engine) {
+    let x: ArrayRef = Arc::new(Int64Array::from_iter_values(0..200_000));
+    register(engine, &[("x", x)], 8);
+}
+
+/// The session constants are one instant per statement, the statement's
+/// start (`StatementClock`), wherever they are evaluated: folded in a
+/// projection, or once per batch as an aggregate's argument, in every
+/// partition. They read the wall clock where they were not folded
+/// (`count(DISTINCT now())` over many batches counted several instants), and
+/// each fold took the time again (`current_time` 2 ms apart from `localtime`
+/// in one row). A fixed start makes the answer exact.
+#[tokio::test]
+async fn session_constants_are_the_statement_start_everywhere() {
+    use datafusion::prelude::SessionContext;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    many_rows(&engine);
+    let start = chrono::DateTime::parse_from_rfc3339("2026-01-15T12:00:00.123456789Z").unwrap();
+    let mut state = engine.context().state();
+    state.config_mut().options_mut().execution.batch_size = 1000;
+    state
+        .config_mut()
+        .options_mut()
+        .extensions
+        .get_mut::<super::StatementClock>()
+        .unwrap()
+        .start_nanos = Some(u64::try_from(start.timestamp_nanos_opt().unwrap()).unwrap());
+    let ctx = SessionContext::new_with_state(state);
+    let run = |sql: &'static str| {
+        let ctx = ctx.clone();
+        async move { texts(&ctx.sql(sql).await.unwrap().collect().await.unwrap()) }
+    };
+    assert_eq!(
+        run(
+            "SELECT count(DISTINCT current_timestamp(9)), count(DISTINCT now()), \
+             count(DISTINCT localtimestamp(6)), count(DISTINCT current_time), count(DISTINCT localtime), \
+             count(DISTINCT current_date), CAST(max(localtimestamp(9)) AS varchar), \
+             CAST(min(now()) AS varchar), CAST(max(current_time) AS varchar), \
+             CAST(max(current_date) AS varchar) FROM t WHERE x >= 0"
+        )
+        .await,
+        [
+            "1",
+            "1",
+            "1",
+            "1",
+            "1",
+            "1",
+            "2026-01-15 12:00:00.123456789",
+            "2026-01-15 12:00:00.123 UTC",
+            "12:00:00.123",
+            "2026-01-15",
+        ]
+    );
+    assert_eq!(
+        run(
+            "SELECT CAST(current_timestamp(6) AS varchar), CAST(now() AS varchar), \
+             CAST(localtimestamp AS varchar), CAST(localtime AS varchar), CAST(current_time AS varchar), \
+             CAST(current_date AS varchar)"
+        )
+        .await,
+        [
+            "2026-01-15 12:00:00.123456 UTC",
+            "2026-01-15 12:00:00.123 UTC",
+            "2026-01-15 12:00:00.123",
+            "12:00:00.123",
+            "12:00:00.123",
+            "2026-01-15",
+        ]
+    );
+}
+
+/// Through the engine (its own clock per statement): every occurrence of
+/// `now()` and the other constants is one value, also across a slow part of
+/// the statement and in every batch and partition.
+#[tokio::test]
+async fn now_is_one_value_for_the_whole_statement() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path());
+    many_rows(&engine);
+    for _ in 0..3 {
+        let batches = rows(
+            &engine,
+            "SELECT CAST(now() AT TIME ZONE 'UTC' = now() AS varchar), \
+             CAST(count(DISTINCT now()) AS varchar), CAST(count(DISTINCT current_timestamp(9)) AS varchar), \
+             CAST(count(DISTINCT localtimestamp(9)) AS varchar), CAST(count(DISTINCT current_time) AS varchar), \
+             CAST(min(current_timestamp(9)) = max(current_timestamp(9)) AS varchar), \
+             CAST(max(current_timestamp(9)) = current_timestamp(9) AS varchar) FROM t",
+        )
+        .await;
+        assert_eq!(texts(&batches), ["true", "1", "1", "1", "1", "true", "true"]);
+        let batches = rows(
+            &engine,
+            "SELECT CAST(count(DISTINCT ts) AS varchar) FROM (SELECT current_timestamp(9) AS ts \
+             UNION ALL SELECT current_timestamp(9) FROM (SELECT x % 1000 AS k, count(*) AS n FROM t GROUP BY 1) g \
+             UNION ALL SELECT current_timestamp(9))",
+        )
+        .await;
+        assert_eq!(texts(&batches), ["1"]);
+    }
+}

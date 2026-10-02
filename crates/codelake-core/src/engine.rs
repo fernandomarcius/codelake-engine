@@ -1000,6 +1000,17 @@ impl Engine {
             state.config_mut().options_mut().execution.time_zone = Some(zone.clone());
             with_functions_for_config(&mut state)?;
         }
+        // One instant for the statement's session constants (`now()`, …).
+        if let Some(clock) = state
+            .config_mut()
+            .options_mut()
+            .extensions
+            .get_mut::<crate::trino_functions::StatementClock>()
+        {
+            clock.start_nanos = chrono::Utc::now()
+                .timestamp_nanos_opt()
+                .and_then(|nanos| u64::try_from(nanos).ok());
+        }
         if let Some(value) = options
             .properties
             .get(crate::session_properties::SORT_MERGE_OVERSIZED_JOINS)

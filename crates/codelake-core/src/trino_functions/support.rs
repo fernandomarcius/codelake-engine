@@ -418,6 +418,30 @@ pub(crate) fn literal_str(scalar: Option<&ScalarValue>) -> Option<&str> {
     }
 }
 
+datafusion::common::extensions_options! {
+    /// The instant the statement started, which `now()`, `current_timestamp`,
+    /// `localtimestamp`, `current_date`, `current_time` and `localtime` answer
+    /// wherever they are evaluated: every occurrence, batch and partition of
+    /// one statement sees the same value, as in Trino. `DataFusion` folds them
+    /// with a start time it takes again each time a plan is optimized, and
+    /// evaluated them with the wall clock where they were not folded (an
+    /// aggregate's argument, a precision argument).
+    pub struct StatementClock {
+        /// Nanoseconds since the epoch; unset outside a statement of the engine.
+        pub start_nanos: Option<u64>, default = None
+    }
+}
+
+impl datafusion::common::config::ConfigExtension for StatementClock {
+    const PREFIX: &'static str = "codelake_statement_clock";
+}
+
+/// The instant the current statement started ([`StatementClock`]).
+pub(crate) fn statement_start(config: &ConfigOptions) -> Option<chrono::DateTime<chrono::Utc>> {
+    let nanos = config.extensions.get::<StatementClock>()?.start_nanos?;
+    Some(chrono::DateTime::from_timestamp_nanos(i64::try_from(nanos).ok()?))
+}
+
 /// Session time zone (`datafusion.execution.time_zone`); Trino's default here is UTC.
 pub(crate) fn session_zone(config: &ConfigOptions) -> Arc<str> {
     match config.execution.time_zone.as_deref() {
@@ -453,6 +477,8 @@ pub(crate) struct Call<'a> {
     pub(crate) rows: usize,
     pub(crate) return_type: &'a DataType,
     pub(crate) zone: Arc<str>,
+    /// The statement's start ([`StatementClock`]), the wall clock outside one.
+    pub(crate) now: chrono::DateTime<chrono::Utc>,
 }
 
 impl Call<'_> {
@@ -644,6 +670,7 @@ impl ScalarUDFImpl for Func {
             rows,
             return_type: args.return_field.data_type(),
             zone: session_zone(&args.config_options),
+            now: statement_start(&args.config_options).unwrap_or_else(chrono::Utc::now),
         };
         // A defect in one function must fail the query, not the process.
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.invoke)(&call))).map_err(

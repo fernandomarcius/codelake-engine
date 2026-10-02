@@ -63,6 +63,7 @@ mod sketch;
 mod statistics;
 mod string;
 mod support;
+pub(crate) use support::StatementClock;
 mod syntax;
 mod try_expr;
 mod url;
@@ -154,7 +155,9 @@ pub(crate) fn case_of(c: char, upper: bool) -> char {
 /// without `NULLS FIRST|LAST` puts NULLs last in both directions (queries,
 /// windows and ordered aggregates; `DataFusion` puts them first for `DESC`).
 pub fn session_config(config: SessionConfig) -> SessionConfig {
-    let config = config.set_str("datafusion.sql_parser.default_null_ordering", "nulls_last");
+    let config = config
+        .set_str("datafusion.sql_parser.default_null_ordering", "nulls_last")
+        .with_option_extension(support::StatementClock::default());
     if config.options().execution.time_zone.is_some() {
         return config;
     }
