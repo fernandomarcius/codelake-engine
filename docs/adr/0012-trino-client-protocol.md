@@ -108,7 +108,10 @@ A separate listener (`[server.trino]`, off by default) serves:
   `system.jdbc.*`. What CodeLake does not have — materialized views,
   procedures, user-defined types, comments, `WITH` properties — is listed
   empty, as Trino lists it for a connector without the feature.
-  `SELECT version()` answers `431`, the version on `/v1/info`, on this
+  `system.jdbc.types` is Trino 431's list, and the engine's own in-memory
+  `datafusion` catalog is listed only once a client created something in it
+  (ISS-064). `SHOW CATALOGS` and `SHOW SCHEMAS` answer from the same
+  listings. `SELECT version()` answers `431`, the version on `/v1/info`, on this
   listener only (the PostgreSQL listener keeps DataFusion's).
 - **DDL Trino clients issue** beyond what `sqlparser` accepts:
   `ALTER TABLE … RENAME TO` and `ALTER VIEW … RENAME TO` (dbt's table

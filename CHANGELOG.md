@@ -260,6 +260,18 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- JDBC/ODBC metadata as the reference engine lists it, found by the shadow's production-query replay
+  (2026-10-02; ISS-064): `system.jdbc.types` has Trino 431's 48 rows (it had 18); the engine's in-memory
+  `datafusion` catalog is no longer listed while a client has created nothing in it (`system.jdbc.catalogs`,
+  `system.metadata.catalogs`, `getCatalogs`); a SQL Server catalog lists every schema the login sees
+  (`db_owner`, `db_datareader`, …, `guest`, `sys`, empty ones) and the system views of `sys`;
+  `system.jdbc.columns` names the declared type (`varchar(20)`, `char(3)`, `time(3)`; it said `varchar`,
+  `time(9)`) with Trino's sizes; `connector_name` is `postgresql`; a PostgreSQL relation with a `jsonb`
+  column is listed without columns instead of failing its catalog's listing; `SHOW CATALOGS` and `SHOW
+  SCHEMAS` (with `FROM`/`IN`, `LIKE`, `ESCAPE`) answer as there (they were refused). Compared row by row,
+  with column names and types, against `trinodb/trino:431` over SQL Server 2022 (with every
+  `DatabaseMetaData` listing of the JDBC driver 431), PostgreSQL 17 and hive: integration test
+  `jdbc_metadata`, differential `jdbc_metadata`.
 - Availability, found by the shadow's production-query replay (2026-10-02; ADR 0018, ISS-063): ~1000 idle
   HTTP keep-alive connections left every new client — `SELECT 1`, the health checks — waiting until it
   timed out, with nothing logged. The server ran with the container's soft open-files limit (1024), never
