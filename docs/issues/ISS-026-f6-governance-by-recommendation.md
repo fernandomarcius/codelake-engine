@@ -1,6 +1,6 @@
 # ISS-026 — F6 query governance: choices applied by recommendation
 
-- Kind: behavior · Applied: 2026-09-25 · Status: awaiting-confirmation
+- Kind: behavior · Applied: 2026-09-25 · Accepted by: Fernando Farias, 2026-10-02 · Status: closed
 1. Killing or canceling a query by id (`CALL system.runtime.kill_query`, `DELETE /v1/query/{id}`) is allowed to the query's owner only (`Access Denied: Cannot kill query owned by <owner>`, `PERMISSION_DENIED` / SQLSTATE `42501`). The reference engine 431 lets any user kill any query with its default access control (checked against `trinodb/trino:431`). Users are the names clients send until F5, so the rule prevents mistakes, not abuse. The alternative, anyone kills anything, matches the reference engine and makes an operator's kill possible without knowing the owner's name.
 2. A full queue answers SQLSTATE `53400` (`configuration_limit_exceeded`) on the PostgreSQL wire, not `53300` (`too_many_connections`): the limit reached is a configured queue, not a connection count. Clients that retry on `53300` do not retry on it.
 3. Default limits (breaking): 32 queries running per node and 16 per user, 1000 and 500 waiting, 600 s in the queue. Before, a node ran every query it received. Deployments with more concurrent clients must raise them in `[governance]`.

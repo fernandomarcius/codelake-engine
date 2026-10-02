@@ -10,37 +10,37 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 
 | ID | Title | Kind | Accepted | Status |
 |---|---|---|---|---|
-| [ISS-001](ISS-001-jemalloc-allocator.md) | jemalloc as the global allocator | dependency | 2026-09-24 | open |
+| [ISS-001](ISS-001-jemalloc-allocator.md) | jemalloc as the global allocator | dependency | 2026-09-24 | closed |
 | [ISS-002](ISS-002-test-crate-lint-allow.md) | `unwrap`/`expect`/`panic` allowed in integration test crates (EX-001) | gate exception | 2026-09-24 | open |
 | [ISS-003](ISS-003-int96-default-time-zone.md) | INT96 time zone configurable per hive catalog, default `America/Sao_Paulo` | compatibility risk | 2026-09-24 | open |
 | [ISS-004](ISS-004-iceberg-out-of-df54.md) | DataFusion 54.1 train without Iceberg | scope | 2026-09-24 | open |
 | [ISS-005](ISS-005-statistics-canary-flipped.md) | Statistics canary test flipped after DataFusion 54 fixed the defect | test change | 2026-09-24 | open |
 | [ISS-006](ISS-006-text-number-comparison-refused.md) | Text compared with a number refused on both client protocols (breaking) | breaking change | 2026-09-25 | closed |
 | [ISS-007](ISS-007-sort-merge-join-hot-keys.md) | Sort-merge join with hot keys fails at the ceiling instead of avoiding the rewrite | memory limit | 2026-09-25 | open |
-| [ISS-008](ISS-008-breaking-commit-without-bang.md) | Commit 9ef792e not marked breaking in its header | history | 2026-09-25 | open |
+| [ISS-008](ISS-008-breaking-commit-without-bang.md) | Commit 9ef792e not marked breaking in its header | history | 2026-09-25 | closed |
 | [ISS-009](ISS-009-flaky-tests-rewritten.md) | Two unstable tests fixed to match their ADRs, not loosened | test change | 2026-09-25 | closed |
-| [ISS-010](ISS-010-red-team-decisions.md) | Ten red-team/semantics decisions applied by recommendation | behavior | 2026-09-24 | open |
+| [ISS-010](ISS-010-red-team-decisions.md) | Ten red-team/semantics decisions applied by recommendation | behavior | 2026-09-24 | closed |
 | [ISS-011](ISS-011-configurable-compat-names.md) | Compatibility names configurable, CodeLake names by default | compatibility | 2026-09-24 | open |
-| [ISS-012](ISS-012-spice-code-reuse.md) | Code copied from Spice.ai under Apache-2.0 | licensing | 2026-09-24 | open |
+| [ISS-012](ISS-012-spice-code-reuse.md) | Code copied from Spice.ai under Apache-2.0 | licensing | 2026-09-24 | closed |
 | [ISS-013](ISS-013-reference-engine-credentials-in-git.md) | Reference engine catalog credentials committed in an external repository | security (external) | 2026-09-24 | open |
-| [ISS-014](ISS-014-w1-corrections-by-recommendation.md) | W1 corrections: choices applied by recommendation | behavior | 2026-09-25 | open |
+| [ISS-014](ISS-014-w1-corrections-by-recommendation.md) | W1 corrections: choices applied by recommendation | behavior | 2026-09-25 | closed |
 | [ISS-015](ISS-015-bench-harness-sub-millisecond.md) | Bench harness measures sub-millisecond cases in bursts | measurement | 2026-09-25 | open |
-| [ISS-016](ISS-016-erp-network-shadow-run.md) | Access to the source network authorized for the F8 shadow run | security | 2026-09-25 | open |
+| [ISS-016](ISS-016-erp-network-shadow-run.md) | Access to the source network authorized for the F8 shadow run | security | 2026-09-25 | closed |
 | [ISS-017](ISS-017-create-or-replace-atomic.md) | CREATE OR REPLACE on hive tables, atomic | removed limitation | 2026-09-25 | closed |
-| [ISS-018](ISS-018-case-preserving-names.md) | Case-preserving names, case-insensitive resolution | removed limitation | 2026-09-25 | awaiting-confirmation |
-| [ISS-019](ISS-019-ctas-literal-unbounded-varchar.md) | CTAS of a literal infers unbounded varchar | removed limitation | 2026-09-25 | open |
+| [ISS-018](ISS-018-case-preserving-names.md) | Case-preserving names, case-insensitive resolution | removed limitation | 2026-09-25 | open |
+| [ISS-019](ISS-019-ctas-literal-unbounded-varchar.md) | CTAS of a literal infers unbounded varchar | removed limitation | 2026-09-25 | closed |
 | [ISS-020](ISS-020-datasize-iec-units.md) | Data sizes accept MiB/GiB | removed limitation | 2026-09-25 | closed |
 | [ISS-021](ISS-021-arrow-flight-sql.md) | New front: Arrow Flight SQL | scope | 2026-09-25 | open |
-| [ISS-022](ISS-022-keep-dbt-trino-adapter.md) | Keep the existing dbt adapter until a native one is validated | dependency | 2026-09-25 | open |
+| [ISS-022](ISS-022-keep-dbt-trino-adapter.md) | Keep the existing dbt adapter until a native one is validated | dependency | 2026-09-25 | closed |
 | [ISS-023](ISS-023-drop-view-keeps-files.md) | DROP VIEW never deletes data files | deliberate divergence | 2026-09-25 | closed |
 | [ISS-024](ISS-024-char-semantics.md) | char(n) semantics instead of refusals (amended by ISS-059: no padding) | removed limitation | 2026-09-25 | closed |
 | [ISS-025](ISS-025-char-wrong-results-merged.md) | Known char(n) wrong results merged into main | known defect | 2026-09-25 | closed |
-| [ISS-026](ISS-026-f6-governance-by-recommendation.md) | F6 query governance: owner-only kill, SQLSTATE 53400, default limits, shared runtime | behavior | 2026-09-25 | awaiting-confirmation |
-| [ISS-027](ISS-027-shadow-run-choices-by-recommendation.md) | Shadow-run harness: choices applied by recommendation | behavior | 2026-09-25 | awaiting-confirmation |
+| [ISS-026](ISS-026-f6-governance-by-recommendation.md) | F6 query governance: owner-only kill, SQLSTATE 53400, default limits, shared runtime | behavior | 2026-09-25 | closed |
+| [ISS-027](ISS-027-shadow-run-choices-by-recommendation.md) | Shadow-run harness: choices applied by recommendation | behavior | 2026-09-25 | closed |
 | [ISS-028](ISS-028-memory-ceiling-rss-test-flaky.md) | Memory-ceiling hash-join test measures process RSS with a thin margin | test reliability | 2026-09-26 | open |
-| [ISS-029](ISS-029-extended-binary-fetch-refused.md) | FETCH in binary format on the PostgreSQL extended protocol is refused | limitation | 2026-09-26 | awaiting-confirmation |
-| [ISS-030](ISS-030-cursor-transactions-by-recommendation.md) | PostgreSQL cursors and transactions: choices applied by recommendation | behavior | 2026-09-26 | awaiting-confirmation |
-| [ISS-031](ISS-031-cursor-slots-by-recommendation.md) | PostgreSQL cursors, second round: one slot per connection, FETCH rows in the pool, DISCARD, MOVE | behavior | 2026-09-26 | awaiting-confirmation |
+| [ISS-029](ISS-029-extended-binary-fetch-refused.md) | FETCH in binary format on the PostgreSQL extended protocol is refused | limitation | 2026-09-26 | closed |
+| [ISS-030](ISS-030-cursor-transactions-by-recommendation.md) | PostgreSQL cursors and transactions: choices applied by recommendation | behavior | 2026-09-26 | closed |
+| [ISS-031](ISS-031-cursor-slots-by-recommendation.md) | PostgreSQL cursors, second round: one slot per connection, FETCH rows in the pool, DISCARD, MOVE | behavior | 2026-09-26 | closed |
 | [ISS-032](ISS-032-differential-divergences-without-owner.md) | Divergences the first differential run found with no front fixing them | known defect | 2026-09-26 | open |
 | [ISS-033](ISS-033-nullsafe-join-branch-unverified.md) | front/nullsafe-join finished but not independently verified | pending work | 2026-09-26 | closed |
 | [ISS-034](ISS-034-remove-limits-branch-unfinished.md) | front/remove-limits: verification failed, fix round unfinished | pending work | 2026-09-26 | closed |
@@ -59,11 +59,11 @@ Status: `open` (accepted, still to revisit or implement), `awaiting-confirmation
 | [ISS-047](ISS-047-sqlserver-undefined-cp1252-bytes.md) | Bytes undefined in code page 1252 keep their value (U+0081), the reference replaces them with U+FFFD | expected difference | 2026-09-26 | closed |
 | [ISS-048](ISS-048-shadow-run-minor-findings.md) | Shadow run: minor findings | defect | 2026-09-26 | open |
 | [ISS-049](ISS-049-dbt-row-number-ties-nondeterministic.md) | dbt_pilot numbers CDC rows with ties: output differs between runs | use-case defect | 2026-09-26 | open |
-| [ISS-050](ISS-050-float-zeros-are-one-value.md) | `0.0` and `-0.0` are one value everywhere (joins diverge from Trino 431) | deliberate divergence | 2026-09-26 | open |
+| [ISS-050](ISS-050-float-zeros-are-one-value.md) | `0.0` and `-0.0` are one value everywhere (joins diverge from Trino 431) | deliberate divergence | 2026-09-26 | closed |
 | [ISS-051](ISS-051-char-container-type-names.md) | Containers of char(n) are typed with varchar elements | known defect | 2026-09-27 | open |
-| [ISS-052](ISS-052-char-round5-by-recommendation.md) | char(n) round 5: choices applied by recommendation | behavior | 2026-09-26 | awaiting-confirmation |
-| [ISS-053](ISS-053-authentication-from-an-identity-service.md) | Client authentication comes from an external identity service | scope decision | 2026-09-27 | open |
-| [ISS-054](ISS-054-sql-server-datetime-compared-as-shown.md) | SQL Server `datetime` compared at the value the engine shows | deliberate divergence | 2026-09-27 | open |
+| [ISS-052](ISS-052-char-round5-by-recommendation.md) | char(n) round 5: choices applied by recommendation | behavior | 2026-09-26 | closed |
+| [ISS-053](ISS-053-authentication-from-an-identity-service.md) | Client authentication comes from an external identity service | scope decision | 2026-09-27 | closed |
+| [ISS-054](ISS-054-sql-server-datetime-compared-as-shown.md) | SQL Server `datetime` compared at the value the engine shows | deliberate divergence | 2026-09-27 | closed |
 | [ISS-055](ISS-055-cancel-between-messages-races-a-cursor.md) | A cancel request between messages sometimes cancels the next FETCH | defect | 2026-09-27 | open |
 | [ISS-056](ISS-056-approx-percentile-of-decimal-is-double.md) | `approx_percentile` of a decimal is `double` (Trino 431: `real`) | deliberate divergence | 2026-09-28 | open |
 | [ISS-057](ISS-057-upstream-unparser-decorrelation-workarounds.md) | Upstream unparser and decorrelation defects worked around in the engine | upstream defect | 2026-09-29 | open |

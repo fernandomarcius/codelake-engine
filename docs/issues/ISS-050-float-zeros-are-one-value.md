@@ -1,6 +1,6 @@
 # ISS-050 — `0.0` and `-0.0` are one value everywhere
 
-- Kind: deliberate divergence · Accepted by: Fernando Farias, 2026-09-26 · Status: open
+- Kind: deliberate divergence · Accepted by: Fernando Farias, 2026-09-26 · Status: closed (2026-10-02: implemented, ADR 0017; record of the divergence)
 - Context: The engine compared floats by their bits (`-0.0` below `0.0`), so `x = 0` dropped
   `-0.0` rows and `x IS DISTINCT FROM 0` kept them. Trino 431 is not consistent: its
   comparisons and `IS DISTINCT FROM` treat the zeros as equal, but its joins, `IN (subquery)`

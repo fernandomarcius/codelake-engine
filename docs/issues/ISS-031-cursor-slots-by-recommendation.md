@@ -1,6 +1,6 @@
 # ISS-031 — PostgreSQL cursors, second round: choices applied by recommendation
 
-- Kind: behavior · Applied: 2026-09-26 (second F6 re-verification fixes) · Status: awaiting-confirmation
+- Kind: behavior · Applied: 2026-09-26 (second F6 re-verification fixes) · Accepted by: Fernando Farias, 2026-10-02 · Status: closed
 - Context: the second F6 re-verification found a `FETCH` among other statements holding its
   rows outside the pool, a connection's statements queued behind its own cursor's slot,
   `DISCARD ALL` leaving cursors open, cursor names not folded to lower case, and the `FETCH`
