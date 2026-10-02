@@ -1,6 +1,6 @@
 # ISS-030 — PostgreSQL cursors and transactions: choices applied by recommendation
 
-- Kind: behavior · Applied: 2026-09-26 (F6 re-verification fixes) · Status: awaiting-confirmation
+- Kind: behavior · Applied: 2026-09-26 (F6 re-verification fixes) · Accepted by: Fernando Farias, 2026-10-02 · Status: closed
 - Context: the F6 re-verification failed the cursors: they survived `COMMIT`/`ROLLBACK`
   holding their slot and memory, `FETCH 0` returned every row left, a `FETCH` the parser
   does not read queued behind its own cursor, and a `FETCH` after a canceled one returned

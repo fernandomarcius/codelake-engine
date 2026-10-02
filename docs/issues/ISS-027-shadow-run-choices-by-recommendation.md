@@ -1,6 +1,6 @@
 # ISS-027 — Shadow-run harness: choices applied by recommendation
 
-- Kind: behavior · Applied: 2026-09-25 · Status: awaiting-confirmation
+- Kind: behavior · Applied: 2026-09-25 · Accepted by: Fernando Farias, 2026-10-02 · Status: closed
 1. `codelake config import` never guesses a hive catalog's `INT96` time zone: `hive.parquet.time-zone` becomes `parquet_time_zone`; without it, the zone comes from `--reference-time-zone` (the reference engine's JVM zone), or the catalog is skipped. The alternative, CodeLake's default (`America/Sao_Paulo`) or the stock image's (UTC), shifts every `INT96` timestamp silently when it is the wrong one.
 2. The harness ships an expected-differences file with ISS-018 (name case) only, applied only when a run names it (`SHADOW_EXPECTED_DIFFERENCES=default` or a path). Revised after the audit: a `declared_type` rule must name one exact table and column, so ISS-019 (`varchar(n)` → unbounded) is declared per column of the project. The alternative, one project-wide ISS-019 rule, cannot tell a literal from a source column and classified finding F8-2 (a SQL Server `varchar(n)` length lost) as expected in the self-test. No rule covers values.
 7. The self-test fixture works around findings F8-1..F8-3 (candidate defects on the acceptance pipelines' patterns) behind the dbt variable `shadow_workarounds`, so the harness is proven while they are open; `SHADOW_SELFTEST_STRICT=1` runs without them and fails. The alternative, a self-test that cannot pass until the connector and planner are fixed, proves nothing about the harness.

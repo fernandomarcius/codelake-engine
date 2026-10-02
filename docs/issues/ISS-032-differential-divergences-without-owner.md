@@ -19,9 +19,11 @@
      (`cursors.toml`, `sqlstate-*`): undefined table (`42P01`), division by zero (`22012`),
      invalid text for a number (`22P02`), syntax error (`42601`), undefined function
      (`42883`). Clients that branch on the SQLSTATE cannot.
-  3. **`SAVEPOINT` and `RELEASE SAVEPOINT`** fail with `XX000`
+  3. ~~**`SAVEPOINT` and `RELEASE SAVEPOINT`** fail with `XX000`
      (`cursors.toml` `savepoints`); **`COMMIT AND CHAIN`** does not open the chained block
-     (`commit-and-chain`).
+     (`commit-and-chain`).~~ fixed: 267f597 answers savepoints (`ROLLBACK TO` closes the cursors
+     declared since the savepoint) and `COMMIT`/`ROLLBACK AND CHAIN` as PostgreSQL does; 33ad145
+     dropped `known = "ISS-032"` from both cases, which are `OK`.
   4. **char(n) beyond comparisons** (`char.toml`, `V*`): internal errors where Trino answers
      (`Utf8View`/`Utf8` mismatches, `make_array` assertion, `MIN/MAX` of char in memory,
      `ORDER BY ch … LIMIT`), `typeof` of char expressions, and functions over char values

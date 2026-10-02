@@ -1,6 +1,6 @@
 # ISS-052 — char(n) round 5: choices applied by recommendation
 
-- Kind: behavior · Accepted by: recommendation (implementer, round 5 of front/w1-df54), 2026-09-26 · Status: awaiting-confirmation
+- Kind: behavior · Applied by recommendation (implementer, round 5 of front/w1-df54), 2026-09-26 · Accepted by: Fernando Farias, 2026-10-02 · Status: closed
 - Context: The fifth verification of the char(n) semantics (HEAD e20fe57) found wrong rows in rows and arrays not written out, in arrays of char values of different lengths, in trims, in `INTERSECT ALL`/`EXCEPT ALL` across hive and in-memory columns and in `varchar(n)` on the PostgreSQL wire. Fixing them took decisions beyond char(n).
 - Applied:
   1. Equality of rows and arrays not written out (`=`, `<>`, `IS [NOT] DISTINCT FROM`, `IN` lists, join conditions) runs as `codelake_nested_test`, value by value, for every query, char or not: `ROW(1, NULL) = ROW(1, NULL)` is now `NULL` (was true), and a join on row or array keys no longer matches `NULL` with `NULL`. The cost: such a join is planned as a nested-loop join (no hash join on row/array keys).

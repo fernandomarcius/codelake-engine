@@ -1,6 +1,6 @@
 # ISS-054 — SQL Server `datetime` compared at the value the engine shows
 
-- Kind: deliberate divergence · Accepted by: Fernando Farias, 2026-09-27 · Status: open
+- Kind: deliberate divergence · Accepted by: Fernando Farias, 2026-09-27 · Status: closed (2026-10-02: implemented and tested; record of the divergence)
 - Context: SQL Server `datetime` stores time in 1/300 s steps, so a value written as
   `17:37:54.173` is stored as `17:37:54.17333…`. Both engines read the column as
   `timestamp(3)` and show `17:37:54.173`. Trino 431 then compares a filter on the column
@@ -20,4 +20,5 @@
   to the second (`date_trunc('second', …)`), which `datetime` represents exactly
   (docs/shadow-run.md).
 - Revisit when: a user needs Trino 431's result for such a filter.
+- Implemented: the comparison stays in the engine at the value shown; only whole-second bounds, a superset the engine narrows, reach SQL Server for `datetime` (fbb4a77, `crates/codelake-connectors/src/sqlserver/dialect.rs`; integration `sqlserver_audit` case 4j, `sqlserver_union_timestamp_types`). Nothing is left to do; closed 2026-10-02 like the other accepted divergences (ISS-047, ISS-050, ISS-062). GitHub #59 was closed on 2026-09-28 by the merge of #60, whose description said "Closes #59 is not used" and GitHub read it as a closing keyword; the closed state is now the intended one.
 - References: shadow run `k3s-f8` cycle 1 (2026-09-27 17:45), ISS-042 (timestamps of different precisions).
