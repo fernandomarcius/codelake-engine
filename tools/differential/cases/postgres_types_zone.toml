@@ -1,0 +1,134 @@
+description = """
+What a PostgreSQL relation's dates, times and numbers are, and the zone its statements run in
+(ISS-060). Found in the Warehouse hub panel's shadow run: `timestamptz` columns were
+`timestamp(9) with time zone` on CodeLake (the reference engine: `timestamp(6) with time zone`);
+a view reading `current_date` answered another day between 21:00 and 24:00 in
+America/Sao_Paulo, the role's default zone, which CodeLake's sessions kept while the reference
+engine's run in `Etc/UTC`; a `numeric` without precision, which the reference engine leaves out
+(`decimal-mapping=STRICT`), is a `decimal(38,20)` on CodeLake, and a value it cannot hold must
+fail, never be rounded.
+
+CodeLake's statements run in the client session's zone (`X-Trino-Time-Zone`, `SET TIME ZONE`;
+`Etc/UTC` without one), the reference engine's always in `Etc/UTC`: with a client zone, a view
+that depends on the session's zone answers the client's day on CodeLake (accepted divergence,
+ISS-060). The current date differs between runs, so the cases compare what follows from the
+zone, never the date itself.
+"""
+oracle = "trino"
+
+setup_postgres = [
+  """CREATE TABLE source.ptz_dt (id INT,
+       ts TIMESTAMP, ts0 TIMESTAMP(0), ts1 TIMESTAMP(1), ts3 TIMESTAMP(3), ts5 TIMESTAMP(5),
+       tz TIMESTAMPTZ, tz0 TIMESTAMPTZ(0), tz2 TIMESTAMPTZ(2), tz3 TIMESTAMPTZ(3),
+       t TIME, t0 TIME(0), t3 TIME(3), t4 TIME(4),
+       a_ts TIMESTAMP[], a_ts3 TIMESTAMP(3)[], a_tz TIMESTAMPTZ[], a_t TIME[], a_t3 TIME(3)[])""",
+  """INSERT INTO source.ptz_dt VALUES (1,
+       '2026-10-01 12:34:56.123456', '2026-10-01 12:34:56', '2026-10-01 12:34:56.1',
+       '2026-10-01 12:34:56.123', '2026-10-01 12:34:56.12345',
+       '2026-10-01 12:34:56.123456+00', '2026-10-01 12:34:56+00', '2026-10-01 12:34:56.12+00',
+       '2026-10-01 12:34:56.123+00',
+       '12:34:56.123456', '12:34:56', '12:34:56.123', '12:34:56.1234',
+       ARRAY['2026-10-01 12:34:56.123456'::TIMESTAMP], ARRAY['2026-10-01 12:34:56.123'::TIMESTAMP(3)],
+       ARRAY['2026-10-01 12:34:56.123456+00'::TIMESTAMPTZ], ARRAY['12:34:56.123456'::TIME],
+       ARRAY['12:34:56.123'::TIME(3)])""",
+  """INSERT INTO source.ptz_dt (id, ts, tz, ts3) VALUES
+       (2, '1960-01-01 00:00:00.5', '1960-01-01 00:00:00.5+00', '1969-12-31 23:59:59.999'),
+       (3, '0001-01-01 00:00:00', '9999-12-31 23:59:59.999999+00', '2300-01-01 00:00:00.001')""",
+  """CREATE VIEW source.ptz_today AS SELECT current_setting('TimeZone') AS zone, current_date AS today,
+       (now() AT TIME ZONE 'Pacific/Kiritimati')::date AS kiritimati_today,
+       (now() AT TIME ZONE 'UTC')::date AS utc_today""",
+  "CREATE TABLE source.ptz_nums (id INT, n NUMERIC, n2 NUMERIC(10,2))",
+  """INSERT INTO source.ptz_nums VALUES (1, 1.5, 1.50), (2, 123456789012345678.12345678901234567890, NULL),
+       (10, 1e20, 0), (11, 0.123456789012345678901, 0), (12, 'NaN', 0), (13, 'Infinity', 0),
+       (14, '-Infinity', 0)""",
+  "GRANT SELECT ON source.ptz_dt, source.ptz_today, source.ptz_nums TO source",
+]
+
+[[case]]
+id = "PT1"
+sql = "SELECT column_name, data_type FROM pg.information_schema.columns WHERE table_schema = 'source' AND table_name = 'ptz_dt'"
+note = "PostgreSQL's precision (6 without one), as the reference engine declares it"
+
+[[case]]
+id = "PT2"
+sql = "SELECT id, ts, ts0, ts1, ts3, ts5, tz, tz0, tz2, tz3, t, t0, t3, t4 FROM pg.source.ptz_dt"
+note = "the column types and the whole range: before 1970 and after 2262"
+
+[[case]]
+id = "PT3"
+sql = "SELECT a_ts, a_ts3, a_tz, a_t, a_t3 FROM pg.source.ptz_dt WHERE id = 1"
+
+[[case]]
+id = "PT4"
+sql = "SELECT id FROM pg.source.ptz_dt WHERE ts < TIMESTAMP '1970-01-01 00:00:00' OR tz > TIMESTAMP '9999-12-31 23:59:59.999998 UTC' OR ts1 = TIMESTAMP '2026-10-01 12:34:56.1'"
+
+[[case]]
+id = "PT5"
+sql = "SELECT typeof(ts1), typeof(ts5), typeof(tz2), typeof(t4), typeof(max(ts3)) FROM pg.source.ptz_dt WHERE id = 1 GROUP BY ts1, ts5, tz2, t4"
+
+[[case]]
+id = "PZ1"
+sql = "SELECT zone FROM pg.source.ptz_today"
+note = "without a client zone both engines' sessions run in Etc/UTC, not in the role's America/Sao_Paulo"
+
+[[case]]
+id = "PZ2"
+sql = "SELECT zone FROM pg.source.ptz_today"
+time_zone = "America/Sao_Paulo"
+expect = "WRONG"
+accepted = "ISS-060 item 7"
+note = "CodeLake: America/Sao_Paulo, the client's; the reference engine: Etc/UTC whatever the client's"
+
+[[case]]
+id = "PZ3"
+sql = "SELECT zone, today = kiritimati_today FROM pg.source.ptz_today"
+oracle = "value"
+time_zone = "Pacific/Kiritimati"
+rows_json = '[["Pacific/Kiritimati", true]]'
+note = "current_date of the view is the client's day (UTC+14; the reference engine answers UTC's, another day from 10:00 UTC)"
+
+[[case]]
+id = "PN1"
+sql = "SELECT id, n2 FROM pg.source.ptz_nums"
+
+[[case]]
+id = "PN2"
+sql = "SELECT id, n FROM pg.source.ptz_nums WHERE id < 10"
+expect = "EXTRA"
+accepted = "ISS-060 item 8"
+note = "the reference engine leaves a numeric without precision out (COLUMN_NOT_FOUND); CodeLake reads it exactly"
+
+[[case]]
+id = "PN3"
+sql = "SELECT n FROM pg.source.ptz_nums WHERE id = 10"
+expect = "ERRO"
+accepted = "ISS-060 item 8"
+error = "the PostgreSQL value 100000000000000000000 of column \"n\" does not fit decimal(38,20): more than 18 integer digits"
+
+[[case]]
+id = "PN4"
+sql = "SELECT n FROM pg.source.ptz_nums WHERE id = 11"
+expect = "ERRO"
+accepted = "ISS-060 item 8"
+error = "the PostgreSQL value 0.123456789012345678901 of column \"n\" does not fit decimal(38,20): more than 20 fraction digits"
+
+[[case]]
+id = "PN5"
+sql = "SELECT n FROM pg.source.ptz_nums WHERE id = 12"
+expect = "ERRO"
+accepted = "ISS-060 item 8"
+error = "the PostgreSQL value NaN of column \"n\" does not fit decimal(38,20): a decimal holds only finite numbers"
+
+[[case]]
+id = "PN6"
+sql = "SELECT n FROM pg.source.ptz_nums WHERE id = 13"
+expect = "ERRO"
+accepted = "ISS-060 item 8"
+error = "the PostgreSQL value Infinity of column \"n\""
+
+[[case]]
+id = "PN7"
+sql = "SELECT n FROM pg.source.ptz_nums WHERE id = 14"
+expect = "ERRO"
+accepted = "ISS-060 item 8"
+error = "the PostgreSQL value -Infinity of column \"n\""

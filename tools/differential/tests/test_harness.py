@@ -164,7 +164,17 @@ class CaseFiles(unittest.TestCase):
             time_zone = "Asia/Tokyo"
         ''')
         self.assertEqual([c.time_zone for c in s.cases], ["America/Sao_Paulo", "Asia/Tokyo"])
-        with self.assertRaisesRegex(cases.CaseError, "trino oracle over the trino protocol"):
+        # A value oracle: the zone goes to CodeLake, whose answer is pinned.
+        s = load('''
+            oracle = "value"
+            [[case]]
+            id = "a"
+            sql = "SELECT 1"
+            rows_json = '[[1]]'
+            time_zone = "Pacific/Kiritimati"
+        ''')
+        self.assertEqual(s.cases[0].time_zone, "Pacific/Kiritimati")
+        with self.assertRaisesRegex(cases.CaseError, "trino or value oracle over the trino protocol"):
             load('''
                 oracle = "postgres"
                 [[case]]
