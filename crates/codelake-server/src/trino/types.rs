@@ -839,6 +839,133 @@ mod tests {
 
     /// A `char(n)` value leaves as the engine holds it, without trailing
     /// spaces, never padded to `n` (Trino 431 pads it, ISS-059).
+    /// Fraction digits of a timestamp or time text (`… 12:20:59.195337 UTC`).
+    fn fraction_digits(text: &str) -> usize {
+        text.split_once('.')
+            .map_or(0, |(_, rest)| rest.bytes().take_while(u8::is_ascii_digit).count())
+    }
+
+    /// The precision a type name declares (`timestamp(6) with time zone`).
+    fn declared_digits(name: &str) -> usize {
+        let open = name.rfind('(').expect(name);
+        name[open + 1..]
+            .split_once(')')
+            .expect(name)
+            .0
+            .parse()
+            .expect(name)
+    }
+
+    /// Protocol invariant: every timestamp and time value is sent with the
+    /// fraction digits its column's type declares, never more (a client
+    /// reads the type and refuses more digits: the .NET driver fails on more
+    /// than 7, "Timestamp with time zone has more than 7 digits of
+    /// precision"). For every Arrow unit, zone and declared precision a
+    /// column can carry, top-level and as array elements; without
+    /// `PARAMETRIC_DATETIME`, milliseconds.
+    #[test]
+    fn values_never_show_more_digits_than_their_type() {
+        use codelake_core::trino_types::{Declared, declared};
+        use datafusion::arrow::array::{
+            ListArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+            TimestampNanosecondArray, TimestampSecondArray,
+        };
+        // 2025-09-23 12:20:59.195337123 UTC: a digit in every place.
+        let nanos: i64 = 1_758_630_059_195_337_123;
+        let day_nanos: i64 = 44_459_195_337_123;
+        let timestamps = |unit: TimeUnit, zone: Option<&str>| -> ArrayRef {
+            let zone: Option<Arc<str>> = zone.map(Arc::from);
+            match unit {
+                TimeUnit::Second => {
+                    arr(TimestampSecondArray::from(vec![nanos / 1_000_000_000]).with_timezone_opt(zone))
+                }
+                TimeUnit::Millisecond => {
+                    arr(TimestampMillisecondArray::from(vec![nanos / 1_000_000]).with_timezone_opt(zone))
+                }
+                TimeUnit::Microsecond => {
+                    arr(TimestampMicrosecondArray::from(vec![nanos / 1_000]).with_timezone_opt(zone))
+                }
+                TimeUnit::Nanosecond => {
+                    arr(TimestampNanosecondArray::from(vec![nanos]).with_timezone_opt(zone))
+                }
+            }
+        };
+        let times = |unit: TimeUnit| -> ArrayRef {
+            match unit {
+                TimeUnit::Second => arr(Time32SecondArray::from(vec![
+                    i32::try_from(day_nanos / 1_000_000_000).unwrap(),
+                ])),
+                TimeUnit::Millisecond => arr(Time32MillisecondArray::from(vec![
+                    i32::try_from(day_nanos / 1_000_000).unwrap(),
+                ])),
+                TimeUnit::Microsecond => arr(Time64MicrosecondArray::from(vec![day_nanos / 1_000])),
+                TimeUnit::Nanosecond => arr(Time64NanosecondArray::from(vec![day_nanos])),
+            }
+        };
+        let units = [
+            TimeUnit::Second,
+            TimeUnit::Millisecond,
+            TimeUnit::Microsecond,
+            TimeUnit::Nanosecond,
+        ];
+        let mut columns: Vec<(Field, ArrayRef)> = Vec::new();
+        for unit in units {
+            let precisions = (0..=9).map(Some).chain([None]);
+            for p in precisions {
+                for zone in [None, Some("UTC"), Some("America/Sao_Paulo")] {
+                    let array = timestamps(unit, zone);
+                    let field = Field::new("ts", array.data_type().clone(), true);
+                    let field = match p.map(Declared::Timestamp) {
+                        Some(d) if d.fits(array.data_type()) => field.with_metadata(d.metadata()),
+                        Some(_) => continue,
+                        None => field,
+                    };
+                    columns.push((field, array));
+                }
+                let array = times(unit);
+                let field = Field::new("t", array.data_type().clone(), true);
+                let field = match p.map(Declared::Time) {
+                    Some(d) if d.fits(array.data_type()) => field.with_metadata(d.metadata()),
+                    Some(_) => continue,
+                    None => field,
+                };
+                columns.push((field, array));
+            }
+        }
+        for (field, array) in &columns {
+            let declared_type = field_type(field, M).unwrap().0;
+            let shown = declared_value(array, 0, M, declared(field)).unwrap();
+            let shown = shown.as_str().unwrap();
+            assert_eq!(
+                fraction_digits(shown),
+                declared_digits(&declared_type),
+                "{declared_type}: {shown} ({field:?})"
+            );
+            let legacy = declared_value(array, 0, L, declared(field)).unwrap();
+            assert!(
+                fraction_digits(legacy.as_str().unwrap()) <= 3,
+                "{legacy} without PARAMETRIC_DATETIME"
+            );
+        }
+        // As array elements: the element type names the unit's precision.
+        for unit in units {
+            for values in [timestamps(unit, None), timestamps(unit, Some("UTC")), times(unit)] {
+                let item = Arc::new(Field::new("item", values.data_type().clone(), true));
+                let offsets = datafusion::arrow::buffer::OffsetBuffer::from_lengths([1]);
+                let list = arr(ListArray::new(Arc::clone(&item), offsets, values, None));
+                let declared_type = name(list.data_type(), M);
+                let shown = value(&list, 0, M).unwrap();
+                let element = shown[0].as_str().unwrap();
+                assert_eq!(
+                    fraction_digits(element),
+                    declared_digits(&declared_type),
+                    "{declared_type}: {element}"
+                );
+            }
+        }
+        assert!(columns.len() > 60, "{}", columns.len());
+    }
+
     #[test]
     fn char_values_are_not_padded() {
         use codelake_core::trino_types::Declared;
