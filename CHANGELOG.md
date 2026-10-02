@@ -294,7 +294,9 @@ versioning: [SemVer](https://semver.org/).
     statement to the next. The reference engine runs its sessions in `Etc/UTC` whatever the client's zone:
     with a client zone CodeLake answers the client's day (accepted divergence, ISS-060).
   - `timestamp`, `timestamptz` and `time` columns were `timestamp(9)`, `timestamp(9) with time zone` and
-    `time(9)`; they have the precision PostgreSQL declares, as in the reference (6 without one:
+    `time(9)`, sent with nine fraction digits, which the .NET driver (NH.Trino.Data.ADO) refuses ("Timestamp
+    with time zone has more than 7 digits of precision"): the Warehouse boletos API answered 503 on every route
+    reading a `timestamptz`. They have the precision PostgreSQL declares, as in the reference (6 without one:
     `timestamp(6) with time zone`; `timestamp(3)`, `timestamp(1)`, `time(4)`…), also as array elements;
     `typeof` names a declared `timestamp(p)` / `time(p)` too (it answered the Arrow unit's precision).
   - **Wrong result**: a `timestamptz` outside 1677–2262 (a `9999-12-31` sentinel) was read as
@@ -306,6 +308,16 @@ versioning: [SemVer](https://semver.org/).
     `NaN`, `±Infinity`) fails the query naming the column (`the PostgreSQL value NaN of column
     "vl_recebido" does not fit decimal(38,20)`). The reference leaves such a column out of the relation
     (`decimal-mapping=STRICT`): accepted divergence, ISS-060.
+- Timestamps and times never reach a client with more digits than the reference declares (a protocol test
+  checks that every value is sent with the digits its column's type declares, for every unit, zone and
+  declared precision; `timestamp_precision.toml` compares functions, casts, literals, Hive and PostgreSQL
+  columns with Trino 431):
+  - **Wrong result**: a `UNION` of timestamps of different precisions took the coarser one and cut the
+    fraction (`timestamp(3)` with `timestamp(0)` was `timestamp(0)`: `.123` became `.000`); it takes the
+    finest, as the reference (ISS-032 item 8).
+  - `current_time` was a `time(9)`; it is the session's wall time at the millisecond, `time(3)` (the
+    reference: `time(3) with time zone`; the engine has no time with a zone, ISS-032 item 7).
+  - SQL Server `time(p)` columns were `time(9)`; they are `time(p)` (7 without `p`), as the reference.
 - PostgreSQL sources get a pushdown policy, as SQL Server has: only what PostgreSQL evaluates exactly like
   the engine is sent to it. Found on a dashboard reading PostgreSQL views (2026-10-01):
   - `count_if`, `arrays_overlap`, array subscripts and `count(*) FILTER (WHERE …)` were sent as written

@@ -38,13 +38,21 @@
      and `x = 0 IS NOT DISTINCT FROM true` answer rows where Trino fails with a syntax error.
   7. **`current_time`** (`session_zone.toml` `Z11-current-time-type`, found 2026-10-01): Trino
      431 answers a `time(3) with time zone` (`09:41:10.612-03:00`); the engine has no
-     `time with time zone` type and answers a `time(9)` (the session's local wall time), which
-     `hour()` refuses.
-  8. **`UNION` of timestamps of different precisions** (`session_zone.toml`
-     `Z12-union-timestamp-precision`, found 2026-10-01): `timestamp(3)` with `timestamp(0)` is
-     typed `timestamp(0)` and the fraction is lost (Trino 431: `timestamp(3)`), with or
-     without a zone.
-- Risk: items 1, 4 and 8 are wrong or unpadded rows; the others are refusals or wrong error
+     `time with time zone` type and answers a `time(3)`, the session's local wall time (it was
+     a `time(9)`, nine digits the .NET driver refuses; branch
+     `fix/postgres-session-zone-precision`).
+  8. ~~**`UNION` of timestamps of different precisions**~~ fixed in branch
+     `fix/postgres-session-zone-precision`: `timestamp(3)` with `timestamp(0)` was typed
+     `timestamp(0)` and the fraction lost; the union takes the finest unit of its inputs, as
+     Trino 431 (`Z12-union-timestamp-precision` and `timestamp_precision.toml` TP11/TP12 are
+     `OK`).
+  9. **MySQL dates and times keep the upstream provider's units** (audit of
+     `timestamp_precision.toml`, 2026-10-02; no MySQL in the differential stack): `TIME` is a
+     `time(9)` (Trino 431: `time(p)`, nine digits a .NET client refuses), `DATETIME(p)` and
+     `TIMESTAMP(p)` are `timestamp(6)` (Trino 431: `timestamp(p)` and `timestamp(p) with time
+     zone`). The MySQL catalog is the upstream `DatabaseCatalogProvider`; a fix declares the
+     precision on its fields as the PostgreSQL and SQL Server connectors do.
+- Risk: items 1 and 4 are wrong or unpadded rows; the others are refusals or wrong error
   codes.
 - Revisit when: a front takes an item: it fixes it, drops `known = "ISS-032"` from the cases it
   turns `OK` (the gate fails until it does) and updates this list.
