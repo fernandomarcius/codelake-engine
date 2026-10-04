@@ -396,27 +396,41 @@ impl ExecutionPlan for BufferedBuildExec {
         let Some(run) = self.slot.current() else {
             return self.input.execute(partition, context);
         };
-        let buffered = lock(&run.buffer.partitions)
-            .get_mut(partition)
-            .and_then(Option::take)
-            .ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "BufferedBuildExec: build partition {partition} read back before it was read, or twice"
-                ))
-            })?;
-        let files = buffered
-            .files
-            .into_iter()
-            .map(|file| run.buffer.spill.read_spill_as_stream_unbuffered(file, None))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Box::pin(ReadBack {
-            schema: self.input.schema(),
-            buffer: Arc::clone(&run.buffer),
-            memory: buffered.memory,
-            handed: 0,
-            files: files.into(),
-        }))
+        // The hash join creates its streams before the decision (as it
+        // always did, see `AdaptiveJoinExec::execute`): this one reads
+        // the partition back once the run has read it.
+        let schema = self.input.schema();
+        let stream = futures::stream::once(async move {
+            run.decision.clone().await.map_err(DataFusionError::Shared)?;
+            read_back(&run, partition)
+        })
+        .try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
+}
+
+/// The rows the run buffered for build partition `partition`.
+fn read_back(run: &Arc<Run>, partition: usize) -> Result<SendableRecordBatchStream> {
+    let buffered = lock(&run.buffer.partitions)
+        .get_mut(partition)
+        .and_then(Option::take)
+        .ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "BufferedBuildExec: build partition {partition} read back before it was read, or twice"
+            ))
+        })?;
+    let files = buffered
+        .files
+        .into_iter()
+        .map(|file| run.buffer.spill.read_spill_as_stream_unbuffered(file, None))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Box::pin(ReadBack {
+        schema: Arc::clone(run.buffer.spill.schema()),
+        buffer: Arc::clone(&run.buffer),
+        memory: buffered.memory,
+        handed: 0,
+        files: files.into(),
+    }))
 }
 
 /// Reads one buffered build partition back: the batches held in memory,
@@ -636,14 +650,22 @@ impl ExecutionPlan for AdaptiveJoinExec {
         let run = buffered.slot.run(partitions, || {
             Run::start(&buffered.input, &context, self.cap, &self.metrics)
         });
+        // The hash join's streams are created now, as without the decision:
+        // a partitioned join waits for every partition of its build side,
+        // and an exchange below it for every output it feeds, before any
+        // goes on; a partition a parent never reads must exist all the same.
+        // They read nothing until polled, and are dropped unread when the
+        // join runs as a sort-merge join.
+        let hashed = self.join.execute(partition, Arc::clone(&context))?;
         let hash_join = Arc::clone(&self.join);
         let side_budget = self.side_budget;
         let kept = Arc::clone(&run);
         let stream = async move {
             let outcome = run.decision.clone().await.map_err(DataFusionError::Shared)?;
             match outcome {
-                Outcome::HashJoin => hash_join.execute(partition, context),
+                Outcome::HashJoin => Ok(hashed),
                 Outcome::SortMerge => {
+                    drop(hashed);
                     let plan = run
                         .sort_merge
                         .get_or_init(|| sort_merge(&hash_join, side_budget).map_err(Arc::new))
