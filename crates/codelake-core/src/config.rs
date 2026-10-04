@@ -562,7 +562,10 @@ pub enum SourceKind {
     /// Parquet warehouse in Trino's file-metastore layout (`hive.metastore=file`).
     Hive {
         /// Absolute local path (`/data/warehouse`, `file:/data/warehouse`) or
-        /// `s3://bucket/prefix`.
+        /// `s3://bucket/prefix`. The hidden column `"$path"` of every table
+        /// starts with it as written: spelled as the reference engine's
+        /// `hive.metastore.catalog.dir` (`file:///data/warehouse`), both
+        /// engines show the same paths.
         warehouse: String,
         /// S3-compatible endpoint (`MinIO`); omit for AWS S3 or local disk.
         s3_endpoint: Option<String>,

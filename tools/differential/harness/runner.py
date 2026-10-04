@@ -117,7 +117,10 @@ def run_setup(engines, suite):
     for sql in suite.setup_trino:
         check("trino", sql, engines.trino.query(for_trino(sql), "memory"))
     for sql in suite.setup_codelake:
-        check("codelake", sql, engines.codelake.query(for_codelake(sql), "datafusion"))
+        # `/*CLSESSION k=v*/`: a setup step that needs a session property
+        # (`ALTER TABLE … EXECUTE optimize`).
+        sql, session = split_session(sql, None)
+        check("codelake", sql, engines.codelake.query(for_codelake(sql), "datafusion", session=session))
     # setup_postgres runs before CodeLake starts (stack.Stack), which lists a
     # source's tables once, at start.
     return errors

@@ -121,7 +121,7 @@ Other case keys:
 | `params = ["ab"]`, `param_types = [25]` | pg protocol | extended protocol (Parse/Bind/Execute) with these text parameters and type OIDs (0 = unspecified) |
 | `oracle_sql` | trino oracle | the SQL Trino runs when it differs (inlined parameters) |
 | `rows_json = '[[1, null]]'` | value oracle | the expected rows (JSON: TOML has no null) |
-| `codelake_session = "k=v"` | trino protocol | `X-Trino-Session` sent to CodeLake only; the `/*CLSESSION k=v*/ SQL` prefix does the same |
+| `codelake_session = "k=v"` | trino protocol | `X-Trino-Session` sent to CodeLake only; the `/*CLSESSION k=v*/ SQL` prefix does the same (in `setup_codelake` too: `ALTER TABLE … EXECUTE optimize`) |
 | `time_zone = "America/Sao_Paulo"` | trino or value oracle, trino protocol | `X-Trino-Time-Zone` sent to both engines (to CodeLake alone with the value oracle; also at file level) |
 | `types = false` | trino oracle | do not compare column types nor names |
 | `compare` | any | as at file level |

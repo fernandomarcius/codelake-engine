@@ -327,6 +327,9 @@ impl TableProvider for HiveView {
             )
             .map_err(|err| DataFusionError::Plan(format!("view {}: {err}", self.name)))?
         };
+        let mut query = query;
+        // The hidden columns (`"$path"`, …) the view reads, as any query.
+        codelake_core::hidden_columns::expose(&view_state, &mut query).await?;
         let plan = view_state.statement_to_plan(query).await?;
         let output = plan.schema().clone();
         if output.fields().len() != self.schema.fields().len() {
@@ -490,6 +493,28 @@ impl HiveCatalog {
         Ok(Some(Arc::new(self.table_provider(schema, table, &metadata)?)))
     }
 
+    /// The table `schema.table` with its hidden columns; `None` for a view or
+    /// a table that does not exist.
+    async fn resolve_with_hidden_columns(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Result<Option<Arc<dyn TableProvider>>> {
+        let metadata = self
+            .metastore
+            .table(schema, table)
+            .await
+            .map_err(metastore_error)?
+            .filter(|metadata| !metadata.is_view());
+        let Some(metadata) = metadata else {
+            return Ok(None);
+        };
+        let table = self
+            .table_provider(schema, table, &metadata)?
+            .with_hidden_columns();
+        Ok(Some(Arc::new(table)))
+    }
+
     pub(crate) fn table_provider(
         &self,
         schema: &str,
@@ -622,6 +647,14 @@ impl SchemaProvider for HiveSchema {
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+        // The second name of a table: the table with its hidden columns
+        // (`codelake_core::hidden_columns`). A view has none.
+        if let Some(table) = codelake_core::hidden_columns::hidden_columns_of(name) {
+            return self
+                .catalog
+                .resolve_with_hidden_columns(&self.schema, &hive_name(table))
+                .await;
+        }
         self.catalog.resolve(&self.schema, &hive_name(name)).await
     }
 

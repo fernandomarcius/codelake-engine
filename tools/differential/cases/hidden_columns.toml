@@ -1,0 +1,195 @@
+# Hidden columns of Hive tables: "$path", "$file_size", "$file_modified_time".
+# Production: the 8 views of schema `dte` (produtos, receber, recebidas, vendas and
+# their vw_*) read "$path" of their `vd_*_base` table and return YEAR, MONTH, DAY
+# and obraId with the base columns; CodeLake refused them (`No field named "$path"`).
+# Both engines read the same files (Trino writes `t`, both write `w`, CodeLake
+# compacts `c`), so path, size and modification time are the same values.
+# "$partition" and "$bucket" exist only on partitioned or bucketed tables, which
+# CodeLake does not read: an unknown column on both, as on any other table.
+
+oracle = "trino"
+setup_trino = [
+  "CREATE SCHEMA hive.hcase",
+  "CREATE TABLE hive.hcase.t (a integer, b varchar) WITH (format = 'PARQUET')",
+  "INSERT INTO hive.hcase.t VALUES (1, 'x'), (2, 'y')",
+  "INSERT INTO hive.hcase.t VALUES (3, 'z')",
+  "CREATE TABLE hive.hcase.w (a integer) WITH (format = 'PARQUET')",
+  "INSERT INTO hive.hcase.w VALUES (1)",
+  "CREATE TABLE hive.hcase.c (a integer) WITH (format = 'PARQUET')",
+  "INSERT INTO hive.hcase.c VALUES (1)",
+  "INSERT INTO hive.hcase.c VALUES (2)",
+  "INSERT INTO hive.hcase.c VALUES (3)",
+  "CREATE VIEW hive.hcase.v_star AS SELECT *, \"$path\" AS p FROM hive.hcase.t",
+  "CREATE VIEW hive.hcase.v_parts AS SELECT v.*, regexp_extract(v.\"$path\", '[^/]+$') AS arquivo, CAST(substr(regexp_extract(v.\"$path\", '[^/]+$'), 1, 4) AS integer) AS \"YEAR\", CAST(substr(regexp_extract(v.\"$path\", '[^/]+$'), 5, 2) AS integer) AS \"MONTH\", CAST(substr(regexp_extract(v.\"$path\", '[^/]+$'), 7, 2) AS integer) AS \"DAY\", a * 100 AS \"obraId\" FROM hive.hcase.t v",
+  "CREATE VIEW hive.hcase.v_where AS SELECT a, b FROM hive.hcase.t WHERE \"$path\" = (SELECT max(\"$path\") FROM hive.hcase.t)",
+  "CREATE VIEW hive.hcase.v_group AS SELECT \"$path\" AS p, count(*) AS n, max(\"$file_size\") AS s FROM hive.hcase.t GROUP BY \"$path\"",
+]
+setup_codelake = [
+  "INSERT INTO hive.hcase.w VALUES (2)",
+  "/*CLSESSION hive.non_transactional_optimize_enabled=true*/ ALTER TABLE hive.hcase.c EXECUTE optimize",
+]
+
+[[case]]
+id = "HC1"
+sql = "SELECT a, b, \"$path\", \"$file_size\", \"$file_modified_time\" FROM hive.hcase.t"
+note = "the file of each row (file:/wh/hcase/t/<name>), its size and modification time, typed varchar, bigint, timestamp(3) with time zone"
+
+[[case]]
+id = "HC2"
+sql = "SELECT * FROM hive.hcase.t"
+note = "* never lists them"
+
+[[case]]
+id = "HC3"
+sql = "SELECT *, \"$path\" FROM hive.hcase.t"
+note = "* next to a hidden column"
+
+[[case]]
+id = "HC4"
+sql = "SELECT t.*, \"$file_size\" FROM hive.hcase.t t"
+note = "a qualified * next to a hidden column"
+
+[[case]]
+id = "HC5"
+sql = "SELECT typeof(\"$path\"), typeof(\"$file_size\"), typeof(\"$file_modified_time\") FROM hive.hcase.t WHERE a = 1"
+
+[[case]]
+id = "HC6"
+sql = "SELECT a FROM hive.hcase.t WHERE \"$path\" = (SELECT max(\"$path\") FROM hive.hcase.t)"
+note = "a filter on the file: the reference engine reads only that file, so does CodeLake"
+
+[[case]]
+id = "HC7"
+sql = "SELECT \"$path\", count(*), max(\"$file_size\") FROM hive.hcase.t GROUP BY \"$path\""
+
+[[case]]
+id = "HC8"
+sql = "SELECT a FROM hive.hcase.t ORDER BY \"$path\", a"
+compare = "ordered"
+
+[[case]]
+id = "HC9"
+sql = "SELECT \"$PATH\", \"$Path\" FROM hive.hcase.t WHERE a = 1"
+note = "any spelling, the header as written"
+
+[[case]]
+id = "HC10"
+sql = "SELECT regexp_extract(\"$path\", '[^/]+$'), split_part(\"$path\", '/', 5), element_at(split(\"$path\", '/'), -1), substr(\"$path\", 1, 5) FROM hive.hcase.t"
+note = "the file name as views take it apart"
+
+[[case]]
+id = "HC11"
+sql = "SELECT x.a, y.a FROM hive.hcase.t x JOIN hive.hcase.t y ON x.\"$path\" = y.\"$path\" AND x.a < y.a"
+
+[[case]]
+id = "HC12"
+sql = "SELECT * FROM hive.hcase.t x JOIN hive.hcase.t y ON x.\"$path\" = y.\"$path\" AND x.a = y.a"
+note = "* over two tables whose hidden columns the query reads"
+
+[[case]]
+id = "HC13"
+sql = "SELECT * FROM hive.hcase.t x JOIN hive.hcase.t y USING (a) WHERE x.\"$path\" = y.\"$path\""
+expect = "RECUSA"
+known = "ISS-065"
+error = "qualify the wildcard"
+note = "* over two such tables joined by USING: refused, the planner has no hidden columns (list the columns or qualify the wildcard)"
+
+[[case]]
+id = "HC14"
+sql = "SELECT \"$path\" FROM hive.hcase.t x JOIN hive.hcase.t y ON x.a = y.a"
+note = "ambiguous: both sides have it"
+
+[[case]]
+id = "HC15"
+sql = "SELECT \"$partition\" FROM hive.hcase.t"
+note = "not partitioned: no such column"
+
+[[case]]
+id = "HC16"
+sql = "SELECT \"$bucket\" FROM hive.hcase.t"
+note = "not bucketed: no such column"
+
+[[case]]
+id = "HC17"
+sql = "SELECT * FROM hive.hcase.v_star"
+note = "a view the reference engine wrote: SELECT *, \"$path\" AS p"
+
+[[case]]
+id = "HC18"
+sql = "SELECT a, b, arquivo, \"YEAR\", \"MONTH\", \"DAY\", \"obraId\" FROM hive.hcase.v_parts"
+note = "the production shape: base columns and the date taken from the file name"
+
+[[case]]
+id = "HC19"
+sql = "SELECT * FROM hive.hcase.v_where"
+note = "a view filtering on the newest file"
+
+[[case]]
+id = "HC20"
+sql = "SELECT * FROM hive.hcase.v_group"
+note = "a view grouping by file"
+
+[[case]]
+id = "HC21"
+sql = "SELECT \"$path\" FROM hive.hcase.v_star"
+note = "a view has no hidden columns"
+
+[[case]]
+id = "HC22"
+sql = "SELECT \"$path\" FROM (SELECT * FROM hive.hcase.t) x"
+note = "* of a subquery does not carry them"
+
+[[case]]
+id = "HC23"
+sql = "SELECT a, \"$path\", \"$file_size\", \"$file_modified_time\" FROM hive.hcase.w"
+note = "after an INSERT by CodeLake: its new file, as each engine lists it"
+
+[[case]]
+id = "HC24"
+sql = "SELECT a, \"$path\", \"$file_size\", \"$file_modified_time\" FROM hive.hcase.c"
+note = "after CodeLake's OPTIMIZE swapped three files for one: every row names the new file"
+
+[[case]]
+id = "HC25"
+sql = "SELECT a, \"$file_modified_time\" FROM hive.hcase.t"
+time_zone = "America/Sao_Paulo"
+note = "always in UTC, whatever the session's zone"
+
+[[case]]
+id = "HC26"
+sql = "SELECT count(*) FROM hive.hcase.t WHERE \"$path\" = 'nowhere'"
+
+[[case]]
+id = "HC27"
+sql = "SELECT a FROM hive.hcase.t t WHERE EXISTS (SELECT 1 FROM hive.hcase.t u WHERE u.\"$path\" = t.\"$path\" AND u.a <> t.a)"
+note = "a correlated reference to the outer table's hidden column"
+
+[[case]]
+id = "HC28"
+sql = "SELECT * FROM hive.hcase.t WHERE \"$file_size\" > 0 AND \"$file_modified_time\" > TIMESTAMP '2000-01-01 00:00:00 UTC'"
+
+[[case]]
+id = "HC29"
+sql = "SELECT column_name FROM hive.information_schema.columns WHERE table_schema = 'hcase' AND table_name = 't'"
+note = "information_schema does not list them"
+
+[[case]]
+id = "HC30"
+sql = "SELECT a, b, \"$path\", \"$file_size\" FROM hive.hcase.t"
+protocol = "pg"
+note = "over the PostgreSQL wire (simple query)"
+
+[[case]]
+id = "HC31"
+sql = "SELECT a, \"$path\" FROM hive.hcase.t WHERE b = $1"
+protocol = "pg"
+params = ["z"]
+param_types = [25]
+oracle_sql = "SELECT a, \"$path\" FROM hive.hcase.t WHERE b = 'z'"
+note = "over the PostgreSQL wire (extended protocol)"
+
+[[case]]
+id = "HC32"
+sql = "SELECT * FROM hive.hcase.v_star"
+protocol = "pg"
+note = "a view reading \"$path\", over the PostgreSQL wire"

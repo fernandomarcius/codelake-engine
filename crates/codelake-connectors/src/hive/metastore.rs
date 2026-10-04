@@ -320,6 +320,10 @@ pub(crate) struct FileMetastore {
     zone: ParquetTimeZone,
     /// Names of the metadata files and markers (ISS-011).
     names: Arc<MetastoreNames>,
+    /// The warehouse as the catalog names it (its `warehouse`, the reference
+    /// engine's `hive.metastore.catalog.dir`), without trailing `/`: the
+    /// start of every `"$path"` value.
+    location: Arc<str>,
 }
 
 /// Removes a local directory tree; absent is fine. Retries briefly because an
@@ -392,7 +396,31 @@ impl FileMetastore {
             precision: HiveTimestampPrecision::default(),
             zone: ParquetTimeZone::default(),
             names: Arc::default(),
+            location: Arc::from(""),
         }
+    }
+
+    /// Sets the warehouse as the catalog names it (`warehouse`, written as
+    /// the reference engine's `hive.metastore.catalog.dir`): `"$path"`
+    /// values start with it, spelled as written (`file:/wh`, `file:///wh`,
+    /// `/wh`, `s3://lake/wh`), as the reference engine spells them.
+    pub(crate) fn with_location(mut self, warehouse: &str) -> Self {
+        self.location = Arc::from(warehouse.trim_end_matches('/'));
+        self
+    }
+
+    /// The URI of the object at `path` as the reference engine shows it in
+    /// `"$path"`: the warehouse as written, then the path under it.
+    pub(crate) fn file_uri(&self, path: &Path) -> String {
+        let relative = path.prefix_match(&self.root).map_or_else(
+            || {
+                path.parts()
+                    .map(|part| part.as_ref().to_owned())
+                    .collect::<Vec<_>>()
+            },
+            |parts| parts.map(|part| part.as_ref().to_owned()).collect(),
+        );
+        format!("{}/{}", self.location, relative.join("/"))
     }
 
     /// Sets the names of the metadata files and markers (ISS-011).

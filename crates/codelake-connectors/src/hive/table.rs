@@ -32,24 +32,29 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use codelake_core::hidden_columns;
 use codelake_core::trace::{self, TARGET, field};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, Int64Array, StringArray};
 use datafusion::arrow::compute::{CastOptions, cast, cast_with_options};
-use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Int64Type, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::config::TableParquetOptions;
+use datafusion::common::stats::ColumnStatistics;
+use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::datasource::TableType;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::source::DataSourceExec;
+use datafusion::datasource::table_schema::TableSchema;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::dml::InsertOp;
+use datafusion::logical_expr::expr_rewriter::unnormalize_col;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::parquet::arrow::async_writer::ParquetObjectWriter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
@@ -325,7 +330,27 @@ pub(crate) struct HiveTable {
     /// `CREATE OR REPLACE` wrote): a table of the same name with another
     /// identity replaced it, and this handle must not read or write it.
     pub(crate) table_id: Option<String>,
+    /// The table's columns and then its hidden columns (`"$path"`, …), when
+    /// it is served with them (`codelake_core::hidden_columns`).
+    pub(crate) hidden: Option<SchemaRef>,
 }
+
+/// The hidden columns of a table, as the reference engine types them.
+fn hidden_fields() -> Vec<FieldRef> {
+    vec![
+        Arc::new(Field::new(hidden_columns::PATH, DataType::Utf8, true)),
+        Arc::new(Field::new(hidden_columns::FILE_SIZE, DataType::Int64, true)),
+        Arc::new(Field::new(
+            hidden_columns::FILE_MODIFIED_TIME,
+            DataType::Timestamp(TimeUnit::Millisecond, Some(UTC.into())),
+            true,
+        )),
+    ]
+}
+
+/// The reference engine shows a file's modification time in UTC, whatever
+/// the session's zone.
+const UTC: &str = "UTC";
 
 impl HiveTable {
     /// The table `schema.table` described by `metadata`.
@@ -375,7 +400,91 @@ impl HiveTable {
             columns: metadata.data_columns.clone(),
             statistics: Arc::new(MetastoreStatistics::from_metadata(metadata)),
             table_id: metadata.table_id().map(str::to_owned),
+            hidden: None,
         })
+    }
+
+    /// The same table served with its hidden columns after its columns.
+    #[must_use]
+    pub(crate) fn with_hidden_columns(mut self) -> Self {
+        let mut fields: Vec<FieldRef> = self.schema.fields().iter().cloned().collect();
+        fields.extend(hidden_fields());
+        self.hidden = Some(Arc::new(Schema::new_with_metadata(
+            fields,
+            self.schema.metadata().clone(),
+        )));
+        self
+    }
+
+    /// The values of the hidden columns for the rows of the file `meta`:
+    /// its URI as the reference engine spells it, its size and its
+    /// modification time, in milliseconds (the reference engine's precision,
+    /// cut, not rounded).
+    fn hidden_values(&self, meta: &ObjectMeta) -> Vec<ScalarValue> {
+        vec![
+            ScalarValue::Utf8(Some(self.metastore.file_uri(&meta.location))),
+            ScalarValue::Int64(i64::try_from(meta.size).ok()),
+            ScalarValue::TimestampMillisecond(Some(meta.last_modified.timestamp_millis()), Some(UTC.into())),
+        ]
+    }
+
+    /// The files of `files` whose hidden column values can satisfy the
+    /// `filters` that read only hidden columns (`"$path" = '…'`): the
+    /// reference engine reads only those files. Applied again above the
+    /// scan; a filter that cannot be evaluated here keeps every file.
+    fn prune_by_hidden_columns(
+        &self,
+        state: &dyn Session,
+        filters: &[Expr],
+        files: Vec<ObjectMeta>,
+    ) -> Result<Vec<ObjectMeta>> {
+        if self.hidden.is_none() {
+            return Ok(files);
+        }
+        let names: Vec<&str> = hidden_columns::HIDDEN_COLUMNS.to_vec();
+        let on_hidden: Vec<Expr> = filters
+            .iter()
+            .filter(|filter| {
+                // Evaluated once per file: a volatile filter (`random()`)
+                // must see every row.
+                let columns = filter.column_refs();
+                !filter.is_volatile()
+                    && !columns.is_empty()
+                    && columns.iter().all(|column| names.contains(&column.name.as_str()))
+            })
+            .cloned()
+            .collect();
+        let Some(predicate) = on_hidden.into_iter().reduce(Expr::and) else {
+            return Ok(files);
+        };
+        // Evaluated over the hidden columns alone, by name.
+        let predicate = unnormalize_col(predicate);
+        let schema = Arc::new(Schema::new(hidden_fields()));
+        let Ok(df_schema) = DFSchema::try_from(Arc::clone(&schema)) else {
+            return Ok(files);
+        };
+        let Ok(predicate) = state.create_physical_expr(predicate, &df_schema) else {
+            return Ok(files);
+        };
+        let mut kept = Vec::with_capacity(files.len());
+        for meta in files {
+            let values = self.hidden_values(&meta);
+            let columns = values
+                .iter()
+                .map(|value| value.to_array_of_size(1))
+                .collect::<Result<Vec<_>>>()?;
+            let row = RecordBatch::try_new(Arc::clone(&schema), columns)?;
+            let keep = match predicate.evaluate(&row).and_then(|value| value.into_array(1)) {
+                Ok(result) => result
+                    .as_boolean_opt()
+                    .is_none_or(|result| result.is_valid(0) && result.value(0)),
+                Err(_) => true,
+            };
+            if keep {
+                kept.push(meta);
+            }
+        }
+        Ok(kept)
     }
 
     /// The same table as the metastore describes it now (its columns may
@@ -492,9 +601,16 @@ impl HiveTable {
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
     ) -> Result<FileScanConfigBuilder> {
+        // The hidden columns are the scan's partition columns: one value per
+        // file (`HiveTable::hidden_values`), for every row of it.
+        let hidden = if self.hidden.is_some() {
+            hidden_fields()
+        } else {
+            Vec::new()
+        };
         self.scan_config(
             runtime,
-            Arc::clone(&self.schema),
+            TableSchema::new(Arc::clone(&self.schema), hidden),
             Reading::Table,
             groups,
             projection,
@@ -518,7 +634,7 @@ impl HiveTable {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let config = self
-            .scan_config(runtime, schema, reading, groups, projection, limit)?
+            .scan_config(runtime, schema.into(), reading, groups, projection, limit)?
             .with_preserve_order(true);
         Ok(DataSourceExec::from_data_source(config.build()))
     }
@@ -528,7 +644,7 @@ impl HiveTable {
     fn scan_config(
         &self,
         runtime: &RuntimeEnv,
-        schema: SchemaRef,
+        schema: TableSchema,
         reading: Reading,
         groups: Vec<Vec<PartitionedFile>>,
         projection: Option<&Vec<usize>>,
@@ -542,6 +658,7 @@ impl HiveTable {
         // In nanoseconds, a value outside 1677–2262 wraps into another
         // instant: see `exact_timestamps.rs` for how those are read.
         let finest = schema
+            .file_schema()
             .fields()
             .iter()
             .filter_map(|field| match field.data_type() {
@@ -610,14 +727,16 @@ impl HiveTable {
 impl HiveTable {
     /// See [`crate::distributable`].
     pub(crate) fn distributable(&self) -> bool {
-        !exact_timestamps::has_nanoseconds(&self.schema, None)
+        // Hidden columns are read on the coordinator: their values come from
+        // the listing, as partition values of the scan.
+        self.hidden.is_none() && !exact_timestamps::has_nanoseconds(&self.schema, None)
     }
 }
 
 #[async_trait]
 impl TableProvider for HiveTable {
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+        Arc::clone(self.hidden.as_ref().unwrap_or(&self.schema))
     }
 
     fn table_type(&self) -> TableType {
@@ -634,7 +753,7 @@ impl TableProvider for HiveTable {
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let span = tracing::info_span!(
@@ -654,18 +773,42 @@ impl TableProvider for HiveTable {
             .instrument(span.clone())
             .await
             .inspect_err(|err| trace::record_error(&span, err))?;
+        let files = self.prune_by_hidden_columns(state, filters, files)?;
         record_files(&span, &files);
         self.register_store(state);
-        let statistics = scan_statistics(self, state, &files).await;
+        let mut statistics = scan_statistics(self, state, &files).await;
         let partitions = state.config().target_partitions().max(1);
         let mut groups: Vec<Vec<PartitionedFile>> = vec![Vec::new(); partitions.min(files.len().max(1))];
         let group_count = groups.len();
         for (index, meta) in files.into_iter().enumerate() {
-            groups[index % group_count].push(PartitionedFile::new_from_meta(meta));
+            let file = if self.hidden.is_some() {
+                let values = self.hidden_values(&meta);
+                PartitionedFile::new_from_meta(meta).with_partition_values(values)
+            } else {
+                PartitionedFile::new_from_meta(meta)
+            };
+            groups[index % group_count].push(file);
         }
+        let columns = self.schema.fields().len();
+        let reads_hidden = self.hidden.is_some()
+            && projection.is_none_or(|projection| projection.iter().any(|index| *index >= columns));
+        let visible: Option<Vec<usize>> = projection.map(|projection| {
+            projection
+                .iter()
+                .copied()
+                .filter(|index| *index < columns)
+                .collect()
+        });
         // A NANOSECONDS catalog cannot take `INT96` values in nanoseconds
         // from the Parquet reader as they come (see `exact_timestamps.rs`).
-        if exact_timestamps::has_nanoseconds(&self.schema, projection) {
+        if exact_timestamps::has_nanoseconds(&self.schema, visible.as_ref()) {
+            if reads_hidden {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "{}.{}: hidden columns ($path, …) together with timestamp columns of a \
+                     NANOSECONDS catalog are not supported yet",
+                    self.schema_name, self.table
+                )));
+            }
             return exact_timestamps::nanosecond_scan(
                 self,
                 state.runtime_env(),
@@ -675,11 +818,16 @@ impl TableProvider for HiveTable {
                 &statistics,
             );
         }
+        let config = self.scan_files(state.runtime_env(), groups, projection, limit)?;
+        if self.hidden.is_some() {
+            statistics.column_statistics.extend(std::iter::repeat_n(
+                ColumnStatistics::new_unknown(),
+                hidden_fields().len(),
+            ));
+        }
         // Statistics are all inexact (see `statistics.rs`): they change the
         // plan, never an answer.
-        let config = self
-            .scan_files(state.runtime_env(), groups, projection, limit)?
-            .with_statistics(statistics);
+        let config = config.with_statistics(statistics);
         Ok(DataSourceExec::from_data_source(config.build()))
     }
 

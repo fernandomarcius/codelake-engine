@@ -422,6 +422,7 @@ mod tests {
                 columns: columns.clone(),
                 statistics: Arc::new(statistics),
                 table_id: None,
+                hidden: None,
             };
             let state = ctx.state();
             async move {
