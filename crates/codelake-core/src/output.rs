@@ -247,6 +247,16 @@ const SPILL_CHUNK_BYTES: usize = 1 << 20;
 /// writer would copy into each chunk: string and binary views are compacted
 /// per chunk, and a batch with a view nested in another type is written whole.
 fn spill_in_chunks(batch: &RecordBatch, spill: &SpillManager) -> Result<Option<RefCountedTempFile>> {
+    let mut file = spill.create_in_progress_file(MERGE_CONSUMER)?;
+    for chunk in spill_chunks(batch)? {
+        file.append_batch(&chunk)?;
+    }
+    file.finish()
+}
+
+/// `batch` in the chunks [`spill_in_chunks`] writes: about
+/// [`SPILL_CHUNK_BYTES`] each, string views compacted.
+pub(crate) fn spill_chunks(batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
     let rows = batch.num_rows();
     let nested = batch.schema().fields().iter().any(|f| f.data_type().is_nested());
     let bytes = batch.get_array_memory_size().max(1);
@@ -257,14 +267,14 @@ fn spill_in_chunks(batch: &RecordBatch, spill: &SpillManager) -> Result<Option<R
             .div_ceil(bytes)
             .clamp(1, rows.max(1))
     };
-    let mut file = spill.create_in_progress_file(MERGE_CONSUMER)?;
+    let mut chunks = Vec::with_capacity(rows.div_ceil(per_chunk.max(1)));
     let mut start = 0;
     while start < rows {
         let len = per_chunk.min(rows - start);
-        file.append_batch(&compact_views(&batch.slice(start, len))?)?;
+        chunks.push(compact_views(&batch.slice(start, len))?);
         start += len;
     }
-    file.finish()
+    Ok(chunks)
 }
 
 /// `batch` with its string and binary views holding only the bytes they use.

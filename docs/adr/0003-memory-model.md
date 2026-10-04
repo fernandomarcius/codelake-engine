@@ -125,10 +125,12 @@
     it never holds more than the ceiling in silence.
   - Statistics: an exact row count is used as it is; an estimate (`Inexact`:
     a filter's selectivity, the hive metastore or footers) must exceed the
-    slice twice over; a build side of unknown size (no statistics: a
-    `generate_series`, a source without them) stays a hash join and fails
-    cleanly if it does not fit. Either operator answers the same rows, so a
-    wrong estimate costs speed or a refusal, never rows.
+    slice twice over. A build side of unknown size (no statistics: a
+    federated source, anything joined or aggregated above one) or estimated
+    past the slice within that margin is decided at run time (below; until
+    2026-10-02 it stayed a hash join and failed if it did not fit). Either
+    operator answers the same rows, so a wrong estimate costs speed, never
+    rows.
   - The join stays a hash join whenever the sort-merge join could answer
     other rows: a null-aware anti join (`NOT IN`, apache/datafusion#22810,
     ADR 0014), mark joins, keys that compare NULLs as equal, a residual
@@ -139,7 +141,27 @@
     nested types), a pushed limit, an output ordering. Joins with no equality
     are nested loop joins, whose spill fallback stays off (ADR 0014).
   - Session property `sort_merge_oversized_joins` (default `true`) turns it
-    off per query.
+    off per query, the run-time decision below included.
+- Hash joins the planner cannot size decide at run time
+  (`codelake_core::adaptive_join`, 2026-10-02). The join stays a
+  `HashJoinExec` in the plan (its dynamic filter, partitioning and the
+  rules after this one see it), its build input read through a
+  `BufferedBuildExec` and the join under an `AdaptiveJoinExec`. When the
+  first output partition runs, every build partition is read at once into a
+  buffer reserved in the pool (not spillable: it spills itself), up to the
+  join's slice divided by the 5/2 overhead of the estimate. All of it fits:
+  the hash join runs over the buffer, which gives each batch back as the
+  join takes it. It does not (past that size, or the pool refuses a batch):
+  the buffer goes to disk in ~1 MiB chunks and the join runs as the
+  sort-merge join of the rule above, built then, its build side read back
+  from the files; the probe side is read once either way. The guards of the
+  rule above apply (a join the sort-merge join could answer differently
+  stays a hash join), and a join inside an input of a rewritten join stays
+  a plain hash join, bounded by the engine's pool as before (its sort-merge
+  form would run within that input's budget). A build side larger than the
+  pool completes instead of failing: ~30 MB of unknown size under 16 MiB
+  (`adaptive_join::tests`), and the 220 MiB `generate_series` join under
+  128 MiB of `tests/memory_ceiling.rs`.
 - Which input a hash join builds, when the statistics cannot say
   (`codelake_core::build_side`, amended 2026-09-30). `DataFusion` builds the
   query's left input and `JoinSelection` swaps the inputs only when the
@@ -234,9 +256,9 @@ batches), or `memory.limit`. A sort gets its fair share among every spilling
 operator the plan registered, idle grouped aggregations included: under a
 small pool a sort of wide rows needs smaller batches (24 MiB, 4 partitions,
 rows of ~210 bytes: 2048 rows per batch). A hash join whose build side does
-not fit runs as a sort-merge join when the planner can size it (above); one it
-cannot size fails cleanly (220 MiB `generate_series` build under 128 MiB:
-116-120 MiB of growth). Admission control per query and per user is M1.
+not fit runs as a sort-merge join: planned so when the planner can size it,
+decided at run time when it cannot (above). Admission control per query and
+per user is M1.
 
 ## Evidence
 
@@ -261,6 +283,8 @@ cannot size fails cleanly (220 MiB `generate_series` build under 128 MiB:
   type), an aggregation of 1M groups 121 MiB (spilled 424 MiB, counts right), a
   220 MiB hash join build 116 MiB (`EXCEEDED_LOCAL_MEMORY_LIMIT`: its
   `generate_series` inputs have no statistics, so it stays a hash join).
+  Since 2026-10-02 that join is decided at run time: right numbers, 113 MiB
+  of growth, 286 MiB spilled (was `EXCEEDED_LOCAL_MEMORY_LIMIT` at 160 MiB).
 - Views over a remote table larger than the pool
   (`crates/codelake-connectors/tests/integration/sqlserver_views_memory.rs`,
   SQL Server 2022 table of 1 million rows, Hive views written by Trino 431,
