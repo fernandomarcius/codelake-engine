@@ -236,6 +236,9 @@ pub fn optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + S
         .unwrap_or(rules.len());
     rules.insert(distinct, Arc::new(crate::distinct_counts::DistinctCountToGroupBy));
     rules.extend(crate::trino_functions::optimizer_rules());
+    // A limit `push_down_limit` left on a federated node goes into it
+    // (`crate::federated_limit`).
+    rules.push(Arc::new(crate::federated_limit::LimitIntoFederation));
     // `NOT IN` keeps its NULL semantics, and nothing is inferred from the
     // keys of a null-aware join (`crate::join_guard`).
     crate::join_guard::guard_filter_pushdown(crate::join_guard::with_null_safe_not_in(rules))

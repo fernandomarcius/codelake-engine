@@ -153,6 +153,23 @@ fn seed_sql() -> Vec<String> {
     ]
 }
 
+/// Catalog `erp2`: database `erp2` of the same server, another source.
+fn second_database(host: &str, port: u16) -> std::sync::Arc<dyn codelake_core::Connector> {
+    std::sync::Arc::new(codelake_connectors::sqlserver::SqlServerConnector::new(
+        "erp2".into(),
+        codelake_connectors::sqlserver::SqlServerParams {
+            host: host.to_owned(),
+            port,
+            database: "erp2".to_owned(),
+            user: "sa".into(),
+            password: secrecy::SecretString::from(SA_PASSWORD),
+            encrypt: "required".into(),
+            trust_server_certificate: true,
+            pool_size: 4,
+        },
+    ))
+}
+
 /// Latest version of a remote table, as the views write it.
 fn latest(table: &str, partition: &str, alias: &str) -> String {
     format!(
@@ -346,6 +363,14 @@ async fn screen_views_over_a_remote_table_larger_than_the_pool() {
         exec(&host, port, "warehouse", &statement).await;
     }
     note("seed", format!("{REMOTE_ROWS} rows in {:?}", started.elapsed()));
+    exec(&host, port, "master", "CREATE DATABASE erp2").await;
+    exec(
+        &host,
+        port,
+        "erp2",
+        "SELECT TOP (200000) * INTO dbo.vd_recebidas FROM warehouse.dbo.vd_recebidas",
+    )
+    .await;
     let shared = shared().await;
     let catalog = format!(
         "connector.name=sqlserver\n\
@@ -365,6 +390,7 @@ async fn screen_views_over_a_remote_table_larger_than_the_pool() {
     };
     let mut engine = open(&shared.warehouse(), spill.path(), POOL, &execution, &[]).await;
     common::attach(&mut engine, sqlserver(&host, port)).await;
+    common::attach(&mut engine, second_database(&host, port)).await;
     let mut failures = Vec::new();
     let timed = |label: &'static str, elapsed: Duration, outcome: &Result<Vec<Vec<String>>, String>| {
         note(
@@ -422,6 +448,27 @@ async fn screen_views_over_a_remote_table_larger_than_the_pool() {
             ));
         }
         assert_pool_given_back(&engine).await;
+    }
+
+    // A `LIMIT` over a `UNION ALL` of two sources (the two ERP servers in
+    // production: here two databases) reaches each of them.
+    let union = "SELECT * FROM (SELECT obraid, nomecliente FROM warehouse.dbo.vd_recebidas \
+                 UNION ALL SELECT obraid, nomecliente FROM erp2.dbo.vd_recebidas) LIMIT 50";
+    let plan = physical_plan(&engine, union).await;
+    let tops = plan
+        .lines()
+        .filter(|l| {
+            l.contains("VirtualExecutionPlan") && l.contains("rewritten_executor_sql=SELECT TOP (50)")
+        })
+        .count();
+    if tops != 2 {
+        failures.push(format!("the limit reached {tops} of the 2 sources:\n{plan}"));
+    }
+    let started = Instant::now();
+    let rows = try_cl(&engine, union).await;
+    timed("union limit", started.elapsed(), &rows);
+    if !matches!(&rows, Ok(rows) if rows.len() == 50) {
+        failures.push(format!("union LIMIT 50: {rows:?}"));
     }
 
     // The aggregation of 17 keys over a view, ordered by every column.
