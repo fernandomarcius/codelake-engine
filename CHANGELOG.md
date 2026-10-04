@@ -274,6 +274,25 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- Memory, found by the shadow run (2026-10-02, CodeLake 3997959 against Trino 431 over the same sources),
+  reading the Warehouse screens' views (a SQL Server table of ~5 million rows joined with small tables
+  deduplicated by `ROW_NUMBER`):
+  - A hash join inside a view builds the input chosen when the view was planned. A view's plan is
+    optimized when the view is scanned and again inside the plan that reads it, and the second pass swapped
+    every join whose inputs have no statistics back to building its left input, the remote table:
+    `SELECT * FROM <view> LIMIT 50` held six `HashJoinInput` partitions of 450-680 MB under the 4 GiB pool and
+    failed after 51 s (two views; Trino 431: 4.2 s), and a third took 30.7 s for its first 50 rows (the
+    whole remote table was read before the first probe). The same SQL written inline answered in 2.9-4.6 s
+    on the shadow candidate.
+  - An aggregation grouped by a column a filter or a join fixes (`bancotipoid = 2`) spills: `DataFusion`
+    read such a column as sorted and the aggregation as partly ordered, whose partial phase cannot emit
+    early, and it failed at its share of the pool with `can spill: true` (17 keys over 4.78 million rows,
+    ordered by every column with `LIMIT 50`: 20-30 s, then `EXCEEDED_LOCAL_MEMORY_LIMIT`; Trino 431: 34 s).
+  - Only the root of a plan reserves the batch it hands on: a view's plan kept its own output reservation,
+    and an aggregation's output under it reserved a slice's whole buffers once per partition (41.7 MB each).
+  - Reproduction (SQL Server 2022, 1 million rows, the views written by Trino 431, pool 256 MiB): every
+    query failed (`LIMIT 50` after 12-13 s); now `LIMIT 50` answers in 0.2-3.0 s (the whole view: 9.4-19.5 s),
+    and every view and the ordered aggregation answer Trino's rows.
 - JDBC/ODBC metadata as the reference engine lists it, found by the shadow's production-query replay
   (2026-10-02; ISS-064): `system.jdbc.types` has Trino 431's 48 rows (it had 18); the engine's in-memory
   `datafusion` catalog is no longer listed while a client has created nothing in it (`system.jdbc.catalogs`,

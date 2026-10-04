@@ -10,8 +10,8 @@
 //!   function is written as nothing, and the receiving side resolves it by name
 //!   in its own registry (built with the query's settings, so zone-sensitive
 //!   functions see the session zone).
-//! - **Execution plans**: the core's twelve nodes (output accounting, join and
-//!   spill guards, batch sizing, view retyping, the federation barrier).
+//! - **Execution plans**: the core's thirteen nodes (output accounting, join and
+//!   spill guards, aggregation order, batch sizing, view retyping, the federation barrier).
 //!
 //! The format is private to one `CodeLake` version: a coordinator and its
 //! workers run the same build.
@@ -30,6 +30,7 @@ use datafusion_proto::protobuf;
 use prost::Message;
 
 use crate::casts::ToDecimal;
+use crate::constant_keys::ForgetOrderExec;
 use crate::declared::TrinoTyped;
 use crate::federation_guard::FederationFilterBarrier;
 use crate::join_guard::{
@@ -206,6 +207,7 @@ const NULL_AWARE_PROBE_BARRIER: u8 = 9;
 const NESTED_LOOP_WITHOUT_FALLBACK: u8 = 10;
 const JOIN_INPUT_RUNTIME: u8 = 11;
 const NULL_KEYS_KEPT: u8 = 12;
+const FORGET_ORDER: u8 = 13;
 
 fn encode_udf(udf: &ScalarUDF) -> Result<Option<Out>> {
     let inner = udf.inner();
@@ -334,6 +336,9 @@ impl CoreCodec {
         if let Some(n) = node.downcast_ref::<JoinSideBudget>() {
             return Ok(Some(Out::new(JOIN_SIDE_BUDGET).u64(n.budget() as u64)));
         }
+        if node.is::<ForgetOrderExec>() {
+            return tag(FORGET_ORDER);
+        }
         if let Some(n) = node.downcast_ref::<SortMergeWithinCeiling>() {
             return Ok(Some(Out::new(SORT_MERGE_WITHIN_CEILING).u64(n.budget() as u64)));
         }
@@ -381,6 +386,7 @@ impl CoreCodec {
                 let budget = usize::try_from(i.u64()?).map_err(|_| err("budget"))?;
                 Arc::new(SortMergeWithinCeiling::new(input, budget))
             }
+            FORGET_ORDER => Arc::new(ForgetOrderExec::new(input)),
             RETYPE => RetypeExec::portable(input, Arc::new(i.schema()?))?,
             NULL_AWARE_PROBE_BARRIER => Arc::new(NullAwareProbeBarrier::new(input)),
             NESTED_LOOP_WITHOUT_FALLBACK => Arc::new(NestedLoopJoinWithoutFallback::new(input)),

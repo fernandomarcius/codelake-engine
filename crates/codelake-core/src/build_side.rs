@@ -25,6 +25,20 @@
 //! null-aware anti join (`NOT IN`) keeps its sides, as in `JoinSelection`,
 //! and nothing is swapped when `datafusion.optimizer.join_reordering` is
 //! off.
+//!
+//! A swap is decided once per join. A view's plan is optimized when the view
+//! is scanned (Hive views and `DataFusion`'s alike plan it with the session's
+//! rules) and again as part of the plan that reads it, and its joins'
+//! inputs are as unsized the second time as the first: swapping them again
+//! put the query's left input back as the build side. Every view read
+//! directly (two passes) held its remote table whole, a view of a view
+//! (three) did not (shadow run, 2026-10-02: `SELECT * FROM <view> LIMIT 50`
+//! over a SQL Server view of ~5 million rows joined with small views held
+//! six `HashJoinInput` partitions of 450-680 MB under a 4 GiB pool and
+//! failed after 51 s; the same SQL written inline built the small views).
+//! A plan already optimized ends in [`ReservedOutputExec`], which only the
+//! last physical rule puts there: the rule leaves what is below one as it
+//! is.
 
 use std::sync::Arc;
 
@@ -35,6 +49,8 @@ use datafusion::error::Result;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::joins::HashJoinExec;
+
+use crate::output::ReservedOutputExec;
 
 /// Name of [`BuildRightWithoutSizes`].
 pub const BUILD_RIGHT_WITHOUT_SIZES: &str = "codelake_build_right_without_sizes";
@@ -55,6 +71,30 @@ fn swappable(join: &HashJoinExec) -> bool {
     join.join_type().supports_swap() && !join.null_aware
 }
 
+/// Swaps the inputs of the hash joins of `plan` whose inputs the statistics
+/// do not both size, leaving out every plan already optimized (below a
+/// [`ReservedOutputExec`]: a view's, whose joins were decided when it was).
+fn build_right(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
+    if plan.is::<ReservedOutputExec>() {
+        return Ok(Transformed::no(plan));
+    }
+    plan.map_children(build_right)?.transform_parent(|node| {
+        let Some(join) = node.downcast_ref::<HashJoinExec>() else {
+            return Ok(Transformed::no(node));
+        };
+        if !swappable(join) {
+            return Ok(Transformed::no(node));
+        }
+        let left = join.left().partition_statistics(None)?;
+        let right = join.right().partition_statistics(None)?;
+        if sized_alike(&left, &right) {
+            return Ok(Transformed::no(node));
+        }
+        tracing::trace!(join_type = ?join.join_type(), "hash join builds its right input");
+        Ok(Transformed::yes(join.swap_inputs(*join.partition_mode())?))
+    })
+}
+
 /// Physical rule, right before `JoinSelection`: see the module documentation.
 #[derive(Debug, Default)]
 pub struct BuildRightWithoutSizes;
@@ -68,22 +108,7 @@ impl PhysicalOptimizerRule for BuildRightWithoutSizes {
         if !config.optimizer.join_reordering {
             return Ok(plan);
         }
-        plan.transform_up(|node| {
-            let Some(join) = node.downcast_ref::<HashJoinExec>() else {
-                return Ok(Transformed::no(node));
-            };
-            if !swappable(join) {
-                return Ok(Transformed::no(node));
-            }
-            let left = join.left().partition_statistics(None)?;
-            let right = join.right().partition_statistics(None)?;
-            if sized_alike(&left, &right) {
-                return Ok(Transformed::no(node));
-            }
-            tracing::trace!(join_type = ?join.join_type(), "hash join builds its right input");
-            Ok(Transformed::yes(join.swap_inputs(*join.partition_mode())?))
-        })
-        .data()
+        build_right(plan).data()
     }
 
     fn name(&self) -> &'static str {
@@ -203,6 +228,16 @@ mod tests {
     /// type, and its build side: `remote` when it reads the remote table,
     /// else the rows its statistics report.
     async fn joins(ctx: &SessionContext, sql: &str) -> Vec<(String, String)> {
+        let plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
+        plan_joins(&plan)
+    }
+
+    /// The build sides of [`plan_joins`].
+    fn build_sides(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
+        plan_joins(plan).into_iter().map(|(_, build)| build).collect()
+    }
+
+    fn plan_joins(plan: &Arc<dyn ExecutionPlan>) -> Vec<(String, String)> {
         fn walk(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<(String, String)>) {
             if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
                 let text = displayable(join.left().as_ref()).indent(true).to_string();
@@ -221,9 +256,8 @@ mod tests {
                 walk(child, out);
             }
         }
-        let plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
         let mut out = Vec::new();
-        walk(&plan, &mut out);
+        walk(plan, &mut out);
         out
     }
 
@@ -280,6 +314,66 @@ mod tests {
         let full = "SELECT coalesce(c.customer_id, w.id) FROM contracts c FULL JOIN wanted w ON c.customer_id = w.id";
         assert_eq!(joins(&ctx, full).await, one("Partitioned Full", "Exact(3)"));
         assert_eq!(ids(&ctx, full).await, [1, 2, 3, 4, 5, 6, 9]);
+    }
+
+    /// A view's plan is optimized when the view is scanned and again inside
+    /// the plan that reads it: its joins keep the side the first pass
+    /// chose, however deep the view, with the rows of the query written out.
+    #[tokio::test]
+    async fn a_join_inside_a_view_builds_its_right_input_once() {
+        let ctx = session(false).await;
+        let body = "SELECT c.customer_id FROM contracts c JOIN wanted w ON c.customer_id = w.id";
+        for statement in [
+            format!("CREATE VIEW joined AS {body}"),
+            "CREATE VIEW over_joined AS SELECT customer_id FROM joined".to_owned(),
+            "CREATE VIEW anti AS SELECT customer_id FROM contracts c \
+             WHERE NOT EXISTS (SELECT 1 FROM wanted w WHERE w.id = c.customer_id)"
+                .to_owned(),
+        ] {
+            ctx.sql(&statement).await.unwrap().collect().await.unwrap();
+        }
+        let inline = joins(&ctx, body).await;
+        assert_eq!(inline, one("Partitioned Inner", "Exact(3)"));
+        // One view (two passes) and a view of it (three): the same join.
+        for sql in [
+            "SELECT * FROM joined",
+            "SELECT * FROM over_joined",
+            "SELECT * FROM joined LIMIT 5",
+        ] {
+            assert_eq!(joins(&ctx, sql).await, inline, "{sql}");
+            assert_eq!(ids(&ctx, sql).await, [2, 4], "{sql}");
+        }
+        // `NOT EXISTS`: the left anti join builds the subquery's table.
+        assert_eq!(
+            joins(&ctx, "SELECT * FROM anti").await,
+            one("Partitioned RightAnti", "Exact(3)")
+        );
+        assert_eq!(ids(&ctx, "SELECT * FROM anti").await, [1, 3, 5, 6]);
+    }
+
+    /// The rule run again over a plan it already optimized (the root a
+    /// `ReservedOutputExec`) changes nothing; over the same plan without that
+    /// root it decides as on the first pass.
+    #[tokio::test]
+    async fn an_optimized_plan_is_left_as_it_is() {
+        let ctx = session(false).await;
+        let sql = "SELECT c.customer_id FROM contracts c JOIN wanted w ON c.customer_id = w.id";
+        let plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
+        assert!(plan.is::<ReservedOutputExec>());
+        let config = ConfigOptions::default();
+        let again = BuildRightWithoutSizes
+            .optimize(Arc::clone(&plan), &config)
+            .unwrap();
+        assert!(Arc::ptr_eq(&plan, &again));
+        // Below the root, the same joins are swapped again: what a second
+        // pass over a view did.
+        let below = Arc::clone(plan.children()[0]);
+        let swapped = BuildRightWithoutSizes
+            .optimize(Arc::clone(&below), &config)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&below, &swapped));
+        assert_eq!(build_sides(&swapped), ["remote"]);
+        assert_eq!(build_sides(&plan), ["Exact(3)"]);
     }
 
     #[tokio::test]

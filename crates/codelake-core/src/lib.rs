@@ -12,6 +12,7 @@ mod coercion;
 pub mod computed_batches;
 pub mod config;
 pub mod connector;
+pub mod constant_keys;
 mod ddl;
 mod declared;
 mod distinct_counts;

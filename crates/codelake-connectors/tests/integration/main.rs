@@ -62,3 +62,5 @@ mod sqlserver_timestamp_sentinels;
 mod sqlserver_union_text_types;
 #[cfg(all(feature = "sqlserver", feature = "hive"))]
 mod sqlserver_union_timestamp_types;
+#[cfg(all(feature = "sqlserver", feature = "hive"))]
+mod sqlserver_views_memory;

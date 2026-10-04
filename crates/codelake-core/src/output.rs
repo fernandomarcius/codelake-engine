@@ -80,6 +80,14 @@ impl PhysicalOptimizerRule for AccountedOutput {
         }
         let plan = plan
             .transform_up(|node| {
+                // The root of a plan optimized inside this one (a view's):
+                // its batches go to the operator above, not to a client, and
+                // reserving each of them again held a slice's whole buffers
+                // once per partition (an aggregation's output under a view
+                // ordered with `LIMIT`: 41.7 MB per partition, refused).
+                if let Some(nested) = node.downcast_ref::<ReservedOutputExec>() {
+                    return Ok(Transformed::yes(Arc::clone(&nested.input)));
+                }
                 let Some(coalesce) = node.downcast_ref::<CoalescePartitionsExec>() else {
                     return Ok(Transformed::no(node));
                 };
@@ -530,6 +538,40 @@ mod tests {
         let text = plan_text(&engine, "SELECT count(*) FROM generate_series(1, 100000)").await;
         assert!(!text.contains("CoalescePartitionsExec"), "{text}");
         assert!(text.contains("AccountedMergeExec"), "{text}");
+    }
+
+    /// A view's plan, optimized with the engine's rules, ends in its own
+    /// `ReservedOutputExec`; inside the plan that reads it only the root one
+    /// stays.
+    #[tokio::test]
+    async fn only_the_root_reserves_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path(), ByteSize::mib(64), 4);
+        engine
+            .context()
+            .sql("CREATE VIEW numbers AS SELECT value AS v FROM generate_series(1, 1000) WHERE value % 3 = 0")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let text = plan_text(&engine, "SELECT count(*) FROM numbers WHERE v > 10").await;
+        assert_eq!(text.matches("ReservedOutputExec").count(), 1, "{text}");
+        assert!(text.trim_start().starts_with("ReservedOutputExec"), "{text}");
+        let nested: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(
+            Arc::new(ReservedOutputExec::new(Arc::new(
+                datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
+                    datafusion::arrow::datatypes::Schema::empty(),
+                )),
+            ))),
+            0,
+            Some(1),
+        ));
+        let plan = AccountedOutput
+            .optimize(nested, &ConfigOptions::default())
+            .unwrap();
+        let text = displayable(plan.as_ref()).indent(false).to_string();
+        assert_eq!(text.matches("ReservedOutputExec").count(), 1, "{text}");
     }
 
     /// A merge with a limit keeps it, above the accounted merge.
