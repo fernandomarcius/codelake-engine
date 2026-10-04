@@ -900,6 +900,9 @@ async fn sqlserver_audit_injection_2022() {
 // Items 6 and 10: pooling, concurrency and consumer cancellation.
 // ---------------------------------------------------------------------------
 
+/// A read of 3000 rows of which the engine keeps 5, its limit kept local.
+const PARTIAL: &str = "SELECT id FROM erp1.dbo.muitas WHERE random() >= 0 LIMIT 5 OFFSET 1";
+
 #[allow(clippy::too_many_lines, reason = "two pool scenarios sharing one container")]
 async fn pool_and_cancel(tag: &str) {
     let mut checks = Checks::new();
@@ -963,15 +966,16 @@ async fn pool_and_cancel(tag: &str) {
         format!("got={concurrent:?}"),
     );
 
-    // Item 10: consume a big result only in part (local LIMIT ... OFFSET, which
-    // is not pushed), then run another query on the same connector.
-    let partial = try_rows(&engine, "SELECT id FROM erp1.dbo.muitas LIMIT 5 OFFSET 1").await;
+    // Item 10: consume a big result only in part (a local LIMIT ... OFFSET:
+    // a filter the source cannot evaluate keeps it from reaching SQL Server
+    // as `TOP`), then run another query on the same connector.
+    let partial = try_rows(&engine, PARTIAL).await;
     checks.check(
         "10a partial consumption of a 3000-row scan returns 5 rows",
         partial.as_ref().is_ok_and(|r| r.len() == 5),
         format!("got_len={:?}", partial.as_ref().map(Vec::len)),
     );
-    let partial_plan = physical_plan(&engine, "SELECT id FROM erp1.dbo.muitas LIMIT 5 OFFSET 1").await;
+    let partial_plan = physical_plan(&engine, PARTIAL).await;
     let partial_remote = partial_plan.as_deref().map(remote_sqls).unwrap_or_default();
     checks.note(format!(
         "partial-consume remote SQL (must NOT carry TOP, so the stream is abandoned mid-way): {partial_remote:?}"
@@ -991,7 +995,10 @@ async fn pool_and_cancel(tag: &str) {
     let after2 = tokio::time::timeout(CONCURRENCY_TIMEOUT, async {
         tokio::join!(
             try_rows(&engine, "SELECT count(*) FROM erp1.dbo.muitas"),
-            try_rows(&engine, "SELECT id FROM erp1.dbo.muitas LIMIT 3 OFFSET 1"),
+            try_rows(
+                &engine,
+                "SELECT id FROM erp1.dbo.muitas WHERE random() >= 0 LIMIT 3 OFFSET 1"
+            ),
             try_rows(&engine, "SELECT count(*) FROM erp1.dbo.a"),
         )
     })
