@@ -46,10 +46,13 @@ gate_coverage() {
 }
 
 # Mutation testing on codelake-core; fails below MUTATION_MIN_CORE percent caught.
+# With every feature, as gate_test builds it: code behind a feature (`portable`)
+# is otherwise neither compiled nor tested, and each of its mutants counts as
+# missed.
 gate_mutants() {
   local extra=()
   [ -n "${MUTANTS_BASE:-}" ] && { git diff "${MUTANTS_BASE}"... > /tmp/pr.diff; extra=(--in-diff /tmp/pr.diff); }
-  cargo mutants --package codelake-core --no-shuffle "${extra[@]+"${extra[@]}"}" || true
+  cargo mutants --package codelake-core --all-features --no-shuffle "${extra[@]+"${extra[@]}"}" || true
   local caught missed timeout score
   caught=$(jq '[.outcomes[] | select(.summary=="CaughtMutant")] | length' mutants.out/outcomes.json)
   missed=$(jq '[.outcomes[] | select(.summary=="MissedMutant")] | length' mutants.out/outcomes.json)
