@@ -53,10 +53,6 @@ impl OptimizerRule for LimitIntoFederation {
         Some(ApplyOrder::TopDown)
     }
 
-    fn supports_rewrite(&self) -> bool {
-        true
-    }
-
     fn rewrite(&self, plan: LogicalPlan, _config: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
         let LogicalPlan::Limit(limit) = &plan else {
             return Ok(Transformed::no(plan));
@@ -185,6 +181,41 @@ mod tests {
             let text = sent(statements);
             assert!(!text.contains("LIMIT"), "{text}");
         }
+    }
+
+    /// Rows a limit keeps, skipped ones included; none for `LIMIT 0`.
+    #[test]
+    fn rows_kept_count_the_skipped_ones() {
+        let limit = |skip, fetch| {
+            let plan = LogicalPlanBuilder::empty(false)
+                .limit(skip, Some(fetch))
+                .unwrap()
+                .build()
+                .unwrap();
+            let LogicalPlan::Limit(limit) = plan else {
+                unreachable!()
+            };
+            rows_kept(&limit)
+        };
+        assert_eq!(limit(0, 5), Some(5));
+        assert_eq!(limit(2, 3), Some(5));
+        assert_eq!(limit(0, 0), None);
+        assert_eq!(LimitIntoFederation.name(), LIMIT_INTO_FEDERATION);
+        assert!(matches!(
+            LimitIntoFederation.apply_order(),
+            Some(ApplyOrder::TopDown)
+        ));
+    }
+
+    /// The rule runs after `DataFusion` pushes limits down, in the engine's
+    /// optimizer.
+    #[test]
+    fn the_rule_runs_after_limits_are_pushed_down() {
+        let rules = crate::engine::optimizer_rules();
+        let names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
+        let pushed = names.iter().position(|n| *n == "push_down_limit").unwrap();
+        let ours = names.iter().position(|n| *n == LIMIT_INTO_FEDERATION).unwrap();
+        assert!(ours > pushed, "{names:?}");
     }
 
     /// The rule applied twice adds one limit.
