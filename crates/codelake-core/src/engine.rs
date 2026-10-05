@@ -816,6 +816,7 @@ impl Engine {
             .with_batch_size(execution.batch_size)
             .with_information_schema(false);
         session = crate::runtime::sort_settings(session, memory);
+        session = crate::runtime::exchange_spill_settings(session);
         session = session.with_option_extension(crate::join_spill::JoinSpillOptions::for_pool(
             memory.limit.as_usize(),
         ));
@@ -2312,6 +2313,9 @@ mod tests {
                 dir.path().display()
             ),
             "RESET datafusion.runtime.memory_limit".to_owned(),
+            // Pinned: exchange spills (`crate::runtime::exchange_spill_settings`).
+            "SET datafusion.execution.max_spill_file_size_bytes = 134217728".to_owned(),
+            "RESET datafusion.execution.max_spill_file_size_bytes".to_owned(),
         ] {
             let err = match engine.sql(&sql).await {
                 Ok(frame) => frame.collect().await.map(|_| ()).unwrap_err(),
