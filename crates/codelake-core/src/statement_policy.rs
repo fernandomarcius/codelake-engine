@@ -269,9 +269,14 @@ mod tests {
     /// The same refusals on plans, which a client reaches without this
     /// module's parser (`datafusion-postgres`, prepared statements).
     #[tokio::test]
-    async fn server_settings_are_refused_on_the_plan() {
+    async fn server_statements_are_refused_on_the_plan() {
         let state = datafusion::prelude::SessionContext::new().state();
         for (sql, refused) in [
+            ("COPY (SELECT 1 AS a) TO '/tmp/x.csv'", true),
+            (
+                "CREATE EXTERNAL TABLE leak (line VARCHAR) STORED AS CSV LOCATION '/etc/hostname'",
+                true,
+            ),
             ("SET datafusion.execution.max_spill_file_size_bytes = 1", true),
             ("RESET datafusion.execution.max_spill_file_size_bytes", true),
             ("SET datafusion.runtime.memory_limit = '1G'", true),
