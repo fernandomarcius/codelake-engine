@@ -293,6 +293,13 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- A query whose exchange spilled from two input tasks at once could hang forever, holding its memory, with
+  no thread running (`DataFusion` 54.1, apache/datafusion#24883): the exchange's spill pool kept two files
+  open and its reader waited on the older one while the batch it needed was in the newer. Every batch an
+  exchange spills now goes to a file of its own, closed before the next one; clients can no longer
+  `SET datafusion.execution.max_spill_file_size_bytes`. Under load, the aggregation by a fixed key hung in 11
+  of 360 runs, now in none of 360; an exchange of 2 000 batches per input under a 64 KiB pool hung in 5 of 5,
+  now in none.
 - Memory, found by the shadow run (2026-10-02, CodeLake 3997959 against Trino 431 over the same sources),
   reading the Warehouse screens' views (a SQL Server table of ~5 million rows joined with small tables
   deduplicated by `ROW_NUMBER`):

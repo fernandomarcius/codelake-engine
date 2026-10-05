@@ -78,6 +78,8 @@ sccache was added keeps working, uncached, with a warning on stderr; rebuild it 
 | `codelake-server` | MEDIUM | 70% (same) |
 
 Score = (caught + timeout) / (caught + missed + timeout). Unviable mutants do not count.
+Mutants are built and tested with every feature, as the unit-test gate builds the crate: code behind a
+feature (`portable`) would otherwise be neither compiled nor tested, and each of its mutants would count as missed.
 
 ## Wrong results are the worst defect
 

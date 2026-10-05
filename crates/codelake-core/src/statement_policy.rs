@@ -5,7 +5,10 @@
 //! how they are committed. `DataFusion` adds statements that read or write any
 //! path the server process can reach (`COPY … TO '<path>'`, `CREATE EXTERNAL
 //! TABLE … LOCATION '<path>'`) and runtime settings that move spill files or
-//! replace the memory pool (`SET datafusion.runtime.*`). They are refused with
+//! replace the memory pool (`SET datafusion.runtime.*`), and the setting the
+//! engine pins so that an exchange's spill cannot deadlock
+//! (`datafusion.execution.max_spill_file_size_bytes`, see
+//! `crate::runtime::exchange_spill_settings`). They are refused with
 //! `NOT_SUPPORTED` before planning, and again on the logical plan, so no
 //! protocol (Trino, PostgreSQL) and no nesting (`EXPLAIN ANALYZE COPY …`)
 //! reaches them.
@@ -33,9 +36,30 @@ fn refused(what: &str) -> DataFusionError {
     ))
 }
 
+/// `DataFusion` settings the engine pins for every query: never a client's
+/// to change either.
+const PINNED_SETTINGS: [&str; 1] = ["datafusion.execution.max_spill_file_size_bytes"];
+
 fn runtime_setting(name: &str) -> DataFusionError {
     DataFusionError::NotImplemented(format!(
         "setting {name} is not supported: runtime settings belong to the server configuration"
+    ))
+}
+
+/// The refusal of setting `name` (any case), if it is the server's.
+fn server_setting(name: &str) -> Option<DataFusionError> {
+    let name = name.to_ascii_lowercase();
+    if name.starts_with(RUNTIME_SETTINGS) {
+        return Some(runtime_setting(&name));
+    }
+    PINNED_SETTINGS
+        .contains(&name.as_str())
+        .then(|| pinned_setting(&name))
+}
+
+fn pinned_setting(name: &str) -> DataFusionError {
+    DataFusionError::NotImplemented(format!(
+        "setting {name} is not supported: the engine pins it so that a spilling exchange cannot hang"
     ))
 }
 
@@ -67,11 +91,7 @@ pub fn check_statement(statement: &DFStatement) -> Result<()> {
         DFStatement::CreateExternalTable(_) => Err(refused("CREATE EXTERNAL TABLE")),
         DFStatement::Explain(explain) => check_statement(&explain.statement),
         DFStatement::Reset(ResetStatement::Variable(name)) => {
-            let name = name.to_string().to_ascii_lowercase();
-            if name.starts_with(RUNTIME_SETTINGS) {
-                return Err(runtime_setting(&name));
-            }
-            Ok(())
+            server_setting(&name.to_string()).map_or(Ok(()), Err)
         }
         DFStatement::Statement(inner) => check_sql_statement(inner),
     }
@@ -91,7 +111,10 @@ fn check_sql_statement(statement: &Statement) -> Result<()> {
             if text.contains(RUNTIME_SETTINGS) {
                 return Err(runtime_setting(RUNTIME_SETTINGS));
             }
-            Ok(())
+            match PINNED_SETTINGS.iter().find(|name| text.contains(*name)) {
+                Some(name) => Err(pinned_setting(name)),
+                None => Ok(()),
+            }
         }
         Statement::Explain { statement, .. } | Statement::Prepare { statement, .. } => {
             check_sql_statement(statement)
@@ -120,16 +143,8 @@ pub fn check_plan(plan: &LogicalPlan) -> Result<()> {
         let refusal = match node {
             LogicalPlan::Copy(_) => Some(refused("COPY")),
             LogicalPlan::Ddl(DdlStatement::CreateExternalTable(_)) => Some(refused("CREATE EXTERNAL TABLE")),
-            LogicalPlan::Statement(PlanStatement::SetVariable(set))
-                if set.variable.to_ascii_lowercase().starts_with(RUNTIME_SETTINGS) =>
-            {
-                Some(runtime_setting(&set.variable))
-            }
-            LogicalPlan::Statement(PlanStatement::ResetVariable(reset))
-                if reset.variable.to_ascii_lowercase().starts_with(RUNTIME_SETTINGS) =>
-            {
-                Some(runtime_setting(&reset.variable))
-            }
+            LogicalPlan::Statement(PlanStatement::SetVariable(set)) => server_setting(&set.variable),
+            LogicalPlan::Statement(PlanStatement::ResetVariable(reset)) => server_setting(&reset.variable),
             _ => None,
         };
         Ok(match refusal {
@@ -242,9 +257,41 @@ mod tests {
             "SET datafusion.runtime.memory_limit = '100G'",
             "SET datafusion.runtime.temp_directory = '/etc'",
             "RESET datafusion.runtime.memory_limit",
+            "SET datafusion.execution.max_spill_file_size_bytes = 134217728",
+            "SET DataFusion.Execution.Max_Spill_File_Size_Bytes TO 1",
+            "RESET datafusion.execution.max_spill_file_size_bytes",
         ] {
             let err = check_statement(&parsed(sql)).unwrap_err();
             assert!(matches!(err, DataFusionError::NotImplemented(_)), "{sql}: {err}");
+        }
+    }
+
+    /// The same refusals on plans, which a client reaches without this
+    /// module's parser (`datafusion-postgres`, prepared statements).
+    #[tokio::test]
+    async fn server_statements_are_refused_on_the_plan() {
+        let state = datafusion::prelude::SessionContext::new().state();
+        for (sql, refused) in [
+            ("COPY (SELECT 1 AS a) TO '/tmp/x.csv'", true),
+            (
+                "CREATE EXTERNAL TABLE leak (line VARCHAR) STORED AS CSV LOCATION '/etc/hostname'",
+                true,
+            ),
+            ("SET datafusion.execution.max_spill_file_size_bytes = 1", true),
+            ("RESET datafusion.execution.max_spill_file_size_bytes", true),
+            ("SET datafusion.runtime.memory_limit = '1G'", true),
+            ("RESET datafusion.runtime.memory_limit", true),
+            ("SET datafusion.execution.batch_size = 1024", false),
+            ("RESET datafusion.execution.batch_size", false),
+        ] {
+            let plan = state.create_logical_plan(sql).await.unwrap();
+            match check_plan(&plan) {
+                Err(err) => {
+                    assert!(refused, "{sql}: {err}");
+                    assert!(matches!(err, DataFusionError::NotImplemented(_)), "{sql}: {err}");
+                }
+                Ok(()) => assert!(!refused, "{sql} passed"),
+            }
         }
     }
 

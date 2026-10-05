@@ -43,6 +43,38 @@ pub(crate) fn sort_settings(session: SessionConfig, memory: &MemoryConfig) -> Se
         .with_sort_spill_reservation_bytes(headroom)
 }
 
+/// Exchange spill settings: every batch a `RepartitionExec` spills goes to a
+/// file of its own (`max_spill_file_size_bytes` = [`EXCHANGE_SPILL_FILE_BYTES`]).
+///
+/// `DataFusion` 54.1 can deadlock otherwise (apache/datafusion#24883, fixed
+/// upstream by #24891, which no 54 release carries). An exchange that does
+/// not keep order shares one spill pool per output partition among all its
+/// input tasks, and a pool's file stays open for the next batches until it
+/// reaches the limit (128 MiB by default). When two input tasks spill at the
+/// same time, the second finds the file taken and opens another: the pool
+/// holds two open files. Its reader reads only the oldest; once that file has
+/// no unread batch it waits for it to grow or close, while the batch it was
+/// told of sits in the newer one, and its partition stops reading its channel.
+/// When the other partition stops the same way, every channel holds data, the
+/// exchange's gate closes, the input tasks wait to send, nothing writes to or
+/// closes the oldest files, and the query hangs, no thread running, holding its
+/// memory. An aggregation under memory pressure did so in about 3% of its
+/// runs under load (`constant_keys::tests`).
+///
+/// With a limit of 0 bytes, the call that spills a batch creates its file,
+/// writes the batch and closes the file before it returns, without waiting
+/// on anything in between: the oldest file a reader waits for is always one a
+/// writer is finishing at that moment. The cost is a file per spilled batch;
+/// only exchanges spill through this pool. Pinned against clients
+/// (`crate::statement_policy`).
+pub(crate) fn exchange_spill_settings(mut session: SessionConfig) -> SessionConfig {
+    session.options_mut().execution.max_spill_file_size_bytes = EXCHANGE_SPILL_FILE_BYTES;
+    session
+}
+
+/// See [`exchange_spill_settings`].
+pub(crate) const EXCHANGE_SPILL_FILE_BYTES: usize = 0;
+
 const SORT_HEADROOM_DIVISOR: usize = 16;
 const MIN_SORT_HEADROOM: usize = 1 << 20;
 const MAX_SORT_HEADROOM: usize = 10 << 20;
@@ -126,6 +158,106 @@ mod tests {
             spill_dir: dir.to_owned(),
             spill_limit: ByteSize::mib(256),
             metadata_cache_limit: ByteSize::mib(1),
+        }
+    }
+
+    /// apache/datafusion#24883 (see [`exchange_spill_settings`]): an
+    /// exchange over two inputs of 2 000 batches each, under a 64 KiB pool
+    /// that makes it spill nearly every batch, read by two partitions that
+    /// yield after each batch. With the pool's files kept open every run hung
+    /// (5 of 5, no thread running); each now ends, in well under a second. The
+    /// timeout only turns a hang into a failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn exchange_spills_from_two_inputs_do_not_hang() {
+        use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::physical_expr::expressions::col;
+        use datafusion::physical_plan::repartition::RepartitionExec;
+        use datafusion::physical_plan::{ExecutionPlan, Partitioning};
+        use futures::StreamExt;
+
+        const BATCHES: i64 = 2_000;
+        const ROWS: i64 = 64;
+        let dir = tempfile::tempdir().unwrap();
+        let memory = MemoryConfig {
+            metadata_cache_limit: ByteSize::b(16 << 10),
+            ..config(dir.path(), ByteSize::b(64 << 10))
+        };
+        let execution = crate::config::ExecutionConfig {
+            batch_size: usize::try_from(ROWS).unwrap(),
+            target_partitions: Some(2),
+            ..crate::config::ExecutionConfig::default()
+        };
+        let engine = crate::Engine::new(&memory, &execution).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let input = |partition: i64| -> Vec<RecordBatch> {
+            (0..BATCHES)
+                .map(|b| {
+                    let keys: Vec<i64> = (0..ROWS).map(|r| (partition * BATCHES + b) * ROWS + r).collect();
+                    let text: Vec<String> = keys.iter().map(|k| format!("{k:0>40}")).collect();
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![
+                            Arc::new(Int64Array::from(keys)),
+                            Arc::new(StringArray::from(text)),
+                        ],
+                    )
+                    .unwrap()
+                })
+                .collect()
+        };
+        let input = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+            &[input(0), input(1)],
+            Arc::clone(&schema),
+            None,
+        )
+        .unwrap();
+        for run in 0..3 {
+            let context = Arc::new(engine.sql("SELECT 1").await.unwrap().task_ctx());
+            assert_eq!(
+                context
+                    .session_config()
+                    .options()
+                    .execution
+                    .max_spill_file_size_bytes,
+                EXCHANGE_SPILL_FILE_BYTES
+            );
+            let exchange: Arc<dyn ExecutionPlan> = Arc::new(
+                RepartitionExec::try_new(
+                    Arc::clone(&input) as Arc<dyn ExecutionPlan>,
+                    Partitioning::Hash(vec![col("k", &schema).unwrap()], 2),
+                )
+                .unwrap(),
+            );
+            let readers: Vec<_> = (0..2)
+                .map(|partition| {
+                    let mut stream = exchange.execute(partition, Arc::clone(&context)).unwrap();
+                    tokio::spawn(async move {
+                        let mut rows = 0;
+                        while let Some(batch) = stream.next().await {
+                            rows += batch.unwrap().num_rows();
+                            tokio::task::yield_now().await;
+                        }
+                        rows
+                    })
+                })
+                .collect();
+            let read = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                futures::future::join_all(readers),
+            )
+            .await;
+            let files = exchange.metrics().and_then(|m| m.spill_count()).unwrap_or(0);
+            let Ok(read) = read else {
+                panic!("run {run} hung after {files} spill files");
+            };
+            let rows: usize = read.into_iter().map(Result::unwrap).sum();
+            assert_eq!(rows, usize::try_from(2 * BATCHES * ROWS).unwrap(), "run {run}");
+            // Vacuous unless both inputs spilled into the pools many times.
+            assert!(files > 100, "run {run}: {files} spill files");
         }
     }
 
