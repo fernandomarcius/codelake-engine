@@ -248,6 +248,30 @@ mod tests {
             .map(datafusion::arrow::array::RecordBatch::num_rows)
             .sum();
         assert_eq!(rows, 33);
+        assert_eq!(UnorderedConstantKeys.name(), UNORDERED_CONSTANT_KEYS);
+        assert!(UnorderedConstantKeys.schema_check());
+        let forget = ForgetOrderExec::new(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+            Arc::new(datafusion::arrow::datatypes::Schema::empty()),
+        )));
+        assert_eq!(forget.name(), "ForgetOrderExec");
+        assert_eq!(forget.maintains_input_order(), [true]);
+        assert_eq!(forget.benefits_from_input_partitioning(), [false]);
+        // Part of the key really sorted on (not a constant): left as it is.
+        let partly = "SELECT k, v % 2, count(*) FROM (SELECT value AS k, value AS v FROM generate_series(1, 100) \
+                      ORDER BY k) GROUP BY k, v % 2";
+        let plan = ctx
+            .sql(partly)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let before = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(before.contains("ordering_mode=PartiallySorted"), "{before}");
+        let after = UnorderedConstantKeys
+            .optimize(plan, &ConfigOptions::default())
+            .unwrap();
+        assert_eq!(displayable(after.as_ref()).indent(true).to_string(), before);
         // A key really sorted on (not a constant) keeps its order.
         let sorted =
             "SELECT k, count(*) FROM (SELECT value AS k FROM generate_series(1, 100) ORDER BY k) GROUP BY k";
