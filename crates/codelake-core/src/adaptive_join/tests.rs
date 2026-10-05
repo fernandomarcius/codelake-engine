@@ -643,7 +643,7 @@ async fn the_nodes_are_transparent_to_the_planner() {
         Arc::new(datafusion::physical_expr::expressions::Column::new("n", 0)),
         Arc::new(datafusion::physical_expr::expressions::Column::new("n", 0)),
     )];
-    let plain = HashJoinExec::try_new(
+    let unbuffered = HashJoinExec::try_new(
         Arc::clone(&side),
         side,
         on,
@@ -655,7 +655,7 @@ async fn the_nodes_are_transparent_to_the_planner() {
         false,
     )
     .unwrap();
-    assert!(!is_buffered(&plain));
+    assert!(!is_buffered(&unbuffered));
     // The sort-merge form built at run time merges through accounted merges.
     let merged = text(&sort_merge(&hash_join, decided.side_budget()).unwrap());
     assert!(merged.contains("SortMergeJoinExec"), "{merged}");
