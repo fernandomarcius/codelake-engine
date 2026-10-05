@@ -78,30 +78,7 @@ impl PhysicalOptimizerRule for AccountedOutput {
         if plan.is::<ReservedOutputExec>() {
             return Ok(plan);
         }
-        let plan = plan
-            .transform_up(|node| {
-                // The root of a plan optimized inside this one (a view's):
-                // its batches go to the operator above, not to a client, and
-                // reserving each of them again held a slice's whole buffers
-                // once per partition (an aggregation's output under a view
-                // ordered with `LIMIT`: 41.7 MB per partition, refused).
-                if let Some(nested) = node.downcast_ref::<ReservedOutputExec>() {
-                    return Ok(Transformed::yes(Arc::clone(&nested.input)));
-                }
-                let Some(coalesce) = node.downcast_ref::<CoalescePartitionsExec>() else {
-                    return Ok(Transformed::no(node));
-                };
-                let input = coalesce.input();
-                if input.output_partitioning().partition_count() < 2 {
-                    return Ok(Transformed::no(node));
-                }
-                let merged = merge(Arc::clone(input));
-                Ok(Transformed::yes(match coalesce.fetch() {
-                    Some(fetch) => Arc::new(GlobalLimitExec::new(merged, 0, Some(fetch))),
-                    None => merged,
-                }))
-            })
-            .data()?;
+        let plan = accounted_merges(plan)?;
         let plan = if plan.output_partitioning().partition_count() > 1 {
             merge(plan)
         } else {
@@ -117,6 +94,37 @@ impl PhysicalOptimizerRule for AccountedOutput {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+/// `plan` with every `CoalescePartitionsExec` of several partitions as an
+/// [`AccountedMergeExec`] (under a `GlobalLimitExec` when it had a limit),
+/// and without the root of a plan optimized inside it (a view's
+/// `ReservedOutputExec`). Also used for plans built while a query runs
+/// (`crate::adaptive_join`).
+pub(crate) fn accounted_merges(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    plan.transform_up(|node| {
+        // The root of a plan optimized inside this one (a view's):
+        // its batches go to the operator above, not to a client, and
+        // reserving each of them again held a slice's whole buffers
+        // once per partition (an aggregation's output under a view
+        // ordered with `LIMIT`: 41.7 MB per partition, refused).
+        if let Some(nested) = node.downcast_ref::<ReservedOutputExec>() {
+            return Ok(Transformed::yes(Arc::clone(&nested.input)));
+        }
+        let Some(coalesce) = node.downcast_ref::<CoalescePartitionsExec>() else {
+            return Ok(Transformed::no(node));
+        };
+        let input = coalesce.input();
+        if input.output_partitioning().partition_count() < 2 {
+            return Ok(Transformed::no(node));
+        }
+        let merged = merge(Arc::clone(input));
+        Ok(Transformed::yes(match coalesce.fetch() {
+            Some(fetch) => Arc::new(GlobalLimitExec::new(merged, 0, Some(fetch))),
+            None => merged,
+        }))
+    })
+    .data()
 }
 
 /// Merges the partitions of its input into one, in no order, like

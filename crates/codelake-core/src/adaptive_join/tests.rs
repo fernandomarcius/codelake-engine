@@ -395,3 +395,278 @@ async fn a_wrapped_plan_still_decides() {
     );
     reserved_goes_to_zero(&engine).await;
 }
+
+// -- The buffer and the run, in isolation ------------------------------------
+
+fn numbers(rows: i64) -> RecordBatch {
+    let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+        datafusion::arrow::datatypes::Field::new("n", datafusion::arrow::datatypes::DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(datafusion::arrow::array::Int64Array::from_iter_values(
+            0..rows,
+        ))],
+    )
+    .unwrap()
+}
+
+/// A buffer of `cap` bytes over a ceiling pool of `pool_bytes`, one
+/// partition.
+fn buffer(
+    cap: usize,
+    pool_bytes: usize,
+) -> (
+    Arc<Buffer>,
+    Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+) {
+    let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> =
+        Arc::new(crate::pool::CeilingPool::new(pool_bytes));
+    let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::clone(&pool))
+        .build_arc()
+        .unwrap();
+    let buffer = Buffer {
+        cap,
+        reservation: Mutex::new(MemoryConsumer::new(BUILD_BUFFER).register(&pool)),
+        spilling: AtomicBool::new(false),
+        spill: SpillManager::new(
+            runtime,
+            SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            numbers(1).schema(),
+        ),
+        partitions: Mutex::new(vec![None]),
+    };
+    (Arc::new(buffer), pool)
+}
+
+/// Batches are held while the buffer fits and given back on release; past
+/// the cap every batch is refused, small ones included.
+#[test]
+fn the_buffer_holds_while_it_fits() {
+    let batch = numbers(1000);
+    let bytes = batch_bytes(&batch);
+    let (buffer, pool) = buffer(2 * bytes, 1 << 30);
+    assert!(buffer.hold(&batch));
+    assert!(buffer.hold(&batch));
+    assert!(!buffer.spilling());
+    assert_eq!(pool.reserved(), 2 * bytes);
+    assert!(!buffer.hold(&batch));
+    assert!(buffer.spilling());
+    assert!(
+        !buffer.hold(&numbers(1)),
+        "once spilling, every batch goes to disk"
+    );
+    assert_eq!(pool.reserved(), 2 * bytes);
+    buffer.release(bytes);
+    assert_eq!(pool.reserved(), bytes);
+    // Refused by the pool, within the cap.
+    let (tight, _) = buffer_with_pool(&batch);
+    assert!(!tight.hold(&batch));
+    assert!(tight.spilling());
+}
+
+fn buffer_with_pool(
+    batch: &RecordBatch,
+) -> (
+    Arc<Buffer>,
+    Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+) {
+    buffer(10 * batch_bytes(batch), batch_bytes(batch) / 2)
+}
+
+/// Batches held in memory go to a file of their own and give their memory
+/// back; the rows read back are the same; settling a spilled buffer does
+/// that for every partition.
+#[tokio::test]
+async fn held_batches_go_to_disk() {
+    let batch = numbers(1000);
+    let bytes = batch_bytes(&batch);
+    let (buffer, pool) = buffer(10 * bytes, 1 << 30);
+    assert_eq!(buffer.settle().unwrap(), Outcome::HashJoin);
+    assert!(buffer.hold(&batch) && buffer.hold(&batch));
+    let mut held = Buffered::default();
+    held.memory.extend([batch.clone(), batch.clone()]);
+    buffer.spill_held(&mut held).unwrap();
+    assert!(held.memory.is_empty());
+    assert_eq!(held.files.len(), 1);
+    assert_eq!(pool.reserved(), 0);
+    let file = held.files.pop().unwrap();
+    let rows: usize = buffer
+        .spill
+        .read_spill_as_stream_unbuffered(file, None)
+        .unwrap()
+        .map(|b| b.unwrap().num_rows())
+        .collect::<Vec<_>>()
+        .await
+        .iter()
+        .sum();
+    assert_eq!(rows, 2000);
+    // Nothing held: no file.
+    buffer.spill_held(&mut held).unwrap();
+    assert!(held.files.is_empty());
+    // Settled after spilling: the partitions' held batches go to disk too.
+    assert!(buffer.hold(&batch));
+    let mut partition = Buffered::default();
+    partition.memory.push_back(batch.clone());
+    *lock(&buffer.partitions) = vec![Some(partition)];
+    buffer.spilling.store(true, Ordering::Release);
+    assert_eq!(buffer.settle().unwrap(), Outcome::SortMerge);
+    let partitions = lock(&buffer.partitions);
+    let settled = partitions[0].as_ref().unwrap();
+    assert!(settled.memory.is_empty());
+    assert_eq!(settled.files.len(), 1);
+    assert_eq!(pool.reserved(), 0);
+}
+
+fn ready_run(buffer: Arc<Buffer>) -> Run {
+    Run {
+        buffer,
+        decision: futures::future::ready(Ok(Outcome::HashJoin)).boxed().shared(),
+        sort_merge: OnceLock::new(),
+    }
+}
+
+/// A run is shared by the output partitions that start while it lives; the
+/// slot holds it until all of them have started, then only its streams do.
+#[test]
+fn a_run_lives_until_every_partition_started_then_with_its_streams() {
+    let slot = Slot::default();
+    let (buffer, _) = buffer(1 << 20, 1 << 30);
+    let first = slot.run(2, || ready_run(Arc::clone(&buffer)));
+    assert!(format!("{first:?}").starts_with("Run"));
+    drop(first);
+    // Not every partition started: the slot keeps the run.
+    let second = slot.run(2, || panic!("the run is shared"));
+    assert!(slot.current().is_some());
+    drop(second);
+    // Both started and their streams are gone: the next execution starts
+    // a run of its own.
+    assert!(slot.current().is_none());
+    let mut started = false;
+    let third = slot.run(1, || {
+        started = true;
+        ready_run(Arc::clone(&buffer))
+    });
+    assert!(started);
+    assert!(slot.current().is_some());
+    drop(third);
+    assert!(slot.current().is_none());
+}
+
+/// Reading a partition back hands each held batch on and gives it back to
+/// the pool when the next one is asked for (or the stream is dropped).
+#[tokio::test]
+async fn read_back_gives_each_batch_back_once_the_next_is_asked() {
+    let batch = numbers(1000);
+    let bytes = batch_bytes(&batch);
+    let (buffer, pool) = buffer(10 * bytes, 1 << 30);
+    for _ in 0..3 {
+        assert!(buffer.hold(&batch));
+    }
+    let mut partition = Buffered::default();
+    partition
+        .memory
+        .extend([batch.clone(), batch.clone(), batch.clone()]);
+    *lock(&buffer.partitions) = vec![Some(partition)];
+    let run = Arc::new(ready_run(Arc::clone(&buffer)));
+    let mut stream = read_back(&run, 0).unwrap();
+    assert!(read_back(&run, 0).is_err(), "a partition is read back once");
+    assert_eq!(pool.reserved(), 3 * bytes);
+    assert_eq!(stream.next().await.unwrap().unwrap().num_rows(), 1000);
+    assert_eq!(pool.reserved(), 3 * bytes, "the batch handed on is still held");
+    stream.next().await.unwrap().unwrap();
+    assert_eq!(pool.reserved(), 2 * bytes);
+    drop(stream);
+    assert_eq!(pool.reserved(), 0);
+}
+
+/// Both nodes pass their input's properties and statistics through and
+/// leave the plan's partitioning alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_nodes_are_transparent_to_the_planner() {
+    fn find(plan: &Arc<dyn ExecutionPlan>, name: &str) -> Option<Arc<dyn ExecutionPlan>> {
+        if plan.name() == name {
+            return Some(Arc::clone(plan));
+        }
+        plan.children().into_iter().find_map(|child| find(child, name))
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path(), crate::ByteSize::mib(64));
+    keyed(&engine, "l", 150_000).await;
+    unsized_table(&engine, "g", &series(3000, 10)).await;
+    let plan = physical(&engine, "SELECT l.k FROM l JOIN g ON l.k = g.k").await;
+    let adaptive = find(&plan, "AdaptiveJoinExec").unwrap();
+    let buffered = find(&plan, "BufferedBuildExec").unwrap();
+    assert!(adaptive.is::<AdaptiveJoinExec>() && buffered.is::<BufferedBuildExec>());
+    for node in [&adaptive, &buffered] {
+        assert_eq!(node.maintains_input_order(), [true]);
+        assert_eq!(node.benefits_from_input_partitioning(), [false]);
+        let child = node.children()[0];
+        assert_eq!(
+            node.properties().output_partitioning(),
+            child.properties().output_partitioning()
+        );
+    }
+    let rows = numbers(2000);
+    let scan: Arc<dyn ExecutionPlan> = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+        &[vec![rows.clone()]],
+        rows.schema(),
+        None,
+    )
+    .unwrap();
+    let sized = BufferedBuildExec::new(scan);
+    assert_eq!(
+        sized.partition_statistics(None).unwrap().num_rows,
+        datafusion::common::stats::Precision::Exact(2000)
+    );
+    let decided = adaptive.downcast_ref::<AdaptiveJoinExec>().unwrap();
+    assert!(decided.cap() > 1 && decided.side_budget() > decided.cap());
+    assert_eq!(
+        displayable(adaptive.as_ref()).one_line().to_string().trim(),
+        format!(
+            "AdaptiveJoinExec: hash_join_build_bytes={}, sort_merge_side_bytes={}",
+            decided.cap(),
+            decided.side_budget()
+        )
+    );
+    let hash_join = Arc::clone(adaptive.children()[0]);
+    assert!(is_buffered(hash_join.downcast_ref::<HashJoinExec>().unwrap()));
+    let rows = numbers(10);
+    let side: Arc<dyn ExecutionPlan> = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+        &[vec![rows.clone()]],
+        rows.schema(),
+        None,
+    )
+    .unwrap();
+    let on: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> = vec![(
+        Arc::new(datafusion::physical_expr::expressions::Column::new("n", 0)),
+        Arc::new(datafusion::physical_expr::expressions::Column::new("n", 0)),
+    )];
+    let plain = HashJoinExec::try_new(
+        Arc::clone(&side),
+        side,
+        on,
+        None,
+        &datafusion::common::JoinType::Inner,
+        None,
+        datafusion::physical_plan::joins::PartitionMode::CollectLeft,
+        datafusion::common::NullEquality::NullEqualsNothing,
+        false,
+    )
+    .unwrap();
+    assert!(!is_buffered(&plain));
+    // The sort-merge form built at run time merges through accounted merges.
+    let merged = text(&sort_merge(&hash_join, decided.side_budget()).unwrap());
+    assert!(merged.contains("SortMergeJoinExec"), "{merged}");
+    assert!(merged.contains("AccountedMergeExec"), "{merged}");
+    assert!(!merged.contains("CoalescePartitionsExec"), "{merged}");
+    // 64 MiB less the exchange slice, halved; less the hash table's 5/2.
+    let slice = crate::join_spill::join_slice(64 << 20, 1);
+    assert_eq!(decided.cap(), crate::join_spill::build_rows_within(slice));
+    assert_eq!(decided.side_budget(), crate::join_spill::side_budget(64 << 20));
+    assert_eq!(
+        displayable(buffered.as_ref()).one_line().to_string().trim(),
+        "BufferedBuildExec"
+    );
+}

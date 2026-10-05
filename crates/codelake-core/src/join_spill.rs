@@ -1249,6 +1249,19 @@ mod tests {
     }
 
     #[test]
+    fn unknown_or_doubtful_sizes_are_decided_at_run_time() {
+        let slice = 10 * MIB;
+        assert!(decided_at_run_time(BuildEstimate::Unknown, slice));
+        assert!(!decided_at_run_time(BuildEstimate::Inexact(slice), slice));
+        assert!(decided_at_run_time(BuildEstimate::Inexact(slice + 1), slice));
+        assert!(!decided_at_run_time(BuildEstimate::Inexact(slice - 1), slice));
+        assert!(!decided_at_run_time(BuildEstimate::Exact(slice + 1), slice));
+        // The slice less the 5/2 overhead of the estimate.
+        assert_eq!(build_rows_within(100), 40);
+        assert_eq!(build_rows_within(10 * MIB), 4 * MIB);
+    }
+
+    #[test]
     fn exact_estimates_count_as_they_are_inexact_ones_twice_over() {
         let slice = 10 * MIB;
         assert!(!exceeds_slice(BuildEstimate::Exact(slice), slice));

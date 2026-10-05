@@ -47,7 +47,6 @@ use datafusion::execution::disk_manager::RefCountedTempFile;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
 use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet, SpillMetrics};
@@ -57,8 +56,6 @@ use datafusion::physical_plan::{
 };
 use futures::future::{BoxFuture, Shared};
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
-
-use crate::output::AccountedMergeExec;
 
 /// Consumer name of the buffered build side.
 pub const BUILD_BUFFER: &str = "HashJoinBuildBuffer";
@@ -698,13 +695,7 @@ fn sort_merge(join: &Arc<dyn ExecutionPlan>, side_budget: usize) -> Result<Arc<d
     let plan = crate::join_spill::sort_merge_of(join, side_budget)?.ok_or_else(|| {
         DataFusionError::Internal("AdaptiveJoinExec: the hash join has no sort-merge form".into())
     })?;
-    plan.transform_up(|node| match node.downcast_ref::<CoalescePartitionsExec>() {
-        Some(merge) if merge.fetch().is_none() => Ok(Transformed::yes(Arc::new(AccountedMergeExec::new(
-            Arc::clone(merge.input()),
-        )) as Arc<dyn ExecutionPlan>)),
-        _ => Ok(Transformed::no(node)),
-    })
-    .data()
+    crate::output::accounted_merges(plan)
 }
 
 #[cfg(test)]
