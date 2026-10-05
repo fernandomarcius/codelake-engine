@@ -302,6 +302,8 @@ fn trino_literal(value: &ScalarValue) -> String {
 /// null-safe join guard right before `FilterPushdown(Post)` (it must see the
 /// build and probe sides `JoinSelection` picked; see [`crate::join_guard`]),
 /// and followed by
+/// [`crate::constant_keys::UnorderedConstantKeys`], which plans an aggregation
+/// grouped by a column a filter fixed as unordered (so that it spills),
 /// [`PlainViews`], which keeps string views out of operators that retain rows
 /// (ADR 0003), [`ComputedBatches`], which sizes the batches of computed values
 /// in bytes, the nested loop join spill guard ([`crate::join_guard`]), and
@@ -316,6 +318,7 @@ pub(crate) fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Syn
     let rules = crate::join_guard::with_null_safe_join_guard(rules);
     let mut rules = guard_aggregate_statistics(rules);
     rules.extend(crate::trino_functions::physical_rules());
+    rules.push(Arc::new(crate::constant_keys::UnorderedConstantKeys));
     rules.push(Arc::new(PlainViews));
     rules.push(Arc::new(ComputedBatches));
     rules.push(Arc::new(NestedLoopJoinSpillGuard));

@@ -154,6 +154,33 @@
   collects a small input and orders sized inputs as before. A null-aware anti
   join keeps its sides, and `datafusion.optimizer.join_reordering = false`
   keeps the query's order.
+  Amended 2026-10-02: the side is decided once per join. A view's plan is
+  optimized when the view is scanned (Hive views and `DataFusion`'s alike)
+  and again inside the plan that reads it, with inputs as unsized as the
+  first time: the second pass swapped the joins back, so every view read
+  directly built its left input, the remote table (a view of a view, three
+  passes, did not). The shadow run found it on 2026-10-02: `SELECT * FROM
+  <view> LIMIT 50` over a SQL Server table of ~5 million rows joined with
+  small tables held six `HashJoinInput` partitions of 450-680 MB under a 4
+  GiB pool and failed after 51 s (Trino 431: 4.2 s), and a view that fit
+  took 30.7 s for its first 50 rows: the whole remote table was read
+  before the first probe. A plan already optimized ends in
+  `ReservedOutputExec` (the last physical rule's node); the rule leaves what
+  is below one as it is.
+- Aggregations grouped by a column a filter fixes run unordered
+  (`codelake_core::constant_keys`, 2026-10-02). `DataFusion` reads a column
+  fixed by a filter or a join (`t = 2`) as sorted, and an aggregation whose
+  keys hold one as reading input partly sorted
+  (`ordering_mode=PartiallySorted`): it waits for that part of the key to
+  change to close groups, which a constant never does. The partial
+  aggregation, which emits early when refused memory, then emits nothing and
+  fails at its share (`can spill: true`, shadow run: 4.78 million rows by 17
+  keys, one fixed by its join, failed after 20-30 s under 4 GiB; Trino 34 s),
+  and the plain-strings rule above leaves it out. Such an aggregation now
+  reads its input through a node whose properties say nothing
+  (`ForgetOrderExec`), and is planned unordered: it emits early and spills.
+  An ordering on constant columns holds in any order, so nothing above it
+  changes.
 - Spill goes to a dedicated directory bounded by `memory.spill_limit`; the
   Kubernetes volume has its own `sizeLimit` above that value.
 - When memory and spill are exhausted, the query fails with a resources error;
@@ -234,6 +261,15 @@ cannot size fails cleanly (220 MiB `generate_series` build under 128 MiB:
   type), an aggregation of 1M groups 121 MiB (spilled 424 MiB, counts right), a
   220 MiB hash join build 116 MiB (`EXCEEDED_LOCAL_MEMORY_LIMIT`: its
   `generate_series` inputs have no statistics, so it stays a hash join).
+- Views over a remote table larger than the pool
+  (`crates/codelake-connectors/tests/integration/sqlserver_views_memory.rs`,
+  SQL Server 2022 table of 1 million rows, Hive views written by Trino 431,
+  pool 256 MiB, 6 partitions): before the 2026-10-02 fixes every query
+  failed (`LIMIT 50` over three views after 12-13 s, their whole reads and
+  the 17-key aggregation with `EXCEEDED_LOCAL_MEMORY_LIMIT` or a refused
+  sort); after, `LIMIT 50` answers in 0.2-3.0 s against 9.4-19.5 s for the
+  whole view, every whole view and the ordered aggregation answer Trino's
+  rows, and the pool peaks at 232 MB.
 - Hash joins over the pool (`join_spill`): in process
   (`join_spill::tests::a_build_side_larger_than_the_pool_completes_as_a_sort_merge_join`),
   a ~20 MB build under 16 MiB fails as a hash join (`Resources exhausted`) and
