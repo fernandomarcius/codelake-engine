@@ -36,6 +36,10 @@ limitations under the License.
 //   the hash join; column byte sizes from statistics replace the width guess
 //   when the source reports them;
 // - switched by a session property (`sort_merge_oversized_joins`).
+//
+// Modified by CodeLake contributors, 2026-10-02: a build side of unknown
+// size is no longer kept a hash join; it is decided at run time
+// (`crate::adaptive_join`), from this rule's slice and sort-merge form.
 
 //! Hash joins whose build side does not fit the memory pool run as
 //! sort-merge joins, which spill (ADR 0003).
@@ -94,10 +98,12 @@ limitations under the License.
 //! The estimate ([`build_estimate`]) is rows × bytes per row × 5/2 (the hash
 //! table and the batches it concatenates). A row count the source knows
 //! exactly is used as it is; an estimate (`Inexact`: a filter's selectivity,
-//! a metastore count) must exceed the slice twice over; a build side of
-//! unknown size keeps the hash join, which fails cleanly if it does not fit.
-//! Statistics steer the choice of operator only: both operators answer the
-//! same rows.
+//! a metastore count) must exceed the slice twice over. A build side of
+//! unknown size, or estimated past the slice but within that margin, is
+//! decided at run time ([`crate::adaptive_join`]): the join reads it first,
+//! and runs as a hash join when it fits the slice, as this sort-merge join
+//! when it does not. Statistics steer the choice of operator only: both
+//! operators answer the same rows.
 
 use std::fmt;
 use std::pin::Pin;
@@ -111,7 +117,7 @@ use datafusion::arrow::datatypes::{DataType, IntervalUnit, Schema, SchemaRef};
 use datafusion::common::config::{ConfigExtension, ConfigOptions};
 use datafusion::common::extensions_options;
 use datafusion::common::stats::Precision;
-use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{JoinType, NullEquality, Statistics};
 use datafusion::common::{human_readable_size, resources_datafusion_err};
 use datafusion::error::{DataFusionError, Result};
@@ -132,6 +138,7 @@ use datafusion::physical_plan::{
 
 use futures::{Stream, StreamExt};
 
+use crate::adaptive_join::AdaptiveJoinExec;
 use crate::pool::{BUFFERS_DIVISOR, is_exchange_buffer};
 
 /// Name of [`SortMergeOversizedJoins`].
@@ -219,12 +226,47 @@ pub fn shared_side_budget(pool_bytes: usize, joins: usize, floor: usize) -> usiz
     (budget / joins.max(1)).max(floor.min(budget))
 }
 
+/// `plan` with the joins decided at run time inside an input of a
+/// rewritten join ([`JoinSideBudget`]) put back as the hash joins they were.
+fn within_budgets(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    plan.transform_down(|node| {
+        if !node.is::<JoinSideBudget>() {
+            return Ok(Transformed::no(node));
+        }
+        let input = crate::adaptive_join::plain_hash_joins(Arc::clone(node.children()[0]))?;
+        Ok(Transformed::new(
+            Arc::clone(&node).with_new_children(vec![input])?,
+            true,
+            TreeNodeRecursion::Jump,
+        ))
+    })
+    .data()
+}
+
 /// Rewritten joins of `plan` that are not inside an input of another one.
 fn outermost_rewrites(plan: &Arc<dyn ExecutionPlan>) -> usize {
     if plan.is::<SortMergeWithinCeiling>() {
         return 1;
     }
     plan.children().into_iter().map(outermost_rewrites).sum()
+}
+
+/// Whether a hash join whose build side is `estimate`, which fits `slice`
+/// as far as the planner knows, decides at run time
+/// ([`crate::adaptive_join`]): its size is unknown, or an estimate past
+/// the slice but within the margin an estimate is given.
+pub fn decided_at_run_time(estimate: BuildEstimate, slice: usize) -> bool {
+    match estimate {
+        BuildEstimate::Unknown => true,
+        BuildEstimate::Inexact(bytes) => bytes > slice,
+        BuildEstimate::Exact(_) => false,
+    }
+}
+
+/// Bytes of build rows a hash join may hold within `slice`: the slice less
+/// the hash table overhead [`estimate`] assumes.
+pub fn build_rows_within(slice: usize) -> usize {
+    slice / OVERHEAD_NUM * OVERHEAD_DEN
 }
 
 /// Whether a build side of `estimate` does not fit `slice`.
@@ -470,6 +512,13 @@ fn sorted_stream(
 /// one batch. The join then runs as one stream and its output is spread again
 /// as the hash join's was: by the same hash, which a partitioned parent pairs
 /// with its other input, or round robin.
+pub(crate) fn sort_merge_of(
+    join: &HashJoinExec,
+    side_budget: usize,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    sort_merge(join, side_budget)
+}
+
 fn sort_merge(join: &HashJoinExec, side_budget: usize) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     let left = below_exchange(join.left());
     let right = below_exchange(join.right());
@@ -562,8 +611,9 @@ fn budgeted(consumer: &MemoryConsumer) -> bool {
 
 /// Consumer names of the state `DataFusion` 54's joins hold (build sides,
 /// bitmaps, the sort-merge join's buffered rows).
-pub const JOIN_STATE: [&str; 6] = [
+pub const JOIN_STATE: [&str; 7] = [
     "HashJoinInput",
+    crate::adaptive_join::BUILD_BUFFER,
     "CrossJoinExec",
     "NestedLoopJoin",
     "PiecewiseMergeJoinInput",
@@ -1073,8 +1123,22 @@ impl PhysicalOptimizerRule for SortMergeOversizedJoins {
                     tracing::trace!(reason, "hash join kept");
                     return Ok(Transformed::no(node));
                 }
+                if crate::adaptive_join::is_buffered(join) {
+                    // Wrapped when a view's plan was optimized.
+                    return Ok(Transformed::no(node));
+                }
                 let estimate = build_estimate(below_exchange(join.left()).as_ref());
                 if !exceeds_slice(estimate, slice) {
+                    if decided_at_run_time(estimate, slice) && sort_merge(join, side_budget)?.is_some() {
+                        tracing::debug!(?estimate, slice, "hash join decided at run time");
+                        let cap = build_rows_within(slice);
+                        return Ok(Transformed::yes(AdaptiveJoinExec::wrap(
+                            &node,
+                            join,
+                            cap,
+                            side_budget,
+                        )?));
+                    }
                     return Ok(Transformed::no(node));
                 }
                 match sort_merge(join, side_budget)? {
@@ -1086,6 +1150,10 @@ impl PhysicalOptimizerRule for SortMergeOversizedJoins {
                 }
             })
             .data()?;
+        // A join inside an input of a rewritten join stays a hash join,
+        // bounded by the engine's pool as before: decided at run time, its
+        // sort-merge form would run within that input's budget.
+        let plan = within_budgets(plan)?;
         // Rewritten joins side by side (a UNION ALL of two) run at once:
         // their inputs share what one join's inputs would get. A join inside
         // an input of another already runs within that input's budget.
@@ -1178,6 +1246,19 @@ mod tests {
         assert_eq!(join_slice(128 * MIB, 4), 28 * MIB);
         assert_eq!(join_slice(0, 3), 0);
         assert_eq!(join_slice(usize::MAX, 1), (usize::MAX - usize::MAX / 8) / 2);
+    }
+
+    #[test]
+    fn unknown_or_doubtful_sizes_are_decided_at_run_time() {
+        let slice = 10 * MIB;
+        assert!(decided_at_run_time(BuildEstimate::Unknown, slice));
+        assert!(!decided_at_run_time(BuildEstimate::Inexact(slice), slice));
+        assert!(decided_at_run_time(BuildEstimate::Inexact(slice + 1), slice));
+        assert!(!decided_at_run_time(BuildEstimate::Inexact(slice - 1), slice));
+        assert!(!decided_at_run_time(BuildEstimate::Exact(slice + 1), slice));
+        // The slice less the 5/2 overhead of the estimate.
+        assert_eq!(build_rows_within(100), 40);
+        assert_eq!(build_rows_within(10 * MIB), 4 * MIB);
     }
 
     #[test]

@@ -78,30 +78,7 @@ impl PhysicalOptimizerRule for AccountedOutput {
         if plan.is::<ReservedOutputExec>() {
             return Ok(plan);
         }
-        let plan = plan
-            .transform_up(|node| {
-                // The root of a plan optimized inside this one (a view's):
-                // its batches go to the operator above, not to a client, and
-                // reserving each of them again held a slice's whole buffers
-                // once per partition (an aggregation's output under a view
-                // ordered with `LIMIT`: 41.7 MB per partition, refused).
-                if let Some(nested) = node.downcast_ref::<ReservedOutputExec>() {
-                    return Ok(Transformed::yes(Arc::clone(&nested.input)));
-                }
-                let Some(coalesce) = node.downcast_ref::<CoalescePartitionsExec>() else {
-                    return Ok(Transformed::no(node));
-                };
-                let input = coalesce.input();
-                if input.output_partitioning().partition_count() < 2 {
-                    return Ok(Transformed::no(node));
-                }
-                let merged = merge(Arc::clone(input));
-                Ok(Transformed::yes(match coalesce.fetch() {
-                    Some(fetch) => Arc::new(GlobalLimitExec::new(merged, 0, Some(fetch))),
-                    None => merged,
-                }))
-            })
-            .data()?;
+        let plan = accounted_merges(plan)?;
         let plan = if plan.output_partitioning().partition_count() > 1 {
             merge(plan)
         } else {
@@ -117,6 +94,37 @@ impl PhysicalOptimizerRule for AccountedOutput {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+/// `plan` with every `CoalescePartitionsExec` of several partitions as an
+/// [`AccountedMergeExec`] (under a `GlobalLimitExec` when it had a limit),
+/// and without the root of a plan optimized inside it (a view's
+/// `ReservedOutputExec`). Also used for plans built while a query runs
+/// (`crate::adaptive_join`).
+pub(crate) fn accounted_merges(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    plan.transform_up(|node| {
+        // The root of a plan optimized inside this one (a view's):
+        // its batches go to the operator above, not to a client, and
+        // reserving each of them again held a slice's whole buffers
+        // once per partition (an aggregation's output under a view
+        // ordered with `LIMIT`: 41.7 MB per partition, refused).
+        if let Some(nested) = node.downcast_ref::<ReservedOutputExec>() {
+            return Ok(Transformed::yes(Arc::clone(&nested.input)));
+        }
+        let Some(coalesce) = node.downcast_ref::<CoalescePartitionsExec>() else {
+            return Ok(Transformed::no(node));
+        };
+        let input = coalesce.input();
+        if input.output_partitioning().partition_count() < 2 {
+            return Ok(Transformed::no(node));
+        }
+        let merged = merge(Arc::clone(input));
+        Ok(Transformed::yes(match coalesce.fetch() {
+            Some(fetch) => Arc::new(GlobalLimitExec::new(merged, 0, Some(fetch))),
+            None => merged,
+        }))
+    })
+    .data()
 }
 
 /// Merges the partitions of its input into one, in no order, like
@@ -247,6 +255,16 @@ const SPILL_CHUNK_BYTES: usize = 1 << 20;
 /// writer would copy into each chunk: string and binary views are compacted
 /// per chunk, and a batch with a view nested in another type is written whole.
 fn spill_in_chunks(batch: &RecordBatch, spill: &SpillManager) -> Result<Option<RefCountedTempFile>> {
+    let mut file = spill.create_in_progress_file(MERGE_CONSUMER)?;
+    for chunk in spill_chunks(batch)? {
+        file.append_batch(&chunk)?;
+    }
+    file.finish()
+}
+
+/// `batch` in the chunks [`spill_in_chunks`] writes: about
+/// [`SPILL_CHUNK_BYTES`] each, string views compacted.
+pub(crate) fn spill_chunks(batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
     let rows = batch.num_rows();
     let nested = batch.schema().fields().iter().any(|f| f.data_type().is_nested());
     let bytes = batch.get_array_memory_size().max(1);
@@ -257,14 +275,14 @@ fn spill_in_chunks(batch: &RecordBatch, spill: &SpillManager) -> Result<Option<R
             .div_ceil(bytes)
             .clamp(1, rows.max(1))
     };
-    let mut file = spill.create_in_progress_file(MERGE_CONSUMER)?;
+    let mut chunks = Vec::with_capacity(rows.div_ceil(per_chunk.max(1)));
     let mut start = 0;
     while start < rows {
         let len = per_chunk.min(rows - start);
-        file.append_batch(&compact_views(&batch.slice(start, len))?)?;
+        chunks.push(compact_views(&batch.slice(start, len))?);
         start += len;
     }
-    file.finish()
+    Ok(chunks)
 }
 
 /// `batch` with its string and binary views holding only the bytes they use.
@@ -572,6 +590,41 @@ mod tests {
             .unwrap();
         let text = displayable(plan.as_ref()).indent(false).to_string();
         assert_eq!(text.matches("ReservedOutputExec").count(), 1, "{text}");
+    }
+
+    /// A merge of two partitions or more becomes the accounted merge; one of
+    /// a single partition has nothing to merge and stays.
+    #[test]
+    fn merges_of_several_partitions_are_accounted() {
+        use datafusion::physical_plan::repartition::RepartitionExec;
+        let leaf: Arc<dyn ExecutionPlan> = Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+            Arc::new(datafusion::arrow::datatypes::Schema::empty()),
+        ));
+        let spread = |n| -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                RepartitionExec::try_new(
+                    Arc::clone(&leaf),
+                    datafusion::physical_plan::Partitioning::RoundRobinBatch(n),
+                )
+                .unwrap(),
+            )
+        };
+        for (partitions, accounted) in [(2, true), (3, true), (1, false)] {
+            let merge: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(spread(partitions)));
+            let text = displayable(accounted_merges(merge).unwrap().as_ref())
+                .indent(false)
+                .to_string();
+            assert_eq!(
+                text.contains("AccountedMergeExec"),
+                accounted,
+                "{partitions}: {text}"
+            );
+            assert_eq!(
+                text.contains("CoalescePartitionsExec"),
+                !accounted,
+                "{partitions}: {text}"
+            );
+        }
     }
 
     /// A merge with a limit keeps it, above the accounted merge.

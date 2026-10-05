@@ -165,6 +165,12 @@ versioning: [SemVer](https://semver.org/).
   fronts' Definition of Done (docs/gates.md).
 
 ### Changed
+- A hash join whose build side the planner cannot size (a federated source, anything joined or aggregated
+  above one) reads that side first and decides (ADR 0003): it runs as a hash join when the side fits the
+  join's slice of the pool, and otherwise writes it to disk and runs as the sort-merge join that spills. It
+  failed with `EXCEEDED_LOCAL_MEMORY_LIMIT`: a 220 MiB build of unknown size under a 128 MiB pool now
+  answers its rows (113 MiB of growth, 286 MiB spilled); ~30 MB under 16 MiB, every join type, the same rows
+  as the hash join. `sort_merge_oversized_joins = false` turns it off with the planned rewrite.
 - **Breaking (ISS-060, awaiting confirmation):** a PostgreSQL `numeric` without precision, or with more than
   38 digits, and arrays of them, are left out of their relation by default, as the reference engine's
   `decimal-mapping=STRICT` leaves them (they were `decimal(38,20)`): absent from `SELECT *`,

@@ -594,10 +594,12 @@ async fn heavy_aggregation_spills_under_the_ceiling() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A hash join whose build side (either one) is ~220 MiB, under 128 MiB: the
-/// right numbers or `EXCEEDED_LOCAL_MEMORY_LIMIT`, within the budget either way.
+/// A hash join whose build side (either one, of unknown size: a series has
+/// no statistics) is ~220 MiB, under 128 MiB: it reads its build side, which
+/// does not fit, to disk and runs as a sort-merge join (ADR 0003): the right
+/// numbers, within the budget. It failed with `EXCEEDED_LOCAL_MEMORY_LIMIT`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn heavy_hash_join_fails_cleanly_under_the_ceiling() {
+async fn heavy_hash_join_of_unknown_size_spills_under_the_ceiling() {
     // Digits of 1..=1,000,000: 9*1 + 90*2 + 900*3 + 9000*4 + 90000*5 + 900000*6 + 7.
     let digits: i64 = 5_888_896;
     let (report, wrong) = heavy(
@@ -612,7 +614,7 @@ async fn heavy_hash_join_fails_cleanly_under_the_ceiling() {
             500_000_500_000_i64,
             2 * (200 * 1_000_000 + digits)
         ])],
-        false,
+        true,
     )
     .await;
     eprintln!("{report}");

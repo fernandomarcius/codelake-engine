@@ -10,8 +10,8 @@
 //!   function is written as nothing, and the receiving side resolves it by name
 //!   in its own registry (built with the query's settings, so zone-sensitive
 //!   functions see the session zone).
-//! - **Execution plans**: the core's thirteen nodes (output accounting, join and
-//!   spill guards, aggregation order, batch sizing, view retyping, the federation barrier).
+//! - **Execution plans**: the core's fifteen nodes (output accounting, join and
+//!   spill guards, run-time join choice, aggregation order, batch sizing, view retyping, the federation barrier).
 //!
 //! The format is private to one `CodeLake` version: a coordinator and its
 //! workers run the same build.
@@ -29,6 +29,7 @@ use datafusion_proto::physical_plan::to_proto::serialize_physical_expr;
 use datafusion_proto::protobuf;
 use prost::Message;
 
+use crate::adaptive_join::{AdaptiveJoinExec, BufferedBuildExec};
 use crate::casts::ToDecimal;
 use crate::constant_keys::ForgetOrderExec;
 use crate::declared::TrinoTyped;
@@ -208,6 +209,8 @@ const NESTED_LOOP_WITHOUT_FALLBACK: u8 = 10;
 const JOIN_INPUT_RUNTIME: u8 = 11;
 const NULL_KEYS_KEPT: u8 = 12;
 const FORGET_ORDER: u8 = 13;
+const ADAPTIVE_JOIN: u8 = 14;
+const BUFFERED_BUILD: u8 = 15;
 
 fn encode_udf(udf: &ScalarUDF) -> Result<Option<Out>> {
     let inner = udf.inner();
@@ -336,6 +339,16 @@ impl CoreCodec {
         if let Some(n) = node.downcast_ref::<JoinSideBudget>() {
             return Ok(Some(Out::new(JOIN_SIDE_BUDGET).u64(n.budget() as u64)));
         }
+        if let Some(n) = node.downcast_ref::<AdaptiveJoinExec>() {
+            return Ok(Some(
+                Out::new(ADAPTIVE_JOIN)
+                    .u64(n.cap() as u64)
+                    .u64(n.side_budget() as u64),
+            ));
+        }
+        if node.is::<BufferedBuildExec>() {
+            return tag(BUFFERED_BUILD);
+        }
         if node.is::<ForgetOrderExec>() {
             return tag(FORGET_ORDER);
         }
@@ -386,6 +399,12 @@ impl CoreCodec {
                 let budget = usize::try_from(i.u64()?).map_err(|_| err("budget"))?;
                 Arc::new(SortMergeWithinCeiling::new(input, budget))
             }
+            ADAPTIVE_JOIN => {
+                let cap = usize::try_from(i.u64()?).map_err(|_| err("cap"))?;
+                let side_budget = usize::try_from(i.u64()?).map_err(|_| err("budget"))?;
+                Arc::new(AdaptiveJoinExec::new(input, cap, side_budget))
+            }
+            BUFFERED_BUILD => Arc::new(BufferedBuildExec::new(input)),
             FORGET_ORDER => Arc::new(ForgetOrderExec::new(input)),
             RETYPE => RetypeExec::portable(input, Arc::new(i.schema()?))?,
             NULL_AWARE_PROBE_BARRIER => Arc::new(NullAwareProbeBarrier::new(input)),
