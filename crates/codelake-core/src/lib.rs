@@ -21,6 +21,7 @@ mod dml_guard;
 pub mod engine;
 pub mod env_refs;
 mod federated_dynamic_filters;
+pub mod federated_limit;
 pub mod federation_guard;
 pub mod federation_policy;
 mod function_names;

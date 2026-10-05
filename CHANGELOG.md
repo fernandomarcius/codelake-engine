@@ -6,6 +6,10 @@ versioning: [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Performance
+- A `LIMIT` straight over a federated sub-plan reaches its source (`TOP (n)` on SQL Server): under a
+  `UNION ALL` of two remote tables each source was asked for its whole table, read until the engine had its
+  rows. The source's policy still decides; a filter it cannot evaluate keeps the limit local. Two SQL Server
+  databases (1 million and 200 000 rows) under `LIMIT 50`: 136 ms → 11.5 ms, `TOP (50)` sent to both.
 - SQL Server: `lower(column)`/`upper(column)` compared with ASCII literals (`=`, `IN`) reach SQL Server as a
   filter that keeps at least the engine's rows (the column under a case-insensitive Latin collation, its
   `LOWER`/`UPPER` under another Latin one; `%` in a `LIKE` where a character beyond ASCII also maps to the
