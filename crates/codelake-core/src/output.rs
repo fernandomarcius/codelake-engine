@@ -592,6 +592,41 @@ mod tests {
         assert_eq!(text.matches("ReservedOutputExec").count(), 1, "{text}");
     }
 
+    /// A merge of two partitions or more becomes the accounted merge; one of
+    /// a single partition has nothing to merge and stays.
+    #[test]
+    fn merges_of_several_partitions_are_accounted() {
+        use datafusion::physical_plan::repartition::RepartitionExec;
+        let leaf: Arc<dyn ExecutionPlan> = Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+            Arc::new(datafusion::arrow::datatypes::Schema::empty()),
+        ));
+        let spread = |n| -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                RepartitionExec::try_new(
+                    Arc::clone(&leaf),
+                    datafusion::physical_plan::Partitioning::RoundRobinBatch(n),
+                )
+                .unwrap(),
+            )
+        };
+        for (partitions, accounted) in [(2, true), (3, true), (1, false)] {
+            let merge: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(spread(partitions)));
+            let text = displayable(accounted_merges(merge).unwrap().as_ref())
+                .indent(false)
+                .to_string();
+            assert_eq!(
+                text.contains("AccountedMergeExec"),
+                accounted,
+                "{partitions}: {text}"
+            );
+            assert_eq!(
+                text.contains("CoalescePartitionsExec"),
+                !accounted,
+                "{partitions}: {text}"
+            );
+        }
+    }
+
     /// A merge with a limit keeps it, above the accounted merge.
     #[tokio::test]
     async fn a_limited_merge_keeps_its_limit() {
