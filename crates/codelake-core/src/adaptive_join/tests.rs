@@ -75,7 +75,14 @@ async fn reserved_goes_to_zero(engine: &crate::Engine) {
     while engine.memory().reserved_bytes != 0 && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    assert_eq!(engine.memory().reserved_bytes, 0);
+    // Who holds memory, in the message of a refusal that lists them.
+    let pool = &engine.context().runtime_env().memory_pool;
+    let holders = MemoryConsumer::new("probe")
+        .register(pool)
+        .try_grow(usize::MAX / 4)
+        .err()
+        .map(|e| e.to_string());
+    assert_eq!(engine.memory().reserved_bytes, 0, "{holders:?}");
 }
 
 /// A table that reports no statistics, as a federated source: a memory
@@ -252,6 +259,9 @@ async fn a_limit_reached_gives_the_buffer_back() {
         let plan = physical(&engine, "SELECT l.k, g.s FROM l JOIN g ON l.k = g.k LIMIT 5").await;
         assert!(text(&plan).contains("AdaptiveJoinExec"), "{}", text(&plan));
         assert_eq!(run(&engine, &plan).await.unwrap().len(), 5);
+        // An exchange keeps the batches of the outputs nobody read until
+        // its plan is dropped, as for any query that stops early.
+        drop(plan);
         reserved_goes_to_zero(&engine).await;
     }
 }
