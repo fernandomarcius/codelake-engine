@@ -223,6 +223,24 @@ mod tests {
         assert_eq!(answers[0], answers[1]);
     }
 
+    /// The node crosses a process boundary (distributed execution).
+    #[cfg(feature = "portable")]
+    #[test]
+    fn the_node_round_trips_through_the_plan_codec() {
+        use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+        let input: Arc<dyn ExecutionPlan> = Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+            Arc::new(datafusion::arrow::datatypes::Schema::empty()),
+        ));
+        let node: Arc<dyn ExecutionPlan> = Arc::new(ForgetOrderExec::new(Arc::clone(&input)));
+        let mut buf = Vec::new();
+        crate::portable::CoreCodec.try_encode(node, &mut buf).unwrap();
+        let ctx = datafusion::prelude::SessionContext::new().task_ctx();
+        let back = crate::portable::CoreCodec
+            .try_decode(&buf, &[input], &ctx)
+            .unwrap();
+        assert!(back.is::<ForgetOrderExec>());
+    }
+
     /// Without the rule, the same plan reads the fixed key as sorted: what
     /// the rule exists for.
     #[tokio::test]
