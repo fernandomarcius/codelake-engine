@@ -10,10 +10,19 @@
 //! because every change of the counters admits every waiting query that fits
 //! before anything else happens.
 //!
+//! A query whose client stopped reading its results does no work: its
+//! execution waits for room in the buffer between it and the client. Such a
+//! query may give its running slot back ([`Permit::suspend`]) and keep a
+//! place among at most `max_suspended_queries` suspended ones; it takes a
+//! running slot again ([`Suspension::resume`]) before it produces anything
+//! more, ahead of the queries that never ran (it was admitted before them)
+//! but, like them, only when the node, its group and its user have room.
+//!
 //! Slots are RAII: a [`Permit`] frees its running slot when dropped, a
-//! [`Ticket`] dropped while waiting frees its queued slot. Every counter is
-//! changed under one lock, and per-user entries are removed at zero, so the
-//! state is bounded by the queries alive.
+//! [`Ticket`] dropped while waiting frees its queued slot, a [`Suspension`]
+//! dropped frees its suspended place. Every counter is changed under one
+//! lock, and per-user entries are removed at zero, so the state is bounded by
+//! the queries alive.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -115,6 +124,9 @@ struct Waiter {
     id: u64,
     user: String,
     group: Option<usize>,
+    /// A suspended query taking its slot back: it waits ahead of the queries
+    /// that never ran.
+    resumed: bool,
     wake: oneshot::Sender<()>,
 }
 
@@ -125,6 +137,9 @@ struct Counters {
     users: HashMap<String, Slots>,
     waiters: VecDeque<Waiter>,
     next_waiter: u64,
+    /// Queries that gave their running slot back while their client does not
+    /// read (node-wide).
+    suspended: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -133,6 +148,7 @@ struct Limits {
     queued: usize,
     running_per_user: usize,
     queued_per_user: usize,
+    suspended: usize,
 }
 
 /// See the module documentation.
@@ -174,6 +190,7 @@ impl Admission {
                 queued: config.max_queued_queries,
                 running_per_user: config.max_running_per_user,
                 queued_per_user: config.max_queued_per_user,
+                suspended: config.max_suspended_queries,
             },
             groups,
             counters: Mutex::new(counters),
@@ -272,21 +289,91 @@ impl Admission {
                 id,
                 user: user.to_owned(),
                 group,
+                resumed: false,
                 wake,
             });
             Some((id, wait))
         };
         self.publish(&counters);
         drop(counters);
+        Ok(self.ticket(user, group, wait))
+    }
+
+    fn ticket(
+        self: &Arc<Self>,
+        user: &str,
+        group: Option<usize>,
+        wait: Option<(u64, oneshot::Receiver<()>)>,
+    ) -> Ticket {
         let (waiter, wait) = wait.map_or((None, None), |(id, wait)| (Some(id), Some(wait)));
-        Ok(Ticket {
+        Ticket {
             admission: Arc::clone(self),
             user: user.to_owned(),
             group,
             waiter,
             wait,
             settled: false,
-        })
+        }
+    }
+
+    /// Gives a running slot back and keeps a suspended place, unless the node
+    /// has `max_suspended_queries` suspended already.
+    fn suspend(&self, user: &str, group: Option<usize>) -> bool {
+        let mut counters = self.lock();
+        if counters.suspended >= self.limits.suspended {
+            return false;
+        }
+        counters.suspended += 1;
+        Self::change(&mut counters, user, group, |s| {
+            s.running = s.running.saturating_sub(1);
+        });
+        self.promote(&mut counters);
+        self.publish(&counters);
+        true
+    }
+
+    /// A suspended query asks for a running slot again: it takes one at once
+    /// when it fits, or waits ahead of every query that never ran, behind the
+    /// suspended ones that asked first. It is never refused: it was admitted
+    /// once already.
+    fn resume(self: &Arc<Self>, user: &str, group: Option<usize>) -> Ticket {
+        let mut counters = self.lock();
+        counters.suspended = counters.suspended.saturating_sub(1);
+        let wait = if self.can_run(&counters, user, group) {
+            Self::change(&mut counters, user, group, |s| s.running += 1);
+            None
+        } else {
+            Self::change(&mut counters, user, group, |s| s.queued += 1);
+            let (wake, wait) = oneshot::channel();
+            let id = counters.next_waiter;
+            counters.next_waiter = counters.next_waiter.wrapping_add(1);
+            let position = counters
+                .waiters
+                .iter()
+                .position(|w| !w.resumed)
+                .unwrap_or(counters.waiters.len());
+            counters.waiters.insert(
+                position,
+                Waiter {
+                    id,
+                    user: user.to_owned(),
+                    group,
+                    resumed: true,
+                    wake,
+                },
+            );
+            Some((id, wait))
+        };
+        self.publish(&counters);
+        drop(counters);
+        self.ticket(user, group, wait)
+    }
+
+    /// A suspension dropped without resuming (the query ended).
+    fn release_suspended(&self) {
+        let mut counters = self.lock();
+        counters.suspended = counters.suspended.saturating_sub(1);
+        self.publish(&counters);
     }
 
     /// Moves every waiting query that now fits from the queue to running, in
@@ -350,6 +437,7 @@ impl Admission {
         // Gauges are f64; counts beyond u32 (never reached) saturate.
         let gauge = |n: usize| u32::try_from(n).map_or(f64::from(u32::MAX), f64::from);
         metrics::slots(None, gauge(counters.node.running), gauge(counters.node.queued));
+        metrics::suspended(gauge(counters.suspended));
         for (group, slots) in self.groups.iter().zip(&counters.groups) {
             metrics::slots(Some(&group.name), gauge(slots.running), gauge(slots.queued));
         }
@@ -359,6 +447,12 @@ impl Admission {
     pub fn load(&self) -> (usize, usize) {
         let counters = self.lock();
         (counters.node.running, counters.node.queued)
+    }
+
+    /// Queries on this node that gave their running slot back while their
+    /// client does not read.
+    pub fn suspended(&self) -> usize {
+        self.lock().suspended
     }
 
     /// `(running, queued)` of `user`.
@@ -401,6 +495,7 @@ impl Ticket {
             admission: Arc::clone(&self.admission),
             user: std::mem::take(&mut self.user),
             group: self.group,
+            held: true,
         }
     }
 }
@@ -419,11 +514,62 @@ pub struct Permit {
     admission: Arc<Admission>,
     user: String,
     group: Option<usize>,
+    /// Still holds the running slot (not given back by [`Permit::suspend`]).
+    held: bool,
+}
+
+impl Permit {
+    /// Gives the running slot back while the query waits for its client, and
+    /// admits whoever fits next. Refused — the permit comes back, still
+    /// running — when the node has `max_suspended_queries` suspended queries
+    /// already (`0` keeps every slot).
+    pub fn suspend(mut self) -> Result<Suspension, Self> {
+        if !self.admission.suspend(&self.user, self.group) {
+            return Err(self);
+        }
+        self.held = false;
+        Ok(Suspension {
+            admission: Arc::clone(&self.admission),
+            user: std::mem::take(&mut self.user),
+            group: self.group,
+            settled: false,
+        })
+    }
 }
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        self.admission.release_running(&self.user, self.group);
+        if self.held {
+            self.admission.release_running(&self.user, self.group);
+        }
+    }
+}
+
+/// A query that gave its running slot back while its client does not read
+/// ([`Permit::suspend`]). Dropping it frees its suspended place.
+#[derive(Debug)]
+pub struct Suspension {
+    admission: Arc<Admission>,
+    user: String,
+    group: Option<usize>,
+    settled: bool,
+}
+
+impl Suspension {
+    /// Asks for a running slot again (see [`Admission`]): the ticket is
+    /// admitted at once or waits ahead of the queries that never ran. It is
+    /// never refused, whatever the queue limits.
+    pub fn resume(mut self) -> Ticket {
+        self.settled = true;
+        self.admission.resume(&self.user, self.group)
+    }
+}
+
+impl Drop for Suspension {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.admission.release_suspended();
+        }
     }
 }
 
@@ -440,6 +586,15 @@ mod tests {
             max_queued_queries: queued,
             max_running_per_user: per_user.0,
             max_queued_per_user: per_user.1,
+            ..GovernanceConfig::default()
+        }))
+    }
+
+    fn with_suspended(running: usize, per_user: usize, suspended: usize) -> Arc<Admission> {
+        Arc::new(Admission::new(&GovernanceConfig {
+            max_running_queries: running,
+            max_running_per_user: per_user,
+            max_suspended_queries: suspended,
             ..GovernanceConfig::default()
         }))
     }
@@ -598,5 +753,219 @@ mod tests {
         let a = admission(1, 0, (10, 10));
         let _running = a.enter("u", None).unwrap();
         assert_eq!(a.enter("v", None).unwrap_err().scope, Scope::Node);
+    }
+
+    /// D4: a user's queries whose client went away give their slots back;
+    /// the same user's next query runs at once.
+    #[tokio::test]
+    async fn suspending_frees_the_running_slot_for_the_same_user() {
+        let a = with_suspended(32, 2, 8);
+        let first = a.enter("app", None).unwrap().ready().await;
+        let second = a.enter("app", None).unwrap().ready().await;
+        let waiting = a.enter("app", None).unwrap();
+        assert!(waiting.is_queued());
+        assert_eq!(a.user_load("app"), (2, 1));
+        let first = first.suspend().unwrap();
+        // The queued query was admitted by the suspension itself.
+        assert_eq!(a.user_load("app"), (2, 0));
+        assert_eq!(a.suspended(), 1);
+        let third = ready_soon(waiting)
+            .await
+            .expect("admitted when a slot was given back");
+        let second = second.suspend().unwrap();
+        assert_eq!((a.load(), a.suspended()), ((1, 0), 2));
+        drop((first, second));
+        assert_eq!((a.load(), a.suspended()), ((1, 0), 0));
+        drop(third);
+        assert_eq!(a.load(), (0, 0));
+        assert!(a.lock().users.is_empty());
+    }
+
+    /// At most `max_suspended_queries` suspended on the node; beyond, a query
+    /// keeps its slot, and `0` keeps every slot.
+    #[tokio::test]
+    async fn the_suspended_cap_keeps_the_slot() {
+        let a = with_suspended(4, 4, 1);
+        let first = a.enter("u", None).unwrap().ready().await;
+        let second = a.enter("u", None).unwrap().ready().await;
+        let first = first.suspend().unwrap();
+        let second = second.suspend().expect_err("the node has one suspended already");
+        assert_eq!((a.load(), a.suspended()), ((1, 0), 1));
+        drop(first);
+        let second = second.suspend().expect("room again");
+        assert_eq!((a.load(), a.suspended()), ((0, 0), 1));
+        drop(second);
+        assert_eq!(a.suspended(), 0);
+
+        let off = with_suspended(4, 4, 0);
+        let permit = off.enter("u", None).unwrap().ready().await;
+        let permit = permit.suspend().expect_err("suspension off");
+        assert_eq!(off.load(), (1, 0));
+        drop(permit);
+        assert_eq!(off.load(), (0, 0));
+    }
+
+    /// A resumed query runs at once when it fits.
+    #[tokio::test]
+    async fn resuming_with_room_runs_at_once() {
+        let a = with_suspended(4, 4, 4);
+        let suspension = a.enter("u", None).unwrap().ready().await.suspend().unwrap();
+        let ticket = suspension.resume();
+        assert!(!ticket.is_queued());
+        assert_eq!((a.load(), a.suspended()), ((1, 0), 0));
+        drop(ticket.ready().await);
+        assert_eq!(a.load(), (0, 0));
+    }
+
+    /// A resumed query waits for room, ahead of the queries that never ran,
+    /// behind the resumed ones that asked first; it is never refused, even
+    /// when the queue is full; and it does not hold back another user's query
+    /// that fits (no head-of-line blocking).
+    #[tokio::test]
+    async fn resumed_queries_wait_ahead_of_new_ones() {
+        let a = Arc::new(Admission::new(&GovernanceConfig {
+            max_running_queries: 2,
+            max_queued_queries: 1,
+            max_running_per_user: 1,
+            max_queued_per_user: 1,
+            max_suspended_queries: 4,
+            ..GovernanceConfig::default()
+        }));
+        let ana = a.enter("ana", None).unwrap().ready().await.suspend().unwrap();
+        let ana_late = a.enter("ana", None).unwrap().ready().await.suspend().unwrap();
+        let ana_now = a.enter("ana", None).unwrap().ready().await;
+        let newcomer = a.enter("ana", None).unwrap();
+        assert!(newcomer.is_queued());
+        assert!(a.enter("ana", None).is_err(), "the queue is full");
+        // Resumed despite the full queue; queued ahead of the newcomer.
+        let ana = ana.resume();
+        let ana_late = ana_late.resume();
+        assert!(ana.is_queued() && ana_late.is_queued());
+        assert_eq!(a.user_load("ana"), (1, 3));
+        // Bob fits: not behind ana's waiting queries.
+        let bob = a.enter("bob", None).unwrap();
+        assert!(!bob.is_queued());
+        drop(bob);
+        drop(ana_now);
+        let ana = ready_soon(ana).await.expect("the first resumed runs first");
+        assert_eq!(a.user_load("ana"), (1, 2));
+        drop(ana);
+        let ana_late = ready_soon(ana_late).await.expect("then the second resumed");
+        drop(ana_late);
+        assert!(ready_soon(newcomer).await.is_some(), "then the newcomer");
+        assert_eq!((a.load(), a.suspended()), ((0, 0), 0));
+    }
+
+    /// A resumed ticket dropped while waiting (the query ended) gives its
+    /// queued place back.
+    #[tokio::test]
+    async fn a_resumed_ticket_dropped_while_waiting_leaves_the_queue() {
+        let a = with_suspended(1, 1, 1);
+        let suspension = a.enter("u", None).unwrap().ready().await.suspend().unwrap();
+        let busy = a.enter("u", None).unwrap().ready().await;
+        let ticket = suspension.resume();
+        assert_eq!((a.load(), a.suspended()), ((1, 1), 0));
+        assert!(ready_soon(ticket).await.is_none());
+        assert_eq!(a.load(), (1, 0));
+        drop(busy);
+        assert_eq!(a.load(), (0, 0));
+        assert!(a.lock().waiters.is_empty());
+    }
+
+    /// Gauges by name, as a metrics exporter would see them.
+    #[derive(Default)]
+    struct Gauges(Mutex<HashMap<String, Arc<GaugeCell>>>);
+
+    #[derive(Default)]
+    struct GaugeCell(std::sync::atomic::AtomicU64);
+
+    impl ::metrics::GaugeFn for GaugeCell {
+        fn increment(&self, _: f64) {}
+        fn decrement(&self, _: f64) {}
+        fn set(&self, value: f64) {
+            self.0.store(value.to_bits(), std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Gauges {
+        fn get(&self, name: &str) -> Option<f64> {
+            let cells = self.0.lock().unwrap();
+            cells
+                .get(name)
+                .map(|cell| f64::from_bits(cell.0.load(std::sync::atomic::Ordering::SeqCst)))
+        }
+    }
+
+    impl ::metrics::Recorder for Gauges {
+        fn describe_counter(
+            &self,
+            _: ::metrics::KeyName,
+            _: Option<::metrics::Unit>,
+            _: ::metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: ::metrics::KeyName,
+            _: Option<::metrics::Unit>,
+            _: ::metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: ::metrics::KeyName,
+            _: Option<::metrics::Unit>,
+            _: ::metrics::SharedString,
+        ) {
+        }
+        fn register_counter(&self, _: &::metrics::Key, _: &::metrics::Metadata<'_>) -> ::metrics::Counter {
+            ::metrics::Counter::noop()
+        }
+        fn register_gauge(&self, key: &::metrics::Key, _: &::metrics::Metadata<'_>) -> ::metrics::Gauge {
+            let mut cells = self.0.lock().unwrap();
+            let cell = cells.entry(key.name().to_owned()).or_default();
+            ::metrics::Gauge::from_arc(Arc::clone(cell))
+        }
+        fn register_histogram(
+            &self,
+            _: &::metrics::Key,
+            _: &::metrics::Metadata<'_>,
+        ) -> ::metrics::Histogram {
+            ::metrics::Histogram::noop()
+        }
+    }
+
+    /// `codelake_queries_suspended` follows the suspended queries, and the
+    /// running gauge the slots they give back and take again.
+    #[test]
+    fn suspended_queries_are_published() {
+        use futures::FutureExt;
+
+        use crate::governance::metrics::{RUNNING, SUSPENDED};
+
+        let gauges = Gauges::default();
+        ::metrics::with_local_recorder(&gauges, || {
+            let a = with_suspended(4, 4, 4);
+            assert_eq!(gauges.get(SUSPENDED), Some(0.0));
+            let permit = a.enter("u", None).unwrap().ready().now_or_never().unwrap();
+            assert_eq!(gauges.get(RUNNING), Some(1.0));
+            let suspension = permit.suspend().unwrap();
+            assert_eq!(
+                (gauges.get(RUNNING), gauges.get(SUSPENDED)),
+                (Some(0.0), Some(1.0))
+            );
+            let ticket = suspension.resume();
+            assert_eq!(
+                (gauges.get(RUNNING), gauges.get(SUSPENDED)),
+                (Some(1.0), Some(0.0))
+            );
+            let suspension = ticket.ready().now_or_never().unwrap().suspend().unwrap();
+            assert_eq!(gauges.get(SUSPENDED), Some(1.0));
+            drop(suspension);
+            assert_eq!(
+                (gauges.get(RUNNING), gauges.get(SUSPENDED)),
+                (Some(0.0), Some(0.0))
+            );
+        });
     }
 }

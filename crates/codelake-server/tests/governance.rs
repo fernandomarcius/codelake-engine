@@ -57,7 +57,21 @@ impl Drop for Server {
     }
 }
 
+/// Suspension is off on this node: its HTTP tests need a query that holds its
+/// slot while its client does not page (the Python client's `carol`).
+/// Suspension has its own node ([`start_server_with`]).
 fn start_server(dir: &std::path::Path) -> Server {
+    start_server_with(
+        dir,
+        "max_running_queries = 8\nmax_running_per_user = 1\nmax_queued_per_user = 1\n\
+         queue_timeout_secs = 60\nmax_suspended_queries = 0",
+        "",
+    )
+}
+
+/// A node whose `[governance]` and `[server.trino]` tables get `governance`
+/// and `trino` (TOML lines).
+fn start_server_with(dir: &std::path::Path, governance: &str, trino: &str) -> Server {
     let (pg, http, statement) = (free_port(), free_port(), free_port());
     let path = dir.join("codelake.toml");
     let mut file = std::fs::File::create(&path).unwrap();
@@ -73,6 +87,7 @@ shutdown_grace_secs = 1
 listen = "127.0.0.1:{statement}"
 header_prefix = "X-Trino-"
 reported_version = "431"
+{trino}
 
 [memory]
 limit = "256MiB"
@@ -81,10 +96,7 @@ spill_limit = "512MiB"
 metadata_cache_limit = "8MiB"
 
 [governance]
-max_running_queries = 8
-max_running_per_user = 1
-max_queued_per_user = 1
-queue_timeout_secs = 60
+{governance}
 "#,
         spill = dir.join("spill").display()
     )
@@ -3038,5 +3050,180 @@ async fn fetch_among_other_statements_holds_its_rows_in_the_pool() {
         states.last().map(Vec::as_slice),
         Some(&["FAILED".to_owned(), "EXCEEDED_LOCAL_MEMORY_LIMIT".to_owned()][..]),
         "{states:?}"
+    );
+}
+
+// ------------------------------------------- D4: abandoned large results ---
+
+/// What one node did with a burst of abandoned large results (D4).
+#[derive(Debug)]
+struct Abandonment {
+    /// `(running, queued, suspended)` once the burst was abandoned.
+    load: (u64, u64, u64),
+    /// Bytes in the pool and RSS (KiB) while the queries wait for the gone
+    /// client, and RSS before the burst.
+    reserved: u64,
+    rss_before_kib: u64,
+    rss_kib: u64,
+    /// Seconds the same user's next query and another user's took.
+    same_user_secs: f64,
+    other_user_secs: f64,
+}
+
+/// Resident memory of the server process, in KiB (Linux).
+fn rss_kib(server: &Server) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", server.child.id())).unwrap();
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.trim().trim_end_matches("kB").trim().parse().ok())
+        .unwrap()
+}
+
+/// Submits `sql` as `user` and pages until the first rows, the end, or a
+/// page that shows the query waiting in the queue.
+async fn first_rows(server: &Server, user: &str, sql: &str) -> serde_json::Value {
+    let http = reqwest::Client::new();
+    let mut page = json(
+        http.post(format!("http://127.0.0.1:{}/v1/statement", server.statement))
+            .header("X-Trino-User", user)
+            .body(sql.to_owned())
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    // The submission's answer always says QUEUED; a page after it says so
+    // only of a query that waits for a slot.
+    let mut fetched = false;
+    while page.get("data").is_none()
+        && !(fetched && page["stats"]["state"] == "QUEUED")
+        && let Some(next) = page["nextUri"].as_str().map(str::to_owned)
+    {
+        page = json(http.get(next).send().await.unwrap()).await;
+        fetched = true;
+    }
+    page
+}
+
+/// Runs `sql` as `user` to its end; the seconds it took and its last page.
+async fn timed(server: &Server, user: &str, sql: &str) -> (f64, serde_json::Value) {
+    let started = Instant::now();
+    let mut page = first_rows(server, user, sql).await;
+    let http = reqwest::Client::new();
+    while let Some(next) = page["nextUri"].as_str().map(str::to_owned) {
+        page = json(http.get(next).send().await.unwrap()).await;
+    }
+    (started.elapsed().as_secs_f64(), page)
+}
+
+/// `(running, queued, suspended)` from `/healthz`.
+async fn load_with_suspended(server: &Server) -> (u64, u64, u64) {
+    let health = json(
+        reqwest::get(format!("http://127.0.0.1:{}/healthz", server.http))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let queries = &health["queries"];
+    (
+        queries["running"].as_u64().unwrap(),
+        queries["queued"].as_u64().unwrap(),
+        queries["suspended"].as_u64().unwrap(),
+    )
+}
+
+/// The shadow replay's burst on a node with `governance`: one user submits
+/// 18 queries with large results, reads their first page and goes away
+/// without canceling (a pod killed by a deploy); then the same user and
+/// another submit one small query each. Ends once the node canceled the 18
+/// as abandoned and gave everything back.
+async fn abandoned_burst(dir: &std::path::Path, governance: &str) -> Abandonment {
+    let server = start_server_with(dir, governance, "client_timeout_secs = 10");
+    server.wait_ready().await;
+    let rss_before_kib = rss_kib(&server);
+    for _ in 0..18 {
+        let page = first_rows(&server, "financeiro", HOLDS_A_SLOT).await;
+        assert!(
+            page["data"].is_array() || page["stats"]["state"] == "QUEUED",
+            "{page}"
+        );
+    }
+    // Past `suspend_after_secs` (1 s).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let load = load_with_suspended(&server).await;
+    let reserved = server.reserved().await;
+    let rss = rss_kib(&server);
+    let (same_user_secs, same) = timed(&server, "financeiro", "SELECT 1").await;
+    assert_eq!(same["data"], serde_json::json!([[1]]), "{same}");
+    let (other_user_secs, other) = timed(&server, "warehouse", "SELECT 2").await;
+    assert_eq!(other["data"], serde_json::json!([[2]]), "{other}");
+
+    // `client_timeout_secs` (10) after the last page, the sweep cancels them.
+    let observer = server.connect("observer").await;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        let abandoned = text_rows(
+            &observer,
+            "SELECT count(*) FROM system.runtime.queries \
+             WHERE \"user\" = 'financeiro' AND error_code = 'ABANDONED_QUERY'",
+        )
+        .await;
+        if abandoned[0][0] == "18" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "abandoned: {abandoned:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    server.slots_free().await;
+    assert_eq!(load_with_suspended(&server).await, (0, 0, 0));
+    assert_eq!(
+        server.pool_drains().await,
+        0,
+        "reservations left after the abandonment"
+    );
+    Abandonment {
+        load,
+        reserved,
+        rss_before_kib,
+        rss_kib: rss,
+        same_user_secs,
+        other_user_secs,
+    }
+}
+
+/// D4 (shadow replay of the the reporting application, 2026-10-07): 18 abandoned
+/// large results held the user's 16 running slots until the abandonment, and
+/// the user's next query waited 295.9 s. With suspension (the default) the
+/// abandoned queries give their slots back after `suspend_after_secs`, keep
+/// only what they buffered (in the pool), and are still canceled as
+/// abandoned; with suspension off (`max_suspended_queries = 0`, the behaviour
+/// before) the same burst still freezes the user until then.
+#[tokio::test]
+async fn abandoned_large_results_do_not_freeze_their_user() {
+    let before = tempfile::tempdir().unwrap();
+    let before = abandoned_burst(before.path(), "max_suspended_queries = 0").await;
+    let after = tempfile::tempdir().unwrap();
+    let after = abandoned_burst(after.path(), "").await;
+    eprintln!("D4 before (suspension off): {before:?}");
+    eprintln!("D4 after (defaults): {after:?}");
+
+    assert_eq!(before.load, (16, 2, 0), "{before:?}");
+    assert!(
+        before.same_user_secs > 5.0,
+        "with suspension off the user waits for the abandonment: {before:?}"
+    );
+    assert_eq!(after.load, (0, 0, 18), "{after:?}");
+    assert!(after.same_user_secs < 1.0, "{after:?}");
+    for run in [&before, &after] {
+        assert!(run.other_user_secs < 1.0, "{run:?}");
+        assert!(run.reserved < 18 * (4 << 20), "{run:?}");
+    }
+    // What waits for the gone client outside the pool stays small: the
+    // suspended node holds about what the frozen one held.
+    assert!(
+        after.rss_kib.saturating_sub(after.rss_before_kib)
+            < before.rss_kib.saturating_sub(before.rss_before_kib) + 64 * 1024,
+        "{before:?} {after:?}"
     );
 }

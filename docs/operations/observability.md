@@ -35,6 +35,7 @@ scrapes do not load the sources.
 | `codelake_spill_limit_bytes` | gauge | `memory.spill_limit` |
 | `codelake_source_up{source,kind}` | gauge | 1 reachable, 0 not |
 | `codelake_queries_running`, `codelake_queries_queued` | gauge | admission slots in use on the node |
+| `codelake_queries_suspended` | gauge | HTTP queries that gave their running slot back while their client does not read (`max_suspended_queries`) |
 | `codelake_resource_group_running{resource_group}`, `codelake_resource_group_queued{resource_group}` | gauge | the same per configured group |
 | `codelake_queries_rejected_total{scope}` | counter | refused with a full queue; `scope`: `node`, `resource_group`, `user` |
 | `codelake_queries_timed_out_total{phase}` | counter | time limit reached; `phase`: `queued`, `running` |

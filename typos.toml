@@ -7,6 +7,8 @@ extend-ignore-re = ["\\b[0-9a-f]{12}(-dirty)?\\b", "00f067aa0ba902b7"]
 # Portuguese words used in docs.
 # A table of the reference use case (shadow run issues).
 depositos = "depositos"
+# the reporting application: an application of the installation (the D4 replay, ISS-066).
+Controle = "Controle"
 # ERRO: outcome of the differential gate (both engines refused, different errors).
 ERRO = "ERRO"
 # A deliberate syntax error in the Trino protocol tests (`SELEC 1`).

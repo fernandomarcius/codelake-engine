@@ -18,21 +18,25 @@
 //! A protocol registers a query ([`Governance::register`]), asks for a place
 //! ([`Governance::enter`]: a running slot, a queued one, or a refusal), waits
 //! for its slot ([`Governance::admit`]) and holds the [`Permit`] while the
-//! query executes.
+//! query executes. A protocol that buffers results for a client that may stop
+//! reading holds it in a [`Slot`], which gives it back while the query waits
+//! for that client and takes one again before it produces more.
 
 mod admission;
 mod kill;
 pub mod metrics;
 mod registry;
+mod slot;
 mod table;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub use admission::{Admission, GLOBAL_GROUP, Permit, Refusal, Scope, Ticket, whole_match};
+pub use admission::{Admission, GLOBAL_GROUP, Permit, Refusal, Scope, Suspension, Ticket, whole_match};
 pub use kill::{ADMINISTRATIVELY_KILLED, KillError, KillRequest, kill_request, kill_request_sql};
 pub use metrics::Phase;
 pub use registry::{Failure, Protocol, QueryInfo, QueryRecord, QueryRegistry, QueryState, RegistryLimits};
+pub use slot::Slot;
 pub use table::{QueriesTable, system_catalog};
 
 use crate::config::GovernanceConfig;
@@ -122,6 +126,7 @@ pub struct Governance {
     registry: Arc<QueryRegistry>,
     admission: Arc<Admission>,
     queue_timeout: Duration,
+    suspend_after: Duration,
     defaults: TimeLimits,
 }
 
@@ -151,6 +156,7 @@ impl Governance {
             })),
             admission: Arc::new(Admission::new(config)),
             queue_timeout: Duration::from_secs(config.queue_timeout_secs),
+            suspend_after: Duration::from_secs(config.suspend_after_secs),
             defaults: TimeLimits {
                 run_time: time(&config.query_max_run_time),
                 execution_time: time(&config.query_max_execution_time),
@@ -164,6 +170,12 @@ impl Governance {
 
     pub fn admission(&self) -> &Arc<Admission> {
         &self.admission
+    }
+
+    /// How long a query waits for its client, holding its running slot,
+    /// before it gives the slot back ([`Slot::wait_for_client`]).
+    pub fn suspend_after(&self) -> Duration {
+        self.suspend_after
     }
 
     /// Configured defaults of the time limits.
@@ -410,6 +422,19 @@ mod tests {
         let defaults = g.default_limits();
         assert_eq!(defaults.run_time, Duration::from_hours(100 * 24));
         let _ = defaults.deadline(&info);
+    }
+
+    #[test]
+    fn suspend_after_is_configured() {
+        let g = Governance::new(
+            &GovernanceConfig {
+                suspend_after_secs: 7,
+                ..GovernanceConfig::default()
+            },
+            None,
+        );
+        assert_eq!(g.suspend_after(), Duration::from_secs(7));
+        assert_eq!(Governance::default().suspend_after(), Duration::from_secs(1));
     }
 
     #[test]

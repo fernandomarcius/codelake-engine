@@ -31,6 +31,11 @@ without evidence is not done.
       volume larger than `spill_limit` ([sizing.md](sizing.md)).
 - [ ] Client time limits (`query_max_run_time`) set in the pipelines'
       profiles.
+- [ ] `[governance]` and `[server.trino]` limits sized for the clients that
+      share the node (the values recommended for the Warehouse API, the
+      the reporting application and dbt are in
+      [ISS-066](../issues/ISS-066-queries-waiting-for-a-client-give-their-slot-back.md));
+      `codelake_queries_suspended` watched against `max_suspended_queries`.
 
 **Operations**
 

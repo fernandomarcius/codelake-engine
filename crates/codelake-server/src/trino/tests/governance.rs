@@ -9,14 +9,25 @@ use axum::http::Method;
 use codelake_core::config::{GovernanceConfig, ResourceGroupConfig};
 use serde_json::{Value, json};
 
-use super::{Harness, Outcome, harness_governed, limits, path_of};
+use super::{Harness, Limits, Outcome, harness_governed, limits, path_of};
 
-/// Rows enough that the producer blocks on the client after two batches and
-/// keeps its running slot while the client does not page.
+/// Rows enough that the producer blocks on the client after two batches; it
+/// keeps its running slot while the client does not page only with
+/// suspension off ([`held_slots`]).
 const HOLDS_A_SLOT: &str = "SELECT value FROM generate_series(1, 100000000)";
 
 fn governed(config: &GovernanceConfig) -> Harness {
     harness_governed(limits(), config)
+}
+
+/// Suspension off: a query whose client does not page keeps its running slot,
+/// as the tests of the queue need a holder (suspension has its own tests,
+/// at the end).
+fn held_slots() -> GovernanceConfig {
+    GovernanceConfig {
+        max_suspended_queries: 0,
+        ..GovernanceConfig::default()
+    }
 }
 
 impl Harness {
@@ -152,7 +163,7 @@ async fn configured_default_time_limit_applies() {
 async fn queued_queries_run_when_a_slot_frees() {
     let h = governed(&GovernanceConfig {
         max_running_queries: 1,
-        ..GovernanceConfig::default()
+        ..held_slots()
     });
     let holder = h.submit_as("ana", HOLDS_A_SLOT, &[]).await;
     h.load_becomes((1, 0)).await;
@@ -186,7 +197,7 @@ async fn a_full_queue_refuses_with_query_queue_full() {
     let h = governed(&GovernanceConfig {
         max_running_queries: 1,
         max_queued_queries: 0,
-        ..GovernanceConfig::default()
+        ..held_slots()
     });
     let holder = h.submit_as("ana", HOLDS_A_SLOT, &[]).await;
     h.load_becomes((1, 0)).await;
@@ -210,7 +221,7 @@ async fn per_user_limit_refuses_that_user_only() {
     let h = governed(&GovernanceConfig {
         max_running_per_user: 1,
         max_queued_per_user: 0,
-        ..GovernanceConfig::default()
+        ..held_slots()
     });
     let holder = h.submit_as("alice", HOLDS_A_SLOT, &[]).await;
     h.load_becomes((1, 0)).await;
@@ -252,7 +263,7 @@ async fn queue_timeout_fails_the_waiting_query() {
     let h = governed(&GovernanceConfig {
         max_running_queries: 1,
         queue_timeout_secs: 1,
-        ..GovernanceConfig::default()
+        ..held_slots()
     });
     let holder = h.submit_as("ana", HOLDS_A_SLOT, &[]).await;
     h.load_becomes((1, 0)).await;
@@ -273,7 +284,7 @@ async fn queue_timeout_fails_the_waiting_query() {
 async fn canceling_a_queued_query_leaves_the_queue() {
     let h = governed(&GovernanceConfig {
         max_running_queries: 1,
-        ..GovernanceConfig::default()
+        ..held_slots()
     });
     let holder = h.submit_as("ana", HOLDS_A_SLOT, &[]).await;
     h.load_becomes((1, 0)).await;
@@ -299,7 +310,7 @@ async fn resource_group_limits_its_members() {
             max_running: 1,
             max_queued: 0,
         }],
-        ..GovernanceConfig::default()
+        ..held_slots()
     });
     let holder = h.submit_as("dbt", HOLDS_A_SLOT, &[]).await;
     h.load_becomes((1, 0)).await;
@@ -338,7 +349,7 @@ async fn session_statements_do_not_queue() {
     let h = governed(&GovernanceConfig {
         max_running_queries: 1,
         max_queued_queries: 0,
-        ..GovernanceConfig::default()
+        ..held_slots()
     });
     let holder = h.submit_as("ana", HOLDS_A_SLOT, &[]).await;
     h.load_becomes((1, 0)).await;
@@ -358,7 +369,7 @@ async fn kill_query_call_stops_a_running_query() {
     let h = governed(&GovernanceConfig {
         max_running_queries: 1,
         max_queued_queries: 0,
-        ..GovernanceConfig::default()
+        ..held_slots()
     });
     let holder = h.submit_as("ana", HOLDS_A_SLOT, &[]).await;
     h.load_becomes((1, 0)).await;
@@ -413,5 +424,160 @@ async fn kill_query_call_stops_a_running_query() {
         error(&again)["message"],
         format!("Target query is not running: {id}")
     );
+    assert_eq!(h.pool_drains().await, 0);
+}
+
+impl Harness {
+    /// Submits as `user` and reads the first page with rows (or the end), as
+    /// a client that reads one page and goes away.
+    async fn first_rows_as(&self, user: &str, sql: &str) -> Value {
+        let mut page = self.submit_as(user, sql, &[]).await;
+        for _ in 0..200 {
+            if page.get("data").is_some() || page.get("nextUri").is_none() {
+                return page;
+            }
+            page = self
+                .call(Method::GET, &path_of(page["nextUri"].as_str().unwrap()), &[], "")
+                .await
+                .body;
+        }
+        panic!("no rows: {page}");
+    }
+
+    /// Waits (at most 10 s) until `count` queries are suspended.
+    async fn suspended_becomes(&self, count: usize) {
+        let admission = self.engine.governance().admission();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while admission.suspended() != count {
+            assert!(
+                Instant::now() < deadline,
+                "suspended {}, expected {count} (load {:?})",
+                admission.suspended(),
+                admission.load()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// D4 (shadow replay of 2026-10-07): an application killed by a deploy
+/// abandons 18 queries with large results after their first page, without
+/// canceling them. Their executions wait for a client that is gone: they give
+/// their running slots back, so the same user's next query runs at once and
+/// another user's too; they hold only their buffered batches in the pool; and
+/// the abandonment still cancels them, giving everything back.
+#[tokio::test]
+async fn abandoned_large_results_give_their_slots_back() {
+    let h = harness_governed(
+        Limits {
+            client_timeout: Duration::from_secs(4),
+            ..limits()
+        },
+        &GovernanceConfig::default(),
+    );
+    let mut abandoned = Vec::new();
+    for _ in 0..18 {
+        let page = h.first_rows_as("financeiro", HOLDS_A_SLOT).await;
+        assert!(page["data"].is_array(), "{page}");
+        abandoned.push(page);
+    }
+    // 16 run (the user's limit) and 2 wait; within the suspension delay the
+    // first ones give their slots back, the waiting ones run and suspend too.
+    h.suspended_becomes(18).await;
+    h.load_becomes((0, 0)).await;
+    // Each holds its last page (kept for a retry) and at most the batches
+    // buffered for its client, all in the pool.
+    let held = h.reserved();
+    assert!(held < 18 * (4 << 20), "18 suspended queries hold {held} bytes");
+
+    let started = Instant::now();
+    let same_user = h
+        .follow_body(h.submit_as("financeiro", "SELECT 1 AS x", &[]).await)
+        .await;
+    let same_user_secs = started.elapsed();
+    assert_eq!(same_user.rows, [vec![json!(1)]], "{}", same_user.last);
+    let started = Instant::now();
+    let other = h
+        .follow_body(h.submit_as("warehouse", "SELECT 2 AS y", &[]).await)
+        .await;
+    assert_eq!(other.rows, [vec![json!(2)]], "{}", other.last);
+    assert!(
+        same_user_secs < Duration::from_secs(2) && started.elapsed() < Duration::from_secs(2),
+        "same user {same_user_secs:?}, other user {:?}",
+        started.elapsed()
+    );
+
+    // Listed as running, as the reference engine lists a query blocked on
+    // its output.
+    let listed = h
+        .follow_body(
+            h.submit_as(
+                "ops",
+                "SELECT count(*) FROM system.runtime.queries \
+                 WHERE \"user\" = 'financeiro' AND state = 'RUNNING'",
+                &[],
+            )
+            .await,
+        )
+        .await;
+    assert_eq!(listed.rows, [vec![json!(18)]], "{}", listed.last);
+
+    // The client is gone: the sweep after `client_timeout` cancels them.
+    tokio::time::sleep(Duration::from_millis(4200)).await;
+    h.state.sweep();
+    for page in abandoned {
+        let out = h.follow_body(page).await;
+        assert_eq!(out.error_name(), Some("ABANDONED_QUERY"), "{}", out.last);
+    }
+    h.suspended_becomes(0).await;
+    h.load_becomes((0, 0)).await;
+    assert_eq!(
+        h.pool_drains().await,
+        0,
+        "reservations left after the abandonment"
+    );
+}
+
+/// A suspended query whose client reads again takes a running slot back
+/// before producing more, and returns every row: with a per-user limit of
+/// one, another query of the user runs while it is suspended, and it waits
+/// for that query's slot before it goes on.
+#[tokio::test]
+async fn a_suspended_query_resumes_with_every_row() {
+    let h = governed(&GovernanceConfig {
+        max_running_per_user: 1,
+        ..GovernanceConfig::default()
+    });
+    let rows = 300_000;
+    let first = h
+        .first_rows_as("ana", &format!("SELECT value FROM generate_series(1, {rows})"))
+        .await;
+    h.suspended_becomes(1).await;
+    assert_eq!(h.engine.governance().admission().user_load("ana"), (0, 0));
+
+    // Her next query runs in the slot given back, and holds it: it works
+    // (nothing to send until it ends), so it never waits for its client.
+    let holder = h
+        .submit_as("ana", "SELECT count(*) FROM generate_series(1, 5000000000)", &[])
+        .await;
+    h.load_becomes((1, 0)).await;
+
+    // Paged again, the first query waits for her slot: no rows beyond what
+    // was buffered while it was suspended.
+    let page = h
+        .call(Method::GET, &path_of(first["nextUri"].as_str().unwrap()), &[], "")
+        .await
+        .body;
+    h.load_becomes((1, 1)).await;
+    h.cancel(&holder).await;
+    let mut out = h.follow_body(page).await;
+    let read_first = first["data"].as_array().unwrap();
+    out.rows
+        .splice(0..0, read_first.iter().map(|r| r.as_array().unwrap().clone()));
+    assert_eq!(out.state(), "FINISHED", "{}", out.last);
+    assert_eq!(out.rows.len(), rows);
+    assert_eq!(out.rows.last().unwrap()[0], json!(rows));
+    h.suspended_becomes(0).await;
+    h.load_becomes((0, 0)).await;
     assert_eq!(h.pool_drains().await, 0);
 }

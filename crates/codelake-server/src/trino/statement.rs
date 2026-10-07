@@ -23,6 +23,13 @@
 //! Every operator of the physical plan is made cooperative, so a canceled,
 //! abandoned or timed-out query stops within one budget of batches even when
 //! an operator produces rows without waiting for input (a cross join).
+//!
+//! Admission: a query whose execution waits for its client (the channel full)
+//! for longer than `[governance] suspend_after_secs` gives its running slot
+//! back, and takes one again before it produces the next batch
+//! ([`governance::Slot`], ADR 0016 amended for D4): a client that went away
+//! without canceling no longer holds a running slot of its user until it is
+//! declared abandoned.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -35,7 +42,7 @@ use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use codelake_core::governance::{self, KillError, Permit, Protocol, Ticket, TimeLimits};
+use codelake_core::governance::{self, KillError, Permit, Protocol, Slot, Ticket, TimeLimits};
 use codelake_core::output::ReservedOutputExec;
 use codelake_core::session_properties::{format_duration, parse_duration};
 use codelake_core::trace::QueryTrace;
@@ -1448,6 +1455,7 @@ async fn run(
     options: QueryOptions,
     work: Work,
     sender: &mpsc::Sender<Event>,
+    slot: &mut Slot,
 ) -> Result<(), QueryError> {
     let error = |e: DataFusionError| QueryError::from(&e);
     query.set_state(QueryState::Planning);
@@ -1470,7 +1478,17 @@ async fn run(
     // Batches waiting for the client count against the memory limit.
     let buffer = MemoryConsumer::new(format!("Trino output buffer {}", query.id))
         .register(&engine.context().runtime_env().memory_pool);
-    while let Some(batch) = stream.next().await {
+    let suspend_after = engine.governance().suspend_after();
+    loop {
+        // A query that gave its slot back while its client did not read
+        // takes one again before it works on the next batch.
+        if !slot.is_running() {
+            slot.resume().await;
+            tracing::debug!(query_id = %query.id, "query resumed: its client reads again");
+        }
+        let Some(batch) = stream.next().await else {
+            return Ok(());
+        };
         let batch = batch.map_err(error)?;
         let reservation = buffer.new_empty();
         reservation
@@ -1480,12 +1498,24 @@ async fn run(
             batch,
             _reservation: reservation,
         };
-        if sender.send(Event::Batch(buffered)).await.is_err() {
+        let room = match sender.try_reserve() {
+            Ok(room) => Ok(room),
+            Err(mpsc::error::TrySendError::Closed(())) => return Ok(()),
+            // The client has not read the batches ahead of this one yet.
+            Err(mpsc::error::TrySendError::Full(())) => {
+                let room = slot.wait_for_client(suspend_after, sender.reserve()).await;
+                if !slot.is_running() {
+                    tracing::debug!(query_id = %query.id, "query suspended: its client did not read");
+                }
+                room
+            }
+        };
+        let Ok(room) = room else {
             // Receiver gone: the query failed or was dropped from the registry.
             return Ok(());
-        }
+        };
+        room.send(Event::Batch(buffered));
     }
-    Ok(())
 }
 
 /// Runs `work` until the query's deadline; past it, `work` is dropped (its
@@ -1508,7 +1538,8 @@ async fn within(
 
 /// Waits for an admission slot, then runs the query holding it; the slot is
 /// freed as soon as execution ends, before the client has fetched the last
-/// buffered rows.
+/// buffered rows, and given back while execution waits for a client that does
+/// not read (see [`run`]).
 async fn execute(
     engine: Arc<Engine>,
     query: Arc<TrinoQuery>,
@@ -1529,11 +1560,12 @@ async fn execute(
             return;
         }
     };
+    let mut slot = Slot::new(permit);
     let work = within(
         &engine,
         &query,
         &limits,
-        run(&engine, &query, options, work, &sender),
+        run(&engine, &query, options, work, &sender, &mut slot),
     );
     // Dropping `work` drops the plan's streams, which abort the tasks they spawned.
     let outcome = tokio::select! {
@@ -1541,7 +1573,7 @@ async fn execute(
         () = cancel.cancelled() => return,
         outcome = work => outcome,
     };
-    drop(permit);
+    drop(slot);
     match outcome {
         Ok(()) => {
             query.set_state(QueryState::Finishing);
