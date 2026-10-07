@@ -293,6 +293,14 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- An HTTP query whose client stopped reading no longer holds a running slot until it is declared abandoned
+  (D4, ADR 0016 amendment, ISS-066): once its execution has waited 1 s for the client
+  (`[governance] suspend_after_secs`) it gives the slot back, and takes one again before it produces more.
+  At most `max_suspended_queries` (32) per node do so; beyond, and with `0`, a query keeps its slot as
+  before. It stays `RUNNING`, keeps its memory in the pool and is still canceled after `client_timeout_secs`;
+  `codelake_queries_suspended` and `/healthz` count them. The shadow replay of the the reporting application
+  abandoned 18 large results of its one user on a deploy: the user's next query waited 295.9 s for the
+  abandonment; it now runs at once (0.046 s against the binary, before 8.6 s with a 10 s client timeout).
 - A query whose exchange spilled from two input tasks at once could hang forever, holding its memory, with
   no thread running (`DataFusion` 54.1, apache/datafusion#24883): the exchange's spill pool kept two files
   open and its reader waited on the older one while the batch it needed was in the newer. Every batch an

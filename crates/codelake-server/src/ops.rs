@@ -127,15 +127,23 @@ struct Health {
 struct QueryLoad {
     running: usize,
     queued: usize,
+    /// Gave their running slot back while their client does not read.
+    suspended: usize,
 }
 
 async fn healthz(State(state): State<Arc<OpsState>>) -> Json<Health> {
-    let (running, queued) = state.engine.governance().admission().load();
+    let admission = state.engine.governance().admission();
+    let (running, queued) = admission.load();
+    let suspended = admission.suspended();
     Json(Health {
         version: env!("CARGO_PKG_VERSION"),
         draining: state.is_draining(),
         memory: state.engine.memory(),
-        queries: QueryLoad { running, queued },
+        queries: QueryLoad {
+            running,
+            queued,
+            suspended,
+        },
         sources: state.sources().await,
     })
 }

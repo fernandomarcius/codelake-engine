@@ -1,6 +1,7 @@
 # ADR 0016 — Query governance in the core: registry, admission, time limits
 
-- Status: Accepted
+- Status: Accepted (amended 2026-10-07: a query waiting for its client
+  gives its slot back, D4, ISS-066)
 - Date: 2026-09-25
 
 ## Context
@@ -80,7 +81,7 @@ Per protocol:
 | refusal | `QUERY_QUEUE_FULL` in the `POST` response itself | SQLSTATE `53400` (`configuration_limit_exceeded`) |
 | time limit | `EXCEEDED_TIME_LIMIT` | SQLSTATE `57014` (`query_canceled`) |
 | session limit | `query_max_run_time`, `query_max_execution_time` | `SET statement_timeout` (as run time) |
-| slot held | from admission to the end of execution (the last batch produced; ≤ 2 buffered batches, reserved, may still wait for the client) | until every row is sent or the stream is dropped; one per connection: while a cursor or suspended portal holds it, the connection's other statements run in it |
+| slot held | from admission to the end of execution (the last batch produced; ≤ 2 buffered batches, reserved, may still wait for the client), given back while execution waits for a client that does not read (amendment D4 below) | until every row is sent or the stream is dropped; one per connection: while a cursor or suspended portal holds it, the connection's other statements run in it |
 | not governed | `USE`, `SET/RESET SESSION`, `PREPARE`, `DEALLOCATE`, `kill_query` | `SET`, `SHOW <variable>`, transaction control, `DISCARD`, `DEALLOCATE`, `kill_query`; `FETCH` and `CLOSE` (governed as their cursor's `DECLARE`, which ends with its transaction unless `WITH HOLD`) |
 | client cancel | `DELETE` of the query's `nextUri` | cancel request (process id + secret key), while the connection executes a message: the governed statements that message runs, queued, planning or sending rows — those it admits and those whose rows it reads (the cursor a `FETCH` reads, the portal an `Execute` resumes); the connection's other cursors and suspended portals read on, as in PostgreSQL; between messages it does nothing, as in PostgreSQL; SQLSTATE `57014` |
 | `kill_query` errors | as the reference engine 431 (checked against it): `NOT_FOUND`, `NOT_SUPPORTED` (not running), `INVALID_ARGUMENTS`, `INVALID_PROCEDURE_ARGUMENT` (`NULL` id), `TYPE_MISMATCH`; plus `PERMISSION_DENIED` (not the owner) | `42704`, `55000`, `22023`, `22023`, `42804`; `42501` |
@@ -246,17 +247,96 @@ cardinality): per-query figures are in `system.runtime.queries`.
 
 Defaults: 32 running and 1000 queued per node, 16 running and 500 queued per
 user, 600 s in the queue, 100 days for both time limits (the properties'
-previous defaults). `[server.trino] history_size` and
+previous defaults); 32 suspended queries per node, suspended after 1 s
+(amendment D4). `[server.trino] history_size` and
 `history_retention_secs` are deprecated in favour of `[governance]`; when
 set, they still apply.
+
+### Amendment 2026-10-07 (D4): a query waiting for its client gives its slot back
+
+**Defect.** The shadow replay of the reporting application
+(2026-10-07) killed the application's pod as a deploy does: it read the first
+page of 18 queries with large results and went away without a `DELETE`. Each
+execution filled the two batches ahead of its client and waited for it,
+holding its running slot until the abandonment sweep canceled it
+(`client_timeout_secs`, 300 s): 16 `RUNNING` (the per-user limit), 2
+`QUEUED`; the same user's next query waited 295.9 s, another user's ran in
+0.07 s. The application sends everything as one user and bursts 20–24
+queries at boot, so one deploy froze it for 5 minutes and held half of the
+node's 32 slots, shared with the Warehouse API and dbt. Abandoned queries with
+small results end at once and never showed it.
+
+**Reference.** Trino 431 counts a query against its resource group from its
+start until it reaches a done state (`InternalResourceGroup.run` registers a
+listener that calls `queryFinished` when `state.isDone()`); a query whose
+output buffer is full stays `RUNNING` and keeps counting (the shadow listed
+the reference's 19 abandoned queries `RUNNING` for 300 s). `FINISHING` there
+is the step after the last output is produced (commit), not a wait for the
+client. The production Trino has no resource groups, so nothing waits behind
+those queries; CodeLake's default per-user limit (ISS-026) made the same
+semantics a freeze. CodeLake departs from the reference here on purpose.
+
+**Decision.** On the HTTP statement protocol, execution sends each batch
+into the bounded channel (≤ 2 batches ahead of the client). When the channel
+is full for longer than `[governance] suspend_after_secs` (default 1 s) the
+query gives its running slot back (`Permit::suspend`, through
+`governance::Slot`) and keeps one of at most `max_suspended_queries` places
+(default 32) of the node; the queries waiting for a slot are admitted at
+once. A suspended query does no work: its plan is not polled until the client
+reads. Before it produces the next batch it takes a running slot again
+(`Suspension::resume`): at once when the node, its group and its user have
+room, otherwise it waits ahead of every query that never ran (it was
+admitted before them), behind the suspended ones that asked first, and is
+never refused by a queue limit nor by `queue_timeout_secs` (its time limits
+still apply). Re-admission is required: the plan produces the rest of the
+result when resumed, so without it a client that reads many queries in turn
+would have them all computing, beyond `max_running_*`. A client that reads in
+time (a page within 1 s of the previous one) never notices; one that takes
+longer only waits for a slot it would have held anyway when the node is full.
+
+- State: a suspended query stays `RUNNING` in `system.runtime.queries` and in
+  the protocol's `stats`, as the reference lists a query blocked on its
+  output; the gauge `codelake_queries_suspended` and `/healthz`
+  (`queries.suspended`) count them.
+- Memory: unchanged. The batches buffered for the client and the page kept
+  for a retry stay reserved in the pool; the operators keep what they
+  reserved. What a blocked plan holds outside the pool (about two batches per
+  worker, ADR 0003) is bounded by the cap: beyond `max_suspended_queries` a
+  query keeps its slot, as before, so at most as many queries hold plan
+  state while waiting for clients as run (`0` turns suspension off).
+- Abandonment: unchanged. The sweep cancels a suspended query
+  `client_timeout_secs` after its client's last request (`ABANDONED_QUERY`),
+  releasing its place and its memory; so do its deadline, `DELETE` and
+  `kill_query`.
+- `client_timeout_secs` keeps its default of 300 s, the reference's
+  `query.client.timeout` (5 m). A shorter default is not justified: the
+  reference's clients (JDBC, the Python DB-API, DBeaver) ask for the next
+  page only when the application reads more rows, so an interactive client
+  that stops scrolling for minutes is not gone, and the reference keeps its
+  query. With suspension, an abandoned query costs its memory (bounded,
+  above) and no admission slot. An installation whose clients all read to
+  the end at once may lower it in `[server.trino]`.
+- Fairness: unchanged. Admission stays first come, first served among the
+  queries that fit, without head-of-line blocking: another user's query runs
+  at once whatever one user has waiting or suspended (D4: 0.07 s before and
+  after).
+- PostgreSQL wire: unchanged (ISS-026 item 4). Its result stream is polled
+  by `datafusion-postgres` in the connection's task, which blocks on the
+  socket write when the client stops reading; the same `Slot` could wrap that
+  stream later. One slot per connection still bounds it.
+
+Measured (`crates/codelake-server/tests/governance.rs`,
+`abandoned_large_results_do_not_freeze_their_user`, the replay's burst
+against the binary): see ISS-066 for the figures before and after.
 
 ## Consequences
 
 - One registry for both protocols: a PostgreSQL client sees HTTP queries in
   `system.runtime.queries` and the other way round.
-- A slow HTTP client no longer holds a running slot once execution ends; a
-  slow PostgreSQL client does (its rows are produced as they are sent), up to
-  its deadline.
+- A slow HTTP client no longer holds a running slot once execution ends, nor
+  while execution waits for it longer than `suspend_after_secs` (amendment
+  D4); a slow PostgreSQL client does (its rows are produced as they are
+  sent), up to its deadline.
 - Admission is per node. The cluster-wide admission budget of M4 builds on
   it; so would authentication-based groups (M1 item 5).
 - Not covered: memory-based admission (queries are admitted by count; the
@@ -278,14 +358,18 @@ set, they still apply.
   batches in flight. The HTTP protocol already runs each query in a task of
   its own and could move first. Measure protocol latency under CPU
   saturation before choosing (ROADMAP M1 item 6).
-- Tests: unit tests of admission, registry, limits and `kill_query` in the
-  core; the HTTP protocol in process
+- Tests: unit tests of admission, registry, limits, `kill_query` and the
+  suspension of a slot (`governance/admission.rs`, `governance/slot.rs`) in
+  the core; the HTTP protocol in process
   (`crates/codelake-server/src/trino/tests/governance.rs`, pool read at zero
   after a timeout); both protocols with real clients (`tokio-postgres`, the
   Python client) against the binary
   (`crates/codelake-server/tests/governance.rs`: time limits, queue and
   per-user limits, cancel request, `kill_query` across protocols, `DELETE`
-  of a PostgreSQL query, pool back at zero after each; cursors across
+  of a PostgreSQL query, pool back at zero after each; a burst of 18
+  abandoned large results of one user with suspension off and on, the
+  same user's next query timed, slots and pool at zero after the
+  abandonment; cursors across
   transactions, slot and pool freed at their end; statements beside an
   open cursor or suspended portal under a per-user limit of one; a `FETCH`
   among other statements held in the pool; the cancel request on the

@@ -196,8 +196,12 @@ max_queued_queries`, a resource group's `max_queued`, or the user's
 (or the group / user its own maximum). On the HTTP protocol,
 `[server.trino] max_active_queries` (default 100) also caps accepted and
 unfinished queries, usually clients that submit and never read (canceled
-after `client_timeout_secs`). A PostgreSQL client that stops reading a
-portal keeps its running slot until its time limit.
+after `client_timeout_secs`); such a query gives its running slot back after
+`suspend_after_secs` while `codelake_queries_suspended` is below
+`max_suspended_queries`, and keeps it beyond (raise the cap, or lower
+`client_timeout_secs`, when a client that goes away often fills it). A
+PostgreSQL client that stops reading a portal keeps its running slot until
+its time limit.
 
 **Act:** list them (query above, grouped by `"user"` and `source`); kill
 abandoned or runaway ones (`kill_query` above); fix the client that leaks

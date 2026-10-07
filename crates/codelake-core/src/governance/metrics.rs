@@ -5,6 +5,7 @@
 //! |---|---|---|
 //! | `codelake_queries_running` | gauge | — |
 //! | `codelake_queries_queued` | gauge | — |
+//! | `codelake_queries_suspended` | gauge | — |
 //! | `codelake_resource_group_running` | gauge | `resource_group` |
 //! | `codelake_resource_group_queued` | gauge | `resource_group` |
 //! | `codelake_queries_rejected_total` | counter | `scope` (`node`, `resource_group`, `user`) |
@@ -17,6 +18,7 @@ use super::registry::{Protocol, QueryState};
 
 pub const RUNNING: &str = "codelake_queries_running";
 pub const QUEUED: &str = "codelake_queries_queued";
+pub const SUSPENDED: &str = "codelake_queries_suspended";
 pub const GROUP_RUNNING: &str = "codelake_resource_group_running";
 pub const GROUP_QUEUED: &str = "codelake_resource_group_queued";
 pub const REJECTED: &str = "codelake_queries_rejected_total";
@@ -51,6 +53,12 @@ pub(crate) fn slots(group: Option<&str>, running: f64, queued: f64) {
             metrics::gauge!(GROUP_QUEUED, "resource_group" => group.to_owned()).set(queued);
         }
     }
+}
+
+/// Queries on the node that gave their running slot back while their client
+/// does not read.
+pub(crate) fn suspended(count: f64) {
+    metrics::gauge!(SUSPENDED).set(count);
 }
 
 pub(crate) fn rejected(scope: &'static str) {

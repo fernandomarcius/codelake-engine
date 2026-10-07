@@ -195,6 +195,17 @@ pub struct GovernanceConfig {
     /// Longest a query waits for a slot before it fails (`EXCEEDED_TIME_LIMIT`).
     #[serde(default = "default_queue_timeout_secs")]
     pub queue_timeout_secs: u64,
+    /// Queries whose client stopped reading that may give their running slot
+    /// back on this node (ADR 0016, amended for D4): such a query does no
+    /// work until its client reads again, and takes a running slot again
+    /// before it produces more. Beyond this many, a query keeps its slot;
+    /// `0` keeps every slot (the behaviour before).
+    #[serde(default = "default_max_suspended_queries")]
+    pub max_suspended_queries: usize,
+    /// Seconds a query's execution waits for its client to make room for
+    /// more results, holding its running slot, before it gives the slot back.
+    #[serde(default = "default_suspend_after_secs")]
+    pub suspend_after_secs: u64,
     /// Default of the `query_max_run_time` session property: wall time from
     /// submission, queueing included. Duration text (`1h`, `30m`).
     #[serde(default = "default_query_time")]
@@ -226,6 +237,8 @@ impl Default for GovernanceConfig {
             max_running_per_user: default_max_running_per_user(),
             max_queued_per_user: default_max_queued_per_user(),
             queue_timeout_secs: default_queue_timeout_secs(),
+            max_suspended_queries: default_max_suspended_queries(),
+            suspend_after_secs: default_suspend_after_secs(),
             query_max_run_time: default_query_time(),
             query_max_execution_time: default_query_time(),
             history_size: default_history_size(),
@@ -274,6 +287,16 @@ const fn default_max_queued_per_user() -> usize {
 
 const fn default_queue_timeout_secs() -> u64 {
     600
+}
+
+/// As many as run at once by default: what waits for clients holds at most
+/// as much memory outside the pool as what runs (ADR 0003).
+const fn default_max_suspended_queries() -> usize {
+    32
+}
+
+const fn default_suspend_after_secs() -> u64 {
+    1
 }
 
 /// The default of both time limits: effectively none, as the session
@@ -1168,8 +1191,13 @@ impl Config {
                 errors.push(format!("governance.{field} must be > 0"));
             }
         }
-        if governance.queue_timeout_secs == 0 {
-            errors.push("governance.queue_timeout_secs must be > 0".into());
+        for (field, value) in [
+            ("queue_timeout_secs", governance.queue_timeout_secs),
+            ("suspend_after_secs", governance.suspend_after_secs),
+        ] {
+            if value == 0 {
+                errors.push(format!("governance.{field} must be > 0"));
+            }
         }
         for (field, value) in [
             ("query_max_run_time", &governance.query_max_run_time),
@@ -1780,22 +1808,28 @@ mod tests {
         assert_eq!(governance.max_queued_queries, 1000);
         assert_eq!(governance.max_running_per_user, 16);
         assert_eq!(governance.queue_timeout_secs, 600);
+        assert_eq!(governance.max_suspended_queries, 32);
+        assert_eq!(governance.suspend_after_secs, 1);
         assert_eq!(governance.query_max_run_time, "100d");
         assert_eq!(validated.config.query_history(), (100, 900));
 
         let with = |section: &str| VALID.replace("[memory]", &format!("{section}\n\n[memory]"));
         let ok = with(
-            "[governance]\nmax_queued_queries = 0\nquery_max_run_time = \"1h\"\n\
+            "[governance]\nmax_queued_queries = 0\nmax_suspended_queries = 0\nquery_max_run_time = \"1h\"\n\
              [[governance.resource_group]]\nname = \"etl\"\nusers = [\"dbt\"]\nmax_running = 2",
         );
         let validated = parse(&ok).validate(&full_env, &|_| true).unwrap();
         let group = &validated.config.governance.resource_groups[0];
         assert_eq!((group.max_running, group.max_queued), (2, 0));
+        assert_eq!(
+            validated.config.governance.max_suspended_queries, 0,
+            "0 is valid: off"
+        );
 
         let errors = errors_of(
             &with(
                 "[governance]\nmax_running_queries = 0\nmax_running_per_user = 0\nqueue_timeout_secs = 0\n\
-                 query_max_execution_time = \"soon\"\n\
+                 suspend_after_secs = 0\nquery_max_execution_time = \"soon\"\n\
                  [[governance.resource_group]]\nname = \"global\"\nmax_running = 0\n\
                  [[governance.resource_group]]\nname = \"a\"\nuser_pattern = \"(\"\nmax_running = 1\n\
                  [[governance.resource_group]]\nname = \"a\"\nusers = [\"x\"]\nmax_running = 1",
@@ -1806,6 +1840,7 @@ mod tests {
             "governance.max_running_queries must be > 0",
             "governance.max_running_per_user must be > 0",
             "governance.queue_timeout_secs must be > 0",
+            "governance.suspend_after_secs must be > 0",
             "governance.query_max_execution_time `soon` is not a positive duration",
             "name `global` is empty or reserved",
             "`global` needs users, user_pattern or source_pattern",
