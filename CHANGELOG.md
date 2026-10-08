@@ -6,6 +6,13 @@ versioning: [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Performance
+- PostgreSQL: a list of values reaches the source as a list. The engine's simplifier turns `x IN (a, b, c)`
+  into `x = a OR x = b OR x = c` (and `NOT IN` into `<>` terms joined by `AND`), the same predicate, which
+  PostgreSQL estimated apart and, over a view, planned forty times slower than the `x = ANY(…)` it makes of
+  `IN`. Equalities of one expression to non-NULL literals of one type joined by `OR` are sent as `IN (…)`,
+  inequalities joined by `AND` as `NOT IN (…)`; the rows do not change. A filtered page of a queue view
+  (`estado`, `base_erp`, `fonte IN` three values, a `timestamp with time zone` window): 35.7 s → 0.84 s
+  (median of 3; Trino 431: 1.56 s), same rows.
 - A `LIMIT` straight over a federated sub-plan reaches its source (`TOP (n)` on SQL Server): under a
   `UNION ALL` of two remote tables each source was asked for its whole table, read until the engine had its
   rows. The source's policy still decides; a filter it cannot evaluate keeps the limit local. Two SQL Server
