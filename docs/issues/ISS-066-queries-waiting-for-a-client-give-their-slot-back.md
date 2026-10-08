@@ -1,6 +1,6 @@
 # ISS-066 — Queries waiting for a client give their slot back: choices applied by recommendation
 
-- Kind: behavior · Applied: 2026-10-07 · Status: awaiting-confirmation
+- Kind: behavior · Applied: 2026-10-07 · Accepted by: Fernando Farias, 2026-10-08 · Status: closed
 - Context: D4 of the shadow replay of the the reporting application (2026-10-07). The application, killed by a
   deploy, read the first page of 18 queries with large results and never canceled them; their executions
   waited for the gone client holding the user's 16 running slots (ISS-026) until the abandonment sweep
@@ -62,7 +62,9 @@
   No resource group is needed for this workload: no user can take more than 16 slots, dbt's 8 threads stay
   under it, and the API's queries are admitted at once beside a full the reporting application (D4: 0.042 s).
   Watch `codelake_queries_suspended`: at the cap, abandoned queries hold slots again until the sweep.
-- Revisit when: a human confirms or overturns these choices; a client is seen waiting for a slot after
+- Accepted for the cut-over (2026-10-08): the recommended values above go into the production runbook
+  (reference-dbt-project `docs/codelake-cutover.md`, section 2) unchanged.
+- Revisit when: a client is seen waiting for a slot after
   reading slowly (raise `suspend_after_secs`); `codelake_queries_suspended` reaches the cap; the PostgreSQL
   wire shows the same pattern.
 - References: ADR 0016 (amendment D4); `crates/codelake-core/src/governance/{admission,slot}.rs`;
