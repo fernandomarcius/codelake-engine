@@ -22,6 +22,13 @@
 //! pushed: under a deterministic collation (every collation PostgreSQL ships)
 //! two strings are equal only when their bytes are.
 //!
+//! A list of values is sent as a list: the engine's simplifier turns `x IN
+//! (a, b, c)` into `x = a OR x = b OR x = c` (and `NOT IN` into `<>` terms
+//! joined by `AND`), which SQL defines as the same predicate, but PostgreSQL
+//! estimates the two spellings differently. Over a view, the `OR` chain could
+//! pick a plan forty times slower than `x = ANY(…)` for the same rows; the
+//! source gets the list back ([`in_lists`]).
+//!
 //! A `timestamp with time zone` literal is sent as `CAST('…+00' AS TIMESTAMP
 //! WITH TIME ZONE)`, an instant: the unparser's `CAST('…' AS TIMESTAMP)` drops
 //! the offset, and PostgreSQL then reads it in the session's `TimeZone`.
@@ -42,7 +49,9 @@ use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{DFSchema, NullEquality, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::expr::{AggregateFunction, Alias};
+use datafusion::logical_expr::utils::{conjunction, disjunction, split_binary_owned};
 use datafusion::logical_expr::{
     Aggregate, BinaryExpr, Cast, Distinct, Expr, ExprSchemable, JoinType, LogicalPlan, Operator,
 };
@@ -451,7 +460,9 @@ impl PushdownPolicy for PostgresPolicy {
     ///   c` became "missing FROM-clause entry");
     /// - `sum(CAST(x AS bigint))` of a narrower integer becomes `sum(x)`;
     /// - a `timestamp with time zone` literal becomes a cast of its UTC text;
-    /// - a timestamp column widened to a finer unit becomes the column.
+    /// - a timestamp column widened to a finer unit becomes the column;
+    /// - equalities of one expression to literals joined by `OR` become an
+    ///   `IN` list, inequalities joined by `AND` a `NOT IN` list.
     fn prepare(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
         let plan = plan
             .transform_up(|node| {
@@ -495,13 +506,140 @@ impl PushdownPolicy for PostgresPolicy {
             // Columns of a filter's or a join's predicate resolve in its schema.
             let schema = Arc::clone(node.schema());
             node.map_expressions(|expr| {
-                expr.transform_down(|e| match widened_column(&e, &schema) {
-                    Some(column) => Ok(Transformed::yes(column.clone())),
-                    None => Ok(instant_literal(e)),
-                })
+                let listed = in_lists(expr)?;
+                listed
+                    .data
+                    .transform_down(|e| match widened_column(&e, &schema) {
+                        Some(column) => Ok(Transformed::yes(column.clone())),
+                        None => Ok(instant_literal(e)),
+                    })
+                    .map(|done| {
+                        Transformed::new_transformed(done.data, done.transformed || listed.transformed)
+                    })
             })
         })
         .data()
+    }
+}
+
+/// `x = a OR x = b OR …` as `x IN (a, b, …)` and `x <> a AND x <> b AND …` as
+/// `x NOT IN (a, b, …)`, wherever they appear in `expr`: the spelling a
+/// client's list had before the engine's simplifier split it.
+///
+/// SQL defines `x IN (a, b)` as `x = a OR x = b` and `x NOT IN (a, b)` as `x
+/// <> a AND x <> b`, NULLs included, and `AND`/`OR` of comparisons without
+/// side effects do not depend on the order of their terms: the rows are the
+/// same. Only non-NULL literals of one type join a list, so PostgreSQL reads
+/// each of them as it reads the single comparison (an untyped `'…'` takes the
+/// type of `x` in both). Terms on other expressions stay as they are.
+fn in_lists(expr: Expr) -> Result<Transformed<Expr>> {
+    expr.transform_up(|e| match &e {
+        Expr::BinaryExpr(BinaryExpr {
+            op: op @ (Operator::Or | Operator::And),
+            ..
+        }) => {
+            let op = *op;
+            Ok(listed(e, op))
+        }
+        _ => Ok(Transformed::no(e)),
+    })
+}
+
+/// The expression and the literals of `term` when it is one of the
+/// comparisons a list joined by `op` is made of: `x = a` (or an `IN` list)
+/// under `OR`, `x <> a` (or a `NOT IN` list) under `AND`.
+fn list_member(term: &Expr, op: Operator) -> Option<(&Expr, Vec<&Expr>)> {
+    let value = |e: &Expr| matches!(e, Expr::Literal(v, _) if !v.is_null());
+    let negated = op == Operator::And;
+    let member = match term {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: compared,
+            right,
+        }) if *compared == if negated { Operator::NotEq } else { Operator::Eq } => {
+            match (value(left), value(right)) {
+                (false, true) => Some((left.as_ref(), vec![right.as_ref()])),
+                (true, false) => Some((right.as_ref(), vec![left.as_ref()])),
+                _ => None,
+            }
+        }
+        Expr::InList(list) if list.negated == negated && list.list.iter().all(value) => {
+            Some((list.expr.as_ref(), list.list.iter().collect()))
+        }
+        _ => None,
+    };
+    // A volatile expression is evaluated once per comparison; one list
+    // would evaluate it once.
+    member.filter(|(x, _)| !x.is_volatile())
+}
+
+fn literal_type(expr: &Expr) -> Option<DataType> {
+    match expr {
+        Expr::Literal(value, _) => Some(value.data_type()),
+        _ => None,
+    }
+}
+
+/// `expr`, a chain of `op`, with the members of each list (see
+/// [`list_member`]) on one expression gathered into a single list where the
+/// first of them stood.
+fn listed(expr: Expr, op: Operator) -> Transformed<Expr> {
+    let terms = split_binary_owned(expr.clone(), op);
+    // For each term, the index of the first term on the same expression whose
+    // literals have the same type, when it is a list member.
+    let mut heads: Vec<Option<usize>> = Vec::with_capacity(terms.len());
+    for (i, term) in terms.iter().enumerate() {
+        let head = list_member(term, op).and_then(|(x, values)| {
+            let kind = literal_type(values[0])?;
+            if values.iter().any(|v| literal_type(v).as_ref() != Some(&kind)) {
+                return None;
+            }
+            let first = terms[..i].iter().position(|other| {
+                list_member(other, op).is_some_and(|(y, others)| {
+                    y == x && others.iter().all(|v| literal_type(v).as_ref() == Some(&kind))
+                })
+            });
+            Some(first.unwrap_or(i))
+        });
+        heads.push(head);
+    }
+    let gathers = |i: usize| heads.iter().filter(|h| **h == Some(i)).count() > 1;
+    if !(0..terms.len()).any(gathers) {
+        return Transformed::no(expr);
+    }
+    let mut out = Vec::with_capacity(terms.len());
+    for (i, term) in terms.iter().enumerate() {
+        match heads[i] {
+            Some(head) if head == i && gathers(i) => {
+                let Some((x, _)) = list_member(term, op) else {
+                    return Transformed::no(expr);
+                };
+                let values = terms
+                    .iter()
+                    .zip(&heads)
+                    .filter(|(_, h)| **h == Some(i))
+                    .filter_map(|(t, _)| list_member(t, op).map(|(_, v)| v))
+                    .flatten()
+                    .cloned()
+                    .collect();
+                out.push(Expr::InList(InList::new(
+                    Box::new(x.clone()),
+                    values,
+                    op == Operator::And,
+                )));
+            }
+            Some(head) if head != i => {}
+            _ => out.push(term.clone()),
+        }
+    }
+    let joined = if op == Operator::Or {
+        disjunction(out)
+    } else {
+        conjunction(out)
+    };
+    match joined {
+        Some(joined) => Transformed::yes(joined),
+        None => Transformed::no(expr),
     }
 }
 
@@ -885,6 +1023,85 @@ mod tests {
         ));
         let sql = render(filter(col("ts").gt_eq(naive)));
         assert!(sql.contains("CAST('2025-09-14 00:00:00' AS TIMESTAMP)"), "{sql}");
+    }
+
+    /// The `OR`/`AND` chains the simplifier makes of `IN`/`NOT IN` reach
+    /// PostgreSQL as lists again; anything else in the chain stays a term.
+    #[test]
+    fn value_lists_split_by_the_simplifier_are_sent_as_lists() {
+        let eq = |c: &str, v: Expr| col(c).eq(v);
+        let sql = render(filter(
+            eq("s", lit("a")).or(eq("s", lit("b"))).or(eq("s", lit("c"))),
+        ));
+        assert!(sql.ends_with(r#"WHERE "t"."s" IN ('a', 'b', 'c')"#), "{sql}");
+
+        let sql = render(filter(
+            col("s")
+                .not_eq(lit("a"))
+                .and(col("id").eq(lit(2)))
+                .and(col("s").not_eq(lit("b"))),
+        ));
+        assert!(sql.contains(r#""t"."s" NOT IN ('a', 'b')"#), "{sql}");
+        assert!(sql.contains(r#"("t"."id" = 2)"#), "{sql}");
+
+        // Other columns, literals on the left and lists already written join.
+        let sql = render(filter(
+            eq("s", lit("a"))
+                .or(eq("id", lit(3)))
+                .or(lit("b").eq(col("s")))
+                .or(col("s").in_list(vec![lit("c"), lit("d"), lit("e"), lit("f")], false)),
+        ));
+        assert!(
+            sql.contains(r#""t"."s" IN ('a', 'b', 'c', 'd', 'e', 'f')"#),
+            "{sql}"
+        );
+        assert!(sql.contains(r#"("t"."id" = 3)"#), "{sql}");
+
+        // Inside a conjunction, as the planner leaves it.
+        let sql = render(filter(
+            col("id")
+                .eq(lit(2))
+                .and(eq("s", lit("a")).or(eq("s", lit("b"))))
+                .and(col("tz").gt_eq(tz_literal(1_757_808_000_000_000))),
+        ));
+        assert!(sql.contains(r#""t"."s" IN ('a', 'b')"#), "{sql}");
+        assert!(
+            sql.contains("CAST('2025-09-14 00:00:00+00' AS TIMESTAMP WITH TIME ZONE)"),
+            "{sql}"
+        );
+
+        // Zoned instants are listed as instants.
+        let sql = render(filter(
+            col("tz")
+                .eq(tz_literal(1_757_808_000_000_000))
+                .or(col("tz").eq(tz_literal(1_757_811_600_000_000))),
+        ));
+        assert!(
+            sql.contains(
+                r#""t"."tz" IN (CAST('2025-09-14 00:00:00+00' AS TIMESTAMP WITH TIME ZONE), CAST('2025-09-14 01:00:00+00' AS TIMESTAMP WITH TIME ZONE))"#
+            ),
+            "{sql}"
+        );
+
+        // Left alone: one term, NULL literals, mixed literal types, `=` under
+        // `AND`, `<>` under `OR`, comparisons of two columns.
+        let unchanged = [
+            eq("s", lit("a")),
+            eq("s", lit(ScalarValue::Utf8(None))).or(eq("s", lit("a"))),
+            eq("n", lit(ScalarValue::Decimal128(Some(150), 12, 2)))
+                .or(eq("n", lit(ScalarValue::Decimal128(Some(1), 12, 0)))),
+            eq("s", lit("a")).and(eq("s", lit("b"))),
+            col("s").not_eq(lit("a")).or(col("s").not_eq(lit("b"))),
+            eq("s", col("s")).or(eq("s", col("s"))),
+        ];
+        for predicate in unchanged {
+            let sql = render(filter(predicate.clone()));
+            assert!(!sql.contains(" IN ("), "{predicate}: {sql}");
+        }
+        // A volatile expression is evaluated per comparison: never one list.
+        let random = datafusion::functions::math::expr_fn::random;
+        let volatile = random().eq(lit(1.0)).or(random().eq(lit(2.0)));
+        assert!(!in_lists(volatile).unwrap().transformed);
     }
 
     /// A timestamp column the engine widens (`codelake_exact_cast`) to meet

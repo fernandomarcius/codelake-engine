@@ -406,6 +406,56 @@ async fn zoned_timestamp_literals_reach_postgresql_as_instants() {
     assert_eq!(rows(&engine, sql).await, [["2026-09-14T06:00:00Z"]]);
 }
 
+/// `IN`/`NOT IN` lists the simplifier splits into `OR`/`AND` chains reach
+/// PostgreSQL as lists again (it plans the chain apart, up to forty times
+/// slower over a view), with the same rows: NULLs are in neither answer.
+#[tokio::test]
+async fn value_lists_reach_postgresql_as_lists() {
+    let (_container, engine, _spill) = collated_source().await;
+    let cases = [
+        (
+            "SELECT id FROM erp.public.t WHERE s IN ('Z', 'e', 'ação') ORDER BY id",
+            vec!["6", "8", "10"],
+            r#""t"."s" IN ('Z', 'e', 'ação')"#,
+        ),
+        (
+            "SELECT id FROM erp.public.t WHERE s NOT IN ('Z', 'e', 'ação') ORDER BY id",
+            vec!["1", "2", "3", "4", "5", "7", "9"],
+            r#""t"."s" NOT IN ('Z', 'e', 'ação')"#,
+        ),
+        (
+            "SELECT id FROM erp.public.t WHERE s = 'Z' OR id = 3 OR s = 'e' ORDER BY id",
+            vec!["3", "6", "8"],
+            r#""t"."s" IN ('Z', 'e')"#,
+        ),
+        (
+            "SELECT id FROM erp.public.t WHERE id IN (1, 4, 11) AND ok IS NOT NULL ORDER BY id",
+            vec!["1", "11"],
+            r#""t"."id" IN (1, 4, 11)"#,
+        ),
+        // The session zone is UTC; the database's is America/Sao_Paulo.
+        (
+            "SELECT id FROM erp.public.t \
+             WHERE at IN (TIMESTAMP '2026-09-14 00:30:00', TIMESTAMP '2026-09-14 03:00:00') \
+               AND d IN (DATE '2026-09-01', DATE '2026-09-04') ORDER BY id",
+            vec!["1", "4"],
+            "IN (CAST('2026-09-14 00:30:00+00' AS TIMESTAMP WITH TIME ZONE), \
+             CAST('2026-09-14 03:00:00+00' AS TIMESTAMP WITH TIME ZONE))",
+        ),
+    ];
+    for (sql, expected, list) in cases {
+        assert_eq!(column(&rows(&engine, sql).await), expected, "{sql}");
+        let remote = sent(&engine, sql).await;
+        assert!(remote.iter().any(|s| s.contains(list)), "{sql}: {remote:?}");
+        // Only the term on another column is left joined by `OR`.
+        let ors = usize::from(sql.contains("id = 3"));
+        assert!(
+            remote.iter().all(|s| s.matches(" OR ").count() == ors),
+            "{sql}: {remote:?}"
+        );
+    }
+}
+
 async fn client(host: &str, port: u16, user: &str, password: &str) -> tokio_postgres::Client {
     let dsn = format!("host={host} port={port} user={user} password={password} dbname=postgres");
     let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
