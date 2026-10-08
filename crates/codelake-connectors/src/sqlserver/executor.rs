@@ -164,6 +164,9 @@ async fn run(pool: Pool, sql: String, schema: SchemaRef, batch_size: usize, tx: 
                 .map_err(tds_error)?
                 .into_row_stream();
             while let Some(row) = rows.try_next().await.map_err(tds_error)? {
+                if read == 0 {
+                    builder.check_columns(row.columns().iter().map(tiberius::Column::name))?;
+                }
                 read += 1;
                 // Consumer gone (query cancelled or LIMIT satisfied): stop; the
                 // connection keeps `poisoned` and is discarded by the pool.

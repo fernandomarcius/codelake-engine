@@ -9,6 +9,11 @@ extend-ignore-re = ["\\b[0-9a-f]{12}(-dirty)?\\b", "00f067aa0ba902b7"]
 depositos = "depositos"
 # the reporting application: an application of the installation (the D4 replay, ISS-066).
 Controle = "Controle"
+# Names of the ERP's columns and of the app that reads them (`Cliente_Rec`,
+# `Itens_Proc`, the reporting application), reproduced by the federated join tests.
+cliente = "cliente"
+controle = "controle"
+itens = "itens"
 # ERRO: outcome of the differential gate (both engines refused, different errors).
 ERRO = "ERRO"
 # A deliberate syntax error in the Trino protocol tests (`SELEC 1`).

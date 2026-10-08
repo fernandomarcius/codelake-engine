@@ -80,16 +80,20 @@ fn federate(plan: LogicalPlan, planner: &Arc<dyn FederationPlanner>) -> LogicalP
     })
 }
 
+/// `plan` federated as its source will receive it, or `None` when the
+/// unparser would not write one of its joins as the plan means it
+/// ([`crate::federated_joins`]): the caller then federates less.
 fn federate_prepared(
     plan: LogicalPlan,
     policy: &dyn PushdownPolicy,
     planner: &Arc<dyn FederationPlanner>,
-) -> Result<LogicalPlan> {
+) -> Result<Option<LogicalPlan>> {
     let prepared = policy.prepare(unmark_supersets(plan)?)?;
-    Ok(federate(
-        with_select_list(aliased_scan_filters(prepared)?)?,
-        planner,
-    ))
+    let prepared = crate::federated_joins::for_unparser(aliased_scan_filters(prepared)?)?;
+    if !crate::federated_joins::renders_faithfully(&prepared) {
+        return Ok(None);
+    }
+    Ok(Some(federate(with_select_list(prepared)?, planner)))
 }
 
 /// An aggregation at the root of a sub-plan renders its aggregates before its
@@ -198,8 +202,10 @@ fn split(
     policy: &dyn PushdownPolicy,
     planner: &Arc<dyn FederationPlanner>,
 ) -> Result<LogicalPlan> {
-    if fully_pushable(&plan, policy) {
-        return federate_prepared(plan, policy, planner);
+    if fully_pushable(&plan, policy)
+        && let Some(federated) = federate_prepared(plan.clone(), policy, planner)?
+    {
+        return Ok(federated);
     }
     if let Some(first) = first_rows(&plan, policy, planner)? {
         return Ok(first);
@@ -261,9 +267,12 @@ fn first_rows(
         .sort(sort.expr.clone())?
         .limit(0, Some(rows))?
         .build()?;
+    let Some(federated) = federate_prepared(first, policy, planner)? else {
+        return Ok(None);
+    };
     let mut local = LogicalPlan::Sort(Sort {
         expr: sort.expr.clone(),
-        input: Arc::new(federate_prepared(first, policy, planner)?),
+        input: Arc::new(federated),
         fetch: sort.fetch,
     });
     for node in between.into_iter().rev() {
@@ -342,7 +351,10 @@ fn lift_scan_filters(
     planner: &Arc<dyn FederationPlanner>,
 ) -> Result<LogicalPlan> {
     let filters = std::mem::take(&mut scan.filters);
-    let bare = federate_prepared(LogicalPlan::TableScan(scan), policy, planner)?;
+    // A table scan has no join: always federated.
+    let bare = federate_prepared(LogicalPlan::TableScan(scan), policy, planner)?.ok_or_else(|| {
+        datafusion::error::DataFusionError::Internal("a table scan has no join to refuse".into())
+    })?;
     // Never drop a predicate: if it cannot be rebuilt, planning fails.
     Ok(match conjunction(filters) {
         Some(predicate) => crate::overflow::check_local_node(LogicalPlan::Filter(Filter::try_new(
@@ -537,22 +549,17 @@ fn with_new_inputs(plan: &LogicalPlan, inputs: Vec<LogicalPlan>) -> Result<Logic
 /// prune or it is not such a scan.
 fn prune_federated(federated: &FederatedPlanNode, needed: &HashSet<Column>) -> Result<Option<LogicalPlan>> {
     // Federation wraps each input of a cross-source join in a projection of
-    // its plain columns: that list is what narrows.
+    // its plain columns, and a join sent whole gets one
+    // (`crate::federated_joins`): that list narrows, and so do the lists of
+    // the derived tables below it.
     if let LogicalPlan::Projection(projection) = &federated.plan
         && projection.expr.iter().all(|e| matches!(e, Expr::Column(_)))
     {
-        let kept: Vec<Expr> = projection
-            .expr
-            .iter()
-            .zip(federated.plan.schema().columns())
-            .filter(|(_, column)| needed.contains(column))
-            .map(|(expr, _)| expr.clone())
-            .collect();
-        if kept.is_empty() || kept.len() == projection.expr.len() {
+        let narrowed = narrow(federated.plan.clone(), Some(needed.clone()))?;
+        if !narrowed.transformed {
             return Ok(None);
         }
-        let pruned = LogicalPlan::Projection(Projection::try_new(kept, Arc::clone(&projection.input))?);
-        return Ok(Some(federate(pruned, &federated.planner)));
+        return Ok(Some(federate(narrowed.data, &federated.planner)));
     }
     // `FROM t AS r`: the projection goes below the alias, as a plain
     // `SELECT` of the table (`FROM (SELECT a, b FROM t) AS r`).
@@ -587,7 +594,117 @@ fn prune_federated(federated: &FederatedPlanNode, needed: &HashSet<Column>) -> R
         Some(alias) => LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(Arc::new(pruned), alias)?),
         None => pruned,
     };
+    // The scan's own list of columns too, which the unparser writes below
+    // the alias.
+    let pruned = narrow(pruned, Some(needed.clone()))?.data;
     Ok(Some(federate(pruned, &federated.planner)))
+}
+
+/// `plan`, a federated sub-plan, with each of its projections listing only
+/// the columns the nodes above it read (`needed` of the root; at least one,
+/// since `SELECT` without a column has no portable SQL), the inputs of a
+/// union still lined up. Only columns leave a list: the plan keeps its
+/// shape, which the unparser renders as it did.
+fn narrow(plan: LogicalPlan, needed: Needed) -> Result<Transformed<LogicalPlan>> {
+    if let (LogicalPlan::Projection(projection), Some(needed)) = (&plan, &needed)
+        && !over_distinct(&projection.input)
+    {
+        let mut kept: Vec<Expr> = projection
+            .expr
+            .iter()
+            .zip(plan.schema().columns())
+            .filter(|(_, column)| needed.contains(column))
+            .map(|(expr, _)| expr.clone())
+            .collect();
+        if kept.is_empty() {
+            kept.extend(projection.expr.first().cloned());
+        }
+        let input = narrow(
+            Arc::unwrap_or_clone(Arc::clone(&projection.input)),
+            Some(columns_of(&kept)),
+        )?;
+        if kept.len() == projection.expr.len() && !input.transformed {
+            return Ok(Transformed::no(plan));
+        }
+        let narrowed = LogicalPlan::Projection(Projection::try_new(kept, Arc::new(input.data))?);
+        return Ok(Transformed::yes(narrowed));
+    }
+    if let (LogicalPlan::TableScan(scan), Some(needed)) = (&plan, &needed)
+        && let Some(listed) = &scan.projection
+    {
+        return narrow_scan(scan, listed, needed);
+    }
+    let needs = needs_of_inputs(&plan, needed);
+    let inputs = plan
+        .inputs()
+        .into_iter()
+        .cloned()
+        .zip(needs.iter().cloned())
+        .map(|(input, need)| narrow(input, need))
+        .collect::<Result<Vec<_>>>()?;
+    if !inputs.iter().any(|input| input.transformed) {
+        return Ok(Transformed::no(plan));
+    }
+    let inputs: Vec<LogicalPlan> = inputs.into_iter().map(|input| input.data).collect();
+    if !lined_up(&plan, &needs, &inputs) {
+        return Ok(Transformed::no(plan));
+    }
+    with_new_inputs(&plan, inputs).map(Transformed::yes)
+}
+
+/// A scan that lists its columns (`listed`, the SQL Server policy lists
+/// them all) listing only those in `needed` and those its own filters read,
+/// at least one: the unparser applies the filters over the list
+/// (`SELECT … FROM (SELECT <list> FROM t) WHERE <filters>`).
+fn narrow_scan(
+    scan: &TableScan,
+    listed: &[usize],
+    needed: &HashSet<Column>,
+) -> Result<Transformed<LogicalPlan>> {
+    let filtered: HashSet<String> = scan
+        .filters
+        .iter()
+        .flat_map(|filter| {
+            filter
+                .column_refs()
+                .into_iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut kept: Vec<usize> = listed
+        .iter()
+        .zip(scan.projected_schema.columns())
+        .filter(|(_, column)| needed.contains(column) || filtered.contains(&column.name))
+        .map(|(index, _)| *index)
+        .collect();
+    if kept.is_empty() {
+        kept.extend(listed.first());
+    }
+    if kept.len() == listed.len() {
+        return Ok(Transformed::no(LogicalPlan::TableScan(scan.clone())));
+    }
+    let narrowed = TableScan::try_new(
+        scan.table_name.clone(),
+        Arc::clone(&scan.source),
+        Some(kept),
+        scan.filters.clone(),
+        scan.fetch,
+    )?;
+    Ok(Transformed::yes(LogicalPlan::TableScan(narrowed)))
+}
+
+/// A `DISTINCT` the unparser writes into the same `SELECT` as a projection
+/// above it: the projection's list is what it compares, so it cannot lose
+/// a column.
+fn over_distinct(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Distinct(_) => true,
+        LogicalPlan::Filter(_) | LogicalPlan::Sort(_) | LogicalPlan::Limit(_) => {
+            plan.inputs().into_iter().any(over_distinct)
+        }
+        _ => false,
+    }
 }
 
 /// Filters over one table scan: a projection of its columns renders as a
@@ -1318,6 +1435,277 @@ mod tests {
         })
         .unwrap();
         found
+    }
+
+    /// A join sent whole (D3 of the shadow run): its select list and the
+    /// lists of the derived tables below it name only what the engine
+    /// reads above it, the join's keys included.
+    fn federated_join(left: LogicalPlan) -> LogicalPlan {
+        let planner: Arc<dyn FederationPlanner> =
+            Arc::new(SQLFederationPlanner::new(crate::testing::executor("crm")));
+        let joined = LogicalPlanBuilder::from(left)
+            .join(
+                remote_scan("u").build().unwrap(),
+                datafusion::logical_expr::JoinType::Left,
+                (
+                    vec![Column::from_qualified_name("c.a")],
+                    vec![Column::from_qualified_name("u.a")],
+                ),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        federate(crate::federated_joins::for_unparser(joined).unwrap(), &planner)
+    }
+
+    fn derived_projection(plan: &LogicalPlan) -> Vec<String> {
+        let mut found = Vec::new();
+        plan.apply(|node| {
+            if let LogicalPlan::Extension(Extension { node }) = node
+                && let Some(federated) = node.as_any().downcast_ref::<FederatedPlanNode>()
+            {
+                federated.plan().apply(|inner| {
+                    if let LogicalPlan::SubqueryAlias(alias) = inner
+                        && let LogicalPlan::Projection(projection) = alias.input.as_ref()
+                    {
+                        found = projection.expr.iter().map(ToString::to_string).collect();
+                    }
+                    Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+                })?;
+            }
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        found
+    }
+
+    #[test]
+    fn a_join_sent_whole_lists_only_the_columns_read_above_it() {
+        let left = remote_scan("t")
+            .project(vec![col("t.a"), col("t.b"), col("t.c")])
+            .unwrap()
+            .alias("c")
+            .unwrap()
+            .build()
+            .unwrap();
+        let plan = LogicalPlanBuilder::from(federated_join(left.clone()))
+            .project(vec![col("c.b"), col("u.c")])
+            .unwrap()
+            .build()
+            .unwrap();
+        let pruned = prune(plan, None).unwrap();
+        assert!(pruned.transformed);
+        assert_eq!(federated_columns(&pruned.data), [["c.b", "u.c"]]);
+        // The derived table keeps the join's key.
+        assert_eq!(derived_projection(&pruned.data), ["t.a", "t.b"]);
+        // Everything read: nothing to narrow.
+        let all = LogicalPlanBuilder::from(federated_join(left.clone()))
+            .project(["c.a", "c.b", "c.c", "u.a", "u.b", "u.c"].map(col).to_vec())
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(!prune(all, None).unwrap().transformed);
+        // Nothing read (`count(*)`): one column, `SELECT` needs one.
+        let counted = LogicalPlanBuilder::from(federated_join(left))
+            .aggregate(
+                Vec::<Expr>::new(),
+                vec![datafusion::functions_aggregate::expr_fn::count(lit(1))],
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let pruned = prune(counted, None).unwrap();
+        assert!(pruned.transformed);
+        assert_eq!(federated_columns(&pruned.data), [["c.a"]]);
+        assert_eq!(derived_projection(&pruned.data), ["t.a"]);
+    }
+
+    #[test]
+    fn a_union_below_a_join_sent_whole_is_narrowed_alike_or_not_at_all() {
+        let union = |left: LogicalPlanBuilder| {
+            left.union(
+                remote_scan("v")
+                    .project(vec![col("v.a"), col("v.b"), col("v.c")])
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap()
+            .alias("c")
+            .unwrap()
+            .build()
+            .unwrap()
+        };
+        let lined = union(
+            remote_scan("t")
+                .project(vec![col("t.a"), col("t.b"), col("t.c")])
+                .unwrap(),
+        );
+        let plan = LogicalPlanBuilder::from(federated_join(lined))
+            .project(vec![col("c.b")])
+            .unwrap()
+            .build()
+            .unwrap();
+        let pruned = prune(plan, None).unwrap();
+        assert_eq!(federated_columns(&pruned.data), [["c.b"]]);
+        let mut lists = Vec::new();
+        pruned
+            .data
+            .apply(|node| {
+                if let LogicalPlan::Extension(Extension { node }) = node
+                    && let Some(federated) = node.as_any().downcast_ref::<FederatedPlanNode>()
+                {
+                    federated.plan().apply(|inner| {
+                        if let LogicalPlan::Union(union) = inner {
+                            lists = union.inputs.iter().map(|i| i.schema().fields().len()).collect();
+                        }
+                        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+                    })?;
+                }
+                Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+        assert_eq!(lists, [2, 2], "the key and the column read, in both inputs");
+        // A distinct union keeps every column it compares.
+        let distinct = LogicalPlanBuilder::from(
+            remote_scan("t")
+                .project(vec![col("t.a"), col("t.b"), col("t.c")])
+                .unwrap()
+                .union(
+                    remote_scan("v")
+                        .project(vec![col("v.a"), col("v.b"), col("v.c")])
+                        .unwrap()
+                        .build()
+                        .unwrap(),
+                )
+                .unwrap()
+                .aggregate(vec![col("a"), col("b"), col("c")], Vec::<Expr>::new())
+                .unwrap()
+                .alias("c")
+                .unwrap()
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+        let plan = LogicalPlanBuilder::from(federated_join(distinct))
+            .project(vec![col("c.b")])
+            .unwrap()
+            .build()
+            .unwrap();
+        let pruned = prune(plan, None).unwrap();
+        assert_eq!(federated_columns(&pruned.data), [["c.b"]]);
+        assert_eq!(derived_projection(&pruned.data), Vec::<String>::new());
+    }
+
+    /// A scan that lists its columns (as the SQL Server policy makes every
+    /// scan do) lists only those read above it, at least one.
+    #[test]
+    fn a_listed_scan_lists_only_the_columns_read() {
+        let planner: Arc<dyn FederationPlanner> =
+            Arc::new(SQLFederationPlanner::new(crate::testing::executor("crm")));
+        let fields = ["a", "b", "c"].map(|column| {
+            datafusion::arrow::datatypes::Field::new(
+                column,
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            )
+        });
+        let schema = datafusion::arrow::datatypes::Schema::new(fields.to_vec());
+        let listed =
+            || datafusion::logical_expr::table_scan(Some("t"), &schema, Some(vec![0, 1, 2])).unwrap();
+        let scan_list = |plan: &LogicalPlan| {
+            let mut found = None;
+            plan.apply(|node| {
+                if let LogicalPlan::Extension(Extension { node }) = node
+                    && let Some(federated) = node.as_any().downcast_ref::<FederatedPlanNode>()
+                {
+                    federated.plan().apply(|inner| {
+                        if let LogicalPlan::TableScan(scan) = inner {
+                            found = scan.projection.clone();
+                        }
+                        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+                    })?;
+                }
+                Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+            found
+        };
+        // Aliased, filtered: the filter's column stays, below the alias.
+        let aliased = listed()
+            .filter(col("t.c").gt(lit(1_i64)))
+            .unwrap()
+            .alias("r")
+            .unwrap()
+            .build()
+            .unwrap();
+        let plan = LogicalPlanBuilder::from(federate(aliased, &planner))
+            .project(vec![col("r.b")])
+            .unwrap()
+            .build()
+            .unwrap();
+        let pruned = prune(plan, None).unwrap();
+        assert_eq!(federated_columns(&pruned.data), [["r.b"]]);
+        assert_eq!(scan_list(&pruned.data), Some(vec![1, 2]));
+        // A filter of the scan itself keeps its column in the list.
+        let LogicalPlan::TableScan(mut filtered) = listed().build().unwrap() else {
+            panic!("a scan")
+        };
+        filtered.filters = vec![col("t.c").gt(lit(1_i64))];
+        let needs_b: HashSet<Column> = [Column::new(Some("t"), "b")].into();
+        let narrowed = narrow(LogicalPlan::TableScan(filtered), Some(needs_b)).unwrap();
+        assert!(narrowed.transformed);
+        let LogicalPlan::TableScan(narrowed) = narrowed.data else {
+            panic!("a scan")
+        };
+        assert_eq!(narrowed.projection, Some(vec![1, 2]));
+        // Nothing read: the first column.
+        let narrowed = narrow(listed().build().unwrap(), Some(HashSet::new())).unwrap();
+        assert!(narrowed.transformed);
+        assert_eq!(narrowed.data.schema().fields().len(), 1);
+        // Everything read: unchanged.
+        let all: HashSet<Column> = ["a", "b", "c"].map(|c| Column::new(Some("t"), c)).into();
+        assert!(!narrow(listed().build().unwrap(), Some(all)).unwrap().transformed);
+        // A scan without a list keeps none.
+        let unlisted = datafusion::logical_expr::table_scan(Some("t"), &schema, None)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(!narrow(unlisted, Some(HashSet::new())).unwrap().transformed);
+    }
+
+    /// A projection over `DISTINCT` renders as one `SELECT DISTINCT`: it
+    /// keeps every column it lists.
+    #[test]
+    fn a_projection_over_distinct_keeps_its_columns() {
+        let planner: Arc<dyn FederationPlanner> =
+            Arc::new(SQLFederationPlanner::new(crate::testing::executor("crm")));
+        let distinct = LogicalPlan::Distinct(datafusion::logical_expr::Distinct::All(Arc::new(
+            remote_scan("t").build().unwrap(),
+        )));
+        for input in [
+            distinct.clone(),
+            LogicalPlanBuilder::from(distinct)
+                .filter(col("t.a").gt(lit(1_i64)))
+                .unwrap()
+                .build()
+                .unwrap(),
+        ] {
+            let listed = LogicalPlanBuilder::from(input)
+                .project(vec![col("t.a"), col("t.b"), col("t.c")])
+                .unwrap()
+                .build()
+                .unwrap();
+            let plan = LogicalPlanBuilder::from(federate(listed, &planner))
+                .project(vec![col("t.a")])
+                .unwrap()
+                .build()
+                .unwrap();
+            assert!(!prune(plan, None).unwrap().transformed);
+        }
+        assert!(!over_distinct(&remote_scan("t").build().unwrap()));
     }
 
     #[test]

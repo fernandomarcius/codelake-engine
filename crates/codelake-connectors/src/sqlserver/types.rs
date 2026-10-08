@@ -430,6 +430,33 @@ impl BatchBuilder {
         })
     }
 
+    /// Checks the columns the server returns against the ones expected, by
+    /// name and position: the engine reads them by position, so a statement
+    /// that lists other columns, or the same in another order, would put a
+    /// column's values in another one, silently when the types agree. A
+    /// column without a name (an expression the statement did not alias)
+    /// is not checked; names compare without case, as SQL Server binds them.
+    pub(crate) fn check_columns<'a>(&self, names: impl ExactSizeIterator<Item = &'a str>) -> Result<()> {
+        let expected = self.schema.fields();
+        if names.len() != expected.len() {
+            return Err(DataFusionError::Execution(format!(
+                "sqlserver: the statement returns {} columns, the plan expects {}",
+                names.len(),
+                expected.len()
+            )));
+        }
+        for (position, (name, field)) in names.zip(expected.iter()).enumerate() {
+            if !name.is_empty() && !name.eq_ignore_ascii_case(field.name()) {
+                return Err(DataFusionError::Execution(format!(
+                    "sqlserver: the statement returns `{name}` as column {}, the plan expects `{}`",
+                    position + 1,
+                    field.name()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Appends one row. Returns a full batch when `batch_size` is reached.
     pub(crate) fn push<'a>(
         &mut self,
@@ -690,6 +717,44 @@ mod tests {
             .push(vec![ColumnData::String(Some(Cow::Borrowed("x")))])
             .unwrap_err();
         assert!(err.to_string().contains("server sent string"), "{err}");
+    }
+
+    /// D2 of the shadow run: a statement listing other columns than the
+    /// plan's, read by position, put a column's values in another one.
+    #[test]
+    fn columns_returned_must_be_the_plans_in_order() {
+        let builder = BatchBuilder::new(
+            schema(vec![("k", DataType::Int64), ("nome_pes", DataType::Utf8)]),
+            8,
+        )
+        .unwrap();
+        assert!(builder.check_columns(["k", "nome_pes"].into_iter()).is_ok());
+        // SQL Server binds names without case; an unaliased expression has none.
+        assert!(builder.check_columns(["K", "Nome_Pes"].into_iter()).is_ok());
+        assert!(builder.check_columns(["", "nome_pes"].into_iter()).is_ok());
+        let swapped = builder
+            .check_columns(["cod_pes", "nome_pes"].into_iter())
+            .unwrap_err();
+        assert!(
+            swapped
+                .to_string()
+                .contains("returns `cod_pes` as column 1, the plan expects `k`"),
+            "{swapped}"
+        );
+        let second = builder.check_columns(["k", "cod_pes"].into_iter()).unwrap_err();
+        assert!(second.to_string().contains("as column 2"), "{second}");
+        let fewer = builder.check_columns(["k"].into_iter()).unwrap_err();
+        assert!(
+            fewer
+                .to_string()
+                .contains("returns 1 columns, the plan expects 2"),
+            "{fewer}"
+        );
+        assert!(
+            builder
+                .check_columns(["k", "nome_pes", "senha_pes"].into_iter())
+                .is_err()
+        );
     }
 
     #[test]
