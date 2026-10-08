@@ -1,0 +1,112 @@
+description = """Joins of PostgreSQL tables sent to PostgreSQL whole, as a LEFT, RIGHT or FULL join with
+filters in WHERE on either side and in ON, over derived tables aggregated and aggregated again by the
+engine, nested subqueries. The DataFusion unparser folded the filter of the table an outer join preserves
+into ON (every row of it came back), put a filter over the side the join completes into the shared WHERE,
+and listed a join's columns side by side (a derived table none), which the engine reads by position
+(codelake_core::federated_joins, ADR 0006 point 12). Found on SQL Server by a reporting application's
+replay on the shadow run (2026-10-07); the same unparser writes PostgreSQL's SQL. The SQL Server side is
+covered by the integration test sqlserver_federated_joins, against Trino 431 too."""
+oracle = "trino"
+compare = "multiset"
+setup_postgres = [
+  "CREATE TABLE source.fj_rec (cliente integer, empresa integer NOT NULL, numvend integer NOT NULL, valor numeric(12,2) NOT NULL)",
+  """INSERT INTO source.fj_rec SELECT CASE WHEN i % 11 = 0 THEN NULL ELSE (i * 13) % 120 + 1 END,
+       (ARRAY[1, 2, 26, 85, 87, 204])[i % 6 + 1], i % 40 + 1, (i * 37 % 10000) / 100.0
+     FROM generate_series(1, 600) AS g(i)""",
+  "CREATE TABLE source.fj_pes (cod integer NOT NULL, nome text, tipo integer NOT NULL, senha text)",
+  """INSERT INTO source.fj_pes SELECT i, CASE WHEN i % 17 = 0 THEN NULL ELSE 'PESSOA ' || i END, i % 3, 'segredo' || i
+     FROM generate_series(1, 100) AS g(i)""",
+  "CREATE TABLE source.fj_cr (cliente integer, empresa integer NOT NULL, valor numeric(12,2) NOT NULL)",
+  """INSERT INTO source.fj_cr SELECT CASE WHEN i % 13 = 0 THEN NULL ELSE (i * 17) % 130 + 1 END,
+       (ARRAY[1, 2, 26, 85, 87, 204])[i % 6 + 1], (i * 29 % 10000) / 100.0
+     FROM generate_series(1, 400) AS g(i)""",
+  "GRANT SELECT ON source.fj_rec, source.fj_pes, source.fj_cr TO source",
+]
+
+[[case]]
+id = "FJ1"
+sql = "SELECT r.cliente, p.nome FROM pg.source.fj_rec r LEFT JOIN pg.source.fj_pes p ON p.cod = r.cliente WHERE r.empresa = 1"
+note = "D1: the preserved side's filter went into ON, every row of fj_rec came back"
+
+[[case]]
+id = "FJ2"
+sql = "SELECT r.cliente, max(p.nome) FROM pg.source.fj_rec r LEFT JOIN pg.source.fj_pes p ON p.cod = r.cliente WHERE r.empresa IN (1, 85) AND r.cliente IS NOT NULL GROUP BY r.cliente"
+note = "the list of payers (F23), aggregated by the engine"
+
+[[case]]
+id = "FJ3"
+sql = "SELECT r.cliente, p.nome FROM pg.source.fj_rec r JOIN pg.source.fj_pes p ON p.cod = r.cliente WHERE r.empresa = 1"
+
+[[case]]
+id = "FJ4"
+sql = "SELECT r.numvend, p.cod FROM pg.source.fj_rec r LEFT JOIN pg.source.fj_pes p ON p.cod = r.cliente WHERE r.empresa = 85 AND p.cod IS NULL"
+
+[[case]]
+id = "FJ5"
+sql = "SELECT r.empresa, count(*), count(p.cod) FROM pg.source.fj_rec r LEFT JOIN pg.source.fj_pes p ON p.cod = r.cliente AND r.empresa = 1 GROUP BY r.empresa"
+note = "a condition on the preserved side in ON keeps every row"
+
+[[case]]
+id = "FJ6"
+sql = "SELECT r.cliente, p.nome FROM pg.source.fj_rec r LEFT JOIN pg.source.fj_pes p ON p.cod = r.cliente AND p.tipo = 0 WHERE r.empresa = 204"
+
+[[case]]
+id = "FJ7"
+sql = "SELECT r.cliente, p.cod FROM pg.source.fj_rec r RIGHT JOIN pg.source.fj_pes p ON p.cod = r.cliente AND r.empresa = 2 WHERE p.tipo = 1"
+
+[[case]]
+id = "FJ8"
+sql = "SELECT r.cliente, p.cod FROM pg.source.fj_rec r RIGHT JOIN pg.source.fj_pes p ON p.cod = r.cliente WHERE p.cod > 90 AND r.empresa = 26"
+
+[[case]]
+id = "FJ9"
+sql = "SELECT coalesce(r.empresa, -1), count(*), count(r.cliente), count(p.cod) FROM pg.source.fj_rec r FULL JOIN pg.source.fj_pes p ON p.cod = r.cliente AND r.empresa = 85 AND p.tipo = 1 GROUP BY 1"
+
+[[case]]
+id = "FJ10"
+sql = "SELECT r.cliente, p.cod FROM (SELECT * FROM pg.source.fj_rec WHERE empresa = 87) r FULL JOIN (SELECT * FROM pg.source.fj_pes WHERE tipo = 0) p ON p.cod = r.cliente"
+note = "FULL join of two filtered tables: each a derived table of its own"
+
+[[case]]
+id = "FJ11"
+sql = "SELECT r.numvend, p.nome, c.valor FROM pg.source.fj_rec r LEFT JOIN pg.source.fj_pes p ON p.cod = r.cliente LEFT JOIN pg.source.fj_cr c ON c.cliente = r.cliente AND c.empresa = 2 WHERE r.empresa = 2 AND r.numvend < 10"
+
+[[case]]
+id = "FJ12"
+sql = "SELECT r.numvend, p.cod, c.valor FROM pg.source.fj_rec r LEFT JOIN pg.source.fj_pes p ON p.cod = r.cliente RIGHT JOIN pg.source.fj_cr c ON c.cliente = r.cliente WHERE c.empresa = 204 AND (r.empresa = 204 OR r.empresa IS NULL)"
+
+[[case]]
+id = "FJ13"
+sql = "SELECT c.k, max(p.nome) AS nome FROM (SELECT cliente AS k, empresa AS e FROM pg.source.fj_rec WHERE empresa = 1 UNION SELECT cliente, empresa FROM pg.source.fj_cr WHERE empresa = 1) c LEFT JOIN pg.source.fj_pes p ON p.cod = c.k GROUP BY c.k"
+note = "D2: a derived aggregation joined, aggregated again by the engine"
+
+[[case]]
+id = "FJ14"
+sql = "SELECT c.k, c.n, count(p.cod), max(p.tipo) FROM (SELECT cliente AS k, count(*) AS n FROM pg.source.fj_rec WHERE empresa = 85 GROUP BY cliente) c LEFT JOIN pg.source.fj_pes p ON p.cod = c.k GROUP BY c.k, c.n"
+note = "integer columns on both sides: a select list by sides would swap values silently"
+
+[[case]]
+id = "FJ15"
+sql = "SELECT r.numvend, c.n FROM pg.source.fj_rec r LEFT JOIN (SELECT cliente AS k, count(*) AS n FROM pg.source.fj_cr GROUP BY cliente) c ON c.k = r.cliente AND c.n > 3 WHERE r.empresa = 26"
+
+[[case]]
+id = "FJ16"
+sql = "SELECT r.numvend, x.nome, x.valor FROM pg.source.fj_rec r LEFT JOIN (SELECT p.cod, p.nome, c.valor FROM pg.source.fj_pes p JOIN pg.source.fj_cr c ON c.cliente = p.cod WHERE c.empresa = 87) x ON x.cod = r.cliente WHERE r.empresa = 87"
+
+[[case]]
+id = "FJ17"
+sql = "SELECT y.k, y.nome FROM (SELECT x.k, max(p.nome) AS nome FROM (SELECT cliente AS k FROM pg.source.fj_rec WHERE empresa = 204 AND cliente IS NOT NULL) x LEFT JOIN pg.source.fj_pes p ON p.cod = x.k GROUP BY x.k) y WHERE y.nome IS NOT NULL OR y.k > 100"
+
+[[case]]
+id = "FJ18"
+sql = "SELECT count(*) FROM pg.source.fj_rec r LEFT JOIN pg.source.fj_pes p ON p.cod = r.cliente WHERE r.empresa = 1"
+
+[[case]]
+id = "FJ19"
+sql = "SELECT * FROM pg.source.fj_cr c LEFT JOIN pg.source.fj_pes p ON p.cod = c.cliente WHERE c.empresa = 85"
+note = "every column of both, in order"
+
+[[case]]
+id = "FJ20"
+sql = "SELECT fj_rec.numvend, fj_pes.nome FROM pg.source.fj_rec LEFT JOIN pg.source.fj_pes ON fj_pes.cod = fj_rec.cliente WHERE fj_rec.empresa = 1 AND fj_rec.numvend = 3"
+note = "tables without an alias"
