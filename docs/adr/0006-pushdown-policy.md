@@ -101,6 +101,33 @@ dynamic filter, so the whole remote table would be read on every run.
     with its NULLs where SQL Server puts them (first ascending, last
     descending) or without NULLs.
 
+12. A join sent whole is written as the plan means it
+    (`codelake_core::federated_joins`). The `DataFusion` unparser (54.1)
+    folds the filters of a table under a join into the join (`ON` when it is
+    outer, even for the side it preserves), puts a filter above a join input
+    into the `WHERE` shared by the whole `FROM`, and builds a join's select
+    list side by side (a derived table contributes nothing, an aliased table
+    `*`), which the engine then reads by position. Before unparsing, the
+    filters of a table a LEFT or RIGHT join preserves are lifted above the
+    join (its `WHERE`); a filtered table of a FULL join, and an aliased
+    input the unparser would merge into the enclosing `SELECT` (the filter
+    of a side the join adds rows for, under its alias), become derived
+    tables of their own; every `SELECT`
+    whose list a join would build gets the plan's columns, in order. A join
+    still in a shape the unparser writes wrong (a join as a right input, a
+    filtered side without an alias that needs a derived table) is not sent:
+    it runs in the engine over its inputs, each federated on its own.
+    `PruneFederatedColumns` narrows the select list of a join sent whole and
+    of the derived tables below it to the columns the engine reads, and the
+    SQL Server reader checks the columns a statement returns against the
+    plan's, by name and position (unnamed expressions excepted): a mismatch
+    fails instead of filling a column with another's values. Found by the
+    the reporting application's replay on the shadow run (2026-10-07): the list of
+    payers returned 150 974 rows instead of 158, the list of customers failed,
+    and both read every column of `Pessoas`. Remove the rewrite when the
+    unparser writes these shapes right: `federated_joins` has a test that
+    fails then.
+
 ## Consequences
 
 - Correctness first: some operators Trino pushes down run locally here, moving

@@ -293,6 +293,20 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- A join of tables of one SQL source sent to it whole could return wrong rows, fail, or read every column
+  (D1-D3, ADR 0006 point 12):
+  the `DataFusion` unparser folded the filter of the table a LEFT JOIN preserves into `ON` (so every row of
+  it came back), put a filter over the side an outer join completes into the shared `WHERE`, and listed a
+  join's columns side by side (a derived table none, an aliased table `*`), read by position. Found by the
+  the reporting application's replay on the shadow run (2026-10-07, Trino 431 over the same SQL Server): the list
+  of payers returned 150 974 rows in 75-92 s instead of 158 in 3 s, other companies and names missing; the
+  list of customers failed with `column dtcad_pes expects Timestamp(ms) but the server sent tinyint`, and
+  would have returned another column's values had the types agreed; both read all 33 columns of `Pessoas`,
+  its passwords included. The filters of a preserved table now go to `WHERE`, a side whose filters would
+  drop the rows an outer join adds becomes a derived table, every `SELECT` a join would list gets the plan's
+  columns in order, narrowed to those the engine reads; a join the unparser would still write wrong runs in
+  the engine over its federated inputs. The SQL Server reader fails on a statement whose columns are not the
+  plan's, by name and position.
 - An HTTP query whose client stopped reading no longer holds a running slot until it is declared abandoned
   (D4, ADR 0016 amendment, ISS-066): once its execution has waited 1 s for the client
   (`[governance] suspend_after_secs`) it gives the slot back, and takes one again before it produces more.

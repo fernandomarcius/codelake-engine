@@ -155,6 +155,50 @@ pub(crate) fn remote_table_observed(
     )
 }
 
+/// The statements a fake source received.
+pub(crate) type Statements = Arc<Mutex<Vec<String>>>;
+
+/// Several remote tables of one source behind one executor, so a join
+/// between them can be federated whole: the executor records each
+/// statement and answers with the columns it holds by name (a join's
+/// output only when its columns have one length).
+pub(crate) fn remote_tables_recording(
+    context: &'static str,
+    tables: Vec<(&str, Vec<(&'static str, ArrayRef)>)>,
+    policy: Option<Arc<dyn PushdownPolicy>>,
+) -> (Vec<Arc<dyn TableProvider>>, Statements) {
+    let statements = Arc::new(Mutex::new(Vec::new()));
+    let executor = Arc::new(IgnoresFilters {
+        context,
+        columns: tables
+            .iter()
+            .flat_map(|(_, columns)| columns.iter().cloned())
+            .collect(),
+        policy,
+        statements: Arc::clone(&statements),
+        zones: Arc::new(Mutex::new(Vec::new())),
+    });
+    let provider = Arc::new(SQLFederationProvider::new(executor));
+    let providers = tables
+        .into_iter()
+        .map(|(table, columns)| {
+            let schema = Arc::new(Schema::new(
+                columns
+                    .iter()
+                    .map(|(name, array)| Field::new(*name, array.data_type().clone(), true))
+                    .collect::<Vec<_>>(),
+            ));
+            let source = SQLTableSource::new_with_schema(
+                Arc::clone(&provider),
+                RemoteTableRef::from(TableReference::bare(table)),
+                schema,
+            );
+            Arc::new(FederatedTableProviderAdaptor::new(Arc::new(source))) as Arc<dyn TableProvider>
+        })
+        .collect();
+    (providers, statements)
+}
+
 /// Executor with no data, for building planners in plan-rewrite tests.
 pub(crate) fn executor(context: &'static str) -> Arc<dyn SQLExecutor> {
     Arc::new(IgnoresFilters {
