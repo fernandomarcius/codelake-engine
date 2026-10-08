@@ -21,7 +21,7 @@ import time
 from typing import Any
 
 from . import compare, dbt, expected, report
-from .config import Config, ConfigError, expected_path, load, time_zone
+from .config import Config, ConfigError, digits, expected_path, load, time_zone
 from .rss import Meter, MeterError, Sampler
 
 EXIT_EQUAL, EXIT_DIVERGENT, EXIT_CONFIG, EXIT_HARNESS = 0, 1, 2, 3
@@ -133,7 +133,14 @@ def run_cycle(config: Config, number: int, project: str) -> dict[str, Any]:
         tables, skipped = dbt.output_tables(runs["reference"].artifact("manifest.json"), merged, config.output_catalogs)
     cycle["skipped_models"] = skipped
     options = compare.Options(
-        config.ignore_columns, config.sample, config.show_rows, config.expected, config.parquet_time_zone
+        config.ignore_columns,
+        config.sample,
+        config.show_rows,
+        config.expected,
+        config.parquet_time_zone,
+        config.double_digits,
+        config.real_digits,
+        config.float_recheck_limit,
     )
     cycle["expected_differences_file"] = config.expected_differences or None
     con = connection(config, work)
@@ -232,6 +239,24 @@ def cmd_compare(argv: list[str]) -> int:
         default="",
         help="IANA zone the hive catalogs convert INT96 timestamps with (needed to compare INT96 columns)",
     )
+    parser.add_argument(
+        "--double-digits",
+        type=int,
+        default=compare.DOUBLE_DIGITS,
+        help="significant digits doubles are compared to (0: exact text)",
+    )
+    parser.add_argument(
+        "--real-digits",
+        type=int,
+        default=compare.REAL_DIGITS,
+        help="significant digits reals are compared to (0: exact text)",
+    )
+    parser.add_argument(
+        "--float-recheck-limit",
+        type=int,
+        default=compare.FLOAT_RECHECK_LIMIT,
+        help="most rows per side paired again at a float rounding boundary (0: none)",
+    )
     parser.add_argument("--memory", default="2GB")
     parser.add_argument("--work", default="/tmp/codelake-shadow")
     parser.add_argument("--out", help="write the JSON result here")
@@ -243,7 +268,18 @@ def cmd_compare(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     rules = expected.load(expected_path(args.expected))
     zone = time_zone(args.parquet_time_zone, "--parquet-time-zone")
-    options = compare.Options(args.ignore_column, args.sample, args.show_rows, rules, zone)
+    double_digits = digits(str(args.double_digits), "--double-digits", 17)
+    real_digits = digits(str(args.real_digits), "--real-digits", 9)
+    options = compare.Options(
+        args.ignore_column,
+        args.sample,
+        args.show_rows,
+        rules,
+        zone,
+        double_digits,
+        real_digits,
+        max(args.float_recheck_limit, 0),
+    )
     con = compare.connect(args.memory, os.path.join(args.work, "duckdb-tmp"))
     results = []
     try:

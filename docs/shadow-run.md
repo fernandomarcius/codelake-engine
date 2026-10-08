@@ -174,6 +174,8 @@ same path inside it.
 | `SHADOW_RSS_INTERVAL_MS` | sampling period | `200` |
 | `SHADOW_RSS_MAX_RATIO` | fail when candidate/reference peak exceeds it (M1: `0.5`); needs both meters, and a cycle where a side was not measured fails | report only |
 | `SHADOW_EXPECTED_DIFFERENCES` | rule file of expected, documented differences (below): a path, or `default` for the shipped `tools/shadow/codelake_shadow/expected-differences.json` | none (no rule) |
+| `SHADOW_DOUBLE_DIGITS`, `SHADOW_REAL_DIGITS` | significant digits floats are compared to (below); a column that is `real` on either side uses the second; `0` compares the exact text | `12`, `6` |
+| `SHADOW_FLOAT_RECHECK_LIMIT` | most rows per side paired again at a float rounding boundary (below); `0` turns it off | `10000` |
 | `SHADOW_SAMPLE`, `SHADOW_SHOW_ROWS` | differing row hashes listed; print their values (opt-in) | `10`, `false` |
 | `SHADOW_DUCKDB_MEMORY` | DuckDB memory limit (it spills beyond it) | `2GB` |
 | `SHADOW_S3_ENDPOINT`, `SHADOW_S3_REGION`, `SHADOW_S3_PATH_STYLE` | S3 warehouses; keys from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` via `SHADOW_PASS_ENV`, or the credential chain | — |
@@ -231,7 +233,19 @@ timestamps as nanoseconds since the epoch of the wall-clock value the engines
 read (an `INT64` timestamp as stored, naive values read as UTC; an `INT96`
 timestamp converted from the UTC instant it stores to
 `SHADOW_PARQUET_TIME_ZONE`, as the hive catalogs do), strings exactly
-(trailing spaces count), binary as hex, NULL distinct from `''`. DuckDB reads
+(trailing spaces count), binary as hex, NULL distinct from `''`, floats
+(`real`, `double`) rounded to `SHADOW_DOUBLE_DIGITS` / `SHADOW_REAL_DIGITS`
+significant digits. Engines that add in another order (a windowed
+`STDDEV_POP`) disagree in the last bit, ~1e-16 relative, which is not a wrong
+result; a difference in the 12th digit of a double still diverges. NaN
+matches NaN whatever its sign bit, infinities keep their sign, `-0` is `0`.
+Two values one ulp apart can still round to different texts at a boundary
+(`…4999` / `…5000`): when only float columns differ and the row counts are
+equal, the rows whose hashes differ are paired again (same text in every
+other column, each float within half a unit of its last compared digit;
+NULL only with NULL, NaN with NaN). The table is then equal and reports the
+paired rows in `float_tolerance`; a pairing it cannot make (or more than
+`SHADOW_FLOAT_RECHECK_LIMIT` rows) stays divergent. DuckDB reads
 `INT96` at microsecond precision: sub-microsecond digits of an `INT96` column
 are not compared.
 

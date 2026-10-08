@@ -43,6 +43,10 @@ def cycle_markdown(cycle: dict[str, Any]) -> str:
     for t in cycle["tables"]:
         rows = t.get("rows", {})
         cols = ", ".join(c["column"] for c in t.get("columns_differing", []))
+        tolerance = t.get("float_tolerance")
+        if tolerance:
+            # Rows whose rounded floats straddled a boundary, paired within tolerance.
+            cols = f"none ({tolerance['rows']} rows paired within float tolerance: {', '.join(tolerance['columns'])})"
         lines.append(
             f"| `{t['table']}` | {t['status']}{' (' + ', '.join(t['reasons']) + ')' if t.get('reasons') else ''} | "
             f"{rows.get('reference', '-')} / {rows.get('candidate', '-')} | {cols} |"
