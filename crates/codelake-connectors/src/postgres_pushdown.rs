@@ -551,7 +551,7 @@ fn in_lists(expr: Expr) -> Result<Transformed<Expr>> {
 fn list_member(term: &Expr, op: Operator) -> Option<(&Expr, Vec<&Expr>)> {
     let value = |e: &Expr| matches!(e, Expr::Literal(v, _) if !v.is_null());
     let negated = op == Operator::And;
-    match term {
+    let member = match term {
         Expr::BinaryExpr(BinaryExpr {
             left,
             op: compared,
@@ -567,7 +567,10 @@ fn list_member(term: &Expr, op: Operator) -> Option<(&Expr, Vec<&Expr>)> {
             Some((list.expr.as_ref(), list.list.iter().collect()))
         }
         _ => None,
-    }
+    };
+    // A volatile expression is evaluated once per comparison; one list
+    // would evaluate it once.
+    member.filter(|(x, _)| !x.is_volatile())
 }
 
 fn literal_type(expr: &Expr) -> Option<DataType> {
@@ -1095,6 +1098,10 @@ mod tests {
             let sql = render(filter(predicate.clone()));
             assert!(!sql.contains(" IN ("), "{predicate}: {sql}");
         }
+        // A volatile expression is evaluated per comparison: never one list.
+        let random = datafusion::functions::math::expr_fn::random;
+        let volatile = random().eq(lit(1.0)).or(random().eq(lit(2.0)));
+        assert!(!in_lists(volatile).unwrap().transformed);
     }
 
     /// A timestamp column the engine widens (`codelake_exact_cast`) to meet
