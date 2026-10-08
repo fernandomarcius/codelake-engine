@@ -13,7 +13,7 @@ import zoneinfo
 from typing import Mapping
 from urllib.parse import urlparse
 
-from . import expected
+from . import compare, expected
 
 # Differences the candidate declares against the reference engine
 # (docs/issues), shipped with the harness as a rule file to opt into:
@@ -93,6 +93,9 @@ class Config:
     expected_differences: str = ""
     expected: list[expected.Rule] = dataclasses.field(default_factory=list)
     parquet_time_zone: str = ""
+    double_digits: int = compare.DOUBLE_DIGITS
+    real_digits: int = compare.REAL_DIGITS
+    float_recheck_limit: int = compare.FLOAT_RECHECK_LIMIT
 
 
 def _bool(value: str, name: str) -> bool:
@@ -111,6 +114,14 @@ def _int(value: str, name: str, minimum: int) -> int:
         raise ConfigError(f"{name} must be an integer") from err
     if number < minimum:
         raise ConfigError(f"{name} must be >= {minimum}")
+    return number
+
+
+def digits(value: str, name: str, maximum: int) -> int:
+    """Significant digits floats are compared to: 0 (exact text) to ``maximum``."""
+    number = _int(value, name, 0)
+    if number > maximum:
+        raise ConfigError(f"{name} must be <= {maximum} (0 compares the exact text)")
     return number
 
 
@@ -263,6 +274,13 @@ def load(env: Mapping[str, str] | None = None) -> Config:
         s3_path_style=bool(check(_bool, get("SHADOW_S3_PATH_STYLE", "false"), "SHADOW_S3_PATH_STYLE")),
     )
     config.parquet_time_zone = check(time_zone, get("SHADOW_PARQUET_TIME_ZONE", ""), "SHADOW_PARQUET_TIME_ZONE") or ""
+    for attr, var, maximum in (("double_digits", "SHADOW_DOUBLE_DIGITS", 17), ("real_digits", "SHADOW_REAL_DIGITS", 9)):
+        number = check(digits, get(var, str(getattr(config, attr))), var, maximum)
+        if number is not None:
+            setattr(config, attr, number)
+    limit = check(_int, get("SHADOW_FLOAT_RECHECK_LIMIT", str(config.float_recheck_limit)), "SHADOW_FLOAT_RECHECK_LIMIT", 0)
+    if limit is not None:
+        config.float_recheck_limit = limit
     if max_ratio is not None and not (reference.rss and candidate.rss):
         errors.append(
             "SHADOW_RSS_MAX_RATIO needs both SHADOW_REFERENCE_RSS and SHADOW_CANDIDATE_RSS: "

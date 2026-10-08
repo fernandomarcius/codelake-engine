@@ -23,7 +23,26 @@ Canonical text of a value (see ``canonical_expr``):
   an ``INT96`` timestamp converted from the UTC instant it stores to the
   Parquet time zone of the hive catalogs (``parquet_time_zone``), as both
   engines read it. ``INT96`` without a configured zone is not compared;
-- binary as hex; dates, times, booleans and floats as their exact text.
+- floats (``real``, ``double``) rounded to N significant digits, in
+  scientific notation (``double_digits``, default 12; ``real_digits``,
+  default 6, for a column that is ``real`` on either side; 0 keeps the exact
+  text). Engines that sum in another order (a windowed ``STDDEV_POP``)
+  disagree in the last bit or two, ~1e-16 relative, which is not a wrong
+  result; a difference in the N-th digit still is. NaN is ``nan`` whatever
+  its sign bit, infinities keep their sign, and ``-0`` is ``0``;
+- binary as hex; dates, times and booleans as their exact text.
+
+Rounding has an edge: two values a few ulps apart that straddle a rounding
+boundary (``...4999`` and ``...5000`` at digit N+1) round to different texts,
+so their rows hash differently. When the only columns whose checksums differ
+are floats and the row counts are equal, the rows whose hashes differ are
+paired again (``float_recheck``): same canonical text in every other column,
+and each float within half a unit of its N-th significant digit (NULL only
+with NULL, NaN only with NaN, an infinity only with itself). Rows of one key
+are paired in sorted order, which can miss a pairing with several float
+columns: that stays divergent, never the reverse. Beyond
+``float_recheck_limit`` rows to pair (default 10000) the table stays
+divergent. Paired rows are reported in ``float_tolerance``.
 
 Every non-NULL value is length-prefixed and tagged with its class, so the
 concatenation of a row's values is unambiguous.
@@ -57,6 +76,7 @@ from __future__ import annotations
 import dataclasses
 import fnmatch
 import json
+import math
 import os
 import re
 from typing import Any
@@ -79,6 +99,12 @@ _INTEGER_TYPES = {
     "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT",
 }
 _FLOAT_TYPES = {"FLOAT", "DOUBLE", "REAL"}
+
+# Significant digits floats are compared to (module docstring): a double
+# holds 15-17, a real 6-9; rows paired again at a rounding boundary.
+DOUBLE_DIGITS = 12
+REAL_DIGITS = 6
+FLOAT_RECHECK_LIMIT = 10000
 
 
 def quote_ident(name: str) -> str:
@@ -130,12 +156,53 @@ def _nanos(col: str, duck_type: str, int96_zone: str | None = None) -> str:
     return f"(CAST(epoch_us({col}) AS HUGEINT) * 1000)"
 
 
+def float_text(col: str, digits: int) -> str:
+    """SQL for the canonical text of a float: rounded to ``digits``
+    significant digits in scientific notation; the exact text when 0."""
+    if digits <= 0:
+        return f"CAST({col} AS VARCHAR)"
+    return (
+        f"(CASE WHEN isnan({col}) THEN 'nan' "
+        f"WHEN isinf({col}) THEN (CASE WHEN {col} > 0 THEN 'inf' ELSE '-inf' END) "
+        f"WHEN {col} = 0 THEN '0' "
+        f"ELSE printf('%.{int(digits) - 1}e', CAST({col} AS DOUBLE)) END)"
+    )
+
+
+def float_digits(ref_type: str, cand_type: str, double_digits: int, real_digits: int) -> int | None:
+    """Significant digits a column is compared to: ``real_digits`` when it is
+    ``real`` on either side, ``double_digits`` otherwise; None when it is not
+    a float on both sides."""
+    if type_class(ref_type) != "F" or type_class(cand_type) != "F":
+        return None
+    bases = {t.upper().split("(")[0].strip() for t in (ref_type, cand_type)}
+    return real_digits if bases & {"FLOAT", "REAL"} else double_digits
+
+
+def floats_close(a: float | None, b: float | None, digits: int) -> bool:
+    """Whether two floats agree to ``digits`` significant digits: within half
+    a unit of the ``digits``-th significant digit of the larger. NULL only
+    with NULL, NaN only with NaN, an infinity only with itself; 0 digits:
+    only an equal value."""
+    if a is None or b is None:
+        return a is None and b is None
+    if math.isnan(a) or math.isnan(b):
+        return math.isnan(a) and math.isnan(b)
+    if a == b:
+        return True
+    if math.isinf(a) or math.isinf(b) or digits <= 0:
+        return False
+    exponent = math.floor(math.log10(max(abs(a), abs(b))))
+    return abs(a - b) <= 0.5 * 10.0 ** (exponent - digits + 1)
+
+
 def canonical_expr(
-    name: str, duck_type: str, int96_zone: str | None = None, replace_class: str = ""
+    name: str, duck_type: str, int96_zone: str | None = None, replace_class: str = "", digits: int = 0
 ) -> str:
     """SQL for the canonical text of one column; never NULL. ``replace_class``
     (a regular expression): each matching character of a text value becomes
-    U+FFFD first (a ``replaced_characters`` rule, ``expected.py``)."""
+    U+FFFD first (a ``replaced_characters`` rule, ``expected.py``).
+    ``digits``: significant digits of a float (``float_text``)."""
     col = quote_ident(name)
     cls = type_class(duck_type)
     if replace_class and cls == "S":
@@ -148,7 +215,7 @@ def canonical_expr(
         )
         text = f"(CASE WHEN {text} = '-0' THEN '0' ELSE {text} END)"
     elif cls == "F":
-        text = f"CAST({col} AS VARCHAR)"
+        text = float_text(col, digits)
     elif cls == "B":
         text = f"(CASE WHEN {col} THEN '1' ELSE '0' END)"
     elif cls == "T":
@@ -383,14 +450,26 @@ def read_side(con: duckdb.DuckDBPyConnection, files: list[str]) -> SideData:
 
 
 def canonical_relation(
-    side: SideData, columns: list[str], zone: str, replace: dict[str, str] | None = None
+    side: SideData,
+    columns: list[str],
+    zone: str,
+    replace: dict[str, str] | None = None,
+    digits: dict[str, int] | None = None,
+    raw: list[str] | None = None,
 ) -> str:
     """SQL of the side's rows as canonical texts ``k0..kn`` of ``columns``
     (lower-case names), one SELECT per file group; ``replace``: column ->
-    character class replaced with U+FFFD (see ``canonical_expr``)."""
+    character class replaced with U+FFFD (see ``canonical_expr``);
+    ``digits``: float column -> significant digits; ``raw``: float columns
+    also selected as ``DOUBLE`` values ``v0..vm``."""
     parts = []
     for group in side.groups:
         items = []
+        for j, column in enumerate(raw or []):
+            if column in group.columns:
+                items.append(f"CAST({quote_ident(group.columns[column][0])} AS DOUBLE) AS v{j}")
+            else:
+                items.append(f"CAST(NULL AS DOUBLE) AS v{j}")
         for i, column in enumerate(columns):
             if column not in group.columns:
                 items.append(f"'~' AS k{i}")
@@ -406,17 +485,23 @@ def canonical_relation(
                     )
                 int96_zone = zone
             replace_class = (replace or {}).get(column, "")
-            items.append(f"{canonical_expr(name, duck_type, int96_zone, replace_class)} AS k{i}")
+            column_digits = (digits or {}).get(column, 0)
+            items.append(f"{canonical_expr(name, duck_type, int96_zone, replace_class, column_digits)} AS k{i}")
         if not items:
             items.append("1 AS k_")
         parts.append(f"SELECT {', '.join(items)} FROM {_relation(group.files)}")
     return " UNION ALL ".join(parts)
 
 
-def _row_expr(columns: list[str]) -> str:
-    if not columns:
+def _row_expr(columns: list[str], only: set[str] | None = None) -> str:
+    """SQL of a row's canonical text; ``only``: of these columns alone."""
+    parts = [
+        f"{quote_literal(name + '=')} || k{i}"
+        for i, name in enumerate(columns)
+        if only is None or name in only
+    ]
+    if not parts:
         return "''"
-    parts = [f"{quote_literal(name + '=')} || k{i}" for i, name in enumerate(columns)]
     return " || '|' || ".join(parts)
 
 
@@ -498,6 +583,72 @@ def differing_rows(
     return total, sample
 
 
+def float_recheck(
+    con: duckdb.DuckDBPyConnection,
+    ref_relation: str,
+    cand_relation: str,
+    columns: list[str],
+    digits: dict[str, int],
+    limit: int,
+) -> int | None:
+    """Pairs the rows whose hashes differ (the extra rows of each hash on
+    each side) when rounding put close floats on two sides of a boundary.
+    The relations carry the raw ``DOUBLE`` of each column of ``digits`` (in
+    its order) as ``v0..vm``. A pair has the same canonical text in every
+    other column and each float within ``floats_close``. Returns the rows
+    paired, or None when one cannot be paired or there are more than
+    ``limit`` on a side."""
+    floats = list(digits)
+    row = _row_expr(columns)
+    key = _row_expr(columns, set(columns) - set(floats))
+    values = ", ".join(f"v{j}" for j in range(len(floats)))
+    sql = f"""
+        WITH ref AS (
+            SELECT md5({row}) AS h, md5({key}) AS kh, {values} FROM ({ref_relation}) AS x
+        ), cand AS (
+            SELECT md5({row}) AS h, md5({key}) AS kh, {values} FROM ({cand_relation}) AS x
+        ), ref_n AS (
+            SELECT h, count(*) AS n FROM ref GROUP BY h
+        ), cand_n AS (
+            SELECT h, count(*) AS n FROM cand GROUP BY h
+        ), diff AS (
+            SELECT coalesce(ref_n.h, cand_n.h) AS h, coalesce(ref_n.n, 0) - coalesce(cand_n.n, 0) AS excess
+            FROM ref_n FULL OUTER JOIN cand_n ON ref_n.h = cand_n.h
+            WHERE coalesce(ref_n.n, 0) <> coalesce(cand_n.n, 0)
+        ), ref_x AS (
+            SELECT ref.*, d.excess AS e, row_number() OVER (PARTITION BY ref.h) AS i
+            FROM ref JOIN diff AS d ON ref.h = d.h WHERE d.excess > 0
+        ), cand_x AS (
+            SELECT cand.*, -d.excess AS e, row_number() OVER (PARTITION BY cand.h) AS i
+            FROM cand JOIN diff AS d ON cand.h = d.h WHERE d.excess < 0
+        )
+        SELECT 0 AS side, kh, {values} FROM ref_x WHERE i <= e
+        UNION ALL
+        SELECT 1 AS side, kh, {values} FROM cand_x WHERE i <= e
+        LIMIT {2 * int(limit) + 1}
+    """
+    rows = con.execute(sql).fetchall()
+    if len(rows) > 2 * limit:
+        return None
+    groups: dict[str, tuple[list[tuple], list[tuple]]] = {}
+    for side, kh, *vals in rows:
+        groups.setdefault(kh, ([], []))[side].append(tuple(vals))
+
+    def order(vals: tuple) -> tuple:
+        return tuple((0, 0.0) if v is None else (1, 0.0) if math.isnan(v) else (2, v) for v in vals)
+
+    paired = 0
+    per_column = [digits[c] for c in floats]
+    for ref_rows, cand_rows in groups.values():
+        if len(ref_rows) != len(cand_rows):
+            return None
+        for a, b in zip(sorted(ref_rows, key=order), sorted(cand_rows, key=order)):
+            if not all(floats_close(x, y, n) for x, y, n in zip(a, b, per_column)):
+                return None
+        paired += len(ref_rows)
+    return paired
+
+
 @dataclasses.dataclass
 class Options:
     ignore_columns: list[str] = dataclasses.field(default_factory=list)
@@ -507,6 +658,12 @@ class Options:
     # IANA zone the hive catalogs of both engines convert INT96 timestamps
     # with (``parquet_time_zone`` / ``hive.parquet.time-zone``).
     parquet_time_zone: str = ""
+    # Significant digits floats are compared to (0: exact text); a column
+    # that is ``real`` on either side uses ``real_digits``.
+    double_digits: int = DOUBLE_DIGITS
+    real_digits: int = REAL_DIGITS
+    # Most rows per side the float recheck pairs (0: no recheck).
+    float_recheck_limit: int = FLOAT_RECHECK_LIMIT
 
 
 def _classify(
@@ -688,7 +845,12 @@ def _compare_table(
     )
     out["schema"] = schema_out
     zone = options.parquet_time_zone
-    ref_relation = canonical_relation(ref_side, compared, zone)
+    digits: dict[str, int] = {}
+    for c in compared:
+        n = float_digits(ref_side.columns[c][1], cand_side.columns[c][1], options.double_digits, options.real_digits)
+        if n is not None:
+            digits[c] = n
+    ref_relation = canonical_relation(ref_side, compared, zone, digits=digits)
     replace: dict[str, str] = {}
     for c in compared:
         rule = expected_rules.replacements(options.expected, name, c)
@@ -711,7 +873,7 @@ def _compare_table(
                 "candidate": f"{rule.characters} ({changed} rows)",
             }
         )
-    cand_relation = canonical_relation(cand_side, compared, zone, replace)
+    cand_relation = canonical_relation(cand_side, compared, zone, replace, digits)
     ref = side_stats(con, ref_relation, compared)
     cand = side_stats(con, cand_relation, compared)
     out["rows"] = {"reference": ref.rows, "candidate": cand.rows}
@@ -728,6 +890,26 @@ def _compare_table(
         }
         for c in diff_columns
     ]
+    if (
+        ref.checksum != cand.checksum
+        and ref.rows == cand.rows
+        and diff_columns
+        and all(c in digits for c in diff_columns)
+        and options.float_recheck_limit > 0
+    ):
+        paired = float_recheck(
+            con,
+            canonical_relation(ref_side, compared, zone, digits=digits, raw=list(digits)),
+            canonical_relation(cand_side, compared, zone, replace, digits, raw=list(digits)),
+            compared,
+            digits,
+            options.float_recheck_limit,
+        )
+        if paired is not None:
+            reasons.remove("checksum")
+            out["float_tolerance"] = {"rows": paired, "columns": diff_columns}
+            out["columns_differing"] = []
+            return _finish(out, reasons, expected, name_case)
     if ref.checksum != cand.checksum:
         total, sample = differing_rows(
             con, ref_relation, cand_relation, compared, options.sample, options.show_rows

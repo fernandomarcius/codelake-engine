@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -345,6 +346,165 @@ class CompareTests(unittest.TestCase):
         self.w.write("ref", "s.t", "SELECT 1 AS a")
         self.assertEqual(self.w.compare()["status"], "missing_candidate")
         self.assertEqual(self.w.compare("s.nope")["status"], "missing_both")
+
+
+class FloatToleranceTests(unittest.TestCase):
+    """Floats agree to N significant digits (12 for double, 6 for real)."""
+
+    def setUp(self) -> None:
+        self.w = Warehouses()
+
+    def tearDown(self) -> None:
+        self.w.dir.cleanup()
+
+    def doubles(self, ref: list[str], cand: list[str], **options) -> dict:
+        """Compares ``s.t(id, x DOUBLE)`` whose x values are SQL expressions."""
+        for side, values in (("ref", ref), ("cand", cand)):
+            rows = ", ".join(f"({i}, CAST({v} AS DOUBLE))" for i, v in enumerate(values))
+            self.w.write(side, "s.t", f"SELECT * FROM (VALUES {rows}) v(id, x)")
+        return self.w.compare(**options)
+
+    def test_the_last_ulp_is_equal(self) -> None:
+        # monitoring.sensor_volume on the shadow run (2026-10-07): STDDEV_POP
+        # over a window summed in another order, 2.2e-16 relative.
+        # Quoted: a string casts to the nearest double (a numeric literal is a
+        # decimal first).
+        ref = ["'334.6947436524383'", "1.5", "'-2.25e-300'"]
+        cand = ["'334.6947436524384'", "1.5", "'-2.25e-300'"]
+        result = self.doubles(ref, cand)
+        self.assertEqual(result["status"], "equal", result)
+        self.assertNotIn("float_tolerance", result)
+        # The exact text (0 digits) still sees it.
+        result = self.doubles(ref, cand, double_digits=0)
+        self.assertEqual(result["reasons"], ["checksum"], result)
+        self.assertEqual([c["column"] for c in result["columns_differing"]], ["x"])
+
+    def test_a_relative_difference_of_1e_6_is_divergent(self) -> None:
+        result = self.doubles(["'334.6947436524383'", "7"], ["CAST('334.6947436524383' AS DOUBLE) * (1 + 1e-6)", "7"])
+        self.assertEqual(result["status"], "divergent", result)
+        self.assertEqual(result["reasons"], ["checksum"], result)
+        self.assertEqual([c["column"] for c in result["columns_differing"]], ["x"])
+        self.assertNotIn("float_tolerance", result)
+        # In the 12th digit too: tolerance is half a unit of it, not more.
+        result = self.doubles(["1.00000000001"], ["1.00000000002"])
+        self.assertEqual(result["status"], "divergent", result)
+
+    def boundary_pairs(self) -> list[tuple[float, float]]:
+        """Neighbouring doubles (one ulp apart) that DuckDB rounds to
+        different 12-digit texts, found next to a rounding boundary."""
+
+        def text(x: float) -> str:
+            sql = f"SELECT {compare.float_text('x', 12)} FROM (SELECT CAST(? AS DOUBLE) AS x)"
+            return self.w.con.execute(sql, [x]).fetchone()[0]
+
+        pairs = []
+        for near in (1.000000000005, 334.6947436525, -0.1000000000005):
+            x = near
+            for _ in range(8):
+                x = math.nextafter(x, 0.0)
+            for _ in range(16):
+                y = math.nextafter(x, math.copysign(math.inf, x))
+                if text(x) != text(y):
+                    pairs.append((x, y))
+                    break
+                x = y
+            else:
+                self.fail(f"no rounding boundary next to {near!r}")
+        return pairs
+
+    def test_a_rounding_boundary_is_paired_within_tolerance(self) -> None:
+        pairs = self.boundary_pairs()
+        ref = [f"'{a!r}'" for a, _ in pairs] + ["2"]
+        cand = [f"'{b!r}'" for _, b in pairs] + ["2"]
+        result = self.doubles(ref, cand)
+        self.assertEqual(result["status"], "equal", result)
+        self.assertEqual(result["float_tolerance"], {"rows": 3, "columns": ["x"]})
+        self.assertEqual(result["columns_differing"], [])
+        # Without the recheck, the rows hash differently.
+        result = self.doubles(ref, cand, float_recheck_limit=0)
+        self.assertEqual(result["reasons"], ["checksum"], result)
+        # Beyond the limit, too.
+        result = self.doubles(ref, cand, float_recheck_limit=2)
+        self.assertEqual(result["reasons"], ["checksum"], result)
+
+    def test_the_recheck_pairs_only_rows_equal_elsewhere(self) -> None:
+        (a, b), *_ = self.boundary_pairs()
+        # Same multiset of values per column, other rows: (k, x) pairs differ.
+        a, b = f"CAST('{a!r}' AS DOUBLE)", f"CAST('{b!r}' AS DOUBLE)"
+        self.w.write("ref", "s.t", f"SELECT * FROM (VALUES ('p', {a}), ('q', 5.0)) v(k, x)")
+        self.w.write("cand", "s.t", f"SELECT * FROM (VALUES ('p', 5.0), ('q', {b})) v(k, x)")
+        result = self.w.compare()
+        self.assertEqual(result["status"], "divergent", result)
+        self.assertNotIn("float_tolerance", result)
+        # A duplicated row on one side is not absorbed by the recheck.
+        self.w.write("ref", "s.t", f"SELECT * FROM (VALUES ('p', {a}), ('p', {a})) v(k, x)")
+        self.w.write("cand", "s.t", f"SELECT * FROM (VALUES ('p', {b}), ('p', {b} * 2)) v(k, x)")
+        self.assertEqual(self.w.compare()["status"], "divergent")
+
+    def test_nan_infinity_null_and_signed_zero(self) -> None:
+        special = ["'nan'", "'inf'", "'-inf'", "NULL", "0.0", "1e308"]
+        # NaN's sign bit and zero's sign do not count.
+        swapped = ["-CAST('nan' AS DOUBLE)", "'inf'", "'-inf'", "NULL", "-0.0", "1e308"]
+        result = self.doubles(special, swapped)
+        self.assertEqual(result["status"], "equal", result)
+        for index, other in (
+            (0, "NULL"),  # NaN is not NULL
+            (0, "0"),  # nor a number
+            (1, "'-inf'"),  # infinities keep their sign
+            (1, "1.7976931348623157e308"),  # and are not the largest double
+            (3, "0.0"),  # NULL is not 0
+            (4, "'nan'"),
+        ):
+            with self.subTest(reference=special[index], candidate=other):
+                cand = list(special)
+                cand[index] = other
+                result = self.doubles(special, cand)
+                self.assertEqual(result["status"], "divergent", result)
+                self.assertNotIn("float_tolerance", result)
+
+    def test_reals_agree_to_6_digits(self) -> None:
+        def reals(ref: str, cand: str, **options) -> dict:
+            self.w.write("ref", "s.t", f"SELECT 1 AS id, CAST({ref} AS FLOAT) AS r")
+            self.w.write("cand", "s.t", f"SELECT 1 AS id, CAST({cand} AS FLOAT) AS r")
+            return self.w.compare(**options)
+
+        self.assertEqual(reals("334.69474", "334.69476")["status"], "equal")
+        self.assertEqual(reals("334.69474", "334.69476", real_digits=0)["status"], "divergent")
+        self.assertEqual(reals("334.69474", "334.69574")["status"], "divergent")
+
+    def test_floats_close(self) -> None:
+        close = compare.floats_close
+        self.assertTrue(close(334.6947436524383, 334.6947436524384, 12))
+        self.assertTrue(close(1.0000000000049998, 1.000000000005, 12))
+        self.assertFalse(close(1.0, 1.00000000001, 12))
+        self.assertTrue(close(0.0, -0.0, 12))
+        self.assertTrue(close(None, None, 12))
+        self.assertTrue(close(math.nan, -math.nan, 12))
+        self.assertTrue(close(math.inf, math.inf, 12))
+        self.assertFalse(close(math.inf, -math.inf, 12))
+        self.assertFalse(close(math.inf, 1.7976931348623157e308, 12))
+        self.assertFalse(close(None, 0.0, 12))
+        self.assertFalse(close(math.nan, 0.0, 12))
+        self.assertFalse(close(1.0, 1.0000000000000002, 0))
+
+    def test_digits_are_configured_and_bounded(self) -> None:
+        env = {
+            "SHADOW_REFERENCE_URL": "http://reference:8080",
+            "SHADOW_CANDIDATE_URL": "http://candidate:8080",
+            "SHADOW_REFERENCE_WAREHOUSE": "/reference",
+            "SHADOW_CANDIDATE_WAREHOUSE": "/candidate",
+            "SHADOW_DBT_PROJECT_DIR": "/project",
+            "SHADOW_DBT_PROFILES_DIR": "/project",
+            "SHADOW_OUT_DIR": "/out",
+        }
+        cfg = config.load(env)
+        self.assertEqual((cfg.double_digits, cfg.real_digits, cfg.float_recheck_limit), (12, 6, 10000))
+        cfg = config.load(dict(env, SHADOW_DOUBLE_DIGITS="0", SHADOW_REAL_DIGITS="7", SHADOW_FLOAT_RECHECK_LIMIT="0"))
+        self.assertEqual((cfg.double_digits, cfg.real_digits, cfg.float_recheck_limit), (0, 7, 0))
+        for var, value in (("SHADOW_DOUBLE_DIGITS", "18"), ("SHADOW_REAL_DIGITS", "10"),
+                           ("SHADOW_DOUBLE_DIGITS", "-1"), ("SHADOW_FLOAT_RECHECK_LIMIT", "x")):
+            with self.subTest(var=var, value=value), self.assertRaisesRegex(config.ConfigError, var):
+                config.load(dict(env, **{var: value}))
 
 
 class ExpectedTests(unittest.TestCase):

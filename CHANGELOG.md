@@ -169,6 +169,11 @@ versioning: [SemVer](https://semver.org/).
   fronts' Definition of Done (docs/gates.md).
 
 ### Changed
+- Shadow run: floats (`real`, `double`) are compared to 6 and 12 significant digits
+  (`SHADOW_REAL_DIGITS`, `SHADOW_DOUBLE_DIGITS`; `0` keeps the exact text), not by their exact text.
+  `monitoring.sensor_volume` diverged on 12 of 151 rows by the last bit of a windowed `STDDEV_POP`
+  (2.2e-16 relative, 2026-10-07). Rows that round to two sides of a boundary are paired again within
+  half a unit of the last digit; a difference of 1e-6 relative still diverges.
 - A hash join whose build side the planner cannot size (a federated source, anything joined or aggregated
   above one) reads that side first and decides (ADR 0003): it runs as a hash join when the side fits the
   join's slice of the pool, and otherwise writes it to disk and runs as the sort-merge join that spills. It
