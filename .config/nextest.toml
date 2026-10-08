@@ -17,3 +17,9 @@ test-threads = 4
 fail-fast = false
 [profile.ci.junit]
 path = "junit.xml"
+
+# One SQL Server and one Trino 431 for ~130 statements on each engine
+# (sqlserver_federated_joins.rs): about 3.5 minutes, the default's limit is 5.
+[[profile.integration.overrides]]
+filter = "test(federated_joins_answer_as_the_reference_engine)"
+slow-timeout = { period = "60s", terminate-after = 10 }
