@@ -12,7 +12,7 @@
   handed over the error surfaces as before (same type, same text, same client code). Every lost connection
   is logged at `WARN`, and the span records `codelake.retries`.
 - Effect: a connection lost **inside** the stream, as the shadow run's was, is still a failed query. The
-  reference engine behaves the same: the rows of a federated read are not resumable, and a reader that
+  reference engine, run without fault-tolerant execution as in the shadow run, behaves the same: the rows of a federated read are not resumable, and a reader that
   started over would hand the consumer the first rows twice, or end short with no error. The retry covers
   what can be repeated without a trace: the connection dropped while the statement is sent, before the
   first row, or inside the first batch (8192 rows).
