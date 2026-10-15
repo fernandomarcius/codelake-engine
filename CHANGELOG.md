@@ -305,6 +305,16 @@ versioning: [SemVer](https://semver.org/).
   integration is published for DataFusion 54 or later (ADR 0013). It was never shipped.
 
 ### Fixed
+- SQL Server: a read whose connection is lost (reset, aborted, broken pipe, or the stream cut inside a
+  message) before any batch reached the consumer starts over on a new connection, up to two more times
+  (pauses of 200 ms and 1 s, ended at once if the client leaves). Found by the shadow run (candidate
+  `b73643f`): one cycle in about 2200 failed with `Connection reset by peer (os error 104)` on a
+  `CREATE TABLE AS` reading ~961 000 rows, and the engine logged nothing. That failure came 4.5 s into a
+  5.3 s read, after several batches had been delivered, so it is **still an error**: a batch cannot be taken
+  back, and reading again from the start would repeat rows or end the stream short without saying so
+  (ISS-067). Each lost connection is logged at `WARN` (server, database, SQL hash, error kind, attempt
+  `n/3`, whether it is retried, rows read, batches delivered, time into the read); the `sqlserver.query`
+  span carries `codelake.retries`. The error the client sees when the read is not retried is unchanged.
 - A join of tables of one SQL source sent to it whole could return wrong rows, fail, or read every column
   (D1-D3, ADR 0006 point 12):
   the `DataFusion` unparser folded the filter of the table a LEFT JOIN preserves into `ON` (so every row of
