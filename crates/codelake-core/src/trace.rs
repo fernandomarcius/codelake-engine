@@ -57,6 +57,8 @@ pub mod field {
     pub const QUERY_TEXT: &str = "db.query.text";
     pub const SQL_HASH: &str = "codelake.sql.hash";
     pub const CANCELLED: &str = "codelake.cancelled";
+    /// Times a source read started over on a new connection.
+    pub const RETRIES: &str = "codelake.retries";
     pub const TRACE_ID: &str = "codelake.trace_id";
 }
 

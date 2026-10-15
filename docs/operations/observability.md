@@ -108,7 +108,7 @@ codelake.query            query id, user, catalog, schema, correlation id, redac
 ├─ codelake.parse / codelake.plan / codelake.execute
 │  ├─ hive.scan           files selected: count, bytes, names
 │  └─ codelake.remote     one per federated scan
-│     └─ sqlserver.query  redacted T-SQL, server, database, pool wait, rows, error number
+│     └─ sqlserver.query  redacted T-SQL, server, database, pool wait, retries, rows, error number
 ├─ codelake.fetch         rows sent to the client; `cancelled` when the client left
 hive.write                file name and rows of each CTAS / INSERT
 ```
@@ -122,7 +122,9 @@ hive.write                file name and rows of each CTAS / INSERT
 - PostgreSQL wire statements appear as `codelake.pg.statement` spans in one
   trace per session; their execution spans are separate traces for now.
 - Look for: the longest child of a slow `codelake.query`; a `sqlserver.query`
-  with long pool wait (raise `pool_size`) or long duration (the source); a
+  with long pool wait (raise `pool_size`), long duration (the source) or
+  `codelake.retries` above zero (the source dropped a connection: see the
+  `WARN` "sqlserver connection lost while reading" lines in the logs); a
   `hive.scan` with thousands of files (compact); `codelake.fetch` long while
   execution is short (a slow client).
 
