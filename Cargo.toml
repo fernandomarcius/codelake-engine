@@ -40,7 +40,7 @@ datafusion-table-providers-mongodb = { version = "=0.13.1", default-features = f
 # Distributed execution (M4, ADR 0011): exact pins, part of the train block.
 # datafusion-distributed 3.0.0 is the last release on DataFusion 54.
 datafusion-distributed = { version = "=3.0.0", default-features = false, features = ["grpc", "parquet", "sql"] }
-datafusion-proto = { version = "=54.1.0", default-features = false }
+datafusion-proto = { version = "=55.2.0", default-features = false }
 # The worker service is a tonic server (datafusion-distributed's transport).
 tonic = { version = "0.14", default-features = false, features = ["transport"] }
 url = "2.5"
