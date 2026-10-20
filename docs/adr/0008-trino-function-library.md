@@ -21,7 +21,7 @@ The two reference pipelines use `date_add('unit', n, ts)`, `date_diff`,
 `localtimestamp`, `from_big_endian_64(substr(varbinary, 3))`, `to_hex`,
 `checksum`, `max_by`, `approx_percentile`, `array_join(array_agg(…))`,
 `uuid()`, `concat_ws`, `greatest`, `round(decimal, n)`, `regexp_replace`, `chr`
-and `replace` (inventory in `docs/requirements/trino-replacement.md`). They are
+and `replace`. They are
 the acceptance floor, not the scope: the library follows Trino's documentation
 categories for any client.
 

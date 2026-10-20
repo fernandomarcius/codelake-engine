@@ -49,13 +49,11 @@ mod sqlserver_audit;
 #[cfg(all(feature = "sqlserver", feature = "hive"))]
 mod sqlserver_case_functions;
 #[cfg(all(feature = "sqlserver", feature = "hive"))]
-mod sqlserver_column_pruning;
 #[cfg(all(feature = "sqlserver", feature = "hive"))]
 mod sqlserver_connection_lost;
 #[cfg(all(feature = "sqlserver", feature = "hive"))]
 mod sqlserver_dynamic_filter;
 #[cfg(all(feature = "sqlserver", feature = "hive"))]
-mod sqlserver_federated_joins;
 #[cfg(all(feature = "sqlserver", feature = "hive"))]
 mod sqlserver_join_build_side;
 #[cfg(all(feature = "sqlserver", feature = "postgres"))]

@@ -4,9 +4,8 @@ The target: **a drop-in replacement for Trino** — same client protocol, SQL
 dialect, functions, session properties, error codes and table formats — with a
 hard memory ceiling instead of a JVM heap, then scale-out.
 
-CodeLake is a general-purpose engine. The two production pipelines described in
-[docs/requirements/trino-replacement.md](docs/requirements/trino-replacement.md)
-are **acceptance cases**: CodeLake must run them unchanged, but they are a floor,
+CodeLake is a general-purpose engine. Two reference production pipelines
+(SQL Server CDC, Hive/Parquet and dbt) are **acceptance cases**: CodeLake must run them unchanged, but they are a floor,
 not the specification. Features follow Trino's contract, with registries that
 connectors extend (catalogs, session properties, functions), never shapes
 hard-coded for one user.

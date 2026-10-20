@@ -456,8 +456,7 @@ async fn local_keys_and_time_windows_reach_sql_server() {
 
     // Text keys of a local table: an IN list at the source, which compares
     // under its case-insensitive collation; the join keeps the exact ones.
-    let semi =
-        "SELECT id FROM warehouse.dbo.chaves WHERE chave IN (SELECT chave FROM hive.pilot.chaves) ORDER BY id";
+    let semi = "SELECT id FROM warehouse.dbo.chaves WHERE chave IN (SELECT chave FROM hive.pilot.chaves) ORDER BY id";
     let (rows, sent) = traced(&engine, &host, port, "chaves", semi).await;
     checks.check(
         "text keys, IN subquery: rows",

@@ -130,7 +130,6 @@ Report vulnerabilities privately: [SECURITY.md](SECURITY.md).
 | `fuzz` | cargo-fuzz targets |
 | `deploy/k8s`, `deploy/compose` | Kubernetes manifests, local stack |
 | `docs/adr` | architecture decisions |
-| `docs/requirements` | what replacing Trino actually requires |
 | `docs/operations`, `scripts/ops` | runbooks, canary |
 
 ## License
