@@ -68,7 +68,7 @@ native-tls = "0.2"
 object_store = { version = "0.13", default-features = false, features = ["fs"] }
 crc32fast = "1.5"
 uuid = { version = "1", features = ["v4"] }
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 # Atomic exchange of two directories (renameat2 RENAME_EXCHANGE) for
 # CREATE OR REPLACE TABLE, without `unsafe`.
