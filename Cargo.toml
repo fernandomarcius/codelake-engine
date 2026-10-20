@@ -84,7 +84,7 @@ fancy-regex = "0.19"
 num-traits = "0.2.19"
 twox-hash = { version = "2.1", default-features = false, features = ["xxhash64", "std"] }
 md5 = { package = "md-5", version = "0.10.6" }
-sha1 = "0.10.6"
+sha1 = "0.11.0"
 sha2 = "0.10.9"
 libm = "0.2.16"
 unicode-normalization = "0.1.25"
