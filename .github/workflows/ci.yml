@@ -65,7 +65,7 @@ jobs:
       - uses: ./.github/actions/toolbelt
         with: { cache-key: coverage }
       - run: scripts/dev.sh scripts/gates.sh coverage
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with: { name: lcov, path: lcov.info, if-no-files-found: ignore }
 
@@ -82,7 +82,7 @@ jobs:
       - run: scripts/dev.sh scripts/gates.sh mutants
         env:
           MUTANTS_BASE: origin/${{ github.base_ref }}
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with: { name: mutants, path: mutants.out, if-no-files-found: ignore }
 
