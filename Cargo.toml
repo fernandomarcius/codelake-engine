@@ -18,7 +18,7 @@ publish = false
 # Bumping DataFusion means bumping this whole block together, never one line.
 [workspace.dependencies]
 # `~54.1`: the train is DataFusion 54.1.x; a 54.2 is a train change (ADR 0002).
-datafusion = { version = "~54.1", default-features = false, features = [
+datafusion = { version = "~55.2", default-features = false, features = [
   "nested_expressions",
   "datetime_expressions",
   "string_expressions",
