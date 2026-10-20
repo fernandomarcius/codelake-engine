@@ -19,5 +19,5 @@ configMapGenerator:
       - codelake.toml=worker.toml
 images:
   - name: codelake
-    newName: ghcr.io/fernandomarcius/codelake
+    newName: ghcr.io/fernandomarcius/codelake-engine
     digest: sha256:0000000000000000000000000000000000000000000000000000000000000000

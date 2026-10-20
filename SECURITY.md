@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Report privately through GitHub Security Advisories
-(<https://github.com/fernandomarcius/CodeLake/security/advisories/new>).
+(<https://github.com/fernandomarcius/codelake-engine/security/advisories/new>).
 Do not open public issues for vulnerabilities. We acknowledge within 3 business
 days and agree on a disclosure date with the reporter.
 

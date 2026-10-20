@@ -14,5 +14,5 @@ images:
   # CI replaces this with the digest of the image that passed every gate.
   # The same digest is promoted HML -> PRD; nothing is rebuilt per environment.
   - name: codelake
-    newName: ghcr.io/fernandomarcius/codelake
+    newName: ghcr.io/fernandomarcius/codelake-engine
     digest: sha256:0000000000000000000000000000000000000000000000000000000000000000

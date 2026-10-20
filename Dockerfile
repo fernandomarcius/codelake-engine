@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # distroless/cc: glibc + libssl + CA certificates, no shell, no package manager.
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
-LABEL org.opencontainers.image.source="https://github.com/fernandomarcius/CodeLake" \
+LABEL org.opencontainers.image.source="https://github.com/fernandomarcius/codelake-engine" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.description="CodeLake federated SQL engine"
 COPY --from=build --chown=65532:65532 /out/codelake /usr/local/bin/codelake
