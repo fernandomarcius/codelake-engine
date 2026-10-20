@@ -56,7 +56,7 @@ codelake-connectors = { path = "crates/codelake-connectors" }
 
 # SQL Server (TDS). native-tls: old SQL Server builds only negotiate TLS 1.0/1.1,
 # which rustls refuses.
-tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "native-tls"] }
+tiberius = { version = "0.13.0", default-features = false, features = ["tds73", "native-tls"] }
 bb8 = "0.9"
 # PostgreSQL connections of the connector's own pool (the upstream pool sets a
 # Redshift parameter PostgreSQL refuses, ISS-060); versions already in the graph.
