@@ -5,7 +5,7 @@
 # the same tool versions. Bump versions here, never ad hoc on a laptop.
 # Same Debian release as the release build (Dockerfile), so a binary built here
 # links against the glibc the production image ships.
-FROM rust:1.98.1-bookworm
+FROM rust:1.99.1-bookworm
 
 ARG MSRV=1.94.0
 ARG BINSTALL_VERSION=1.23.0
