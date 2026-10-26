@@ -29,7 +29,7 @@ datafusion = { version = "~54.1", default-features = false, features = [
 ] }
 # Exact pin: the table-provider crates ask for ^0.5.5 and 0.5.7 already needs
 # DataFusion 55; only one 0.5.x may be in the graph.
-datafusion-federation = { version = "=0.5.5", features = ["sql"] }
+datafusion-federation = { version = "=0.5.8", features = ["sql"] }
 # One crate per connector since 0.13. `default-features = false` on purpose:
 # `federation` moved from the facade to these crates and is enabled per
 # connector in crates/codelake-connectors/Cargo.toml (MongoDB stays unfederated).
